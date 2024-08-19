@@ -1,15 +1,22 @@
 import string
 from abc import abstractmethod
 import os
+from typing import Any
 
+import mido.midifiles.meta
 import music21.midi
 import numpy
 import pretty_midi as midi
-from pretty_midi import PrettyMIDI
+from numpy import ndarray, dtype
+from pretty_midi import PrettyMIDI, Instrument, Note
 import music21 as m21
 import numpy as np
+
+import constants
 from util.ArrayList import ArrayList
-from AGSM.convert import ConvTempo
+from AGSM.convert import ConvTempo, ConvKey
+from transformer.tokenizer import Tokenizer
+import transformer.tokenizer as tr
 
 PITCH = 0
 VELOCITY = 1
@@ -17,104 +24,100 @@ DURATION_INT = 2
 DURATION_FEW = 3
 BEGIN_TIME_INT = 4
 BEGIN_TIME_FEW = 5
+START_SEQ = np.array([[0, 0, 0, 0]], dtype=int)
+END_SEQ = np.array([[5, 5, 5, 5]], dtype=int)
+''''
+規則：
+    AyaNode:
+        Aya_node = [音高, 強さ, 始まりの拍(16), 終わりの拍までの長さ(16)]
+    TOKEN:
+        <S_SEQ>: [0, 0, 0, 0]
+        <E_SEQ>: [5, 5, 5, 5]
+'''
 
 
-def _get_midi_datasets(directory):
-    try:
-        return midi.PrettyMIDI(directory)
-    except OSError or ValueError:
-        return None
-    except IndexError:
-        return None
-    except ValueError:
-        return None
 
 
-class _AbstractConvert:
-    @abstractmethod
-    def convert(self, directory: str, midi_data: PrettyMIDI):
-        pass
+class ConvertMidi:
 
-
-class ConvertProperties:
-    _conv_list = []
-
-    def __init__(self):
-        self._conv_list = ArrayList[_AbstractConvert]()
-
-    def change_key(self, key: str):
-        self._conv_list.add(_ConvertChangeKey(key))
-        return self
-
-    def sort(self):
-        self._conv_list.add(_Sort())
-        return self
-
-    def convert(self, directory, midi_data):
-        for i in range(self._conv_list.size()):
-            self._conv_list.get(i).convert(directory, midi_data)
-
-
-class ConvertNumPy:
-    directory = ""
-    midi_data = midi.PrettyMIDI()
-    np_note = []
-    isError = False
-
-    def __init__(self, directory: str, conv_list: ConvertProperties):
+    def __init__(self, tokenizer: Tokenizer, directory: str, program_list: list, tempo: int, midi_data: PrettyMIDI = None):
         self.directory = directory
-        self.conv: ConvertProperties = conv_list
-        try:
-            self.midi_data = _get_midi_datasets(directory)
-        except OSError:
-            self.isError = True
+        self.midi_data = midi_data
+        self.program_list = program_list
+        self.tempo = tempo
+        self.aya_node = None
+        self.is_error = False
+        self.tokenizer = tokenizer
+
+    def convert(self):
+        self._ct_tempo()
+        self._ct_key()
+        if not self.is_error:
+            convert_notes: np = None
+            program_count = 0
+            for inst in self.midi_data.instruments:
+                inst: Instrument = inst
+                if not inst.is_drum and inst.program in self.program_list:
+                    cn = self.ct_aya_node(inst.notes)
+                    cn: ndarray = self.split_seq_data(cn)
+
+                    if convert_notes is None:
+                        convert_notes = cn
+                    else:
+                        pad_convert_notes, pad_cn = self.padding(convert_notes, cn)
+                        convert_notes = np.vstack((pad_convert_notes, pad_cn), dtype=int)
+                    program_count += 1
+
+            if program_count == 0:
+                print(f"{self.directory}には欲しい楽曲がありませんでした")
+                self.is_error = True
+            elif np.min(convert_notes) < 0:
+                print(f"{self.directory}の値の中に0以下の値が格納されていたため、中断します。")
+                self.is_error = True
+
+            self.aya_node = convert_notes
+            return convert_notes
+
+
+    def split_seq_data(self, target: ndarray):
+
+        if len(target.shape) == 1:
+            musics_seq = [target.tolist()]
+        else:
+            musics_seq = target.tolist()
+
+        new_music_seq = [[]]
+        for i in range(len(musics_seq)):
+            result = []
+            current_sublist = []
+            for value in musics_seq[i]:
+                current_sublist.append(value)
+                if value == 2:
+                    result.append(current_sublist)
+                    current_sublist = []
+            new_music_seq = new_music_seq + result
+
+        return np.array(self._padding(new_music_seq))
 
         pass
 
-    # [音高, 強さ,　始まり(4分), 始まり(8分),　始まり(16),　終わり(4分), 終わり(8分),　終わり(16),  ルート音]
-    def convert(self):
-        if not self.isError:
-            self.conv.convert(self.directory, self.midi_data)
-        else:
-            print("エラーが発生し、読み込めません。")
-
-        np_notes = np.array([[0, 0, 0, 0, 0, 0, 0, 0, 0]])
-        try:
-            correct_inst_count = 0
-            for inst in self.midi_data.instruments:
-                if not inst.is_drum and (inst.program in range(0, 9) or inst.program == 56 or inst.program in range(64, 69)):
-                    correct_inst_count += 1
-                    np_notes = np.vstack([np_notes, [0, 0, 0, 0, 0, 0, 0, 0, 0]])
-                    for note in inst.notes:
-                        pitch = int(note.pitch)  # 音高
-
-                        velocity = int(note.velocity)  # 強さ
-
-
-
-#                        np_notes = np.vstack([np_notes, [int(pitch), int(velocity), duration_int, duration_few,
-#                                                         begin_time_int, begin_time_few, root_note]])
-
-                    np_notes = np.vstack([np_notes, [0, 0, 0, 0, 0, 0, 0, 0, 0]])
-            self.np_note = np_notes
-            if correct_inst_count <= 0:
-                print(f"{self.directory}には欲しい楽器がありません！！")
-                self.isError = True
-
-            if np.min(np_notes) < 0:
-                print(f"{self.directory}の値の中に0以下の値が格納されていたため、中断します。")
-                self.isError = True
-        except AttributeError:
-            print("処理を行う過程でエラーが発生しました。")
-            self.np_note = np.array([[-1, -1, -1, -1, -1, -1, -1, -1, -1]])
-            self.isError = True
-        except TypeError:
-            print("処理を行う過程でエラーが発生しました。")
-            self.np_note = np.array([[-1, -1, -1, -1, -1, -1, -1, -1, -1]])
-            self.isError = True
+    def _padding(self, target: list):
+        max_lengths = []
+        for t in target:
+            max_lengths.append(len(t))
+        max_length = max(max_lengths)
+        print(f"Max length is {max_length}")
+        for t in target:
+            if len(t) < max_length:
+                for _ in range(max_length - len(t)):
+                    t.append(0)
+        return target
+        pass
 
     def save(self):
-        if not self.isError:
+        if not self.is_error:
+            print(f"Result shape is:{self.aya_node.shape}")
+
             current_dir = os.path.dirname(os.path.abspath(__file__))
 
             # ルートディレクトリまでの相対パスを計算
@@ -127,131 +130,123 @@ class ConvertNumPy:
 
             filename = split_direc[-1].split(".")[0]
 
-            np.savez(out_directory + "/np/datasets/" + filename, *self.np_note)
+            np.savez(out_directory + "/np/datasets/" + filename, self.aya_node)
             print("処理が正常に終了しました。")
         else:
             print("Transformerが望むデータ形式ではないため、保存ができませんでした。")
 
-    @staticmethod
-    def get_root_pitch(pitch):
-        return pitch % 12
+    def ct_aya_node(self, notes: list) -> ndarray[Any, dtype[Any]]:
+        node = np.array([self.tokenizer.get(-1, constants.START_SEQ_TOKEN)])
 
-    def get_root_note(self, start: float) -> int:
-        bass = self.get_bass()
-        if bass is None:
-            #self.isError = True
-            return 99
-        else:
-            measure = self.get_measure(start)
-            for note in bass.notes:
-                if note.start >= self.get_measure_sec() * (measure - 1):
-                    return self.get_root_pitch(note.pitch)
-            #self.isError = True
-            return 99
+        back_start = None
+        for note in notes:
 
-    def get_bass(self):
-        for inst in self.midi_data.instruments:
-            if inst.program in range(33, 41):
-                return inst
+            note: Note = note
+            start = self.ct_time_to_beat(note.start)
+            end = self.ct_time_to_beat(note.end)
 
-        return None
+            if back_start is not None:
+                shift = abs((back_start // 32) - (start // 32))
+                if shift < 4:
+                    node = np.append(node, self.tokenizer.get(shift, tr.SHIFT_TYPE)) #何小節のブランクができたかを計算
+                else:
+                    node = np.append(node, self.tokenizer.get(-1, constants.END_SEQ_TOKEN))
+                    node = np.append(node, self.tokenizer.get(-1, constants.START_SEQ_TOKEN))
 
-    def get_measure(self, start):
-        measure_sec = self.get_measure_sec()  # 一小節当たりの秒数
-        return start / measure_sec + 1
+            pitch_token = self.tokenizer.get(note.pitch, tr.PITCH_TYPE)
+            velocity_token = self.tokenizer.get(note.velocity, tr.VELOCITY_TYPE)
+            duration_token = self.tokenizer.get(min(abs(end - start), 99), tr.DURATION_TYPE)
+            start_token = self.tokenizer.get(start % 32, tr.START_TYPE)
+            note_token = np.array([start_token, pitch_token, velocity_token, duration_token])
+            node = np.concatenate((node, note_token))
+            back_start = start
 
-    def get_measure_sec(self):
-        time, tempo = self.midi_data.get_tempo_changes()
-        s = 60 / tempo[0]  # 一泊当たりの秒数
-        return 4 * s
+        node = np.append(node, self.tokenizer.get(-1, constants.END_SEQ_TOKEN))
+        return node
 
-    @staticmethod
-    def get_begin_time(before: midi.Note, notes: midi.Note) -> float:
-        return notes.start - before.start
-
-    def split_float_to_ints(self, num):
-        if num < 0:
-            return -1, -1
-        else:
-            # 整数部を取得
-            integer_part = int(num)
-
-            # 少数部を取得し、整数部に変換
-            decimal_part_as_str = str(num).split('.')[1]
-            decimal_part_as_int = int(decimal_part_as_str[0:3])
-
-            return integer_part, decimal_part_as_int
-
-
-class _Sort(_AbstractConvert):
-
-    def convert(self, directory: str, midi_data: PrettyMIDI):
+    def _ct_key(self):
         try:
-            for inst in midi_data.instruments:
-                ins: midi.Instrument = inst
+            if self.midi_data is None:
+                ct = ConvKey(self.directory, "C")
+                ct.convert()
+                self.midi_data = ct.midi_data
+                if ct.is_Error:
+                    self.is_error = ct.is_Error
+            else:
+                ct = ConvKey(directory=self.directory, midi_data=self.midi_data, key="C")
+                ct.convert()
+                self.midi_data = ct.midi_data
+        except OSError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
+        except IndexError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
+        except mido.midifiles.meta.KeySignatureError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
+        except ValueError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
 
-                if not ins.is_drum and inst.program in range(1, 10):
-                    ins.notes = sorted(ins.notes, key=lambda note: note.start)
-                    pass
-            pass
-        except AttributeError:
-            print("謎のエラー")
 
 
-
-class _ConvertChangeKey(_AbstractConvert):
-    is_Error = False
-
-    def __init__(self, conv_key: str):
-        self.conv_key_number = self.get_key_number(conv_key)
-
-    def convert(self, directory: str, midi_data: PrettyMIDI):
+    def _ct_tempo(self):
         try:
-            score = m21.converter.parse(directory)
-            key = score.analyze("key").tonic.name
-            now_key_number = self.get_key_number(key)
-            transpose_number = abs(now_key_number - self.conv_key_number)
-            for inst in midi_data.instruments:
-                if not inst.is_drum:
-                    for note in inst.notes:
-                        note.pitch -= transpose_number
-        except AttributeError:
-            print(f"{directory}が移調できませんでした。")
-            self.is_Error = True
-        except music21.midi.MidiException:
-            self.is_Error = True
-            print(f"{directory}が移調できませんでした。")
-        except music21.converter.ConverterFileException:
-            self.is_Error = True
-            print(f"{directory}が移調できませんでした")
-        except music21.exceptions21.StreamException:
-            self.is_Error = True
-            print(f"{directory}が移調できませんでした")
-        pass
+            if self.midi_data is None:
+                ct = ConvTempo(self.directory, self.tempo)
+                ct.convert()
+                self.midi_data = ct.midi_data
+                if ct.is_Error:
+                    self.is_error = ct.is_Error
+            else:
+                ct = ConvTempo(directory=self.directory, midi_data=self.midi_data, change_tempo=120)
+                ct.convert()
+                self.midi_data = ct.midi_data
+        except OSError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
+        except IndexError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
+        except ValueError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
 
-    @staticmethod
-    def get_key_number(key):
-        if key == "C":
-            return 0
-        if key == "C#" or key == "D-":
-            return 1
-        if key == "D":
-            return 2
-        if key == "D#" or key == "E-":
-            return 3
-        if key == "E":
-            return 4
-        if key == "F":
-            return 5
-        if key == "F#" or key == "G-":
-            return 6
-        if key == "G":
-            return 7
-        if key == "G#" or key == "A-":
-            return 8
-        if key == "A":
-            return 9
-        if key == "A#" or key == "B-":
-            return 10
-        if key == "B":
-            return 11
+        except mido.midifiles.meta.KeySignatureError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
+
+
+    def ct_time_to_beat(self, time: float) -> int:
+        b4 = 60 / self.tempo
+        b8 = b4 / 2
+        b16 = b8 / 2
+        b32 = b16 / 2
+
+        beat, sub = self.calc_time_to_beat(time, b32)
+
+        return beat
+
+    def calc_time_to_beat(self, time, beat_time) -> (int, int):
+        main_beat: int = time // beat_time
+        sub_time: int = time % beat_time
+        return main_beat, sub_time
+
+    def padding(self, array1: ndarray, array2: ndarray):
+        print(f"a:{array1.shape[-1]}  b:{array2.shape[-1]}")
+
+        max_len = max(array1.shape[-1], array2.shape[-1])
+
+        # 0でパディングして同じ長さに揃える
+        if len(array1.shape) > 1:
+            padded_array1 = np.array([np.pad(row, (0, max_len - len(row)), mode='constant') for row in array1])
+        else:
+            padded_array1 = np.pad(array1, (0, max_len - len(array1)), mode='constant')
+
+        if len(array2.shape) > 1:
+            padded_array2 = np.array([np.pad(row, (0, max_len - len(row)), mode='constant') for row in array2])
+        else:
+            padded_array2 = np.pad(array2, (0, max_len - len(array2)), mode='constant')
+
+        return padded_array1, padded_array2

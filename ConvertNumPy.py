@@ -1,26 +1,21 @@
-import convert.ConvertMidi as cm
+from convert.ConvertMidi import ConvertMidi
+from transformer.tokenizer import Tokenizer
 import os
 
-"""
-datasets = "data/JazzMidi/"
-out = "out/np/JazzMidi/"
-files = os.listdir(datasets)
-for file in files:
-    converter = midiNum.MidiConvertToNumPy(datasets + "/" + file)
-    if not converter.is_error:
-        change = changeKey.ChangingKey(datasets + "/" + file, converter.convert())
-        change.set_convert_key("C")
-        numpy_data = change.convert()
-        np.savez(out + file, *numpy_data)
-
-"""
-
-datasets = "data/JazzMidi/"
+datasets = "data/other/"
 files = os.listdir(datasets)
 
+BRASS = [57, 58, 65, 66, 67, 68]
+PIANO = [1, 2, 3, 4, 5, 6, 7, 8]
+GUITAR = [25, 26, 27, 28, 29, 30, 31, 32]
 
 
+ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 67, 68]
+tokenizer = Tokenizer()
 for file in files:
-    con = cm.ConvertNumPy(datasets + file, cm.ConvertProperties().change_key('C'))
+    con = ConvertMidi(tokenizer, datasets + file, BRASS, 120)
     con.convert()
     con.save()
+
+tokenizer.save()
+print(len(tokenizer.tokens))

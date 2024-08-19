@@ -1,12 +1,27 @@
-import numpy as np
 import json
 import constants
+
+PITCH_TYPE = 'p'
+VELOCITY_TYPE = 'v'
+DURATION_TYPE = 'd'
+
+START_TYPE = 's'
+SHIFT_TYPE = 'h'
 
 
 class Tokenizer:
     def __init__(self, load_data: str = None):
         if load_data is None:
-            self.vocab_size = 3
+            # 特殊トークン
+            self.special_token_position = 3
+            #旋律トークン
+            self.pitch_position = 10
+            self.velocity_position = 300
+            self.duration_position = 500
+            #指示トークン
+            self.instruction_start_position = 600
+            self.instruction_shift_position = 650
+
             self.tokens: dict = dict()
             self.tokens[constants.PADDING_TOKEN] = 0
             self.tokens[constants.START_SEQ_TOKEN] = 1
@@ -14,35 +29,44 @@ class Tokenizer:
         else:
             with open(load_data, 'r') as file:
                 self.tokens: dict = json.load(file)
-            self.vocab_size = len(self.tokens)
+                self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
 
-    def get(self, a: str) -> int:
-        if a in self.tokens:
-            return self.tokens[a]
+    def rev_get(self, a):
+        return self.rev_tokens[a]
+
+    def get(self, a: int, token_type: str):
+        if a == -1:
+            my_token = token_type
         else:
-            self.tokens[a] = self.vocab_size
-            self.vocab_size += 1
-            return self.tokens[a]
+            my_token = f"{token_type}_{a}"
+
+        if my_token in self.tokens:
+            return self.tokens[my_token]
+        else:
+            if token_type is PITCH_TYPE:
+                self.tokens[my_token] = self.pitch_position
+                self.pitch_position += 1
+
+            elif token_type is VELOCITY_TYPE:
+                self.tokens[my_token] = self.velocity_position
+                self.velocity_position += 1
+
+            elif token_type is DURATION_TYPE:
+                self.tokens[my_token] = self.duration_position
+                self.duration_position += 1
+
+            elif token_type is START_TYPE:
+                self.tokens[my_token] = self.instruction_start_position
+                self.instruction_start_position += 1
+
+            elif token_type is SHIFT_TYPE:
+                self.tokens[my_token] = self.instruction_shift_position
+                self.instruction_shift_position += 1
+
+            return self.tokens[my_token]
 
     def save(self):
         json_string = json.dumps(self.tokens)
         with open("out/vocab/vocab_list.json", 'w') as file:
             file.write(json_string)
     pass
-
-
-def convert_token(data: list, tokenizer: Tokenizer) -> list:
-    new_data: list = []
-    is_first: bool = True
-    for i in range(len(data)):
-        if data[i] == [0, 0, 0, 0, 0, 0, 0, 0, 0] and is_first:
-            new_data.append(tokenizer.get(constants.START_SEQ_TOKEN))
-            is_first = False
-        elif data[i] == [0, 0, 0, 0, 0, 0, 0, 0, 0]:
-            new_data.append(tokenizer.get(constants.END_SEQ_TOKEN))
-            is_first = True
-        else:
-            str_token = "_".join(map(str, data[i]))
-            new_data.append(tokenizer.get(str_token))
-
-    return new_data
