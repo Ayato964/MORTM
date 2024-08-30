@@ -35,7 +35,19 @@ END_SEQ = np.array([[5, 5, 5, 5]], dtype=int)
         <E_SEQ>: [5, 5, 5, 5]
 '''
 
+def convert_tolist(target: list):
+    new_target = None
+    for t in target:
+        t: ndarray
+        cul = []
+        for c in t:
+            cul.append(c)
+        if new_target is not None:
+            new_target = new_target + [cul]
+        else:
+            new_target = [cul]
 
+    return new_target
 
 
 class ConvertMidi:
@@ -51,7 +63,7 @@ class ConvertMidi:
 
     def convert(self):
         self._ct_tempo()
-        self._ct_key()
+        #self._ct_key()
         if not self.is_error:
             convert_notes: np = None
             program_count = 0
@@ -59,13 +71,20 @@ class ConvertMidi:
                 inst: Instrument = inst
                 if not inst.is_drum and inst.program in self.program_list:
                     cn = self.ct_aya_node(inst.notes)
-                    cn: ndarray = self.split_seq_data(cn)
+
+                    if len(cn) >= 1000:
+                        new_array = np.array_split(cn, np.arange(1000, len(cn), 1000))
+                        new_array = convert_tolist(new_array)
+                        cn: ndarray = np.array(self._padding(new_array))
+                        print(cn.shape)
+                    else:
+                        cn: ndarray = np.array(self._padding([cn.tolist()], 1000))
 
                     if convert_notes is None:
                         convert_notes = cn
                     else:
-                        pad_convert_notes, pad_cn = self.padding(convert_notes, cn)
-                        convert_notes = np.vstack((pad_convert_notes, pad_cn), dtype=int)
+                        #pad_convert_notes, pad_cn = self.padding(convert_notes, cn)
+                        convert_notes = np.vstack((convert_notes, cn), dtype=int)
                     program_count += 1
 
             if program_count == 0:
@@ -101,11 +120,13 @@ class ConvertMidi:
 
         pass
 
-    def _padding(self, target: list):
-        max_lengths = []
-        for t in target:
-            max_lengths.append(len(t))
-        max_length = max(max_lengths)
+    def _padding(self, target: list, max_length: int = None):
+        if max_length is None:
+            max_lengths = []
+            for t in target:
+                max_lengths.append(len(t))
+            max_length = max(max_lengths)
+
         print(f"Max length is {max_length}")
         for t in target:
             if len(t) < max_length:
@@ -114,7 +135,7 @@ class ConvertMidi:
         return target
         pass
 
-    def save(self):
+    def save(self) -> bool:
         if not self.is_error:
             print(f"Result shape is:{self.aya_node.shape}")
 
@@ -126,14 +147,16 @@ class ConvertMidi:
             # ルートディレクトリからoutディレクトリへのパスを生成
             out_directory = os.path.join(project_root, 'out')
 
-            split_direc = self.directory.split("/")
+            split_direc = self.directory.split("\\")
 
             filename = split_direc[-1].split(".")[0]
 
             np.savez(out_directory + "/np/datasets/" + filename, self.aya_node)
             print("処理が正常に終了しました。")
+            return True
         else:
             print("Transformerが望むデータ形式ではないため、保存ができませんでした。")
+            return False
 
     def ct_aya_node(self, notes: list) -> ndarray[Any, dtype[Any]]:
         node = np.array([self.tokenizer.get(-1, constants.START_SEQ_TOKEN)])
@@ -147,8 +170,9 @@ class ConvertMidi:
 
             if back_start is not None:
                 shift = abs((back_start // 32) - (start // 32))
-                if shift < 4:
-                    node = np.append(node, self.tokenizer.get(shift, tr.SHIFT_TYPE)) #何小節のブランクができたかを計算
+                if 4 > shift:
+                    if shift > 0:
+                        node = np.append(node, self.tokenizer.get(shift, tr.SHIFT_TYPE)) #何小節のブランクができたかを計算
                 else:
                     node = np.append(node, self.tokenizer.get(-1, constants.END_SEQ_TOKEN))
                     node = np.append(node, self.tokenizer.get(-1, constants.START_SEQ_TOKEN))
@@ -217,6 +241,18 @@ class ConvertMidi:
             print(f"{self.directory}でエラーが発生。処理を中断します。")
             self.is_error = True
 
+        except EOFError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
+
+        except KeyError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
+        except ZeroDivisionError:
+            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            self.is_error = True
+
+
 
     def ct_time_to_beat(self, time: float) -> int:
         b4 = 60 / self.tempo
@@ -250,3 +286,4 @@ class ConvertMidi:
             padded_array2 = np.pad(array2, (0, max_len - len(array2)), mode='constant')
 
         return padded_array1, padded_array2
+

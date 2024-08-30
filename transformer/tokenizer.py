@@ -1,4 +1,7 @@
 import json
+
+import numpy as np
+
 import constants
 
 PITCH_TYPE = 'p'
@@ -23,6 +26,7 @@ class Tokenizer:
             self.instruction_shift_position = 650
 
             self.tokens: dict = dict()
+            self.token_max: dict = self._init_mx_dict()
             self.tokens[constants.PADDING_TOKEN] = 0
             self.tokens[constants.START_SEQ_TOKEN] = 1
             self.tokens[constants.END_SEQ_TOKEN] = 2
@@ -31,16 +35,25 @@ class Tokenizer:
                 self.tokens: dict = json.load(file)
                 self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
 
+    def _init_mx_dict(self) -> dict:
+        my_dict = dict()
+        for i in range(0, 654):
+            my_dict[i] = 0
+        return my_dict
+
     def rev_get(self, a):
         return self.rev_tokens[a]
 
-    def get(self, a: int, token_type: str):
+    def get(self, a: int, token_type: str, b = False):
         if a == -1:
+            b = True
             my_token = token_type
         else:
             my_token = f"{token_type}_{a}"
 
         if my_token in self.tokens:
+            if not b:
+                self.token_max[self.tokens[my_token]] += 1
             return self.tokens[my_token]
         else:
             if token_type is PITCH_TYPE:
@@ -63,10 +76,16 @@ class Tokenizer:
                 self.tokens[my_token] = self.instruction_shift_position
                 self.instruction_shift_position += 1
 
+            self.token_max[self.tokens[my_token]] = 1
             return self.tokens[my_token]
 
     def save(self):
         json_string = json.dumps(self.tokens)
         with open("out/vocab/vocab_list.json", 'w') as file:
             file.write(json_string)
+
+        json_s = json.dumps(self.token_max)
+        with open("out/vocab/vocab_max.json", 'w') as file:
+            file.write(json_s)
+
     pass

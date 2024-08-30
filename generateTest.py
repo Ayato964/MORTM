@@ -8,29 +8,32 @@ from convert import ConvertAyaNodeToMidi as nm
 import transformer.tokenizer as token
 model_directory = "out/model/"
 
-tokenizer = token.Tokenizer("out/vocab/vocab_list_before.json")
+tokenizer = token.Tokenizer("out/vocab/vocab_list.json")
 
 model = AyatoModel(
-    vocab_size=tokenizer.vocab_size,
-    d_model=512,
-    dim_feedforward=3000,
-    trans_layer=7,
-    position_length=3000,
+    vocab_size=654,
+    d_model=1024,
+    dim_feedforward=2048,
+    trans_layer=12,
+    num_heads=16,
+    position_length=2048
 )
-model.load_state_dict(torch.load("out/model/AyatoModel.ALL_0.9.0_0.026402872055768967.pth"))
+model.load_state_dict(torch.load("out/model/AyatoModel.0.9.5_6.238151550292969.pth"))
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 print("HEEEE")
 # メロディ生成の実行
 #np_notes = np.load("out/np/test/test.npz")
 
-start = tokenizer.get(constants.START_SEQ_TOKEN)
+start = tokenizer.get(-1, constants.START_SEQ_TOKEN, b=True)
 
-#gene = model.generate(tokenizer.get(constants.START_SEQ_TOKEN), max_length=10)
-gene = model.top_p_sampling(start, tokenizer, max_length=20)
+#gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=0.2)
+gene = model.generate_by_length(start, max_length=20)
+
 output = gene[0]
+print(output)
 for t in output:
-    print(f"{t}  {tokenizer.rev_get(t)}")
+    print(f"{t}  {tokenizer.rev_get(t.tolist())}")
 
 midi: pm.PrettyMIDI = nm.convert(gene[0], tokenizer)
 
