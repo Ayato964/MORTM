@@ -3,7 +3,7 @@
 
 """
 import messager
-import transformer.AyatoTransFormer as atf
+import transformer.mortem as atf
 import os
 import torch
 import datetime
@@ -15,7 +15,7 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 model_version = "0.9.2"
 today_date = datetime.date.today().strftime('%Y%m%d')
 
-print(f"ToDay is{datetime.date.today()}! start generating AyatoModel.{model_version}_{today_date}")
+print(f"ToDay is{datetime.date.today()}! start generating MORTEM_Model.{model_version}_{today_date}")
 
 #directory = "out/np/test/"
 directory = "out/np/datasets/"

@@ -2,7 +2,7 @@ import json
 
 import constants
 import torch
-from transformer.AyatoTransFormer import AyatoModel
+from transformer.mortem import MORTEM
 import pretty_midi as pm
 from convert import ConvertAyaNodeToMidi as nm
 import transformer.tokenizer as token
@@ -10,7 +10,7 @@ model_directory = "out/model/"
 
 tokenizer = token.Tokenizer("out/vocab/vocab_list.json")
 
-model = AyatoModel(
+model = MORTEM(
     vocab_size=654,
     d_model=1024,
     dim_feedforward=2048,

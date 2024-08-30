@@ -39,7 +39,7 @@ def send_prediction_end_time(message,loader_len, begin_time, end_time,
 def set_train_data(directory, datasets):
     if not IS_DEBUG:
         print("Generating TrainData.....")
-        t_data = AyatoDataSet()
+        t_data = MORTEM_DataSets()
         for dataset in datasets:
             print(f"Load [{directory + dataset}]")
             np_load_data = np.load(directory + dataset)
@@ -89,9 +89,9 @@ def train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, w
           position_length=2048):
     loader = DataLoader(ayato_dataset, batch_size=16, shuffle=True, pin_memory=False)
     print("Creating Model....")
-    model = AyatoModel(vocab_size=vocab_size, trans_layer=trans_layer, num_heads=num_heads,
-                       d_model=d_model, dim_feedforward=dim_feedforward,
-                       dropout=dropout, position_length=position_length).to(device)
+    model = MORTEM(vocab_size=vocab_size, trans_layer=trans_layer, num_heads=num_heads,
+                   d_model=d_model, dim_feedforward=dim_feedforward,
+                   dropout=dropout, position_length=position_length).to(device)
 
     criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(device))  # 損失関数を定義
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-5)  # オプティマイザを定義
@@ -134,7 +134,7 @@ def train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, w
                 mail_bool = False
             if (count + 1) % 100 == 0:
                 message.send_mail("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
-                                                                f"{f"learning sequence {count + 1}"}結果は、\n {epoch_loss:.4f}でした。")
+                                                                f"learning sequence {count + 1}結果は、\n {epoch_loss:.4f}でした。")
             print(epoch_loss)
 
 
@@ -147,7 +147,7 @@ def train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, w
 device = get_device()
 
 
-class AyatoModel(nn.Module):
+class MORTEM(nn.Module):
     token_dict = {
         0: "600_633",
         1: "10_139",
@@ -158,7 +158,7 @@ class AyatoModel(nn.Module):
 
     def __init__(self, vocab_size, trans_layer=6, num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1,
                  position_length=2048):
-        super(AyatoModel, self).__init__()
+        super(MORTEM, self).__init__()
 
         self.trans_layer = trans_layer
         self.num_heads = num_heads
@@ -285,7 +285,7 @@ class AyatoModel(nn.Module):
 
 
 
-class AyatoDataSet(Dataset):
+class MORTEM_DataSets(Dataset):
     def __init__(self):
         self.musics_seq = None
         self.tgt_seq = None
