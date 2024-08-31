@@ -112,7 +112,7 @@ def train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, w
             input_ids.to(device)
 
             optimizer.zero_grad()
-            #inputs_mask = model.transformer.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
+            #inputs_mask = model.mortem.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
             targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(device)
             padding_mask_in: Tensor = get_padding_mask(input_ids)
             padding_mask_tgt: Tensor = get_padding_mask(targets)

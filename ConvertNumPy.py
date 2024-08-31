@@ -1,5 +1,5 @@
 from convert.ConvertMidi import ConvertMidi
-from transformer.tokenizer import Tokenizer
+from mortem.tokenizer import Tokenizer
 import os
 from messager import Messenger
 def find_midi_files(root_folder):

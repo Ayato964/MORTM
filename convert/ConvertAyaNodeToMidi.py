@@ -3,7 +3,7 @@ import pretty_midi as pm
 from pretty_midi.pretty_midi import Instrument, Note
 
 import constants
-from transformer.tokenizer import Tokenizer
+from mortem.tokenizer import Tokenizer
 
 def sum_begin_time(a_int: int, a_few: int):
     sum_str = f"{a_int}.{a_few}"

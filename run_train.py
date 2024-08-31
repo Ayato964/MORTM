@@ -3,11 +3,11 @@
 
 """
 import messager
-import transformer.mortem as atf
+import mortem.mortem as atf
 import os
 import torch
 import datetime
-from transformer.tokenizer import Tokenizer
+from mortem.tokenizer import Tokenizer
 from messager import Messenger
 import json
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'

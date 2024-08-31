@@ -2,10 +2,10 @@ import json
 
 import constants
 import torch
-from transformer.mortem import MORTEM
+from mortem.mortem import MORTEM
 import pretty_midi as pm
 from convert import ConvertAyaNodeToMidi as nm
-import transformer.tokenizer as token
+import mortem.tokenizer as token
 model_directory = "out/model/"
 
 tokenizer = token.Tokenizer("out/vocab/vocab_list.json")
