@@ -1,0 +1,206 @@
+import datetime
+import json
+import os
+import time
+
+import torch
+from torch import Tensor
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import numpy as np
+from messager import Messenger
+from .datasets import MORTEM_DataSets
+from .mortem import MORTEM
+
+IS_DEBUG = False
+
+
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    else:
+        return torch.device('cpu')
+
+
+def _send_prediction_end_time(message, loader_len, begin_time, end_time,
+                              vocab_size: int, num_epochs: int, trans_layer, num_heads, d_model,
+                              dim_feedforward, dropout, position_length):
+    t = end_time - begin_time
+    end_time_progress = (t * loader_len * num_epochs) / 3600
+    message.send_mail("終了見込みについて",
+                      f"現在学習が進行しています。\n"
+                      f"今回設定したパラメータに基づいて終了時刻を計算しました。\n"
+                      f"ボキャブラリーサイズ:{vocab_size}\n"
+                      f"エポック回数:{num_epochs}\n"
+                      f"Transformerのレイヤー層:{trans_layer}\n"
+                      f"Modelの次元数:{d_model}\n"
+                      f"シーケンスの長さ:{dim_feedforward}\n"
+                      f"ドロップアウト:{dropout}\n"
+                      f"\n\n シーケンスの1回目の処理が終了しました。かかった時間は{t:.1f}秒でした。\n"
+                      f"終了見込み時間は{end_time_progress:.2f}時間です"
+                      )
+
+
+# デバイスを取得
+def _set_train_data(directory, datasets):
+    if not IS_DEBUG:
+        print("Generating TrainData.....")
+        t_data = MORTEM_DataSets()
+        for dataset in datasets:
+            print(f"Load [{directory + dataset}]")
+            np_load_data = np.load(directory + dataset)
+            train_data = None
+            for i in range(len(np_load_data)):
+
+                np_data = np.expand_dims(np_load_data[f'arr_{i}'], axis=0)[0]
+                print(np_data.shape)
+
+                if train_data is None:
+                    train_data = np_data
+                else:
+                    train_data = np.concatenate((train_data, np_data), axis=0)
+            print(f"最初の５音:{train_data[-1][0:25]}")
+            t_data.add_data(train_data)
+        print(f"Token size: {sum(len(sub) for sub in t_data.musics_seq)} ")
+        print("----------------------------------")
+        #t_data.split_seq_data()
+        #t_data.set_padding()
+        t_data.set_train_data()
+
+        return t_data
+    else:
+        np_load_data = np.load(directory + datasets[0])
+        print(np_load_data[f'arr_{3}'])
+    return None
+
+
+def _get_padding_mask(input_ids):
+    pad_id = None
+    for inputs in input_ids:
+        pad = []
+        for token in inputs:
+            if token == 0:
+                pad.append(0)
+            else:
+                pad.append(1)
+        if pad_id is None:
+            pad_id = [pad]
+        else:
+            pad_id = pad_id + [pad]
+    padding_mask = torch.tensor(pad_id, dtype=torch.float).to(get_device())
+    return padding_mask
+
+
+def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, trans_layer=6,
+           num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1,
+           position_length=2048):
+    loader = DataLoader(ayato_dataset, batch_size=16, shuffle=True, pin_memory=False)
+    print("Creating Model....")
+    model = MORTEM(vocab_size=vocab_size, trans_layer=trans_layer, num_heads=num_heads,
+                   d_model=d_model, dim_feedforward=dim_feedforward,
+                   dropout=dropout, position_length=position_length).to(get_device())
+
+    criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(get_device()))  # 損失関数を定義
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-5)  # オプティマイザを定義
+
+    print("Start training...")
+
+    loss_val = None
+    mail_bool = True
+    for epoch in range(num_epochs):
+        print(f"epoch {epoch + 1} start....")
+        print(f"batch size :{len(loader)}")
+        count = 1
+        epoch_loss = 0.0
+        model.train()
+        for input_ids, targets in loader:  # seqにはbatch_size分の楽曲が入っている
+            print(f"learning sequence {count}")
+            begin_time = time.time()
+            input_ids.to(get_device())
+
+            optimizer.zero_grad()
+            #inputs_mask = model.mortem.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
+            targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(get_device())
+            padding_mask_in: Tensor = _get_padding_mask(input_ids)
+            padding_mask_tgt: Tensor = _get_padding_mask(targets)
+
+            output = model(input_ids, targets, None, targets_mask, padding_mask_in, padding_mask_tgt)
+
+            outputs = output.view(-1, output.size(-1))
+            targets = targets.view(-1).long()
+
+            loss = criterion(outputs, targets)  # 損失を計算
+            loss.backward()  # 逆伝播
+            optimizer.step()  # オプティマイザを更新
+            epoch_loss += loss.item()
+            count += 1
+            end_time = time.time()
+
+            if mail_bool:
+                _send_prediction_end_time(message, len(loader), begin_time, end_time, vocab_size, num_epochs,
+                                          trans_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
+                mail_bool = False
+            if (count + 1) % 100 == 0 and message is not None:
+                message.send_mail("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
+                                                                f"learning sequence {count}結果は、\n {epoch_loss:.4f}でした。")
+            print(epoch_loss)
+
+        print(f"Epoch [{epoch + 1}/{num_epochs}],  Loss: {epoch_loss:.4f}")
+        if message is not None:
+            message.send_mail("機械学習の途中経過について",
+                              f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
+        loss_val = epoch_loss / count
+    return model, loss_val
+
+
+def train_mortem(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
+                 message: Messenger = None,
+                 trans_layer=12, num_heads=8, d_model=1024, dim_feedforward=2048, dropout=0.2, position_length=2048):
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    today_date = datetime.date.today().strftime('%Y%m%d')
+
+    print(f"ToDay is{datetime.date.today()}! start generating MORTEM_Model.{version}_{today_date}")
+
+    datasets = os.listdir(dataset_directory)
+    train_data = _set_train_data(dataset_directory, datasets)
+
+    try:
+        with open(weight_directory, 'r') as file:
+            freq_dict = json.load(file)
+            # 逆数を取り、頻出度が0の場合は小さい値に設定
+            epsilon = 1e-10  # 非ゼロの小さい値を設定しておく
+            weights = []
+
+            for i in range(len(freq_dict)):
+                freq = freq_dict[str(i)]  # JSONのキーは文字列なのでstrに変換
+                if freq == 0:
+                    weights.append(epsilon)
+                else:
+                    weights.append(1.0 / freq)
+            # テンソルに変換
+            weight_tensor = torch.tensor(weights)
+            weight_tensor = weight_tensor / weight_tensor.sum()
+            print(weight_tensor[650:653])
+        model, loss = _train(train_data, message, vocab_size, num_epochs, weight_tensor,
+                             d_model=d_model,
+                             dim_feedforward=dim_feedforward,
+                             trans_layer=trans_layer,
+                             num_heads=num_heads,
+                             position_length=position_length,
+                             dropout=dropout
+                             )  # 20エポック分機械学習を行う。
+
+        if message is not None:
+            message.send_mail("機械学習終了のお知らせ",
+                              f"AyatoModel.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
+
+        torch.save(model.state_dict(), f"{save_directory}/MORTEM.{version}_{loss}.pth")  # できたモデルをセーブする
+
+        return model
+
+    except torch.cuda.OutOfMemoryError:
+        if message is not None:
+            message.send_mail("エラーが発生し、処理を中断しました",
+                              "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
+
+    pass

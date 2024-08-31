@@ -40,7 +40,7 @@ for file in md_file:
     if is_saved:
         count += 1
     print(count)
-    if count - 1 >= 15000:
+    if count - 1 >= 12000:
         break
 
 tokenizer.save()

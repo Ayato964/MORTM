@@ -171,8 +171,8 @@ class ConvertMidi:
             if back_start is not None:
                 shift = abs((back_start // 32) - (start // 32))
                 if 4 > shift:
-                    if shift > 0:
-                        node = np.append(node, self.tokenizer.get(shift, tr.SHIFT_TYPE)) #何小節のブランクができたかを計算
+                    #if shift > 0:
+                    node = np.append(node, self.tokenizer.get(shift, tr.SHIFT_TYPE)) #何小節のブランクができたかを計算
                 else:
                     node = np.append(node, self.tokenizer.get(-1, constants.END_SEQ_TOKEN))
                     node = np.append(node, self.tokenizer.get(-1, constants.START_SEQ_TOKEN))
