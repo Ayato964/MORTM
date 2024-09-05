@@ -5,12 +5,12 @@
 import os
 import torch
 import datetime
-from mortem.tokenizer import Tokenizer
+from mortm.tokenizer import Tokenizer
 from messager import Messenger
-from mortem.train import train_mortem
+from mortm.train import train_mortm
 import json
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 message = Messenger()
-model = train_mortem("out/np/datasets/", "out/model", "0.9.6",
-                     654, 3, "out/vocab/vocab_max.json", message)
+model = train_mortm("out/np/datasets/", "out/model", "0.10.0",
+                    654, 3, "out/vocab/vocab_max.json", message)

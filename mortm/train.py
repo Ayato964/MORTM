@@ -9,8 +9,8 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import numpy as np
 from messager import Messenger
-from .datasets import MORTEM_DataSets
-from .mortem import MORTEM
+from .datasets import MORTM_DataSets
+from .mortm import MORTM
 
 IS_DEBUG = False
 
@@ -45,7 +45,7 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
 def _set_train_data(directory, datasets):
     if not IS_DEBUG:
         print("Generating TrainData.....")
-        t_data = MORTEM_DataSets()
+        t_data = MORTM_DataSets()
         for dataset in datasets:
             print(f"Load [{directory + dataset}]")
             np_load_data = np.load(directory + dataset)
@@ -93,12 +93,12 @@ def _get_padding_mask(input_ids):
 
 def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, trans_layer=6,
            num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1,
-           position_length=2048):
+           position_length=2048, accumulation_steps=16):
     loader = DataLoader(ayato_dataset, batch_size=16, shuffle=True, pin_memory=False)
     print("Creating Model....")
-    model = MORTEM(vocab_size=vocab_size, trans_layer=trans_layer, num_heads=num_heads,
-                   d_model=d_model, dim_feedforward=dim_feedforward,
-                   dropout=dropout, position_length=position_length).to(get_device())
+    model = MORTM(vocab_size=vocab_size, trans_layer=trans_layer, num_heads=num_heads,
+                  d_model=d_model, dim_feedforward=dim_feedforward,
+                  dropout=dropout, position_length=position_length).to(get_device())
 
     criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(get_device()))  # 損失関数を定義
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-5)  # オプティマイザを定義
@@ -112,14 +112,15 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
         print(f"batch size :{len(loader)}")
         count = 1
         epoch_loss = 0.0
+
         model.train()
+        optimizer.zero_grad()
+
         for input_ids, targets in loader:  # seqにはbatch_size分の楽曲が入っている
             print(f"learning sequence {count}")
             begin_time = time.time()
             input_ids.to(get_device())
-
-            optimizer.zero_grad()
-            #inputs_mask = model.mortem.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
+            #inputs_mask = model.mortm.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
             targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(get_device())
             padding_mask_in: Tensor = _get_padding_mask(input_ids)
             padding_mask_tgt: Tensor = _get_padding_mask(targets)
@@ -131,7 +132,12 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
 
             loss = criterion(outputs, targets)  # 損失を計算
             loss.backward()  # 逆伝播
-            optimizer.step()  # オプティマイザを更新
+
+            if count % accumulation_steps == 0: #実質バッチサイズは64である
+                optimizer.step()  # オプティマイザを更新
+                optimizer.zero_grad()
+                print("Optimizerを更新しました。")
+
             epoch_loss += loss.item()
             count += 1
             end_time = time.time()
@@ -140,9 +146,10 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
                 _send_prediction_end_time(message, len(loader), begin_time, end_time, vocab_size, num_epochs,
                                           trans_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
                 mail_bool = False
+
             if (count + 1) % 100 == 0 and message is not None:
                 message.send_mail("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
-                                                                f"learning sequence {count}結果は、\n {epoch_loss:.4f}でした。")
+                                                                f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
             print(epoch_loss)
 
         print(f"Epoch [{epoch + 1}/{num_epochs}],  Loss: {epoch_loss:.4f}")
@@ -153,9 +160,9 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
     return model, loss_val
 
 
-def train_mortem(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
-                 message: Messenger = None,
-                 trans_layer=12, num_heads=8, d_model=1024, dim_feedforward=2048, dropout=0.2, position_length=2048):
+def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
+                message: Messenger = None,
+                trans_layer=12, num_heads=8, d_model=1024, dim_feedforward=2048, dropout=0.2, position_length=2048):
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
 
@@ -192,9 +199,9 @@ def train_mortem(dataset_directory, save_directory, version: str, vocab_size: in
 
         if message is not None:
             message.send_mail("機械学習終了のお知らせ",
-                              f"AyatoModel.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
+                              f"MORTM.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
 
-        torch.save(model.state_dict(), f"{save_directory}/MORTEM.{version}_{loss}.pth")  # できたモデルをセーブする
+        torch.save(model.state_dict(), f"{save_directory}/MORTM.{version}_{loss}.pth")  # できたモデルをセーブする
 
         return model
 

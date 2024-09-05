@@ -13,7 +13,7 @@ def get_device():
         return torch.device('cpu')
 
 
-class MORTEM_DataSets(Dataset):
+class MORTM_DataSets(Dataset):
     def __init__(self):
         self.musics_seq = None
         self.tgt_seq = None

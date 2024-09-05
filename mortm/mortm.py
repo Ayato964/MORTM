@@ -13,7 +13,7 @@ def get_device():
 device = get_device()
 
 
-class MORTEM(nn.Module):
+class MORTM(nn.Module):
     token_dict = {
         0: "600_633",
         1: "10_139",
@@ -24,7 +24,7 @@ class MORTEM(nn.Module):
 
     def __init__(self, vocab_size, trans_layer=6, num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1,
                  position_length=2048):
-        super(MORTEM, self).__init__()
+        super(MORTM, self).__init__()
 
         self.trans_layer = trans_layer
         self.num_heads = num_heads

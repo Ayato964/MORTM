@@ -15,8 +15,8 @@ import numpy as np
 import constants
 from util.ArrayList import ArrayList
 from AGSM.convert import ConvTempo, ConvKey
-from mortem.tokenizer import Tokenizer
-import mortem.tokenizer as tr
+from mortm.tokenizer import Tokenizer
+import mortm.tokenizer as tr
 
 PITCH = 0
 VELOCITY = 1
