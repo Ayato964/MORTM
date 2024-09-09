@@ -1,7 +1,11 @@
-from convert.ConvertMidi import ConvertMidi
+'''
+要確認
+'''
+import gmail_messanger
+from mortm.ConvertMidi import ConvertMidi
 from mortm.tokenizer import Tokenizer
 import os
-from messager import Messenger
+from mortm.messager import Messenger
 def find_midi_files(root_folder):
     midi_files = []
 
@@ -24,19 +28,20 @@ GUITAR = [25, 26, 27, 28, 29, 30, 31, 32]
 
 ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 67, 68]
 
-tokenizer = Tokenizer()
+tokenizer = Tokenizer("out/vocab")
 
 
 datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets"
 md_file = find_midi_files(datasets)
 
 
-mes = Messenger()
+mes: Messenger = gmail_messanger.GmailMessanger()
+
 count = 0
 for file in md_file:
     con = ConvertMidi(tokenizer, file, BRASS, 120)
     con.convert()
-    is_saved = con.save()
+    is_saved = con.save("out/np/datasets")
     if is_saved:
         count += 1
     print(count)
@@ -47,4 +52,4 @@ tokenizer.save()
 print(len(tokenizer.tokens))
 print(tokenizer.token_max)
 
-mes.send_mail("データセットの前処理が完了しました。", f"ボキャブラリーサイズは{len(tokenizer.tokens)}です")
+mes.send_message("データセットの前処理が完了しました。", f"ボキャブラリーサイズは{len(tokenizer.tokens)}です")

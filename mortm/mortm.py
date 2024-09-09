@@ -1,14 +1,9 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-from .PositionalEncoding import PositionalEncoding
+from PositionalEncoding import PositionalEncoding
 
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    else:
-        return torch.device('cpu')
-
+from constants import get_device
 
 device = get_device()
 

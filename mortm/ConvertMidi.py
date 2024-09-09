@@ -1,22 +1,18 @@
-import string
-from abc import abstractmethod
-import os
+'''
+Midiデータを tokenizerで変換し、数値の配列にしたものをnumpyに変換し、指定されたディレクトリに保存します。
+'''
+
 from typing import Any
 
 import mido.midifiles.meta
-import music21.midi
-import numpy
-import pretty_midi as midi
 from numpy import ndarray, dtype
 from pretty_midi import PrettyMIDI, Instrument, Note
-import music21 as m21
 import numpy as np
 
 import constants
-from util.ArrayList import ArrayList
 from AGSM.convert import ConvTempo, ConvKey
-from mortm.tokenizer import Tokenizer
-import mortm.tokenizer as tr
+from tokenizer import Tokenizer
+import tokenizer as tr
 
 PITCH = 0
 VELOCITY = 1
@@ -135,23 +131,15 @@ class ConvertMidi:
         return target
         pass
 
-    def save(self) -> bool:
+    def save(self, save_directory:str) -> bool:
         if not self.is_error:
             print(f"Result shape is:{self.aya_node.shape}")
-
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-
-            # ルートディレクトリまでの相対パスを計算
-            project_root = os.path.abspath(os.path.join(current_dir, '..'))
-
-            # ルートディレクトリからoutディレクトリへのパスを生成
-            out_directory = os.path.join(project_root, 'out')
 
             split_direc = self.directory.split("\\")
 
             filename = split_direc[-1].split(".")[0]
 
-            np.savez(out_directory + "/np/datasets/" + filename, self.aya_node)
+            np.savez(save_directory + "/" + filename, self.aya_node)
             print("処理が正常に終了しました。")
             return True
         else:

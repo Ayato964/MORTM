@@ -1,16 +1,13 @@
+'''
+Tokenizerで変換したシーケンスを全て保管します。
+'''
 import random
 import time
 
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-
-
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    else:
-        return torch.device('cpu')
+from constants import get_device
 
 
 class MORTM_DataSets(Dataset):

@@ -1,19 +1,20 @@
 import json
 
-import numpy as np
-
 import constants
 
+'''旋律トークン'''
 PITCH_TYPE = 'p'
 VELOCITY_TYPE = 'v'
 DURATION_TYPE = 'd'
 
+'''指示トークン'''
 START_TYPE = 's'
 SHIFT_TYPE = 'h'
 
 
 class Tokenizer:
-    def __init__(self, load_data: str = None):
+    def __init__(self, save_directory: str, load_data: str = None):
+        self.save_directory = save_directory
         if load_data is None:
             # 特殊トークン
             self.special_token_position = 3
@@ -81,11 +82,11 @@ class Tokenizer:
 
     def save(self):
         json_string = json.dumps(self.tokens)
-        with open("out/vocab/vocab_list.json", 'w') as file:
+        with open(self.save_directory + "/vocab_list.json", 'w') as file:
             file.write(json_string)
 
         json_s = json.dumps(self.token_max)
-        with open("out/vocab/vocab_max.json", 'w') as file:
+        with open(self.save_directory + "/vocab_max.json", 'w') as file:
             file.write(json_s)
 
     pass

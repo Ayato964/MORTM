@@ -1,6 +1,4 @@
-import json
-
-import constants
+from mortm import constants
 import torch
 from mortm.mortm import MORTM
 import pretty_midi as pm

@@ -1,3 +1,4 @@
+import torch
 
 PITCH_MAX = 128
 VELO = 128
@@ -9,4 +10,10 @@ ROOT = 99
 START_SEQ_TOKEN = "<S_SEQ>"
 END_SEQ_TOKEN = "<E_SEQ>"
 PADDING_TOKEN = "<PAD>"
-VOCAB_SIZE = PITCH_MAX + VELO + LENGTH + LENGTH_HALF + BEGIN + BEGIN_HALF + ROOT
+
+
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    else:
+        return torch.device('cpu')

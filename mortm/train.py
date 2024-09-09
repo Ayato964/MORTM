@@ -1,3 +1,10 @@
+'''
+MORTMの学習を行う際にこのモジュールを使います。
+train_mortmメソッドを呼び出し、引数の型に合ったオブジェクトを代入してください。
+最低でも、「データセット(Tokenizerで変換したもの)のディレクトリ」、「モデルの出力先のディレクトリ」,
+「モデルのバージョン」,「ボキャブラリーサイズ」,「エポック回数」、「各トークンの出現回数のリスト」が必要です。
+'''
+
 import datetime
 import json
 import os
@@ -5,21 +12,16 @@ import time
 
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import torch.nn as nn
 import numpy as np
 from messager import Messenger
-from .datasets import MORTM_DataSets
+
+from datasets import MORTM_DataSets
 from .mortm import MORTM
+from constants import get_device
 
 IS_DEBUG = False
-
-
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    else:
-        return torch.device('cpu')
 
 
 def _send_prediction_end_time(message, loader_len, begin_time, end_time,
@@ -27,7 +29,7 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
                               dim_feedforward, dropout, position_length):
     t = end_time - begin_time
     end_time_progress = (t * loader_len * num_epochs) / 3600
-    message.send_mail("終了見込みについて",
+    message.send_message("終了見込みについて",
                       f"現在学習が進行しています。\n"
                       f"今回設定したパラメータに基づいて終了時刻を計算しました。\n"
                       f"ボキャブラリーサイズ:{vocab_size}\n"
@@ -38,7 +40,7 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
                       f"ドロップアウト:{dropout}\n"
                       f"\n\n シーケンスの1回目の処理が終了しました。かかった時間は{t:.1f}秒でした。\n"
                       f"終了見込み時間は{end_time_progress:.2f}時間です"
-                      )
+                         )
 
 
 # デバイスを取得
@@ -93,15 +95,15 @@ def _get_padding_mask(input_ids):
 
 def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, trans_layer=6,
            num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1,
-           position_length=2048, accumulation_steps=16):
-    loader = DataLoader(ayato_dataset, batch_size=16, shuffle=True, pin_memory=False)
+           position_length=2048, accumulation_steps=4, batch_size=16):
+    loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True, pin_memory=False)
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, trans_layer=trans_layer, num_heads=num_heads,
                   d_model=d_model, dim_feedforward=dim_feedforward,
                   dropout=dropout, position_length=position_length).to(get_device())
 
     criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(get_device()))  # 損失関数を定義
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-5)  # オプティマイザを定義
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0.01)  # オプティマイザを定義
 
     print("Start training...")
 
@@ -120,7 +122,7 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
             print(f"learning sequence {count}")
             begin_time = time.time()
             input_ids.to(get_device())
-            #inputs_mask = model.mortm.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
+            #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
             targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(get_device())
             padding_mask_in: Tensor = _get_padding_mask(input_ids)
             padding_mask_tgt: Tensor = _get_padding_mask(targets)
@@ -133,7 +135,7 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
             loss = criterion(outputs, targets)  # 損失を計算
             loss.backward()  # 逆伝播
 
-            if count % accumulation_steps == 0: #実質バッチサイズは64である
+            if count % accumulation_steps == 0:  #実質バッチサイズは64である
                 optimizer.step()  # オプティマイザを更新
                 optimizer.zero_grad()
                 print("Optimizerを更新しました。")
@@ -148,13 +150,13 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
                 mail_bool = False
 
             if (count + 1) % 100 == 0 and message is not None:
-                message.send_mail("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
+                message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
                                                                 f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
             print(epoch_loss)
 
         print(f"Epoch [{epoch + 1}/{num_epochs}],  Loss: {epoch_loss:.4f}")
         if message is not None:
-            message.send_mail("機械学習の途中経過について",
+            message.send_message("機械学習の途中経過について",
                               f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
         loss_val = epoch_loss / count
     return model, loss_val
@@ -162,7 +164,9 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = None,
-                trans_layer=12, num_heads=8, d_model=1024, dim_feedforward=2048, dropout=0.2, position_length=2048):
+                trans_layer=12, num_heads=8, d_model=1024,
+                dim_feedforward=2048, dropout=0.2, position_length=2048,
+                accumulation_steps=4, batch_size=16):
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
 
@@ -194,11 +198,13 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                              trans_layer=trans_layer,
                              num_heads=num_heads,
                              position_length=position_length,
-                             dropout=dropout
+                             dropout=dropout,
+                             accumulation_steps=accumulation_steps,
+                             batch_size=batch_size
                              )  # 20エポック分機械学習を行う。
 
         if message is not None:
-            message.send_mail("機械学習終了のお知らせ",
+            message.send_message("機械学習終了のお知らせ",
                               f"MORTM.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
 
         torch.save(model.state_dict(), f"{save_directory}/MORTM.{version}_{loss}.pth")  # できたモデルをセーブする
@@ -207,7 +213,7 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
 
     except torch.cuda.OutOfMemoryError:
         if message is not None:
-            message.send_mail("エラーが発生し、処理を中断しました",
+            message.send_message("エラーが発生し、処理を中断しました",
                               "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
 
     pass

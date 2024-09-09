@@ -1,8 +1,7 @@
-import numpy as np
 import pretty_midi as pm
-from pretty_midi.pretty_midi import Instrument, Note
+from pretty_midi.pretty_midi import Note
 
-import constants
+from mortm import constants
 from mortm.tokenizer import Tokenizer
 
 def sum_begin_time(a_int: int, a_few: int):

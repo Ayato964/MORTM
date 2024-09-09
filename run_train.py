@@ -3,14 +3,12 @@
 
 """
 import os
-import torch
-import datetime
-from mortm.tokenizer import Tokenizer
-from messager import Messenger
+import gmail_messanger as gm
 from mortm.train import train_mortm
-import json
+
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-message = Messenger()
+message: gm.Messenger = gm.GmailMessanger()
+
 model = train_mortm("out/np/datasets/", "out/model", "0.10.0",
                     654, 3, "out/vocab/vocab_max.json", message)
