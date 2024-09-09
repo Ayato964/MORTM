@@ -3,12 +3,12 @@
 
 """
 import os
-import gmail_messanger as gm
+#import gmail_messanger as gm
 from mortm.train import train_mortm
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-message: gm.Messenger = gm.GmailMessanger()
+#message: gm.Messenger = gm.GmailMessanger()
 
-model = train_mortm("out/np/datasets/", "out/model", "0.10.0",
-                    654, 3, "out/vocab/vocab_max.json", message)
+model = train_mortm("out/np/datasets/", "out/model", "test",
+                    654, 3, "out/vocab/vocab_max.json", accumulation_steps=1)

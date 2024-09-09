@@ -15,11 +15,11 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import numpy as np
-from messager import Messenger
+from .messager import Messenger
 
-from datasets import MORTM_DataSets
+from .datasets import MORTM_DataSets
 from .mortm import MORTM
-from constants import get_device
+from .constants import get_device
 
 IS_DEBUG = False
 

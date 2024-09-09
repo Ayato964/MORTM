@@ -9,10 +9,10 @@ from numpy import ndarray, dtype
 from pretty_midi import PrettyMIDI, Instrument, Note
 import numpy as np
 
-import constants
+from . import constants
 from AGSM.convert import ConvTempo, ConvKey
-from tokenizer import Tokenizer
-import tokenizer as tr
+from .tokenizer import Tokenizer
+from . import tokenizer as tr
 
 PITCH = 0
 VELOCITY = 1

@@ -1,9 +1,9 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-from PositionalEncoding import PositionalEncoding
+from .PositionalEncoding import PositionalEncoding
 
-from constants import get_device
+from .constants import get_device
 
 device = get_device()
 

@@ -1,6 +1,6 @@
 import json
 
-import constants
+from . import constants
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
