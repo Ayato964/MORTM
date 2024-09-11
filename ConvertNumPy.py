@@ -1,7 +1,7 @@
 '''
 要確認
 '''
-import gmail_messanger
+from mortm import gmail_messanger
 from mortm.ConvertMidi import ConvertMidi
 from mortm.tokenizer import Tokenizer
 import os

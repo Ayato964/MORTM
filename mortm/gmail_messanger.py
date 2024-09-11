@@ -16,24 +16,25 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.send']
 
 class GmailMessanger(Messenger):
 
-    def __init__(self):
+    def __init__(self, token_file: str, client_secret_file: str, send_address):
         super().__init__()
+        self.token_file = token_file
+        self.client_secret_file = client_secret_file
+        self.send_address = send_address
         self.creds = self.authenticate_gmail()
 
     def authenticate_gmail(self):
         creds = None
-        # token.jsonファイルが存在する場合、それを読み込む
-        if os.path.exists('../token.json'):
-            creds = Credentials.from_authorized_user_file('../token.json', SCOPES)
-        # 認証トークンが存在しないか、無効である場合、ユーザーにログインを促す
+        if os.path.exists(self.token_file):
+            creds = Credentials.from_authorized_user_file(self.token_file, SCOPES)
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             else:
-                flow = InstalledAppFlow.from_client_secrets_file('../client_secret.json', SCOPES)
+                flow = InstalledAppFlow.from_client_secrets_file(self.client_secret_file, SCOPES)
                 creds = flow.run_local_server(port=0)
             # 認証情報を保存
-            with open('../token.json', 'w') as token:
+            with open(self.token_file, 'w') as token:
                 token.write(creds.to_json())
         return creds
 
@@ -59,10 +60,7 @@ class GmailMessanger(Messenger):
         # 認証を実行してGmail APIサービスを取得
         service = build('gmail', 'v1', credentials=self.creds)
 
-        # メール情報を作成
-        to = 'nagoshi@kthrlab.jp'
-
-        message = self.create_message(to, subject, body)
+        message = self.create_message(self.send_address, subject, body)
 
         # メールを送信
         self._send_email(service, 'me', message)

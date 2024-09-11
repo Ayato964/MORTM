@@ -131,7 +131,7 @@ class ConvertMidi:
         return target
         pass
 
-    def save(self, save_directory:str) -> bool:
+    def save(self, save_directory: str) -> bool:
         if not self.is_error:
             print(f"Result shape is:{self.aya_node.shape}")
 

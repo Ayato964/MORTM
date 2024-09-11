@@ -16,10 +16,10 @@ model = MORTM(
     num_heads=16,
     position_length=2048
 )
-model.load_state_dict(torch.load("out/model/MORTEM.0.9.6_5.885403119980641.pth"))
+model.load_state_dict(torch.load("out/model/MORTEM.0.10.0_5.892386341144358.pth"))
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
-print("HEEEE")
+
 # メロディ生成の実行
 #np_notes = np.load("out/np/test/test.npz")
 

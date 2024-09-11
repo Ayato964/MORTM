@@ -144,7 +144,7 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
             count += 1
             end_time = time.time()
 
-            if mail_bool:
+            if mail_bool and message is not None:
                 _send_prediction_end_time(message, len(loader), begin_time, end_time, vocab_size, num_epochs,
                                           trans_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
                 mail_bool = False
