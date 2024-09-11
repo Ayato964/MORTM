@@ -7,19 +7,21 @@ import time
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-from .constants import get_device
+
 
 
 class MORTM_DataSets(Dataset):
-    def __init__(self):
+    def __init__(self, progress):
         self.musics_seq = None
         self.tgt_seq = None
+        self.progress = progress
 
     def __len__(self):
         return len(self.musics_seq)
 
     def __getitem__(self, item):
-        return torch.tensor(self.musics_seq[item], dtype=torch.int).to(get_device()), torch.tensor(self.tgt_seq[item], dtype=torch.int).to(get_device())
+        return (torch.tensor(self.musics_seq[item], dtype=torch.int).to(self.progress.get_device()),
+                torch.tensor(self.tgt_seq[item], dtype=torch.int).to(self.progress.get_device()))
 
     def add_data(self, music_seq: np.ndarray):
         if self.musics_seq is None:

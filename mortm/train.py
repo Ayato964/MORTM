@@ -71,10 +71,10 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
 
 
 # デバイスを取得
-def _set_train_data(directory, datasets):
+def _set_train_data(directory, datasets, progress: LearningProgress):
     if not IS_DEBUG:
         print("Generating TrainData.....")
-        t_data = MORTM_DataSets()
+        t_data = MORTM_DataSets(progress)
         for dataset in datasets:
             print(f"Load [{directory + dataset}]")
             np_load_data = np.load(directory + dataset)
@@ -199,7 +199,7 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
     print(f"ToDay is{datetime.date.today()}! start generating MORTEM_Model.{version}_{today_date}")
 
     datasets = os.listdir(dataset_directory)
-    train_data = _set_train_data(dataset_directory, datasets)
+    train_data = _set_train_data(dataset_directory, datasets, progress)
 
     try:
         with open(weight_directory, 'r') as file:
