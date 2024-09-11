@@ -30,3 +30,7 @@ rpr (デフォルト: False)
 
     意味: 相対位置表現（Relative Position Representations, RPR）を使用するかどうかを指定します。
     役割: RPRを使用する場合は、エンコーダ層をカスタムエンコーダに置き換え、位置エンコーディングの代わりに相対位置表現を使用します。RPRは、より効果的に位置情報をキャプチャできるとされています。
+
+ Pipにアップロードするとき
+ python .\setup.py sdist bdist_wheel
+twine upload dist/*
