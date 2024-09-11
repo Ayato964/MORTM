@@ -17,37 +17,12 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 import numpy as np
 from .messager import Messenger
+from .progress import LearningProgress, _DefaultLearningProgress
 
 from .datasets import MORTM_DataSets
 from .mortm import MORTM
 
 IS_DEBUG = False
-
-
-class LearningProgress:
-
-    @abstractmethod
-    def step_optimizer(self, optimizer, **kwargs):
-        pass
-
-    @abstractmethod
-    def get_device(self):
-        pass
-
-
-class _DefaultLearningProgress(LearningProgress):
-
-    def get_device(self):
-        if torch.cuda.is_available():
-            return torch.device('cuda')
-        else:
-            return torch.device('cpu')
-        pass
-
-    def step_optimizer(self, optimizer, **kwargs):
-        optimizer.step()  # オプティマイザを更新
-        optimizer.zero_grad()
-        pass
 
 
 
@@ -125,7 +100,7 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
            position_length=2048, accumulation_steps=4, batch_size=16):
     loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True, pin_memory=False)
     print("Creating Model....")
-    model = MORTM(vocab_size=vocab_size, trans_layer=trans_layer, num_heads=num_heads,
+    model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
                   d_model=d_model, dim_feedforward=dim_feedforward,
                   dropout=dropout, position_length=position_length).to(progress.get_device())
 

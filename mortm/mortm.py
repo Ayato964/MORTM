@@ -3,9 +3,7 @@ from torch import Tensor
 import torch.nn as nn
 from .PositionalEncoding import PositionalEncoding
 
-from .constants import get_device
-
-device = get_device()
+from .progress import LearningProgress
 
 
 class MORTM(nn.Module):
@@ -17,10 +15,12 @@ class MORTM(nn.Module):
         4: "600_605"
     }
 
-    def __init__(self, vocab_size, trans_layer=6, num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1,
+    def __init__(self, vocab_size, progress: LearningProgress, trans_layer=6, num_heads=8, d_model=512,
+                 dim_feedforward=1024, dropout=0.1,
                  position_length=2048):
         super(MORTM, self).__init__()
 
+        self.progress = progress
         self.trans_layer = trans_layer
         self.num_heads = num_heads
         self.d_model = d_model
@@ -28,18 +28,19 @@ class MORTM(nn.Module):
         self.dropout = dropout
 
         #位置エンコーディングを作成
-        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, dropout, position_length).to(device)
+        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, dropout, position_length).to(
+            self.progress.get_device())
         #Transformerの設定
         self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
                                                           num_encoder_layers=self.trans_layer,
                                                           num_decoder_layers=self.trans_layer,
                                                           dropout=self.dropout, dim_feedforward=dim_feedforward,
-                                                          ).to(device)
+                                                          ).to(self.progress.get_device())
         print(f"Input Vocab Size:{vocab_size}")
-        self.Wout = nn.Linear(self.d_model, vocab_size).to(device)
+        self.Wout = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
 
-        self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model).to(device)
-        self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(device)
+        self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model).to(self.progress.get_device())
+        self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
     def forward(self, inputs_seq, tgt_seq, input_mask, tgt_mask, input_padding_mask, tgt_padding_mask):
 
@@ -65,7 +66,7 @@ class MORTM(nn.Module):
 
     def generate_by_length(self, input_seq, max_length, p=0.9, temperature=0.1):
         self.eval()
-        output = torch.tensor([input_seq], dtype=torch.long).unsqueeze(1).to(device)
+        output = torch.tensor([input_seq], dtype=torch.long).unsqueeze(1).to(self.progress.get_device())
         for _ in range(max_length):
             with torch.no_grad():
                 output = self._next_note_token(output)
@@ -76,7 +77,7 @@ class MORTM(nn.Module):
         isEnd = False
         token_count = 0
         while not isEnd:
-            mask = self.transformer.generate_square_subsequent_mask(output.shape[1]).to(device)
+            mask = self.transformer.generate_square_subsequent_mask(output.shape[1]).to(self.progress.get_device())
             outputs = self(output, output, mask, mask, None, None)
             logits = outputs[:, -1, :]
 
@@ -91,7 +92,7 @@ class MORTM(nn.Module):
                 isEnd = True
             token_count += 1
 
-            output = torch.cat((output.flatten(), token.unsqueeze(0))).unsqueeze(0).to(device)
+            output = torch.cat((output.flatten(), token.unsqueeze(0))).unsqueeze(0).to(self.progress.get_device())
 
         return output
 
@@ -113,13 +114,12 @@ class MORTM(nn.Module):
         #print(next_token)
         return next_token
 
-
     def top_p_sampling(self, input_ids, tokenizer, p=0.9, max_length=20, temperature=0.2):
         self.eval()
-        output = torch.tensor([input_ids], dtype=torch.long).unsqueeze(1).to(device)
+        output = torch.tensor([input_ids], dtype=torch.long).unsqueeze(1).to(self.progress.get_device())
         for _ in range(max_length):
             with torch.no_grad():
-                mask = self.transformer.generate_square_subsequent_mask(output.shape[1]).to(device)
+                mask = self.transformer.generate_square_subsequent_mask(output.shape[1]).to(self.progress.get_device())
                 outputs = self(output, output, mask, mask, None, None)
                 logits = outputs[:, -1, :]
 
@@ -140,11 +140,9 @@ class MORTM(nn.Module):
                 next_token = dis.sample()
                 # バッチサイズを一致させるために次元を調整
                 next_token = next_token.unsqueeze(0)
-                output = torch.cat((output.flatten(), next_token)).unsqueeze(0).to(device)
+                output = torch.cat((output.flatten(), next_token)).unsqueeze(0).to(self.progress.get_device())
                 #print(output)
         return output.tolist()
-
-
 
 
 class DummyDecoder(nn.Module):

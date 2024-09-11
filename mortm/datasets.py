@@ -7,11 +7,11 @@ import time
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-
+from .progress import LearningProgress
 
 
 class MORTM_DataSets(Dataset):
-    def __init__(self, progress):
+    def __init__(self, progress: LearningProgress):
         self.musics_seq = None
         self.tgt_seq = None
         self.progress = progress

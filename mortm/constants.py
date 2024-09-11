@@ -11,9 +11,3 @@ START_SEQ_TOKEN = "<S_SEQ>"
 END_SEQ_TOKEN = "<E_SEQ>"
 PADDING_TOKEN = "<PAD>"
 
-
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    else:
-        return torch.device('cpu')
