@@ -16,7 +16,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import numpy as np
-from .messager import Messenger
+from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
 
 from .datasets import MORTM_DataSets
@@ -77,21 +77,11 @@ def _set_train_data(directory, datasets, progress: LearningProgress):
         print(np_load_data[f'arr_{3}'])
     return None
 
-
 def _get_padding_mask(input_ids, progress: LearningProgress):
-    pad_id = None
-    for inputs in input_ids:
-        pad = []
-        for token in inputs:
-            if token == 0:
-                pad.append(0)
-            else:
-                pad.append(1)
-        if pad_id is None:
-            pad_id = [pad]
-        else:
-            pad_id = pad_id + [pad]
-    padding_mask = torch.tensor(pad_id, dtype=torch.bool).to(progress.get_device())
+    # input_ids が Tensor であることを仮定
+    pad_id = (input_ids != 0).to(torch.bool)
+    padding_mask = pad_id.to(progress.get_device())
+    print(padding_mask)
     return padding_mask
 
 
@@ -150,21 +140,19 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
                                           trans_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
                 mail_bool = False
 
-            if (count + 1) % 100 == 0 and message is not None:
+            if (count + 1) % 100 == 0:
                 message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
                                                                    f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
             print(epoch_loss)
 
-        print(f"Epoch [{epoch + 1}/{num_epochs}],  Loss: {epoch_loss:.4f}")
-        if message is not None:
-            message.send_message("機械学習の途中経過について",
+        message.send_message("機械学習の途中経過について",
                                  f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
         loss_val = epoch_loss / count
     return model, loss_val
 
 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
-                message: Messenger = None,
+                message: Messenger = _DefaultMessenger(),
                 trans_layer=12, num_heads=8, d_model=1024,
                 dim_feedforward=2048, dropout=0.2, position_length=2048,
                 accumulation_steps=4, batch_size=16, progress: LearningProgress = _DefaultLearningProgress()):
@@ -204,8 +192,7 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                              batch_size=batch_size
                              )  # 20エポック分機械学習を行う。
 
-        if message is not None:
-            message.send_message("機械学習終了のお知らせ",
+        message.send_message("機械学習終了のお知らせ",
                                  f"MORTM.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
 
         torch.save(model.state_dict(), f"{save_directory}/MORTM.{version}_{loss}.pth")  # できたモデルをセーブする
@@ -213,11 +200,7 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
         return model
 
     except torch.cuda.OutOfMemoryError:
-        if message is not None:
-            message.send_message("エラーが発生し、処理を中断しました",
+        message.send_message("エラーが発生し、処理を中断しました",
                                  "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
-        else:
-            print("学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
-
     pass
 

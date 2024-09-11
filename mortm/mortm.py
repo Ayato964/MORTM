@@ -37,7 +37,7 @@ class MORTM(nn.Module):
                                                           dropout=self.dropout, dim_feedforward=dim_feedforward,
                                                           ).to(self.progress.get_device())
         print(f"Input Vocab Size:{vocab_size}")
-        self.Wout = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
+        self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
 
         self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
