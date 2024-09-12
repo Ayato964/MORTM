@@ -48,8 +48,10 @@ def convert_tolist(target: list):
 
 class ConvertMidi:
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, program_list: list, tempo: int, midi_data: PrettyMIDI = None):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list: list,
+                 tempo: int, midi_data: PrettyMIDI = None):
         self.directory = directory
+        self.file_name = file_name
         self.midi_data = midi_data
         self.program_list = program_list
         self.tempo = tempo
@@ -84,10 +86,10 @@ class ConvertMidi:
                     program_count += 1
 
             if program_count == 0:
-                print(f"{self.directory}には欲しい楽曲がありませんでした")
+                print(f"{self.directory}/{ self.file_name}には欲しい楽曲がありませんでした")
                 self.is_error = True
             elif np.min(convert_notes) < 0:
-                print(f"{self.directory}の値の中に0以下の値が格納されていたため、中断します。")
+                print(f"{self.directory}/{ self.file_name}の値の中に0以下の値が格納されていたため、中断します。")
                 self.is_error = True
 
             self.aya_node = convert_notes
@@ -135,11 +137,7 @@ class ConvertMidi:
         if not self.is_error:
             print(f"Result shape is:{self.aya_node.shape}")
 
-            split_direc = self.directory.split("\\")
-
-            filename = split_direc[-1].split(".")[0]
-
-            np.savez(save_directory + "/" + filename, self.aya_node)
+            np.savez(save_directory + "/" + self.file_name, self.aya_node)
             print("処理が正常に終了しました。")
             return True
         else:
@@ -179,26 +177,26 @@ class ConvertMidi:
     def _ct_key(self):
         try:
             if self.midi_data is None:
-                ct = ConvKey(self.directory, "C")
+                ct = ConvKey(self.directory + "/" + self.file_name, "C")
                 ct.convert()
                 self.midi_data = ct.midi_data
                 if ct.is_Error:
                     self.is_error = ct.is_Error
             else:
-                ct = ConvKey(directory=self.directory, midi_data=self.midi_data, key="C")
+                ct = ConvKey(directory=self.directory + "/" + self.file_name, midi_data=self.midi_data, key="C")
                 ct.convert()
                 self.midi_data = ct.midi_data
         except OSError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
         except IndexError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
         except mido.midifiles.meta.KeySignatureError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
         except ValueError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
 
 
@@ -206,38 +204,38 @@ class ConvertMidi:
     def _ct_tempo(self):
         try:
             if self.midi_data is None:
-                ct = ConvTempo(self.directory, self.tempo)
+                ct = ConvTempo(self.directory + "/" + self.file_name, self.tempo)
                 ct.convert()
                 self.midi_data = ct.midi_data
                 if ct.is_Error:
                     self.is_error = ct.is_Error
             else:
-                ct = ConvTempo(directory=self.directory, midi_data=self.midi_data, change_tempo=120)
+                ct = ConvTempo(directory=self.directory + "/" + self.file_name, midi_data=self.midi_data, change_tempo=120)
                 ct.convert()
                 self.midi_data = ct.midi_data
         except OSError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
         except IndexError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
         except ValueError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
 
         except mido.midifiles.meta.KeySignatureError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
 
         except EOFError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
 
         except KeyError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
         except ZeroDivisionError:
-            print(f"{self.directory}でエラーが発生。処理を中断します。")
+            print(f"{self.directory}/{ self.file_name}でエラーが発生。処理を中断します。")
             self.is_error = True
 
 

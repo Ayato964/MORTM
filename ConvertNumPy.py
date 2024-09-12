@@ -1,24 +1,24 @@
 '''
 要確認
 '''
-from mortm import gmail_messanger
+#from mortm import gmail_messanger
 from mortm.ConvertMidi import ConvertMidi
 from mortm.tokenizer import Tokenizer
 import os
-from mortm.messager import Messenger
+#from mortm.messager import Messenger
 def find_midi_files(root_folder):
     midi_files = []
-
+    direc = []
     # Walk through the directory
     for defpath, surnames, filenames in os.walk(root_folder):
         for file in filenames:
             # Check if the file is a MIDI file
             if file.lower().endswith(('.mid', '.midi')):
                 # Get the full path and add it to the list
-                full_path = os.path.join(defpath, file)
-                midi_files.append(full_path)
+                midi_files.append(file)
+                direc.append(defpath)
 
-    return midi_files
+    return direc, midi_files
 
 
 
@@ -31,15 +31,15 @@ ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 6
 tokenizer = Tokenizer("out/vocab")
 
 
-datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets"
-md_file = find_midi_files(datasets)
+datasets = "data/JazzMidi"
+directory, md_file = find_midi_files(datasets)
 
 
-mes: Messenger = gmail_messanger.GmailMessanger()
+#mes: Messenger = gmail_messanger.GmailMessanger()
 
 count = 0
-for file in md_file:
-    con = ConvertMidi(tokenizer, file, BRASS, 120)
+for i in range(len(md_file)):
+    con = ConvertMidi(tokenizer, directory[i], md_file[i], BRASS, 120)
     con.convert()
     is_saved = con.save("out/np/datasets")
     if is_saved:
@@ -52,4 +52,4 @@ tokenizer.save()
 print(len(tokenizer.tokens))
 print(tokenizer.token_max)
 
-mes.send_message("データセットの前処理が完了しました。", f"ボキャブラリーサイズは{len(tokenizer.tokens)}です")
+#mes.send_message("データセットの前処理が完了しました。", f"ボキャブラリーサイズは{len(tokenizer.tokens)}です")
