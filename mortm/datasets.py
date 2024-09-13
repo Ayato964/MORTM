@@ -20,8 +20,8 @@ class MORTM_DataSets(Dataset):
         return len(self.musics_seq)
 
     def __getitem__(self, item):
-        return (torch.tensor(self.musics_seq[item], dtype=torch.int).to(self.progress.get_device()),
-                torch.tensor(self.tgt_seq[item], dtype=torch.int).to(self.progress.get_device()))
+        return (torch.tensor(self.musics_seq[item], dtype=torch.long).to(self.progress.get_device()),
+                torch.tensor(self.tgt_seq[item], dtype=torch.long).to(self.progress.get_device()))
 
     def add_data(self, music_seq: np.ndarray):
         if self.musics_seq is None:
