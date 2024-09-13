@@ -16,8 +16,8 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.send']
 
 class GmailMessanger(Messenger):
 
-    def __init__(self, token_file: str, client_secret_file: str, send_address):
-        super().__init__()
+    def __init__(self, token_file: str, client_secret_file: str, send_address: str, step_by_message_count=100):
+        super().__init__(step_by_message_count=step_by_message_count)
         self.token_file = token_file
         self.client_secret_file = client_secret_file
         self.send_address = send_address

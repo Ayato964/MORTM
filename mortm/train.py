@@ -140,7 +140,7 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
                                           trans_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
                 mail_bool = False
 
-            if (count + 1) % 100 == 0:
+            if (count + 1) % message.step_by_message_count == 0:
                 message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
                                                                    f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
             print(epoch_loss / count)
