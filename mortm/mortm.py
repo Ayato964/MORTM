@@ -61,8 +61,8 @@ class MORTM(nn.Module):
 
         out.permute(1, 0, 2)
 
-        score = self.Wout(out)
-        return score
+        score:Tensor = self.Wout(out)
+        return score.to(self.progress.get_device())
 
     def generate_by_length(self, input_seq, max_length, p=0.9, temperature=0.1):
         self.eval()

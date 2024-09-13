@@ -93,7 +93,7 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
                   d_model=d_model, dim_feedforward=dim_feedforward,
                   dropout=dropout, position_length=position_length).to(progress.get_device())
 
-    criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device()))  # 損失関数を定義
+    criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0.01)  # オプティマイザを定義
 
     print("Start training...")
@@ -121,9 +121,10 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
 
             output = model(input_ids, targets, None, targets_mask, padding_mask_in, padding_mask_tgt)
 
-            outputs = output.view(-1, output.size(-1))
-            targets = targets.view(-1).long()
+            outputs = output.view(-1, output.size(-1)).to(progress.get_device())
+            targets = targets.view(-1).to(progress.get_device()).long()
             loss = criterion(outputs, targets)  # 損失を計算
+
             loss.backward()  # 逆伝播
 #            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
