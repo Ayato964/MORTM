@@ -79,9 +79,8 @@ def _set_train_data(directory, datasets, progress: LearningProgress):
 
 def _get_padding_mask(input_ids, progress: LearningProgress):
     # input_ids が Tensor であることを仮定
-    pad_id = (input_ids != 0).to(torch.bool)
+    pad_id = (input_ids != 0).to(torch.float)
     padding_mask = pad_id.to(progress.get_device())
-    print(padding_mask)
     return padding_mask
 
 
@@ -113,7 +112,8 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
         for input_ids, targets in loader:  # seqにはbatch_size分の楽曲が入っている
             print(f"learning sequence {count}")
             begin_time = time.time()
-            input_ids.to(progress.get_device())
+            input_ids = input_ids.to(progress.get_device())
+            targets = targets.to(progress.get_device())
             #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
             targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
             padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
@@ -123,10 +123,9 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
 
             outputs = output.view(-1, output.size(-1))
             targets = targets.view(-1).long()
-
             loss = criterion(outputs, targets)  # 損失を計算
             loss.backward()  # 逆伝播
-
+#            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
                 progress.step_optimizer(optimizer)
                 print("Optimizerを更新しました。")
@@ -143,7 +142,7 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
             if (count + 1) % 100 == 0:
                 message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
                                                                    f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
-            print(epoch_loss)
+            print(epoch_loss / count)
 
         message.send_message("機械学習の途中経過について",
                                  f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
@@ -180,7 +179,9 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
             # テンソルに変換
             weight_tensor = torch.tensor(weights)
             weight_tensor = weight_tensor / weight_tensor.sum()
-            print(weight_tensor[650:653])
+
+            print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
+
         model, loss = _train(train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
                              d_model=d_model,
                              dim_feedforward=dim_feedforward,
