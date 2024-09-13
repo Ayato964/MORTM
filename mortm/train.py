@@ -86,8 +86,8 @@ def _get_padding_mask(input_ids, progress: LearningProgress):
 
 def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress, trans_layer=6,
            num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1,
-           position_length=2048, accumulation_steps=4, batch_size=16):
-    loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True, pin_memory=False)
+           position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0):
+    loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True, pin_memory=False, num_workers=num_workers)
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
                   d_model=d_model, dim_feedforward=dim_feedforward,
@@ -154,7 +154,7 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(),
                 trans_layer=12, num_heads=8, d_model=1024,
-                dim_feedforward=2048, dropout=0.2, position_length=2048,
+                dim_feedforward=2048, dropout=0.2, position_length=2048, num_workers=0,
                 accumulation_steps=4, batch_size=16, progress: LearningProgress = _DefaultLearningProgress()):
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
@@ -191,7 +191,8 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                              position_length=position_length,
                              dropout=dropout,
                              accumulation_steps=accumulation_steps,
-                             batch_size=batch_size
+                             batch_size=batch_size,
+                             num_workers=num_workers
                              )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",
