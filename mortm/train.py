@@ -156,8 +156,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
 
         if is_save_training_progress:
             torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}.pth") #エポック終了時に途中経過を保存
-
-        print("途中経過を保存しました。")
+            print("途中経過を保存しました。")
 
     return model, loss_val
 
