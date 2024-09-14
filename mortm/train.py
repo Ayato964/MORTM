@@ -16,14 +16,15 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import numpy as np
+from torch.optim.lr_scheduler import LambdaLR
+
 from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
-
 from .datasets import MORTM_DataSets
 from .mortm import MORTM
+from .noam import noam_lr
 
 IS_DEBUG = False
-
 
 
 def _send_prediction_end_time(message, loader_len, begin_time, end_time,
@@ -84,9 +85,10 @@ def _get_padding_mask(input_ids, progress: LearningProgress):
     return padding_mask
 
 
-def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress, trans_layer=6,
-           num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1,
-           position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0):
+def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress, trans_layer=6,
+           num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
+           position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000):
+
     loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True, pin_memory=False, num_workers=num_workers)
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
@@ -94,7 +96,8 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
                   dropout=dropout, position_length=position_length).to(progress.get_device())
 
     criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0.01)  # オプティマイザを定義
+    optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), weight_decay=0.01)  # オプティマイザを定義
+    scheduler = LambdaLR(optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
 
     print("Start training...")
 
@@ -145,16 +148,24 @@ def _train(ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, 
                                                                    f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
             print(epoch_loss / count)
 
+            scheduler.step()
+
         message.send_message("機械学習の途中経過について",
                                  f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
         loss_val = epoch_loss / count
+
+        if is_save_training_progress:
+            torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}.pth") #エポック終了時に途中経過を保存
+
+        print("途中経過を保存しました。")
+
     return model, loss_val
 
 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(),
-                trans_layer=12, num_heads=8, d_model=1024,
-                dim_feedforward=2048, dropout=0.2, position_length=2048, num_workers=0,
+                trans_layer=12, num_heads=8, d_model=1024, is_save_training_progress=False,
+                dim_feedforward=2048, dropout=0.2, position_length=2048, num_workers=0, warmup_steps=4000,
                 accumulation_steps=4, batch_size=16, progress: LearningProgress = _DefaultLearningProgress()):
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
@@ -183,7 +194,7 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
 
             print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
 
-        model, loss = _train(train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
+        model, loss = _train(save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
                              d_model=d_model,
                              dim_feedforward=dim_feedforward,
                              trans_layer=trans_layer,
@@ -192,7 +203,9 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                              dropout=dropout,
                              accumulation_steps=accumulation_steps,
                              batch_size=batch_size,
-                             num_workers=num_workers
+                             num_workers=num_workers,
+                             warmup_steps=warmup_steps,
+                             is_save_training_progress=is_save_training_progress
                              )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",
