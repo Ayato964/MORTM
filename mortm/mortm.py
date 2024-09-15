@@ -123,7 +123,7 @@ class MORTM(nn.Module):
                 outputs = self(output, output, mask, mask, None, None)
                 logits = outputs[:, -1, :]
 
-                print(logits[-1, 10:138])
+                #print(logits[-1, 10:138])
 
                 logits = logits / temperature
 

@@ -127,11 +127,11 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             outputs = output.view(-1, output.size(-1)).to(progress.get_device())
             targets = targets.view(-1).to(progress.get_device()).long()
             loss = criterion(outputs, targets)  # 損失を計算
-
             loss.backward()  # 逆伝播
 #            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
                 progress.step_optimizer(optimizer)
+                scheduler.step()
                 print("Optimizerを更新しました。")
 
             epoch_loss += loss.item()
@@ -146,9 +146,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             if (count + 1) % message.step_by_message_count == 0:
                 message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
                                                                    f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
-            print(epoch_loss / count)
-
-            scheduler.step()
+            print(loss.item())
 
         message.send_message("機械学習の途中経過について",
                                  f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")

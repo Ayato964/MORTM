@@ -36,6 +36,7 @@ class Tokenizer:
                 self.tokens: dict = json.load(file)
                 self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
 
+
     def _init_mx_dict(self) -> dict:
         my_dict = dict()
         for i in range(0, 654):

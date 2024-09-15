@@ -4,11 +4,13 @@ from mortm.mortm import MORTM
 import pretty_midi as pm
 from convert import ConvertAyaNodeToMidi as nm
 import mortm.tokenizer as token
+from mortm.progress import _DefaultLearningProgress
 model_directory = "out/model/"
 
-tokenizer = token.Tokenizer("out/vocab/vocab_list.json")
+tokenizer = token.Tokenizer(save_directory="out/vocab/vocab_list.json", load_data="out/vocab/vocab_list.json")
 
 model = MORTM(
+    progress=_DefaultLearningProgress(),
     vocab_size=654,
     d_model=1024,
     dim_feedforward=2048,
@@ -16,7 +18,7 @@ model = MORTM(
     num_heads=16,
     position_length=2048
 )
-model.load_state_dict(torch.load("out/model/MORTEM.0.10.0_5.892386341144358.pth"))
+model.load_state_dict(torch.load("out/model/MORTM.test_5.849682997076823.pth"))
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 
@@ -25,7 +27,7 @@ model.to(device)
 
 start = tokenizer.get(-1, constants.START_SEQ_TOKEN, b=True)
 
-gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=0.2)
+gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=0.1)
 #gene = model.generate_by_length(start, max_length=20)
 
 output = gene[0]
