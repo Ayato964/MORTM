@@ -96,7 +96,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
                   dropout=dropout, position_length=position_length).to(progress.get_device())
 
     criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
-    optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), weight_decay=0.01)  # オプティマイザを定義
+    optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), weight_decay=0.001)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
 
     print("Start training...")
@@ -128,7 +128,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             targets = targets.view(-1).to(progress.get_device()).long()
             loss = criterion(outputs, targets)  # 損失を計算
             loss.backward()  # 逆伝播
-#            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
                 progress.step_optimizer(optimizer)
                 scheduler.step()
@@ -176,7 +176,7 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
         with open(weight_directory, 'r') as file:
             freq_dict = json.load(file)
             # 逆数を取り、頻出度が0の場合は小さい値に設定
-            epsilon = 1e-10  # 非ゼロの小さい値を設定しておく
+            epsilon = 1e-6  # 非ゼロの小さい値を設定しておく
             weights = []
 
             for i in range(len(freq_dict)):
