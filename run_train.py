@@ -10,4 +10,4 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 #message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp')
 
 model = train_mortm("out/np/datasets/", "out/model", "test",
-                    654, 3, "out/vocab/vocab_max.json")
+                    654, 3, "out/vocab/vocab_max.json",)
