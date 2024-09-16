@@ -8,6 +8,7 @@ import mido.midifiles.meta
 from numpy import ndarray, dtype
 from pretty_midi import PrettyMIDI, Instrument, Note
 import numpy as np
+from torch.nn.utils.rnn import pad_sequence
 
 from . import constants
 from AGSM.convert import ConvTempo, ConvKey
