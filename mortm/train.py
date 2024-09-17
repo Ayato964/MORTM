@@ -105,8 +105,8 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
         for inputs in loader:  # seqにはbatch_size分の楽曲が入っている
             print(f"learning sequence {count}")
             begin_time = time.time()
-            input_ids: Tensor = inputs[:, :-1]
-            targets: Tensor = inputs[:, 1:]
+            input_ids: Tensor = inputs[:, :-1].to(progress.get_device())
+            targets: Tensor = inputs[:, 1:].to(progress.get_device())
 
             #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
             #targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())

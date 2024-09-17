@@ -28,8 +28,8 @@ class MORTM(nn.Module):
         self.dropout = dropout
 
         #位置エンコーディングを作成
-        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, dropout, position_length).to(
-            self.progress.get_device())
+        self.positional: PositionalEncoding = (PositionalEncoding(self.d_model, progress, dropout, position_length).to(self.progress.get_device()))
+
         #Transformerの設定
         self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
                                                           num_encoder_layers=self.trans_layer,
