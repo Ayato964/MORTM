@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 import numpy as np
 from torch.optim.lr_scheduler import LambdaLR
+from torch.nn.utils.rnn import pad_sequence
 
 from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
@@ -48,48 +49,35 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
 
 # デバイスを取得
 def _set_train_data(directory, datasets, progress: LearningProgress):
-    if not IS_DEBUG:
-        print("Generating TrainData.....")
-        t_data = MORTM_DataSets(progress)
-        for dataset in datasets:
-            print(f"Load [{directory + dataset}]")
-            np_load_data = np.load(directory + dataset)
-            train_data = None
-            for i in range(len(np_load_data)):
+    print("Starting load....")
+    mortm_datasets = MORTM_DataSets(progress)
+    for dataset in datasets:
+        print(f"Load [{directory + dataset}]")
+        np_load_data = np.load(directory + dataset)
+        mortm_datasets.add_data(np_load_data)
+    print("load Successful!!")
+    print("---------------------------------------")
 
-                np_data = np.expand_dims(np_load_data[f'arr_{i}'], axis=0)[0]
-                print(np_data.shape)
-
-                if train_data is None:
-                    train_data = np_data
-                else:
-                    train_data = np.concatenate((train_data, np_data), axis=0)
-            print(f"最初の５音:{train_data[-1][0:25]}")
-            t_data.add_data(train_data)
-        print(f"Token size: {sum(len(sub) for sub in t_data.musics_seq)} ")
-        print("----------------------------------")
-        #t_data.split_seq_data()
-        #t_data.set_padding()
-        t_data.set_train_data()
-
-        return t_data
-    else:
-        np_load_data = np.load(directory + datasets[0])
-        print(np_load_data[f'arr_{3}'])
-    return None
+    return mortm_datasets
 
 def _get_padding_mask(input_ids, progress: LearningProgress):
     # input_ids が Tensor であることを仮定
     pad_id = (input_ids != 0).to(torch.float)
     padding_mask = pad_id.to(progress.get_device())
     return padding_mask
+def collate_fn(batch):
+    # バッチ内のテンソルの長さを揃える（パディングする）
+    batch = pad_sequence(batch, batch_first=True, padding_value=0)
+    return batch
 
 
 def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress, trans_layer=6,
            num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
            position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000):
 
-    loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True, pin_memory=False, num_workers=num_workers)
+    loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True,
+                        num_workers=num_workers, collate_fn=collate_fn)
+
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
                   d_model=d_model, dim_feedforward=dim_feedforward,
@@ -112,17 +100,18 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
         model.train()
         optimizer.zero_grad()
 
-        for input_ids, targets in loader:  # seqにはbatch_size分の楽曲が入っている
+        for input_ids, in loader:  # seqにはbatch_size分の楽曲が入っている
             print(f"learning sequence {count}")
             begin_time = time.time()
-            input_ids = input_ids.to(progress.get_device())
-            targets = targets.to(progress.get_device())
+            input_ids: Tensor = input_ids[:-1]
+            targets: Tensor = torch.tensor(input_ids[1:], device=progress.get_device())
             #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
             #targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
+
             padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
             padding_mask_tgt: Tensor = _get_padding_mask(targets, progress)
 
-            output = model(input_ids, targets, None, None, padding_mask_in, padding_mask_tgt)
+            output = model(input_ids, targets, padding_mask_in, padding_mask_tgt)
 
             outputs = output.view(-1, output.size(-1)).to(progress.get_device())
             targets = targets.view(-1).to(progress.get_device()).long()

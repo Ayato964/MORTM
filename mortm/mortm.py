@@ -42,7 +42,7 @@ class MORTM(nn.Module):
         self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
-    def forward(self, inputs_seq, tgt_seq, input_mask, tgt_mask, input_padding_mask, tgt_padding_mask):
+    def forward(self, inputs_seq, tgt_seq, input_padding_mask, tgt_padding_mask, input_mask=None, tgt_mask=None):
 
         inputs_em: Tensor = self.embedding(inputs_seq)
         inputs_em = inputs_em.permute(1, 0, 2)

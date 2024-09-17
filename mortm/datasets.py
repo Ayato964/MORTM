@@ -12,31 +12,20 @@ from .progress import LearningProgress
 
 class MORTM_DataSets(Dataset):
     def __init__(self, progress: LearningProgress):
-        self.musics_seq = None
-        self.tgt_seq = None
+        self.musics_seq: list = []
         self.progress = progress
 
     def __len__(self):
         return len(self.musics_seq)
 
     def __getitem__(self, item):
-        return (torch.tensor(self.musics_seq[item], dtype=torch.long).to(self.progress.get_device()),
-                torch.tensor(self.tgt_seq[item], dtype=torch.long).to(self.progress.get_device()))
+        return torch.tensor(self.musics_seq[item], dtype=torch.long, device=self.progress.get_device())
 
     def add_data(self, music_seq: np.ndarray):
-        if self.musics_seq is None:
-            if len(music_seq.shape) == 1:
-                self.musics_seq = [music_seq.tolist()]
-            else:
-                self.musics_seq = music_seq.tolist()
-        else:
-            if len(music_seq.shape) == 1:
-                music_seq: list = [music_seq.tolist()]
-                self.musics_seq = self.musics_seq + music_seq
-            else:
-                self.musics_seq = self.musics_seq + music_seq.tolist()
 
-        print(self._get_shape(self.musics_seq))
+        for i in range(len(music_seq) - 1):
+            aya_node = music_seq[f'array{i + 1}']
+            self.musics_seq = self.musics_seq + [aya_node.tolist()]
         pass
 
     def split_seq_data(self):
