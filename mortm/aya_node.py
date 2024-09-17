@@ -27,7 +27,7 @@ def calc_time_to_beat(time, beat_time) -> (int, int):
 def get_token(tempo: int, tokenizer: Tokenizer, token_type: str) -> Callable[[Note, Note], int]:
     def get_pitch(back_notes: Note, note: Note) -> int:
         p: int = note.pitch
-        return tokenizer.get(p, token_type)
+        return tokenizer.get(p, PITCH_TYPE)
 
 
 

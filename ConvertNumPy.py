@@ -2,7 +2,6 @@
 要確認
 '''
 #from mortm import gmail_messanger
-from mortm.ConvertMidi import ConvertMidi
 from mortm.tokenizer import Tokenizer
 from mortm.convert import MidiToAyaNode
 import os
