@@ -55,7 +55,9 @@ def _set_train_data(directory, datasets, progress: LearningProgress):
         print(f"Load [{directory + dataset}]")
         np_load_data = np.load(directory + dataset)
         mortm_datasets.add_data(np_load_data)
+        print(f"最初の5音:{mortm_datasets.musics_seq[-1][:5]}")
     print("load Successful!!")
+    print(f"データセットの規模（曲数）：{len(datasets)}")
     print("---------------------------------------")
 
     return mortm_datasets
@@ -100,13 +102,16 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
         model.train()
         optimizer.zero_grad()
 
-        for input_ids, in loader:  # seqにはbatch_size分の楽曲が入っている
+        for inputs in loader:  # seqにはbatch_size分の楽曲が入っている
             print(f"learning sequence {count}")
             begin_time = time.time()
-            input_ids: Tensor = input_ids[:-1]
-            targets: Tensor = torch.tensor(input_ids[1:], device=progress.get_device())
+            input_ids: Tensor = inputs[:, :-1]
+            targets: Tensor = inputs[:, 1:]
+
             #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
             #targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
+
+            print(input_ids.shape, targets.shape)
 
             padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
             padding_mask_tgt: Tensor = _get_padding_mask(targets, progress)
@@ -114,7 +119,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             output = model(input_ids, targets, padding_mask_in, padding_mask_tgt)
 
             outputs = output.view(-1, output.size(-1)).to(progress.get_device())
-            targets = targets.view(-1).to(progress.get_device()).long()
+            targets = targets.reshape(-1).long()
             loss = criterion(outputs, targets)  # 損失を計算
             loss.backward()  # 逆伝播
             #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)

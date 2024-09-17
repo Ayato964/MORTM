@@ -46,6 +46,7 @@ class MORTM(nn.Module):
 
         inputs_em: Tensor = self.embedding(inputs_seq)
         inputs_em = inputs_em.permute(1, 0, 2)
+
         inputs_pos: Tensor = self.positional(inputs_em)
 
         if tgt_seq is None:
