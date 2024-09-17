@@ -4,6 +4,7 @@
 #from mortm import gmail_messanger
 from mortm.ConvertMidi import ConvertMidi
 from mortm.tokenizer import Tokenizer
+from mortm.convert import MidiToAyaNode
 import os
 #from mortm.messager import Messenger
 def find_midi_files(root_folder):
@@ -31,7 +32,7 @@ ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 6
 tokenizer = Tokenizer("out/vocab")
 
 
-datasets = "data/JazzMidi"
+datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
 directory, md_file = find_midi_files(datasets)
 
 
@@ -39,7 +40,7 @@ directory, md_file = find_midi_files(datasets)
 
 count = 0
 for i in range(len(md_file)):
-    con = ConvertMidi(tokenizer, directory[i], md_file[i], BRASS, 120)
+    con = MidiToAyaNode(tokenizer, directory[i], md_file[i], BRASS)
     con.convert()
     is_saved = con.save("out/np/datasets")
     if is_saved:

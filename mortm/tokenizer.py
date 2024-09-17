@@ -19,12 +19,12 @@ class Tokenizer:
             # 特殊トークン
             self.special_token_position = 3
             #旋律トークン
-            self.pitch_position = 10
-            self.velocity_position = 300
-            self.duration_position = 500
+            self.pitch_position = constants.PITCH_BEGIN_ID
+            self.velocity_position = constants.VELOCITY_BEGIN_ID
+            self.duration_position = constants.DURATION_BEGIN_ID
             #指示トークン
-            self.instruction_start_position = 600
-            self.instruction_shift_position = 650
+            self.instruction_start_position = constants.START_BEGIN_ID
+            self.instruction_shift_position = constants.SHIFT_BEGIN_ID
 
             self.tokens: dict = dict()
             self.token_max: dict = self._init_mx_dict()
@@ -39,7 +39,7 @@ class Tokenizer:
 
     def _init_mx_dict(self) -> dict:
         my_dict = dict()
-        for i in range(0, 654):
+        for i in range(0, constants.SHIFT_BEGIN_ID + 3):
             my_dict[i] = 0
         return my_dict
 

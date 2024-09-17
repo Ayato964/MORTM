@@ -2,7 +2,7 @@ from mortm import constants
 import torch
 from mortm.mortm import MORTM
 import pretty_midi as pm
-from convert import ConvertAyaNodeToMidi as nm
+from mortm.convert import ConvertAyaNodeToMidi as nm
 import mortm.tokenizer as token
 from mortm.progress import _DefaultLearningProgress
 model_directory = "out/model/"
