@@ -87,7 +87,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
                   dropout=dropout, position_length=position_length).to(progress.get_device())
 
     #criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
-    criterion = MORTCrossEntropyLoss(progress.get_device(),penalty=0.01, ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())
+    criterion = MORTCrossEntropyLoss(progress.get_device(),penalty=1, ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1, betas=(0.9, 0.98), weight_decay=0.01)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
