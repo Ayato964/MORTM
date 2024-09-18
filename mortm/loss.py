@@ -34,7 +34,14 @@ class MORTCrossEntropyLoss(_Loss):
         mask = (score != 0) & (t_score != 0)  # 両方とも0でない位置だけを選択
         diff_count = torch.sum(score[mask] != t_score[mask])
 
-        return self.cross(outputs, targets) + diff_count.item() * self.penalty
+        total_tokens = torch.sum(score).item()  # 評価対象となるトークンの数
+        if total_tokens > 0:
+            error_percentage = diff_count.item() / total_tokens  # 間違いの割合を計算
+        else:
+            error_percentage = 0  # トークンがない場合はエラーはゼロ
+
+
+        return self.cross(outputs, targets) + error_percentage * self.penalty
 
     def get_group_tensor(self, input_tensor: Tensor) -> Tensor:
         output_tensor = torch.zeros_like(input_tensor).to(device=self.device)

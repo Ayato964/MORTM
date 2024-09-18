@@ -125,7 +125,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             targets = targets.reshape(-1).long()
             loss = criterion(outputs, targets)  # 損失を計算
             loss.backward()  # 逆伝播
-            #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
                 progress.step_optimizer(optimizer)
                 scheduler.step()
