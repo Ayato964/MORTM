@@ -2,7 +2,6 @@ from mortm import constants
 import torch
 from mortm.mortm import MORTM
 import pretty_midi as pm
-from mortm.convert import ConvertAyaNodeToMidi as nm
 import mortm.tokenizer as token
 from mortm.progress import _DefaultLearningProgress
 model_directory = "out/model/"
@@ -11,14 +10,14 @@ tokenizer = token.Tokenizer(save_directory="out/vocab/vocab_list.json", load_dat
 
 model = MORTM(
     progress=_DefaultLearningProgress(),
-    vocab_size=654,
-    d_model=1024,
-    dim_feedforward=2048,
-    trans_layer=12,
-    num_heads=16,
-    position_length=2048
+    vocab_size=395,
+    d_model=2048,
+    trans_layer=6,
+    dim_feedforward=4096,
+    position_length=8000,
+    num_heads=8,
 )
-model.load_state_dict(torch.load("out/model/MORTM.test_5.849682997076823.pth"))
+model.load_state_dict(torch.load("out/model/MORTM.train.5.5.2929.pth"))
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 
@@ -27,16 +26,16 @@ model.to(device)
 
 start = tokenizer.get(-1, constants.START_SEQ_TOKEN, b=True)
 
-gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=0.1)
-#gene = model.generate_by_length(start, max_length=20)
+gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=0.01)
+#gene = model.generate_by_length(start, max_length=20).tolist()
 
 output = gene[0]
 print(output)
 for t in output:
     print(f"{t}  {tokenizer.rev_get(t)}")
 
-midi: pm.PrettyMIDI = nm.convert(gene[0], tokenizer)
+#midi: pm.PrettyMIDI = nm.convert(gene[0], tokenizer)
 
-print(midi.instruments[0].notes[0])
+#print(midi.instruments[0].notes[0])
 
-midi.write("out/generated/test.mid")
+#midi.write("out/generated/test.mid")

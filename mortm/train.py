@@ -7,6 +7,7 @@ train_mortmメソッドを呼び出し、引数の型に合ったオブジェク
 
 import datetime
 import json
+import math
 import os
 import time
 from abc import abstractmethod
@@ -76,7 +77,7 @@ def collate_fn(batch):
 
 def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress, trans_layer=6,
            num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
-           position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000):
+           position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
     loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True,
                         num_workers=num_workers, collate_fn=collate_fn)
@@ -86,10 +87,10 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
                   d_model=d_model, dim_feedforward=dim_feedforward,
                   dropout=dropout, position_length=position_length).to(progress.get_device())
 
-    #criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
-    criterion = MORTCrossEntropyLoss(progress.get_device(),penalty=1, ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())
+    criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
+    #criterion = MORTCrossEntropyLoss(progress.get_device(),penalty=1, ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1, betas=(0.9, 0.98), weight_decay=0.01)  # オプティマイザを定義
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=0.01)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
 
     print("Start training...")
@@ -123,11 +124,15 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
 
             outputs = output.view(-1, output.size(-1)).to(progress.get_device())
             targets = targets.reshape(-1).long()
+
             loss = criterion(outputs, targets)  # 損失を計算
+
             loss.backward()  # 逆伝播
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
-                progress.step_optimizer(optimizer)
+                progress.step_optimizer(optimizer, model)
                 scheduler.step()
                 print("Optimizerを更新しました。")
                 print(f"学習率：{scheduler.get_last_lr()}")
@@ -159,7 +164,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(),
-                trans_layer=12, num_heads=8, d_model=1024, is_save_training_progress=False,
+                trans_layer=12, num_heads=8, d_model=1024, is_save_training_progress=False, lr_param=1,
                 dim_feedforward=2048, dropout=0.2, position_length=2048, num_workers=0, warmup_steps=4000,
                 accumulation_steps=4, batch_size=16, progress: LearningProgress = _DefaultLearningProgress()):
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -182,7 +187,7 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                 if freq == 0:
                     weights.append(epsilon)
                 else:
-                    weights.append(1.0 / freq)
+                    weights.append(1.0 / (math.log(freq + 1.0) + epsilon))  # 対数スケーリングを適用
             # テンソルに変換
             weight_tensor = torch.tensor(weights)
             weight_tensor = weight_tensor / weight_tensor.sum()
@@ -200,7 +205,8 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                              batch_size=batch_size,
                              num_workers=num_workers,
                              warmup_steps=warmup_steps,
-                             is_save_training_progress=is_save_training_progress
+                             is_save_training_progress=is_save_training_progress,
+                             lr_param=lr_param
                              )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",

@@ -1,7 +1,7 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-from .PositionalEncoding import PositionalEncoding
+from .PositionalEncoding import RelativePositionalEncoding, PositionalEncoding, LearnablePositionalEncoding
 
 from .progress import LearningProgress
 
@@ -28,8 +28,8 @@ class MORTM(nn.Module):
         self.dropout = dropout
 
         #位置エンコーディングを作成
-        self.positional: PositionalEncoding = (PositionalEncoding(self.d_model, progress, dropout, position_length).to(self.progress.get_device()))
-
+        #self.positional: LearnablePositionalEncoding = LearnablePositionalEncoding(self.d_model, progress, dropout, position_length).to(self.progress.get_device())
+        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length).to(self.progress.get_device())
         #Transformerの設定
         self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
                                                           num_encoder_layers=self.trans_layer,
@@ -79,7 +79,7 @@ class MORTM(nn.Module):
         token_count = 0
         while not isEnd:
             mask = self.transformer.generate_square_subsequent_mask(output.shape[1]).to(self.progress.get_device())
-            outputs = self(output, output, mask, mask, None, None)
+            outputs = self(output, output, None, None)
             logits = outputs[:, -1, :]
 
             str_token_duration = self.token_dict[token_count]
@@ -121,7 +121,7 @@ class MORTM(nn.Module):
         for _ in range(max_length):
             with torch.no_grad():
                 mask = self.transformer.generate_square_subsequent_mask(output.shape[1]).to(self.progress.get_device())
-                outputs = self(output, output, mask, mask, None, None)
+                outputs = self( output, output, None, None)
                 logits = outputs[:, -1, :]
 
                 #print(logits[-1, 10:138])
