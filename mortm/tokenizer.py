@@ -1,6 +1,8 @@
 import json
+from typing import List
 
 from . import constants
+from .aya_node import Token
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -13,18 +15,15 @@ SHIFT_TYPE = 'h'
 
 
 class Tokenizer:
-    def __init__(self, save_directory: str, load_data: str = None):
+    def __init__(self, save_directory: str,  token: List[Token], load_data: str = None):
         self.save_directory = save_directory
         if load_data is None:
             # 特殊トークン
             self.special_token_position = 3
-            #旋律トークン
-            self.pitch_position = constants.PITCH_BEGIN_ID
-            self.velocity_position = constants.VELOCITY_BEGIN_ID
-            self.duration_position = constants.DURATION_BEGIN_ID
-            #指示トークン
-            self.instruction_start_position = constants.START_BEGIN_ID
-            self.instruction_shift_position = constants.SHIFT_BEGIN_ID
+            p = self.special_token_position
+            for t in token:
+                t.token_position = p
+                p += t.get_range() + 1
 
             self.tokens: dict = dict()
             self.token_max: dict = self._init_mx_dict()

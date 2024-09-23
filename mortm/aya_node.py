@@ -1,10 +1,9 @@
-import numpy as np
-from numpy import ndarray
+
 from pretty_midi.pretty_midi import Note
-from typing import Callable
 
 from .tokenizer import Tokenizer
-from .tokenizer import PITCH_TYPE,SHIFT_TYPE,START_TYPE,VELOCITY_TYPE,DURATION_TYPE
+from .tokenizer import PITCH_TYPE, SHIFT_TYPE, START_TYPE, VELOCITY_TYPE, DURATION_TYPE
+from abc import abstractmethod
 
 
 def ct_time_to_beat(time: float, tempo: int) -> int:
@@ -24,57 +23,94 @@ def calc_time_to_beat(time, beat_time) -> (int, int):
     return main_beat, sub_time
 
 
-def get_token(tempo: int, tokenizer: Tokenizer, token_type: str) -> Callable[[Note, Note], int]:
-    def get_pitch(back_notes: Note, note: Note) -> int:
+class Token:
+    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
+        self.tempo = tempo
+        self.tokenizer = tokenizer
+        self.token_type = token_type
+        self.token_position = 0
+
+    @abstractmethod
+    def get_token(self, back_notes: Note, note: Note) -> int:
+        pass
+
+    @abstractmethod
+    def get_range(self) -> int:
+        pass
+
+
+
+class Pitch(Token):
+
+    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
+        super().__init__(tempo, tokenizer, token_type)
+
+    def get_range(self) -> int:
+        return 128
+
+    def get_token(self, back_notes: Note, note: Note) -> int:
         p: int = note.pitch
-        return tokenizer.get(p, PITCH_TYPE)
+        return self.tokenizer.get(p, PITCH_TYPE)
 
 
+class Velocity(Token):
 
-    def get_velocity(back_notes: Note, note: Note) -> int:
+    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
+        super().__init__(tempo, tokenizer, token_type)
+
+    def get_token(self, back_notes: Note, note: Note) -> int:
         v: int = note.velocity
-        return tokenizer.get(v, VELOCITY_TYPE)
+        return self.tokenizer.get(v, VELOCITY_TYPE)
+
+    def get_range(self) -> int:
+        return 128
 
 
-    def get_duration(back_note: Note, note: Note) -> int:
-        start = ct_time_to_beat(note.start, tempo)
-        end = ct_time_to_beat(note.end, tempo)
+class Duration(Token):
+
+    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
+        super().__init__(tempo, tokenizer, token_type)
+
+    def get_token(self, back_notes: Note, note: Note) -> int:
+        start = ct_time_to_beat(note.start, self.tempo)
+        end = ct_time_to_beat(note.end, self.tempo)
         d = int(max(abs(end - start), 1))
 
         if 100 < d:
             d = 100
 
-        return tokenizer.get(d, DURATION_TYPE)
+        return self.tokenizer.get(d, DURATION_TYPE)
+
+    def get_range(self) -> int:
+        return 100
 
 
-    def get_start(back:Note, note: Note) -> int:
-        s = ct_time_to_beat(note.start, tempo)
+class Start(Token):
+    def get_token(self, back_notes: Note, note: Note) -> int:
+        s = ct_time_to_beat(note.start, self.tempo)
+        return self.tokenizer.get(int(s % 32), START_TYPE)
 
-        return tokenizer.get(int(s % 32), START_TYPE)
+    def get_range(self) -> int:
+        return 32
 
 
-    def get_shift(back: Note, note: Note) -> int:
-        if back is None:
+class Shift(Token):
+    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
+        super().__init__(tempo, tokenizer, token_type)
+
+    def get_token(self, back_notes: Note, note: Note) -> int:
+        if back_notes is None:
             return -1
         else:
-            back_start = ct_time_to_beat(back.start, tempo)
-            note_start = ct_time_to_beat(note.start, tempo)
+            back_start = ct_time_to_beat(back_notes.start, self.tempo)
+            note_start = ct_time_to_beat(note.start, self.tempo)
 
             shift = int(abs((back_start // 32) - (note_start // 32)))
 
             if shift > 3:
                 shift = 3
 
-            return tokenizer.get(shift, SHIFT_TYPE)
+        return self.tokenizer.get(shift, SHIFT_TYPE)
 
-
-    if token_type is PITCH_TYPE:
-        return get_pitch
-    elif token_type is VELOCITY_TYPE:
-        return get_velocity
-    elif token_type is DURATION_TYPE:
-        return get_duration
-    elif token_type is START_TYPE:
-        return get_start
-    elif token_type is SHIFT_TYPE:
-        return get_shift
+    def get_range(self) -> int:
+        return 4

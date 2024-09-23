@@ -6,18 +6,19 @@ from numpy import ndarray
 from typing import List, Callable
 
 from . import constants
+from .aya_node import Token, Pitch, Velocity, Duration, Shift, Start
 from . import aya_node
 from .tokenizer import Tokenizer
 
 
-def _get_token_converter(tempo:int, tokenizer: Tokenizer) -> List[Callable[[Note, Note], int]]:
-    register: List[Callable[[Note, Note], int]] = list()
+def _get_token_converter(tempo:int, tokenizer: Tokenizer) -> List[Token]:
+    register: List[Token] = list()
 
-    register.append(aya_node.get_token(tempo, tokenizer, aya_node.SHIFT_TYPE))
-    register.append(aya_node.get_token(tempo, tokenizer, aya_node.START_TYPE))
-    register.append(aya_node.get_token(tempo, tokenizer, aya_node.PITCH_TYPE))
-    register.append(aya_node.get_token(tempo, tokenizer, aya_node.VELOCITY_TYPE))
-    register.append(aya_node.get_token(tempo, tokenizer, aya_node.DURATION_TYPE))
+    register.append(Shift(tempo, tokenizer, aya_node.SHIFT_TYPE))
+    register.append(Start(tempo, tokenizer, aya_node.START_TYPE))
+    register.append(Pitch(tempo, tokenizer, aya_node.PITCH_TYPE))
+    register.append(Velocity(tempo, tokenizer, aya_node.VELOCITY_TYPE))
+    register.append(Duration(tempo, tokenizer, aya_node.DURATION_TYPE))
 
     return register
 
@@ -25,7 +26,7 @@ def _get_token_converter(tempo:int, tokenizer: Tokenizer) -> List[Callable[[Note
 class MidiToAyaNode:
 
     def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None,
-                 token_converter: List[Callable[[Note, Note], int]]=None):
+                 token_converter: List[Token] = None):
         self.program_list = program_list
         self.tokenizer = tokenizer
         self.directory = directory
@@ -34,9 +35,9 @@ class MidiToAyaNode:
         self.is_error = False
         self.aya_node = [0]
         if token_converter is not None:
-            self.token_converter: List[Callable[[Note, Note], int]] = token_converter
+            self.token_converter: List[Token] = token_converter
         else:
-            self.token_converter: List[Callable[[Note, Note], int]] = _get_token_converter(self.tempo, tokenizer)
+            self.token_converter: List[Token] = _get_token_converter(self.tempo, tokenizer)
 
         if midi_data is not None:
             self.midi_data: PrettyMIDI = midi_data
@@ -118,9 +119,9 @@ class MidiToAyaNode:
                 clip = np.append(clip, self.tokenizer.get(-1, constants.START_SEQ_TOKEN))
 
             for conv in self.token_converter:
-                conv: Callable[[Note, Note], int] = conv
+                conv: Token = conv
 
-                token = conv(back_note, note)
+                token = conv.get_token(back_note, note)
                 if token != -1:
                     clip = np.append(clip, token)
 
