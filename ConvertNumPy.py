@@ -2,10 +2,12 @@
 要確認
 '''
 #from mortm import gmail_messanger
-from mortm.tokenizer import Tokenizer
+from mortm.tokenizer import Tokenizer, get_token_converter
 from mortm.convert import MidiToAyaNode
 import os
 #from mortm.messager import Messenger
+
+
 def find_midi_files(root_folder):
     midi_files = []
     direc = []
@@ -28,7 +30,6 @@ GUITAR = [25, 26, 27, 28, 29, 30, 31, 32]
 
 ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 67, 68]
 
-tokenizer = Tokenizer("out/vocab")
 
 
 datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
@@ -36,6 +37,8 @@ directory, md_file = find_midi_files(datasets)
 
 
 #mes: Messenger = gmail_messanger.GmailMessanger()
+
+tokenizer = Tokenizer(get_token_converter(120))
 
 count = 0
 for i in range(len(md_file)):
@@ -48,7 +51,7 @@ for i in range(len(md_file)):
     if count - 1 >= 12000:
         break
 
-tokenizer.save()
+tokenizer.save("out/vocab/")
 print(len(tokenizer.tokens))
 print(tokenizer.token_max)
 

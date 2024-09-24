@@ -1,8 +1,6 @@
 
 from pretty_midi.pretty_midi import Note
 
-from .tokenizer import Tokenizer
-from .tokenizer import PITCH_TYPE, SHIFT_TYPE, START_TYPE, VELOCITY_TYPE, DURATION_TYPE
 from abc import abstractmethod
 
 
@@ -24,9 +22,8 @@ def calc_time_to_beat(time, beat_time) -> (int, int):
 
 
 class Token:
-    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
+    def __init__(self, tempo: int, token_type: str):
         self.tempo = tempo
-        self.tokenizer = tokenizer
         self.token_type = token_type
         self.token_position = 0
 
@@ -38,38 +35,42 @@ class Token:
     def get_range(self) -> int:
         pass
 
+    @abstractmethod
+    def convert(self) -> int:
+        pass
+
+    def __call__(self, back_notes: Note, note: Note, *args, **kwargs):
+        symbol: int = self.get_token(back_notes, note)
+        if symbol == -1:
+            my_token = None
+            pass
+        else:
+            my_token = f"{self.token_type}_{symbol}"
+
+        return my_token
 
 
 class Pitch(Token):
 
-    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
-        super().__init__(tempo, tokenizer, token_type)
-
     def get_range(self) -> int:
         return 128
 
-    def get_token(self, back_notes: Note, note: Note) -> int:
+    def get_token(self, back_notes: Note, note: Note) ->int:
         p: int = note.pitch
-        return self.tokenizer.get(p, PITCH_TYPE)
+        return p
 
 
 class Velocity(Token):
 
-    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
-        super().__init__(tempo, tokenizer, token_type)
-
     def get_token(self, back_notes: Note, note: Note) -> int:
         v: int = note.velocity
-        return self.tokenizer.get(v, VELOCITY_TYPE)
+        return v
 
     def get_range(self) -> int:
         return 128
 
 
 class Duration(Token):
-
-    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
-        super().__init__(tempo, tokenizer, token_type)
 
     def get_token(self, back_notes: Note, note: Note) -> int:
         start = ct_time_to_beat(note.start, self.tempo)
@@ -79,7 +80,7 @@ class Duration(Token):
         if 100 < d:
             d = 100
 
-        return self.tokenizer.get(d, DURATION_TYPE)
+        return d
 
     def get_range(self) -> int:
         return 100
@@ -88,15 +89,13 @@ class Duration(Token):
 class Start(Token):
     def get_token(self, back_notes: Note, note: Note) -> int:
         s = ct_time_to_beat(note.start, self.tempo)
-        return self.tokenizer.get(int(s % 32), START_TYPE)
+        return s % 32
 
     def get_range(self) -> int:
         return 32
 
 
 class Shift(Token):
-    def __init__(self, tempo: int, tokenizer: Tokenizer, token_type: str):
-        super().__init__(tempo, tokenizer, token_type)
 
     def get_token(self, back_notes: Note, note: Note) -> int:
         if back_notes is None:
@@ -110,7 +109,7 @@ class Shift(Token):
             if shift > 3:
                 shift = 3
 
-        return self.tokenizer.get(shift, SHIFT_TYPE)
+        return shift
 
     def get_range(self) -> int:
         return 4

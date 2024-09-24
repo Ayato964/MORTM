@@ -10,34 +10,18 @@ from .aya_node import Token, Pitch, Velocity, Duration, Shift, Start
 from . import aya_node
 from .tokenizer import Tokenizer
 
-
-def _get_token_converter(tempo:int, tokenizer: Tokenizer) -> List[Token]:
-    register: List[Token] = list()
-
-    register.append(Shift(tempo, tokenizer, aya_node.SHIFT_TYPE))
-    register.append(Start(tempo, tokenizer, aya_node.START_TYPE))
-    register.append(Pitch(tempo, tokenizer, aya_node.PITCH_TYPE))
-    register.append(Velocity(tempo, tokenizer, aya_node.VELOCITY_TYPE))
-    register.append(Duration(tempo, tokenizer, aya_node.DURATION_TYPE))
-
-    return register
-
-
 class MidiToAyaNode:
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None,
-                 token_converter: List[Token] = None):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None,):
         self.program_list = program_list
-        self.tokenizer = tokenizer
         self.directory = directory
         self.file_name = file_name
         self.tempo = 120
         self.is_error = False
         self.aya_node = [0]
-        if token_converter is not None:
-            self.token_converter: List[Token] = token_converter
-        else:
-            self.token_converter: List[Token] = _get_token_converter(self.tempo, tokenizer)
+        self.token_converter: List[Token] = tokenizer.token_list
+
+        self.tokenizer = tokenizer
 
         if midi_data is not None:
             self.midi_data: PrettyMIDI = midi_data
@@ -116,14 +100,15 @@ class MidiToAyaNode:
             note: Note = note
 
             if back_note is None:
-                clip = np.append(clip, self.tokenizer.get(-1, constants.START_SEQ_TOKEN))
+                clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
 
             for conv in self.token_converter:
                 conv: Token = conv
 
-                token = conv.get_token(back_note, note)
-                if token != -1:
-                    clip = np.append(clip, token)
+                token = conv(back_note, note)
+                if token is not None:
+                    token_id = self.tokenizer.get(token)
+                    clip = np.append(clip, token_id)
 
             back_note = note
 
@@ -131,7 +116,7 @@ class MidiToAyaNode:
 
             if clip_time >= 60 * split_count:
                 if len(clip) >= 10:
-                    clip = np.append(clip, self.tokenizer.get(-1, constants.END_SEQ_TOKEN))
+                    clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
 
                     aya_node_inst.append(clip)
 
@@ -142,7 +127,7 @@ class MidiToAyaNode:
                 split_count += 1
 
         if len(clip) >= 10:
-            clip = np.append(clip, self.tokenizer.get(-1, constants.END_SEQ_TOKEN))
+            clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
             aya_node_inst.append(clip)
 
         return aya_node_inst
