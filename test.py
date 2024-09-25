@@ -1,24 +1,7 @@
-from mortm.convert import MidiToAyaNode, AyaNodeToMidi
-from mortm.tokenizer import Tokenizer
-from mortm.train import _set_train_data
-from mortm.progress import _DefaultLearningProgress
-import os
 
-'''
-tokenizer = Tokenizer("out/vocab/")
-print(tokenizer.instruction_shift_position)
-BRASS = [57, 58, 65, 66, 67, 68]
+import  numpy as np
 
-con = MidiToAyaNode(tokenizer, "data/other", "along.mid", program_list=BRASS)
-con.convert()
-con.save("out")
-tokenizer.save()
+n = np.load("out/np/datasets/0a8e56ecd33f368b86ce0f76eeecefda.mid.npz")
 
-dec = AyaNodeToMidi("out/along.mid.npz")
+print(n['array1'])
 
-print(dec.npz_dict['array1'])
-
-'''
-
-datasets = os.listdir("out/np/datasets")
-_set_train_data("out/np/datasets/", datasets, _DefaultLearningProgress())

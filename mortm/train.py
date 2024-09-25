@@ -129,10 +129,10 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
 
             loss.backward()  # 逆伝播
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
 
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
-                progress.step_optimizer(optimizer, model)
+                progress.step_optimizer(optimizer, model, accumulation_steps)
                 scheduler.step()
                 print("Optimizerを更新しました。")
                 print(f"学習率：{scheduler.get_last_lr()}")

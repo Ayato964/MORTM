@@ -6,7 +6,7 @@ import torch
 class LearningProgress:
 
     @abstractmethod
-    def step_optimizer(self, optimizer, model, **kwargs):
+    def step_optimizer(self, optimizer, model, accumulation_steps, **kwargs):
         pass
 
     @abstractmethod
@@ -23,7 +23,13 @@ class _DefaultLearningProgress(LearningProgress):
             return torch.device('cpu')
         pass
 
-    def step_optimizer(self, optimizer, model, **kwargs):
+    def step_optimizer(self, optimizer, model, accumulation_steps, **kwargs):
+
+        # パラメータの勾配を累積ステップ数でスケーリング
+        for param in model.parameters():
+            if param.grad is not None:
+                param.grad.data /= accumulation_steps
+
         optimizer.step()  # オプティマイザを更新
 
         print(f"現在のNORMは{self.get_gradient_norm(model)}です。")
