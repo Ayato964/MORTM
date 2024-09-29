@@ -42,7 +42,9 @@ class Tokenizer:
             self.tokens[constants.PADDING_TOKEN] = 0
             self.tokens[constants.START_SEQ_TOKEN] = 1
             self.tokens[constants.END_SEQ_TOKEN] = 2
+            self.is_converter = False
         else:
+            self.is_converter = True
             with open(load_data, 'r') as file:
                 self.tokens: dict = json.load(file)
                 self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
@@ -63,8 +65,8 @@ class Tokenizer:
                 length = self.get_length(sp[0])
 
                 self.tokens[token] = length
-
-            self.token_max[self.tokens[token]] += 1
+            if not self.is_converter:
+                self.token_max[self.tokens[token]] += 1
             return self.tokens[token]
 
     def get_length(self, token_type: str):

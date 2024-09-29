@@ -19,6 +19,8 @@ import torch.nn as nn
 import numpy as np
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.tensorboard import SummaryWriter
+
 
 from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
@@ -69,13 +71,50 @@ def _get_padding_mask(input_ids, progress: LearningProgress):
     pad_id = (input_ids != 0).to(torch.float)
     padding_mask = pad_id.to(progress.get_device())
     return padding_mask
+
+
 def collate_fn(batch):
     # バッチ内のテンソルの長さを揃える（パディングする）
     batch = pad_sequence(batch, batch_first=True, padding_value=0)
     return batch
 
+#Xavier初期化
+def initialize_weights(m):
+    if isinstance(m, nn.Linear):  # 線形層に対して適用
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.MultiheadAttention):  # 自己注意層に対して適用
+        nn.init.xavier_uniform_(m.in_proj_weight)
+        nn.init.xavier_uniform_(m.out_proj.weight)
+        if m.in_proj_bias is not None:
+            nn.init.zeros_(m.in_proj_bias)
 
-def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress, trans_layer=6,
+
+# LayerNormの初期化
+def initialize_layernorm(m):
+    if isinstance(m, nn.LayerNorm):
+        nn.init.ones_(m.weight)  # LayerNormのスケールを1で初期化
+        nn.init.zeros_(m.bias)   # バイアスを0で初期化
+
+
+# He初期化の関数
+def initialize_weights_with_he(m):
+    if isinstance(m, nn.Linear):  # ReLU活性化関数を使う層に対して適用
+        nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+
+def update_log(model, writer, global_step):
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            writer.add_scalar(f"Gradient Norm/{name}", param.grad.norm(), global_step)
+
+        writer.add_histogram(f"Parameter Value/{name}", param, global_step)
+
+def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
+           trans_layer=6, load_model_directory:str = None,
            num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
            position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
@@ -86,14 +125,19 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
     model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
                   d_model=d_model, dim_feedforward=dim_feedforward,
                   dropout=dropout, position_length=position_length).to(progress.get_device())
+    if load_model_directory is not None:
+        model.load_state_dict(torch.load(load_model_directory))
 
     criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
+
+
     #criterion = MORTCrossEntropyLoss(progress.get_device(),penalty=1, ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=0.01)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
 
     print("Start training...")
+    writer = SummaryWriter(save_directory + "/runs/")
 
     loss_val = None
     mail_bool = True
@@ -129,7 +173,9 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
 
             loss.backward()  # 逆伝播
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            update_log(model, writer, count)
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
 
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
                 progress.step_optimizer(optimizer, model, accumulation_steps)
@@ -150,20 +196,23 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
                 message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
                                                                    f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
             print(loss.item())
+            writer.flush()
 
         message.send_message("機械学習の途中経過について",
                                  f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
         loss_val = epoch_loss / count
+        writer.add_scalar('Loss/train', epoch_loss / count, epoch)  # 損失値を記録
 
         if is_save_training_progress:
             torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}.pth") #エポック終了時に途中経過を保存
             print("途中経過を保存しました。")
+    writer.close()
 
     return model, loss_val
 
 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
-                message: Messenger = _DefaultMessenger(),
+                message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
                 trans_layer=12, num_heads=8, d_model=1024, is_save_training_progress=False, lr_param=1,
                 dim_feedforward=2048, dropout=0.2, position_length=2048, num_workers=0, warmup_steps=4000,
                 accumulation_steps=4, batch_size=16, progress: LearningProgress = _DefaultLearningProgress()):
@@ -190,11 +239,12 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                     weights.append(1.0 / (math.log(freq + 1.0) + epsilon))  # 対数スケーリングを適用
             # テンソルに変換
             weight_tensor = torch.tensor(weights)
-            weight_tensor = weight_tensor / weight_tensor.sum()
+            #weight_tensor = weight_tensor / weight_tensor.sum()
 
             print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
 
         model, loss = _train(save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
+                             load_model_directory=load_model_directory,
                              d_model=d_model,
                              dim_feedforward=dim_feedforward,
                              trans_layer=trans_layer,
