@@ -42,23 +42,17 @@ class MORTM(nn.Module):
         self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
-    def forward(self, inputs_seq, tgt_seq, input_padding_mask, tgt_padding_mask, input_mask=None, tgt_mask=None):
+    def forward(self, inputs_seq, input_padding_mask):
+        mask = self.transformer.generate_square_subsequent_mask(inputs_seq.shape[1]).to(self.progress.get_device())
 
         inputs_em: Tensor = self.embedding(inputs_seq)
         inputs_em = inputs_em.permute(1, 0, 2)
 
         inputs_pos: Tensor = self.positional(inputs_em)
 
-        if tgt_seq is None:
-            tgt_pos = inputs_pos
-        else:
-            tgt_em: Tensor = self.embedding(tgt_seq)
-            tgt_em = tgt_em.permute(1, 0, 2)
-            tgt_pos: Tensor = self.positional(tgt_em)
-
         #print(inputs_pos.shape, tgt_pos.shape)
-        out: Tensor = self.transformer(inputs_pos, tgt_pos, input_mask, tgt_mask,
-                                       src_key_padding_mask=input_padding_mask, tgt_key_padding_mask=tgt_padding_mask)
+        out: Tensor = self.transformer(inputs_pos, inputs_pos, tgt_mask=mask,
+                                       src_key_padding_mask=input_padding_mask, tgt_key_padding_mask=input_padding_mask)
 
         out.permute(1, 0, 2)
 
@@ -109,27 +103,130 @@ class MORTM(nn.Module):
         end_logit_score[:, indices_to_remove] = -float('Inf')
 
         score = self.softmax(end_logit_score)[-1]
+
+
+
         dis = torch.distributions.categorical.Categorical(probs=score)
         next_token = dis.sample()
 
         #print(next_token)
         return next_token
 
-    def top_p_sampling(self, input_ids, tokenizer, p=0.9, max_length=20, temperature=0.2):
+
+    def p_sampling_with_temperature_sequence(self, input_sequence, temperature=1.0, top_p=0.7, max_length=100):
         self.eval()
-        output = torch.tensor([input_ids], dtype=torch.long).unsqueeze(1).to(self.progress.get_device())
+        """
+        MORTMモデルにPサンプリングと温度シーケンスを実装する関数
+
+        Args:
+            input_sequence: 1次元の入力シーケンス (List[int] or torch.Tensor)。
+            temperature: 温度パラメータ。デフォルトは1.0。
+            top_p: サンプリングの確率の累積で選択する確率p。デフォルトは0.9。
+            max_length: 生成するシーケンスの最大長さ。デフォルトは100。
+
+        Returns:
+            1次元の生成されたシーケンス (torch.Tensor)。
+        """
+
+        # 入力シーケンスをtorch.tensorに変換
+        if not isinstance(input_sequence, torch.Tensor):
+            input_sequence = torch.tensor(input_sequence, dtype=torch.long, device=self.progress.get_device())
+
+        # 入力シーケンスの長さを取得
+        input_length = input_sequence.size(0)
+
+        # 生成されたシーケンスを格納するリスト
+        generated_sequence = input_sequence.tolist()
+
+        # 生成をループ
+        for _ in range(max_length):
+            # モデルに渡すための入力の準備 (2次元に変換)
+            input_tensor = input_sequence.unsqueeze(0)  # (1, sequence_length)
+            print(input_tensor)
+
+            # モデルに入力して次のトークンのスコアを取得 (3次元で返ってくる)
+            with torch.no_grad():
+                mask = self.transformer.generate_square_subsequent_mask(input_tensor.shape[1]).to(self.progress.get_device())
+
+                print(mask)
+                scores = self(input_tensor, input_tensor, None, None, tgt_mask=mask)  # (1, sequence_length, vocab_size)
+
+            # 最新のトークンのスコアを取得 (最後のトークンに対するスコア)
+            logits = scores[:, -1, :]  # (1, vocab_size)
+
+            # 温度の適用
+            logits = logits / temperature
+
+            logits = logits[-1, :]
+
+            # ソフトマックスを適用して確率を取得
+            probs = self.softmax(logits)  # (1, vocab_size)
+
+            # 上位p確率でトークンをフィルタリング
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+
+            #print(sorted_probs, sorted_indices)
+
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            # 確率pを超えるトークンをフィルタリング
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_probs[sorted_indices_to_remove] = 0.0
+
+            # 再度正規化
+            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+
+            # 必ず1次元に変換してからサンプリング
+            sorted_probs = sorted_probs.squeeze()  # (vocab_size)
+            if sorted_probs.dim() > 1:
+                sorted_probs = sorted_probs.squeeze(0)  # (vocab_size) に変換
+
+            print(sorted_probs)
+
+            # トークンをサンプリング
+            sampled_index = torch.multinomial(sorted_probs, 1).item()  # サンプリングされたインデックスを取得
+
+            # ソートされたインデックスから元のインデックスに変換
+            next_token = sorted_indices[sampled_index].item()
+
+
+            # シーケンスにトークンを追加
+            generated_sequence.append(next_token)
+
+            # 次のステップの入力として準備
+            input_sequence = torch.tensor(generated_sequence, dtype=torch.long,
+                                          device=self.progress.get_device())
+            #print(input_sequence)
+        return input_sequence
+
+    def top_p_sampling(self, input_ids, tokenizer, p=0.8, max_length=20, temperature=0.2):
+        self.eval()
+        output = torch.tensor([input_ids], dtype=torch.long).to(self.progress.get_device())
         for _ in range(max_length):
             with torch.no_grad():
                 mask = self.transformer.generate_square_subsequent_mask(output.shape[1]).to(self.progress.get_device())
                 outputs = self( output, output, None, None)
+
+                #print(outputs)
+
                 logits = outputs[:, -1, :]
 
-                #print(logits[-1, 10:138])
+                #print(logits)
+
 
                 logits = logits / temperature
 
+
+
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(self.softmax(sorted_logits), dim=-1)
+
+
+
+                #cumulative_probs = torch.cumsum(self.softmax(sorted_logits), dim=-1)
+                cumulative_probs = self.softmax(sorted_logits)
+
+                print(cumulative_probs.argmax())
+
                 sorted_indices_to_remove = cumulative_probs > p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
@@ -137,6 +234,9 @@ class MORTM(nn.Module):
                 logits[:, indices_to_remove] = -float('Inf')
 
                 probabilities = self.softmax(logits)[-1]
+
+                print(probabilities)
+
                 dis = torch.distributions.categorical.Categorical(probs=probabilities)
                 next_token = dis.sample()
                 # バッチサイズを一致させるために次元を調整

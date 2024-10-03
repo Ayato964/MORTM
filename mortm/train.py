@@ -111,7 +111,7 @@ def update_log(model, writer, global_step):
         if param.grad is not None:
             writer.add_scalar(f"Gradient Norm/{name}", param.grad.norm(), global_step)
 
-        writer.add_histogram(f"Parameter Value/{name}", param, global_step)
+        writer.add_scalar(f"Parameter Value/{name}", param.norm(), global_step)
 
 def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
            trans_layer=6, load_model_directory:str = None,
@@ -162,9 +162,8 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             print(input_ids.shape, targets.shape)
 
             padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
-            padding_mask_tgt: Tensor = _get_padding_mask(targets, progress)
 
-            output = model(input_ids, targets, padding_mask_in, padding_mask_tgt)
+            output = model(input_ids, padding_mask_in)
 
             outputs = output.view(-1, output.size(-1)).to(progress.get_device())
             targets = targets.reshape(-1).long()
