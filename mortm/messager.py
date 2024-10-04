@@ -17,5 +17,5 @@ class _DefaultMessenger(Messenger):
         super().__init__(step_by_message_count)
 
     def send_message(self, subject: str, body: str):
-        print(subject, body)
+        #print(subject, body)
         pass

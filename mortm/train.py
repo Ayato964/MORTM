@@ -131,8 +131,6 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
     criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
 
 
-    #criterion = MORTCrossEntropyLoss(progress.get_device(),penalty=1, ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())
-
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=0.01)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
 
@@ -143,7 +141,6 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
     mail_bool = True
     for epoch in range(num_epochs):
         print(f"epoch {epoch + 1} start....")
-        print(f"batch size :{len(loader)}")
         count = 1
         epoch_loss = 0.0
 
@@ -151,7 +148,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
         optimizer.zero_grad()
 
         for inputs in loader:  # seqにはbatch_size分の楽曲が入っている
-            print(f"learning sequence {count}")
+            #print(f"learning sequence {count}")
             begin_time = time.time()
             input_ids: Tensor = inputs[:, :-1].to(progress.get_device())
             targets: Tensor = inputs[:, 1:].to(progress.get_device())
@@ -159,7 +156,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
             #targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
 
-            print(input_ids.shape, targets.shape)
+            #print(input_ids.shape, targets.shape)
 
             padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
 
@@ -179,8 +176,6 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
                 progress.step_optimizer(optimizer, model, accumulation_steps)
                 scheduler.step()
-                print("Optimizerを更新しました。")
-                print(f"学習率：{scheduler.get_last_lr()}")
 
             epoch_loss += loss.item()
             count += 1
@@ -194,8 +189,10 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             if (count + 1) % message.step_by_message_count == 0:
                 message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
                                                                    f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
-            print(loss.item())
             writer.flush()
+
+            progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr())
+
 
         message.send_message("機械学習の途中経過について",
                                  f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
@@ -209,6 +206,11 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
 
     return model, loss_val
 
+def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr):
+    per = sequence / batch_size * 100
+    block = int(per / 100 * 50)
+    bar = f" \033[32m{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
+    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.3f} Lr:{lr}", end="")
 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
