@@ -114,7 +114,7 @@ class MidiToAyaNode:
 
             clip_time = note.end
 
-            if clip_time >= 60 * split_count:
+            if clip_time >= 30 * split_count:
                 if len(clip) >= 10:
                     clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
 

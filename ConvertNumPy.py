@@ -32,7 +32,7 @@ ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 6
 
 
 
-datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+datasets = "data/JazzMidi"
 directory, md_file = find_midi_files(datasets)
 
 
@@ -42,9 +42,9 @@ tokenizer = Tokenizer(get_token_converter(120))
 
 count = 0
 for i in range(len(md_file)):
-    con = MidiToAyaNode(tokenizer, directory[i], md_file[i], BRASS)
+    con = MidiToAyaNode(tokenizer, directory[i], md_file[i], PIANO)
     con.convert()
-    is_saved = con.save("out/np/datasets")
+    is_saved = con.save("out/np/corecct")
     if is_saved:
         count += 1
     print(count)

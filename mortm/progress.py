@@ -32,7 +32,7 @@ class _DefaultLearningProgress(LearningProgress):
 
         optimizer.step()  # オプティマイザを更新
 
-        print(f"現在のNORMは{self.get_gradient_norm(model)}です。")
+        #print(f"現在のNORMは{self.get_gradient_norm(model)}です。")
 
         optimizer.zero_grad()
         pass

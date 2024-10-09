@@ -55,13 +55,17 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
 def _set_train_data(directory, datasets, progress: LearningProgress):
     print("Starting load....")
     mortm_datasets = MORTM_DataSets(progress)
+    loss_count = 0
     for dataset in datasets:
         print(f"Load [{directory + dataset}]")
         np_load_data = np.load(directory + dataset)
-        mortm_datasets.add_data(np_load_data)
-        print(f"最初の5音:{mortm_datasets.musics_seq[-1][:5]}")
+        if len(np_load_data) > 1:
+            mortm_datasets.add_data(np_load_data)
+            print(f"最初の5音:{mortm_datasets.musics_seq[-1][:5]}")
+        else:
+            loss_count += 1
     print("load Successful!!")
-    print(f"データセットの規模（曲数）：{len(datasets)}")
+    print(f"データセットの規模（曲数）：{len(datasets) - loss_count}")
     print("---------------------------------------")
 
     return mortm_datasets
