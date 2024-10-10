@@ -1,18 +1,17 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-from .PositionalEncoding import RelativePositionalEncoding, PositionalEncoding, LearnablePositionalEncoding
+from .PositionalEncoding import PositionalEncoding
 
 from .progress import LearningProgress
 
 
 class MORTM(nn.Module):
     token_dict = {
-        0: "600_633",
-        1: "10_139",
-        2: "300_429",
-        3: "500_600",
-        4: "600_605"
+        'SHIFT': [1, 6],
+        'START': [7, 38],
+        'PITCH': [39, 166],
+        'DURATION': [167, 266]
     }
 
     def __init__(self, vocab_size, progress: LearningProgress, trans_layer=6, num_heads=8, d_model=512,
@@ -60,58 +59,66 @@ class MORTM(nn.Module):
         score:Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
 
-    def generate_by_length(self, input_seq, max_length, p=0.9, temperature=0.1):
+    def generate_by_length(self, input_sequence, top_k=3, max_length=100):
         self.eval()
-        output = torch.tensor([input_seq], dtype=torch.long).unsqueeze(1).to(self.progress.get_device())
-        for _ in range(max_length):
-            with torch.no_grad():
-                output = self._next_note_token(output)
+        if not isinstance(input_sequence, torch.Tensor):
+            input_sequence = torch.tensor(input_sequence, dtype=torch.long, device=self.progress.get_device())
 
-        return output
 
-    def _next_note_token(self, output, p=0.9, temperature=0.1):
-        isEnd = False
-        token_count = 0
-        while not isEnd:
-            mask = self.transformer.generate_square_subsequent_mask(output.shape[1]).to(self.progress.get_device())
-            outputs = self(output, output, None, None)
-            logits = outputs[:, -1, :]
+            for _ in range(max_length):
+              #print(f"I{i} input_tensor")
 
-            str_token_duration = self.token_dict[token_count]
-            parts = str_token_duration.split("_")
-            token_duration = [int(part) for part in parts]
-            if token_count != 4:
-                token = self._next_token(logits[:, token_duration[0]:token_duration[1]])
-                token += token_duration[0]
+                # モデルに入力して次のトークンのスコアを取得 (3次元で返ってくる)
+                with torch.no_grad():
+                    input_sequence = self.generate_note(input_sequence, top_k)
+        return input_sequence
+
+    def generate_note(self, input_sequence, top_k):
+        if len(input_sequence) != 0:
+            fill_count = len(input_sequence) % 4
+        else:
+            fill_count = 0
+        for i in range(fill_count, 4):
+            input_tensor = input_sequence.unsqueeze(0)  # (1, sequence_length)
+
+            score = self(input_tensor)
+            logits = score[:, -1, :]
+            logits = logits[-1, :]
+            if i == 0:
+                token_id = self.sampling(logits, top_k=1, temperature=0.5)
+            elif i == 1:
+                token_id = self.sampling(logits, top_k=2, temperature=0.5)
+            elif i == 2:
+                token_id = self.sampling(logits, top_k=10, temperature=1.2)
             else:
-                token = self._next_token(logits)
-                isEnd = True
-            token_count += 1
+                token_id = self.sampling(logits, top_k=2, temperature=0.5)
 
-            output = torch.cat((output.flatten(), token.unsqueeze(0))).unsqueeze(0).to(self.progress.get_device())
+            input_sequence = torch.cat((input_sequence, torch.tensor([token_id], device=self.progress.get_device()))).to(self.progress.get_device())
 
-        return output
-
-    def _next_token(self, end_logit_score: Tensor, p=0.9, temperature=0.1):
-        end_logit_score = end_logit_score / temperature
-
-        sorted_logits, sorted_indices = torch.sort(end_logit_score, descending=True)
-        cumulative_probs = torch.cumsum(self.softmax(sorted_logits), dim=-1)
-        sorted_indices_to_remove = cumulative_probs > p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-        end_logit_score[:, indices_to_remove] = -float('Inf')
-
-        score = self.softmax(end_logit_score)[-1]
+        return input_sequence
 
 
 
-        dis = torch.distributions.categorical.Categorical(probs=score)
-        next_token = dis.sample()
 
-        #print(next_token)
+
+
+
+    def sampling(self, logits: Tensor, top_k: int, temperature: float)-> int:
+        logits_t = logits / temperature
+        probs = self.softmax(logits_t)
+        # トップKの確率でトークンをフィルタリング
+        sorted_probs, sorted_indices = torch.topk(probs, top_k)
+
+        # 再度正規化
+        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+
+        # トークンをサンプリング
+        sampled_index = torch.multinomial(sorted_probs, 1).item()  # サンプリングされたインデックスを取得
+
+        # ソートされたインデックスから元のインデックスに変換
+        next_token = sorted_indices[sampled_index].item()
         return next_token
+
 
     def top_k_sampling_with_temperature_sequence(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
         self.eval()
@@ -172,6 +179,8 @@ class MORTM(nn.Module):
 
             # ソートされたインデックスから元のインデックスに変換
             next_token = sorted_indices[sampled_index].item()
+
+#            print(next_token)
 
             # シーケンスにトークンを追加
             generated_sequence.append(next_token)

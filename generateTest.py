@@ -18,7 +18,7 @@ model = MORTM(
     trans_layer=16, num_heads=8, d_model=1024,
     dim_feedforward=2048
 )
-model.load_state_dict(torch.load("out/model/MORTM.train.3.2.9623.pth"))
+model.load_state_dict(torch.load("out/model/MORTM.train.0.3.3800.pth"))
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 
@@ -30,11 +30,11 @@ start = [tokenizer.get(constants.START_SEQ_TOKEN)]
 print(f"First:{start}")
 
 #gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=2.0)
-gene = model.top_k_sampling_with_temperature_sequence(start, max_length=100, temperature=1, top_k=10)
-#gene = model.generate_by_length(start, max_length=20)
+#gene = model.top_k_sampling_with_temperature_sequence(start, max_length=100, temperature=1, top_k=10)
+
+gene = model.generate_by_length(start, max_length=20)
 
 output = gene
-print(output)
 for t in output:
     t: torch.Tensor = t
     print(f"{t}  {tokenizer.rev_get(t.tolist())}")
