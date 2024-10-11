@@ -1,4 +1,3 @@
-
 from pretty_midi.pretty_midi import Note
 
 from abc import abstractmethod
@@ -35,13 +34,9 @@ class Token:
     def get_range(self) -> int:
         pass
 
-    @abstractmethod
-    def convert(self) -> int:
-        pass
-
     def __call__(self, back_notes: Note, note: Note, *args, **kwargs):
         symbol: int = self.get_token(back_notes, note)
-        if symbol == -1:
+        if symbol == -999:
             my_token = None
             pass
         else:
@@ -50,12 +45,30 @@ class Token:
         return my_token
 
 
+class StartRE(Token):
+
+    def get_range(self) -> int:
+        return 192
+
+    def get_token(self, back_notes: Note, note: Note) -> int:
+        now_start = ct_time_to_beat(note.start, self.tempo)
+        back_start = ct_time_to_beat(back_notes.start, self.tempo)
+        shift = int(now_start - back_start)
+
+        if shift > 96:
+            shift = 96
+        if shift < -96:
+            shift = -96
+
+        return shift
+
+
 class Pitch(Token):
 
     def get_range(self) -> int:
         return 128
 
-    def get_token(self, back_notes: Note, note: Note) ->int:
+    def get_token(self, back_notes: Note, note: Note) -> int:
         p: int = note.pitch
         return p
 
@@ -99,7 +112,7 @@ class Shift(Token):
 
     def get_token(self, back_notes: Note, note: Note) -> int:
         if back_notes is None:
-            return -1
+            return -999
         else:
             back_start = ct_time_to_beat(back_notes.start, self.tempo)
             note_start = ct_time_to_beat(note.start, self.tempo)

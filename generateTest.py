@@ -3,6 +3,7 @@ import torch
 from mortm.mortm import MORTM
 import pretty_midi as pm
 import mortm.tokenizer as token
+import numpy as np
 
 from mortm.progress import _DefaultLearningProgress
 from mortm.tokenizer import get_token_converter
@@ -23,9 +24,11 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 
 # メロディ生成の実行
-#np_notes = np.load("out/np/test/test.npz")
+np_notes = np.load("out/np/0a0e71e3f20423688a1321a23501c443.mid.npz")
 
-start = [tokenizer.get(constants.START_SEQ_TOKEN)]
+start = np_notes[f'array1'][:50]
+
+#start = [tokenizer.get(constants.START_SEQ_TOKEN)]
 
 print(f"First:{start}")
 
