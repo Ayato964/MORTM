@@ -3,7 +3,7 @@ from typing import List
 from numpy import ndarray
 
 from . import constants
-from .aya_node import Token, Start,Shift,Pitch,Velocity,Duration
+from .aya_node import Token, Start,Shift,Pitch,Velocity,Duration, StartRE
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -18,8 +18,9 @@ SHIFT_TYPE = 'h'
 def get_token_converter(tempo: int) -> List[Token]:
     register: List[Token] = list()
 
-    register.append(Shift(tempo, SHIFT_TYPE))
-    register.append(Start(tempo, START_TYPE))
+    #register.append(Shift(tempo, SHIFT_TYPE))
+    #register.append(Start(tempo, START_TYPE))
+    register.append(StartRE(tempo, START_TYPE))
     register.append(Pitch(tempo, PITCH_TYPE))
     #register.append(Velocity(tempo, VELOCITY_TYPE))
     register.append(Duration(tempo, DURATION_TYPE))

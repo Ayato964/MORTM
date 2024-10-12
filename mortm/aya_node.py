@@ -48,17 +48,21 @@ class Token:
 class StartRE(Token):
 
     def get_range(self) -> int:
-        return 192
+        return 96
 
     def get_token(self, back_notes: Note, note: Note) -> int:
         now_start = ct_time_to_beat(note.start, self.tempo)
-        back_start = ct_time_to_beat(back_notes.start, self.tempo)
+        if back_notes is not None:
+            back_start = ct_time_to_beat(back_notes.start, self.tempo)
+        else:
+            back_start = 0
         shift = int(now_start - back_start)
 
+        if shift < 0:
+            print("WHATS!?!?!?!?!?")
+
         if shift > 96:
-            shift = 96
-        if shift < -96:
-            shift = -96
+            shift = 64 + shift % 32
 
         return shift
 
