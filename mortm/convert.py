@@ -84,7 +84,6 @@ class MidiToAyaNode:
         aya_node_inst = [clip_1, clip_2 ... clip_n]
 
         よって、二次元配列のndarrayを返す。
-
         :param inst: インストゥルメント
         :return: 60秒にクリッピングされた旋律の配列(2次元)
         """
@@ -96,7 +95,9 @@ class MidiToAyaNode:
         clip_time: float = 0
         split_count: int = 1
 
-        for note in inst.notes:
+        sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
+
+        for note in sorted_notes:
             note: Note = note
 
             if back_note is None:
@@ -115,10 +116,7 @@ class MidiToAyaNode:
             clip_time = note.end
 
             if clip_time >= 30 * split_count:
-                if len(clip) >= 10:
-                    clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
-
-                    aya_node_inst.append(clip)
+                aya_node_inst = self.marge_clip(clip, aya_node_inst)
 
                 clip = np.array([], dtype=int)
                 back_note = None
@@ -127,7 +125,14 @@ class MidiToAyaNode:
                 split_count += 1
 
         if len(clip) >= 10:
+            aya_node_inst = self.marge_clip(clip, aya_node_inst)
+
+        return aya_node_inst
+
+    def marge_clip(self, clip, aya_node_inst):
+        if len(clip) >= 10:
             clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
+
             aya_node_inst.append(clip)
 
         return aya_node_inst
