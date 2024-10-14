@@ -31,8 +31,9 @@ class _DefaultLearningProgress(LearningProgress):
                 param.grad.data /= accumulation_steps
 
         optimizer.step()  # オプティマイザを更新
-
-        #print(f"現在のNORMは{self.get_gradient_norm(model)}です。")
+        norm = self.get_gradient_norm(model)
+        if not (0.1 < norm < 1.0):
+            print(f"\033[31m 警告\033[0m：NORMが既定値から逸脱しています。学習率、またはバッチサイズを調整してください。({norm:.4f})")
 
         optimizer.zero_grad()
         pass

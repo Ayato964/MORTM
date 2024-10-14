@@ -48,7 +48,7 @@ for i in range(len(md_file)):
     if is_saved:
         count += 1
     print(count)
-    if count - 1 >= 100:
+    if count - 1 >= 28000:
         break
 
 tokenizer.save("out/vocab/")
