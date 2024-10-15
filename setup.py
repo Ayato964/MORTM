@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='MORTM',
-    version='0.16.4',
+    version='0.17.0',
     author='Nagoshi Takaaki',
     author_email='nagoshi@kthrlab.jp',
     description='音楽の旋律生成を実現したシステム',
