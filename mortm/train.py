@@ -82,32 +82,6 @@ def collate_fn(batch):
     batch = pad_sequence(batch, batch_first=True, padding_value=0)
     return batch
 
-#Xavier初期化
-def initialize_weights(m):
-    if isinstance(m, nn.Linear):  # 線形層に対して適用
-        nn.init.xavier_uniform_(m.weight)
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.MultiheadAttention):  # 自己注意層に対して適用
-        nn.init.xavier_uniform_(m.in_proj_weight)
-        nn.init.xavier_uniform_(m.out_proj.weight)
-        if m.in_proj_bias is not None:
-            nn.init.zeros_(m.in_proj_bias)
-
-
-# LayerNormの初期化
-def initialize_layernorm(m):
-    if isinstance(m, nn.LayerNorm):
-        nn.init.ones_(m.weight)  # LayerNormのスケールを1で初期化
-        nn.init.zeros_(m.bias)   # バイアスを0で初期化
-
-
-# He初期化の関数
-def initialize_weights_with_he(m):
-    if isinstance(m, nn.Linear):  # ReLU活性化関数を使う層に対して適用
-        nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
 
 
 def update_log(model, writer, global_step):
@@ -147,6 +121,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
         print(f"epoch {epoch + 1} start....")
         count = 1
         epoch_loss = 0.0
+        verification_loss = 0.0
 
         model.train()
         optimizer.zero_grad()
@@ -195,7 +170,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
                                                                    f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
             writer.flush()
 
-            progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr())
+            progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss)
 
 
         message.send_message("機械学習の途中経過について",
@@ -210,11 +185,13 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
 
     return model, loss_val
 
-def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr):
+
+def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
     per = sequence / batch_size * 100
     block = int(per / 100 * 50)
     bar = f" \033[32m{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
-    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.3f} Lr:{lr}", end="")
+    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
+
 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
@@ -274,5 +251,14 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
     except torch.cuda.OutOfMemoryError:
         message.send_message("エラーが発生し、処理を中断しました",
                                  "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
+        print("オーバーフローしました。")
     pass
+
+class VerificationLoss:
+
+    def __init__(self, datasets: MORTM_DataSets):
+        self.dataloader = DataLoader(dataset=datasets, collate_fn=collate_fn, shuffle=False)
+
+    def __call__(self, *args, **kwargs):
+        pass
 

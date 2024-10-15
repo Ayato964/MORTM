@@ -14,16 +14,19 @@ DURATION_TYPE = 'd'
 START_TYPE = 's'
 SHIFT_TYPE = 'h'
 
+'''変換の向き'''
+TO_TOKEN = 0
+TO_MUSIC = 1
 
-def get_token_converter(tempo: int) -> List[Token]:
+def get_token_converter(tempo: int, convert: int) -> List[Token]:
     register: List[Token] = list()
 
     #register.append(Shift(tempo, SHIFT_TYPE))
     #register.append(Start(tempo, START_TYPE))
-    register.append(StartRE(tempo, START_TYPE))
-    register.append(Pitch(tempo, PITCH_TYPE))
+    register.append(StartRE(tempo, START_TYPE, convert))
+    register.append(Pitch(tempo, PITCH_TYPE, convert))
     #register.append(Velocity(tempo, VELOCITY_TYPE))
-    register.append(Duration(tempo, DURATION_TYPE))
+    register.append(Duration(tempo, DURATION_TYPE, convert))
 
     return register
 
@@ -46,6 +49,7 @@ class Tokenizer:
             self.is_converter = False
         else:
             self.is_converter = True
+            self.token_list = token
             with open(load_data, 'r') as file:
                 self.tokens: dict = json.load(file)
                 self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
