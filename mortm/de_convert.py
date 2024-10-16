@@ -10,7 +10,7 @@ def ct_tokens_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str):
     seq_hot = seq[1:]
     split_tokens = seq_hot.split(split_size=3)
     midi = PrettyMIDI()
-    inst = Instrument(program=66)
+    inst = Instrument(program=1)
     back: Note = None
 
     for tokens in split_tokens:
@@ -28,7 +28,7 @@ def ct_tokens_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str):
 
 
 def get_note(tokens: Tensor, back_note: Note, tokenizer: Tokenizer, token_converter: List[Token]) -> Note:
-    if 3 == len(tokens):
+    if 3 == len(tokens) and not (2 in tokens):
         pitch = token_converter[1](token=tokenizer.rev_get(tokens[1].item()))
         duration = token_converter[2](token=tokenizer.rev_get(tokens[2].item()))
         shift = token_converter[0](token=tokenizer.rev_get(tokens[0].item()))
