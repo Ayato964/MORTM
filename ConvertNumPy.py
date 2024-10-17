@@ -24,7 +24,7 @@ def find_midi_files(root_folder):
 
 
 
-BRASS = [57, 65, 66, 67, 68]
+BRASS = [65, 66]
 PIANO = [1, 2, 3, 4, 5, 6, 7, 8]
 GUITAR = [25, 26, 27, 28, 29, 30, 31, 32]
 
