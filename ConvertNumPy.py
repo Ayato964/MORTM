@@ -41,13 +41,16 @@ directory, md_file = find_midi_files(datasets)
 tokenizer = Tokenizer(get_token_converter(120, TO_TOKEN))
 
 count = 0
+reasons = dict()
 for i in range(len(md_file)):
-    con = MidiToAyaNode(tokenizer, directory[i], md_file[i], BRASS)
+    con = MidiToAyaNode(tokenizer, directory[i], md_file[i], PIANO)
     con.convert()
-    is_saved = con.save("out/np/datasets")
+    is_saved, reason = con.save("out/np/datasets")
     if is_saved:
         count += 1
-    print(count)
+
+    print(f"\r Save Count:{count} Step;{i}/{len(md_file)} Result:{reason}  Loaded:[{md_file[i]}] ", end="")
+
     if count - 1 >= 28000:
         break
 

@@ -80,9 +80,10 @@ class StartRE(Token):
         if shift < 0:
             print("WHATS!?!?!?!?!?")
 
-        if shift > 96:
+        if shift > 96 :
             shift = 64 + shift % 32
-
+        if back_notes is None:
+            shift = shift % 32
         return shift
 
 

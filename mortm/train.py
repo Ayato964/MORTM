@@ -109,7 +109,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
     criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
 
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-5)  # オプティマイザを定義
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98))  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
 
     print("Start training...")
@@ -127,15 +127,9 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
         optimizer.zero_grad()
 
         for inputs in loader:  # seqにはbatch_size分の楽曲が入っている
-            #print(f"learning sequence {count}")
             begin_time = time.time()
             input_ids: Tensor = inputs[:, :-1].to(progress.get_device())
             targets: Tensor = inputs[:, 1:].to(progress.get_device())
-
-            #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
-            #targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
-
-            #print(input_ids.shape, targets.shape)
 
             padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
 
@@ -150,7 +144,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
 
             update_log(model, writer, count)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
 
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
                 progress.step_optimizer(optimizer, model, accumulation_steps)

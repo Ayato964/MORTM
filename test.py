@@ -4,7 +4,7 @@ import torch
 from mortm.de_convert import ct_tokens_to_midi
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC
 
-n = np.load("out/np/Test5.npz")
+n = np.load("out/np/datasets2/002677f2e6e4666fdf9827d28bfa639f.mid.npz")
 
 print(n['array1'])
 
