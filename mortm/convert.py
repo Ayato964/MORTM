@@ -102,8 +102,8 @@ class MidiToAyaNode:
         for note in sorted_notes:
             note: Note = note
 
-            #if back_note is None:
-            #   clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
+            if back_note is None:
+               clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
 
             for conv in self.token_converter:
                 conv: Token = conv

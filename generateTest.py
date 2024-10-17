@@ -18,10 +18,10 @@ model = MORTM(
     progress=_DefaultLearningProgress(),
     vocab_size=327,
     position_length=8500,
-    trans_layer=9, num_heads=32, d_model=1024,
+    trans_layer=12, num_heads=32, d_model=1024,
     dim_feedforward=4096
 )
-model.load_state_dict(torch.load("out/model/MORTM.train.0.1.9445.pth"))
+model.load_state_dict(torch.load("out/model/MORTM.1.0_beta_2.pth"))
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 

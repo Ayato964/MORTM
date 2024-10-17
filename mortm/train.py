@@ -109,7 +109,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
     criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
 
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98))  # オプティマイザを定義
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
 
     print("Start training...")
