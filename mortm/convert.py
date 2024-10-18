@@ -90,7 +90,7 @@ class MidiToAyaNode:
         :return: 60秒にクリッピングされた旋律の配列(2次元)
         """
 
-        clip = np.array(self.tokenizer.get(constants.START_SEQ_TOKEN), dtype=int)
+        clip = np.array([], dtype=int)
         aya_node_inst = []
         back_note = None
 
@@ -132,6 +132,7 @@ class MidiToAyaNode:
         return aya_node_inst
 
     def marge_clip(self, clip, aya_node_inst):
+        #clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
         aya_node_inst.append(clip)
 
         return aya_node_inst
