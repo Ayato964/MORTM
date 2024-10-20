@@ -1,8 +1,9 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-from .PositionalEncoding import PositionalEncoding
 
+from .PositionalEncoding import PositionalEncoding
+from .RelativePositionalRepresentations import CustomTransformerEncoderLayer
 from .progress import LearningProgress
 
 
@@ -16,7 +17,7 @@ class MORTM(nn.Module):
 
     def __init__(self, vocab_size, progress: LearningProgress, trans_layer=6, num_heads=8, d_model=512,
                  dim_feedforward=1024, dropout=0.1,
-                 position_length=2048):
+                 position_length=2048, use_rpr=True):
         super(MORTM, self).__init__()
 
         self.progress = progress
@@ -30,12 +31,25 @@ class MORTM(nn.Module):
         #self.positional: LearnablePositionalEncoding = LearnablePositionalEncoding(self.d_model, progress, dropout, position_length).to(self.progress.get_device())
         self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length).to(self.progress.get_device())
         #Transformerの設定
-        self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
-                                                          num_encoder_layers=self.trans_layer,
-                                                          num_decoder_layers=0,
-                                                          dropout=self.dropout, dim_feedforward=dim_feedforward,
-                                                          custom_decoder=DummyDecoder()
-                                                          ).to(self.progress.get_device())
+        if not use_rpr:
+            self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
+                                                              num_encoder_layers=self.trans_layer,
+                                                              num_decoder_layers=0,
+                                                              dropout=self.dropout, dim_feedforward=dim_feedforward,
+                                                              custom_decoder=DummyDecoder()
+                                                              ).to(self.progress.get_device())
+        else:
+            encoder = CustomTransformerEncoderLayer(d_model=d_model, n_head=num_heads,
+                                                    dim_feedforward=dim_feedforward,
+                                                    dropout=dropout, max_len=position_length)
+
+            self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
+                                                              num_encoder_layers=self.trans_layer,
+                                                              num_decoder_layers=0,
+                                                              dropout=self.dropout, dim_feedforward=dim_feedforward,
+                                                              custom_encoder=encoder,
+                                                              custom_decoder=DummyDecoder()
+                                                              ).to(self.progress.get_device())
         print(f"Input Vocab Size:{vocab_size}")
         self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
 

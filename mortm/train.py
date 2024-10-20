@@ -145,7 +145,8 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             targets = targets.reshape(-1).long()
 
             loss = criterion(outputs, targets)  # 損失を計算
-
+            epoch_loss += loss.item()
+            loss = loss / accumulation_steps
             loss.backward()  # 逆伝播
 
             update_log(model, writer, count)
@@ -156,7 +157,6 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
                 progress.step_optimizer(optimizer, model, accumulation_steps)
                 scheduler.step()
 
-            epoch_loss += loss.item()
             count += 1
             end_time = time.time()
 

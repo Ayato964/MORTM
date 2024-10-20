@@ -25,11 +25,6 @@ class _DefaultLearningProgress(LearningProgress):
 
     def step_optimizer(self, optimizer, model, accumulation_steps, **kwargs):
 
-        # パラメータの勾配を累積ステップ数でスケーリング
-        for param in model.parameters():
-            if param.grad is not None:
-                param.grad.data /= accumulation_steps
-
         optimizer.step()  # オプティマイザを更新
         norm = self.get_gradient_norm(model)
         if not (0.1 < norm < 1.0):
