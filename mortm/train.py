@@ -138,7 +138,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             #print(input_ids.shape, targets.shape)
 
             padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
-
+            #print(padding_mask_in)
             output = model(input_ids, padding_mask_in)
 
             outputs = output.view(-1, output.size(-1)).to(progress.get_device())
@@ -150,8 +150,6 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
             loss.backward()  # 逆伝播
 
             update_log(model, writer, count)
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
 
             if count % accumulation_steps == 0:  #実質バッチサイズは64である
                 progress.step_optimizer(optimizer, model, accumulation_steps)
