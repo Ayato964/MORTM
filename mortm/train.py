@@ -92,7 +92,7 @@ def update_log(model, writer, global_step):
         writer.add_scalar(f"Parameter Value/{name}", param.norm(), global_step)
 
 def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
-           trans_layer=6, load_model_directory:str = None,
+           trans_layer=6, load_model_directory:str = None, use_rpr=False,
            num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
            position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
@@ -102,7 +102,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
                   d_model=d_model, dim_feedforward=dim_feedforward,
-                  dropout=dropout, position_length=position_length).to(progress.get_device())
+                  dropout=dropout, position_length=position_length, use_rpr=use_rpr).to(progress.get_device())
     if load_model_directory is not None:
         model.load_state_dict(torch.load(load_model_directory))
 
@@ -194,7 +194,7 @@ def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
 
 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
-                message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
+                message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=False,
                 trans_layer=9, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=1,
                 dim_feedforward=4096, dropout=0.2, position_length=8000, num_workers=0, warmup_steps=4000,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress()):
@@ -239,7 +239,8 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                              num_workers=num_workers,
                              warmup_steps=warmup_steps,
                              is_save_training_progress=is_save_training_progress,
-                             lr_param=lr_param
+                             lr_param=lr_param,
+                             use_rpr=use_rpr
                              )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",

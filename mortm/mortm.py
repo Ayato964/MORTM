@@ -3,7 +3,8 @@ from torch import Tensor
 import torch.nn as nn
 
 from .PositionalEncoding import PositionalEncoding
-from .RelativePositionalRepresentations import CustomTransformerEncoderLayer
+from .RelativePositionalRepresentations import CustomTransformerEncoder
+from .rpr import TransformerEncoderLayerRPR, TransformerEncoderRPR
 from .progress import LearningProgress
 
 
@@ -39,17 +40,16 @@ class MORTM(nn.Module):
                                                               custom_decoder=DummyDecoder()
                                                               ).to(self.progress.get_device())
         else:
-            encoder = CustomTransformerEncoderLayer(d_model=d_model, n_head=num_heads,
-                                                    dim_feedforward=dim_feedforward,
-                                                    dropout=dropout, max_len=position_length)
+            encoder_norm = nn.LayerNorm(self.d_model)
+            encoder_layer = TransformerEncoderLayerRPR(self.d_model, self.num_heads, self.dim_feedforward, self.dropout, er_len=position_length)
+            encoder = TransformerEncoderRPR(encoder_layer, self.trans_layer, encoder_norm)
+            self.transformer = nn.Transformer(
+                d_model=self.d_model, nhead=self.num_heads, num_encoder_layers=self.trans_layer,
+                num_decoder_layers=0, dropout=self.dropout, # activation=self.ff_activ,
+                dim_feedforward=self.dim_feedforward, custom_decoder=DummyDecoder(), custom_encoder=encoder
+            ).to(device=progress.get_device())
 
-            self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
-                                                              num_encoder_layers=self.trans_layer,
-                                                              num_decoder_layers=0,
-                                                              dropout=self.dropout, dim_feedforward=dim_feedforward,
-                                                              custom_encoder=encoder,
-                                                              custom_decoder=DummyDecoder()
-                                                              ).to(self.progress.get_device())
+            print("Use RPR Transformer")
         print(f"Input Vocab Size:{vocab_size}")
         self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
 
