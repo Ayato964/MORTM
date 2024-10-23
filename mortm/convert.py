@@ -1,5 +1,5 @@
 from AGSM.convert import ConvTempo
-from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note
+from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
 import mido
 import numpy as np
 from numpy import ndarray
@@ -28,6 +28,13 @@ class MidiToAyaNode:
         else:
             try:
                 self.midi_data: PrettyMIDI = PrettyMIDI(f"{directory}/{file_name}")
+                time_s = self.midi_data.time_signature_changes
+                for t in time_s:
+                    t_s: TimeSignature = t
+                    if not (t_s.numerator == 4 and t_s.denominator == 4):
+                        self.is_error = True
+                        self.error_reason = "旋律に変拍子が混じっていました。"
+                        break
             except Exception:
                 self.is_error = True
                 self.error_reason = "MIDIのロードができませんでした。"

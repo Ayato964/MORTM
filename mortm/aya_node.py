@@ -136,7 +136,7 @@ class Duration(Token):
 class Start(Token):
 
     def de_convert(self, number: int):
-        return number
+        return ct_beat_to_time(number, self.tempo)
 
     def get_token(self, back_notes: Note, note: Note) -> int:
         s = ct_time_to_beat(note.start, self.tempo)
@@ -153,7 +153,7 @@ class Shift(Token):
 
     def get_token(self, back_notes: Note, note: Note) -> int:
         if back_notes is None:
-            return -999
+            return 0
         else:
             back_start = ct_time_to_beat(back_notes.start, self.tempo)
             note_start = ct_time_to_beat(note.start, self.tempo)

@@ -21,9 +21,9 @@ TO_MUSIC = 1
 def get_token_converter(tempo: int, convert: int) -> List[Token]:
     register: List[Token] = list()
 
-    #register.append(Shift(tempo, SHIFT_TYPE))
-    #register.append(Start(tempo, START_TYPE))
-    register.append(StartRE(tempo, START_TYPE, convert))
+    register.append(Shift(tempo, SHIFT_TYPE, convert))
+    register.append(Start(tempo, START_TYPE, convert))
+    #register.append(StartRE(tempo, START_TYPE, convert))
     register.append(Pitch(tempo, PITCH_TYPE, convert))
     #register.append(Velocity(tempo, VELOCITY_TYPE))
     register.append(Duration(tempo, DURATION_TYPE, convert))

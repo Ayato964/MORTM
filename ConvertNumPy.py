@@ -43,7 +43,7 @@ tokenizer = Tokenizer(get_token_converter(120, TO_TOKEN))
 count = 0
 reasons = dict()
 for i in range(len(md_file)):
-    con = MidiToAyaNode(tokenizer, directory[i], md_file[i], PIANO)
+    con = MidiToAyaNode(tokenizer, directory[i], md_file[i], BRASS)
     con.convert()
     is_saved, reason = con.save("out/np/datasets")
     if is_saved:
