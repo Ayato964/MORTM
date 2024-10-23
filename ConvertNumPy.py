@@ -25,14 +25,15 @@ def find_midi_files(root_folder):
 
 
 BRASS = [65, 66]
-PIANO = [1, 2, 3, 4, 5, 6, 7, 8]
+PIANO = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 GUITAR = [25, 26, 27, 28, 29, 30, 31, 32]
 
 ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 67, 68]
 
 
 
-datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+#datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+datasets = "data/other"
 directory, md_file = find_midi_files(datasets)
 
 
