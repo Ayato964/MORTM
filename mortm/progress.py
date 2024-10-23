@@ -25,7 +25,7 @@ class _DefaultLearningProgress(LearningProgress):
 
     def step_optimizer(self, optimizer, model, accumulation_steps, **kwargs):
         norm = self.get_gradient_norm(model)
-        if not (0.1 < norm < 1.0):
+        if not (0.1 < norm < 3.0):
             print(
                 f"\033[31m 警告\033[0m：NORMが既定値から逸脱しています。学習率、またはバッチサイズを調整してください。({norm:.4f})")
 

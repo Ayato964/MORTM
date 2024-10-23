@@ -192,8 +192,8 @@ def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
 
 
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
-                message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=False,
-                trans_layer=9, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=1,
+                message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=True,
+                trans_layer=9, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1,
                 dim_feedforward=4096, dropout=0.2, position_length=8000, num_workers=0, warmup_steps=4000,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress()):
 
