@@ -55,9 +55,11 @@ class Token:
             else:
                 my_token = f"{self.token_type}_{symbol}"
         else:
+            if token is None:
+                return None, None
             split = token.split("_")
             if split[0] is self.token_type:
-                my_token = self.de_convert(int(split[-1]))
+                my_token = self.de_convert(int(float(split[-1])))
                 return split[0], my_token
             else:
                 return None, None

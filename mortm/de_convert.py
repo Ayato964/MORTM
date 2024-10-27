@@ -47,7 +47,7 @@ def get_note_b5(tokens: Tensor, back_note: Note, tokenizer: Tokenizer, token_con
 
 def get_type_number(token_list, t):
     for i in range(len(token_list)):
-        t_type, number = token_list[i](t)
+        t_type, number = token_list[i](token=t)
         if t_type is not None:
             return t_type, number
     return None, None
@@ -56,7 +56,7 @@ def get_type_number(token_list, t):
 
 def ct_token_to_midi_1_0(tokenizer: Tokenizer, seq: Tensor, save_directory:str, program=1):
     midi = PrettyMIDI()
-    inst: Instrument = Instrument(program=1)
+    inst: Instrument = Instrument(program=program)
     token_list = tokenizer.token_list
     note_list = {'START':0, 'PITCH':0, 'DURATION':0, 'VELOCITY':100}
     shift_time = 0
@@ -74,7 +74,9 @@ def ct_token_to_midi_1_0(tokenizer: Tokenizer, seq: Tensor, save_directory:str, 
                 note_list['DURATION'] = number
                 inst.notes.append(get_note_1_0(note_list, shift_time))
     midi.instruments.append(inst)
-    return midi.write(save_directory)
+    midi.write(save_directory)
+    return midi
+
 def get_note_1_0(note_list, shift_time)-> Note:
     return Note(pitch=note_list['PITCH'], start=note_list['START'] + shift_time,
                 end=note_list['START'] + note_list['DURATION'] + shift_time, velocity=note_list['VELOCITY'])
