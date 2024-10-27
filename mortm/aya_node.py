@@ -56,7 +56,11 @@ class Token:
                 my_token = f"{self.token_type}_{symbol}"
         else:
             split = token.split("_")
-            my_token = self.de_convert(int(split[-1]))
+            if split[0] is self.token_type:
+                my_token = self.de_convert(int(split[-1]))
+                return split[0], my_token
+            else:
+                return None, None
 
         return my_token
 
@@ -149,7 +153,12 @@ class Start(Token):
 class Shift(Token):
 
     def de_convert(self, number: int):
-        return number
+        b4 = 60 / self.tempo
+        b8 = b4 / 2
+        b16 = b8 / 2
+        b32 = b16 / 2
+
+        return b32 * 32 * number
 
     def get_token(self, back_notes: Note, note: Note) -> int:
         if back_notes is None:

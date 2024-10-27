@@ -118,67 +118,70 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
     loss_val = None
     mail_bool = True
     for epoch in range(num_epochs):
-        print(f"epoch {epoch + 1} start....")
-        count = 1
-        epoch_loss = 0.0
-        verification_loss = 0.0
+        try:
+            print(f"epoch {epoch + 1} start....")
+            count = 1
+            epoch_loss = 0.0
+            verification_loss = 0.0
 
-        model.train()
-        optimizer.zero_grad()
+            model.train()
+            optimizer.zero_grad()
 
-        for inputs in loader:  # seqにはbatch_size分の楽曲が入っている
-            #print(f"learning sequence {count}")
-            begin_time = time.time()
-            input_ids: Tensor = inputs[:, :-1].to(progress.get_device())
-            targets: Tensor = inputs[:, 1:].to(progress.get_device())
+            for inputs in loader:  # seqにはbatch_size分の楽曲が入っている
+                #print(f"learning sequence {count}")
+                begin_time = time.time()
+                input_ids: Tensor = inputs[:, :-1].to(progress.get_device())
+                targets: Tensor = inputs[:, 1:].to(progress.get_device())
 
-            #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
-            #targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
+                #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
+                #targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
 
-            #print(input_ids.shape, targets.shape)
+                #print(input_ids.shape, targets.shape)
 
-            padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
-            #print(padding_mask_in)
-            output = model(input_ids, padding_mask_in)
+                padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
+                #print(padding_mask_in)
+                output = model(input_ids, padding_mask_in)
 
-            outputs = output.view(-1, output.size(-1)).to(progress.get_device())
-            targets = targets.reshape(-1).long()
+                outputs = output.view(-1, output.size(-1)).to(progress.get_device())
+                targets = targets.reshape(-1).long()
 
-            loss = criterion(outputs, targets)  # 損失を計算
-            epoch_loss += loss.item()
-            loss = loss / accumulation_steps
-            loss.backward()  # 逆伝播
+                loss = criterion(outputs, targets)  # 損失を計算
+                epoch_loss += loss.item()
+                loss = loss / accumulation_steps
+                loss.backward()  # 逆伝播
 
-            update_log(model, writer, count)
+                update_log(model, writer, count)
 
-            if count % accumulation_steps == 0:  #実質バッチサイズは64である
-                progress.step_optimizer(optimizer, model, accumulation_steps)
-                scheduler.step()
+                if count % accumulation_steps == 0:  #実質バッチサイズは64である
+                    progress.step_optimizer(optimizer, model, accumulation_steps)
+                    scheduler.step()
 
-            count += 1
-            end_time = time.time()
+                count += 1
+                end_time = time.time()
 
-            if mail_bool and message is not None:
-                _send_prediction_end_time(message, len(loader), begin_time, end_time, vocab_size, num_epochs,
-                                          trans_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
-                mail_bool = False
+                if mail_bool and message is not None:
+                    _send_prediction_end_time(message, len(loader), begin_time, end_time, vocab_size, num_epochs,
+                                              trans_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
+                    mail_bool = False
 
-            if (count + 1) % message.step_by_message_count == 0:
-                message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
-                                                                   f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
-            writer.flush()
+                if (count + 1) % message.step_by_message_count == 0:
+                    message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
+                                                                       f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
+                writer.flush()
 
-            progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss)
+                progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss)
 
 
-        message.send_message("機械学習の途中経過について",
-                                 f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
-        loss_val = epoch_loss / count
-        writer.add_scalar('Loss/train', epoch_loss / count, epoch)  # 損失値を記録
+            message.send_message("機械学習の途中経過について",
+                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
+            loss_val = epoch_loss / count
+            writer.add_scalar('Loss/train', epoch_loss / count, epoch)  # 損失値を記録
 
-        if is_save_training_progress:
-            torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}.pth") #エポック終了時に途中経過を保存
-            print("途中経過を保存しました。")
+            if is_save_training_progress:
+                torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}.pth") #エポック終了時に途中経過を保存
+                print("途中経過を保存しました。")
+        except torch.cuda.OutOfMemoryError:
+            torch.save(model.state_dict(), f"{save_directory}/MORTM.error_end.{epoch}.pth")
     writer.close()
 
     return model, loss_val

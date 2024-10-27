@@ -32,9 +32,6 @@ class _DefaultLearningProgress(LearningProgress):
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
 
-        norm2 = self.get_gradient_norm(model)
-        if norm2 != norm:
-            print("クリッピングを適応しました。")
         optimizer.step()  # オプティマイザを更新
         optimizer.zero_grad()
         pass
