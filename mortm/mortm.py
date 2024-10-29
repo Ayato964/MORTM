@@ -73,68 +73,7 @@ class MORTM(nn.Module):
         score:Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
 
-    def generate_by_length(self, input_sequence, top_k=3, max_length=100):
-        self.eval()
-        if not isinstance(input_sequence, torch.Tensor):
-            input_sequence = torch.tensor(input_sequence, dtype=torch.long, device=self.progress.get_device())
-
-
-            for _ in range(max_length):
-              #print(f"I{i} input_tensor")
-
-                # モデルに入力して次のトークンのスコアを取得 (3次元で返ってくる)
-                with torch.no_grad():
-                    input_sequence = self.generate_note(input_sequence, top_k)
-        return input_sequence
-
-    def generate_note(self, input_sequence, top_k):
-        if len(input_sequence) != 0:
-            fill_count = len(input_sequence) % 4
-        else:
-            fill_count = 0
-        for i in range(fill_count, 4):
-            input_tensor = input_sequence.unsqueeze(0)  # (1, sequence_length)
-
-            score = self(input_tensor)
-            logits = score[:, -1, :]
-            logits = logits[-1, :]
-            if i == 0:
-                token_id = self.sampling(logits, top_k=1, temperature=0.5)
-            elif i == 1:
-                token_id = self.sampling(logits, top_k=2, temperature=0.5)
-            elif i == 2:
-                token_id = self.sampling(logits, top_k=10, temperature=1.2)
-            else:
-                token_id = self.sampling(logits, top_k=2, temperature=0.5)
-
-            input_sequence = torch.cat((input_sequence, torch.tensor([token_id], device=self.progress.get_device()))).to(self.progress.get_device())
-
-        return input_sequence
-
-
-
-
-
-
-
-    def sampling(self, logits: Tensor, top_k: int, temperature: float)-> int:
-        logits_t = logits / temperature
-        probs = self.softmax(logits_t)
-        # トップKの確率でトークンをフィルタリング
-        sorted_probs, sorted_indices = torch.topk(probs, top_k)
-
-        # 再度正規化
-        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-
-        # トークンをサンプリング
-        sampled_index = torch.multinomial(sorted_probs, 1).item()  # サンプリングされたインデックスを取得
-
-        # ソートされたインデックスから元のインデックスに変換
-        next_token = sorted_indices[sampled_index].item()
-        return next_token
-
-
-    def top_k_sampling_with_temperature_sequence(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
+    def top_k_sampling_length(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
         self.eval()
         """
         MORTMモデルにトップKサンプリングと温度シーケンスを実装する関数
@@ -204,51 +143,45 @@ class MORTM(nn.Module):
 
         return input_sequence
 
-    def top_p_sampling(self, input_ids, tokenizer, p=0.8, max_length=20, temperature=0.2):
+    def top_p_sampling_length(self, input_seq, p=0.8, max_length=20, temperature=0.2):
         self.eval()
-        output = torch.tensor([input_ids], dtype=torch.long).to(self.progress.get_device())
+        if not isinstance(input_seq, torch.Tensor):
+            input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
+
+        generated = input_seq.tolist()
         for _ in range(max_length):
-            with torch.no_grad():
-                mask = self.transformer.generate_square_subsequent_mask(output.shape[1]).to(self.progress.get_device())
-                outputs = self( output, output, None, None)
+            logits= self(input_seq)
+            token = self.top_p_sampling(logits, p=p, temperature=temperature)
+            generated.append(token)
 
-                #print(outputs)
+        input_seq = torch.tensor(generated, dtype=torch.long, device=self.progress.get_device())
+        return input_seq
 
-                logits = outputs[:, -1, :]
+    def top_p_sampling(self, logits, p=0.9, temperature=1.0)-> int:
 
-                #print(logits)
+        logits = logits / temperature
+        # logitsをソフトマックスで確率分布に変換
+        probs = self.softmax(logits, dim=-1)
+        # 確率の降順に並べ替え、そのインデックスを取得
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
 
+        # 累積確率を計算
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-                logits = logits / temperature
+        # 累積確率がpを超えるインデックスを取得
+        cutoff_index = torch.where(cumulative_probs > p)[0][0]
 
+        # 上位pに入らないトークンの確率を0にする
+        sorted_probs[cutoff_index + 1:] = 0
 
+        # 確率を再正規化
+        sorted_probs /= torch.sum(sorted_probs)
 
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        # トークンをサンプリング
+        sampled_index = torch.multinomial(sorted_probs, 1)
 
-
-
-                #cumulative_probs = torch.cumsum(self.softmax(sorted_logits), dim=-1)
-                cumulative_probs = self.softmax(sorted_logits)
-
-                print(cumulative_probs.argmax())
-
-                sorted_indices_to_remove = cumulative_probs > p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                logits[:, indices_to_remove] = -float('Inf')
-
-                probabilities = self.softmax(logits)[-1]
-
-                print(probabilities)
-
-                dis = torch.distributions.categorical.Categorical(probs=probabilities)
-                next_token = dis.sample()
-                # バッチサイズを一致させるために次元を調整
-                next_token = next_token.unsqueeze(0)
-                output = torch.cat((output.flatten(), next_token)).unsqueeze(0).to(self.progress.get_device())
-                #print(output)
-        return output.tolist()
+        # インデックスを元の順序に戻す
+        return sorted_indices[sampled_index].item()
 
 
 class DummyDecoder(nn.Module):

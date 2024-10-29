@@ -16,7 +16,6 @@ class MidiToAyaNode:
         self.program_list = program_list
         self.directory = directory
         self.file_name = file_name
-        self.tempo = 120
         self.is_error = False
         self.aya_node = [0]
         self.token_converter: List[Token] = tokenizer.token_list
@@ -38,9 +37,6 @@ class MidiToAyaNode:
             except Exception:
                 self.is_error = True
                 self.error_reason = "MIDIのロードができませんでした。"
-
-        if not self.is_error:
-            self.ct_tempo()
 
         pass
 
@@ -115,7 +111,7 @@ class MidiToAyaNode:
             for conv in self.token_converter:
                 conv: Token = conv
 
-                token = conv(back_note, note)
+                token = conv(back_notes=back_note, note=note, tempo=120)
                 if token is not None:
                     token_id = self.tokenizer.get(token)
                     clip = np.append(clip, token_id)
@@ -124,7 +120,7 @@ class MidiToAyaNode:
 
             clip_time = note.start
 
-            if clip_time >= 30 * split_count:
+            if clip_time >= 24 * split_count:
                 aya_node_inst = self.marge_clip(clip, aya_node_inst)
 
                 clip = np.array([], dtype=int)

@@ -28,14 +28,13 @@ def calc_time_to_beat(time, beat_time) -> (int, int):
 
 
 class Token:
-    def __init__(self, tempo: int, token_type: str, convert_type: int):
-        self.tempo = tempo
+    def __init__(self, token_type: str, convert_type: int):
         self.token_type = token_type
         self.token_position = 0
         self.convert_type = convert_type
 
     @abstractmethod
-    def get_token(self, back_notes: Note, note: Note) -> int:
+    def get_token(self, back_notes: Note, note: Note, tempo:int) -> int:
         pass
 
     @abstractmethod
@@ -43,12 +42,12 @@ class Token:
         pass
 
     @abstractmethod
-    def de_convert(self, number: int):
+    def de_convert(self, number: int, tempo: int):
         pass
 
-    def __call__(self, back_notes: Note = None, note: Note= None, token:str=None, *args, **kwargs):
+    def __call__(self, back_notes: Note = None, note: Note= None, token:str=None, tempo: int= 120, *args, **kwargs):
         if self.convert_type == 0:
-            symbol: int = self.get_token(back_notes, note)
+            symbol: int = self.get_token(back_notes, note, tempo)
             if symbol == -999:
                 my_token = None
                 pass
@@ -59,7 +58,7 @@ class Token:
                 return None, None
             split = token.split("_")
             if split[0] is self.token_type:
-                my_token = self.de_convert(int(float(split[-1])))
+                my_token = self.de_convert(int(float(split[-1])), tempo)
                 return split[0], my_token
             else:
                 return None, None
@@ -69,16 +68,16 @@ class Token:
 
 class StartRE(Token):
 
-    def de_convert(self, number: int):
-        return ct_beat_to_time(number, self.tempo)
+    def de_convert(self, number: int, tempo):
+        return ct_beat_to_time(number, tempo)
 
     def get_range(self) -> int:
         return 96
 
-    def get_token(self, back_notes: Note, note: Note) -> int:
-        now_start = ct_time_to_beat(note.start, self.tempo)
+    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
+        now_start = ct_time_to_beat(note.start, tempo)
         if back_notes is not None:
-            back_start = ct_time_to_beat(back_notes.start, self.tempo)
+            back_start = ct_time_to_beat(back_notes.start, tempo)
         else:
             back_start = 0
         shift = int(now_start - back_start)
@@ -95,13 +94,13 @@ class StartRE(Token):
 
 class Pitch(Token):
 
-    def de_convert(self, number: int):
+    def de_convert(self, number: int, tempo):
         return number
 
     def get_range(self) -> int:
         return 128
 
-    def get_token(self, back_notes: Note, note: Note) -> int:
+    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
         p: int = note.pitch
         return p
 
@@ -109,10 +108,10 @@ class Pitch(Token):
 class Velocity(Token):
 
 
-    def de_convert(self, number: int):
+    def de_convert(self, number: int, tempo):
         return number
 
-    def get_token(self, back_notes: Note, note: Note) -> int:
+    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
         v: int = note.velocity
         return v
 
@@ -122,12 +121,12 @@ class Velocity(Token):
 
 class Duration(Token):
 
-    def de_convert(self, number: int):
-        return ct_beat_to_time(number, self.tempo)
+    def de_convert(self, number: int, tempo):
+        return ct_beat_to_time(number, tempo)
 
-    def get_token(self, back_notes: Note, note: Note) -> int:
-        start = ct_time_to_beat(note.start, self.tempo)
-        end = ct_time_to_beat(note.end, self.tempo)
+    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
+        start = ct_time_to_beat(note.start, tempo)
+        end = ct_time_to_beat(note.end, tempo)
         d = int(max(abs(end - start), 1))
 
         if 100 < d:
@@ -141,11 +140,11 @@ class Duration(Token):
 
 class Start(Token):
 
-    def de_convert(self, number: int):
-        return ct_beat_to_time(number, self.tempo)
+    def de_convert(self, number: int, tempo):
+        return ct_beat_to_time(number, tempo)
 
-    def get_token(self, back_notes: Note, note: Note) -> int:
-        s = ct_time_to_beat(note.start, self.tempo)
+    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
+        s = ct_time_to_beat(note.start, tempo)
         return s % 32
 
     def get_range(self) -> int:
@@ -154,20 +153,20 @@ class Start(Token):
 
 class Shift(Token):
 
-    def de_convert(self, number: int):
-        b4 = 60 / self.tempo
+    def de_convert(self, number: int, tempo):
+        b4 = 60 / tempo
         b8 = b4 / 2
         b16 = b8 / 2
         b32 = b16 / 2
 
         return b32 * 32 * number
 
-    def get_token(self, back_notes: Note, note: Note) -> int:
+    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
         if back_notes is None:
             return 0
         else:
-            back_start = ct_time_to_beat(back_notes.start, self.tempo)
-            note_start = ct_time_to_beat(note.start, self.tempo)
+            back_start = ct_time_to_beat(back_notes.start, tempo)
+            note_start = ct_time_to_beat(note.start, tempo)
 
             shift = int(abs((back_start // 32) - (note_start // 32)))
 
