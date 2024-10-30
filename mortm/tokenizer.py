@@ -92,3 +92,11 @@ class Tokenizer:
             file.write(json_s)
 
     pass
+
+    def rev_mode(self):
+        self.is_converter = True
+        for li in self.token_list:
+            li.convert_type = TO_MUSIC
+        self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
+        print(self.rev_tokens)
+        pass

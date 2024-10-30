@@ -29,9 +29,9 @@ def ct_tokens_to_midi_b5(tokenizer: Tokenizer, seq: Tensor, save_directory:str):
 
 def get_note_b5(tokens: Tensor, back_note: Note, tokenizer: Tokenizer, token_converter: List[Token]) -> Note:
     if 3 == len(tokens) and not (2 in tokens):
-        pitch = token_converter[1](token=tokenizer.rev_get(tokens[1].item()))
-        duration = token_converter[2](token=tokenizer.rev_get(tokens[2].item()))
-        shift = token_converter[0](token=tokenizer.rev_get(tokens[0].item()))
+        t, pitch = token_converter[1](token=tokenizer.rev_get(tokens[1].item()))
+        t, duration = token_converter[2](token=tokenizer.rev_get(tokens[2].item()))
+        t, shift = token_converter[0](token=tokenizer.rev_get(tokens[0].item()))
         if back_note is not None:
             start = back_note.start + shift
         else:
@@ -39,7 +39,6 @@ def get_note_b5(tokens: Tensor, back_note: Note, tokenizer: Tokenizer, token_con
         end = start + duration
 
         note = Note(pitch=pitch, velocity=100, start=start, end=end)
-        print(note)
         return note
     else:
         return None

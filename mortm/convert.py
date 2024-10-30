@@ -38,7 +38,9 @@ class MidiToAyaNode:
                 self.is_error = True
                 self.error_reason = "MIDIのロードができませんでした。"
 
-        pass
+        if not self.is_error:
+            self.tempo_change_time, self.tempo = self.midi_data.get_tempo_changes()
+
 
     def convert(self):
         """
@@ -108,19 +110,20 @@ class MidiToAyaNode:
             if back_note is None:
                clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
 
+            tempo = self.get_tempo(note.start)
+
             for conv in self.token_converter:
                 conv: Token = conv
 
-                token = conv(back_notes=back_note, note=note, tempo=120)
+                token = conv(back_notes=back_note, note=note, tempo=tempo)
                 if token is not None:
                     token_id = self.tokenizer.get(token)
                     clip = np.append(clip, token_id)
 
             back_note = note
-
             clip_time = note.start
 
-            if clip_time >= 24 * split_count:
+            if clip_time >= 16 * split_count:
                 aya_node_inst = self.marge_clip(clip, aya_node_inst)
 
                 clip = np.array([], dtype=int)
@@ -131,7 +134,6 @@ class MidiToAyaNode:
         if len(clip) > 0:
             clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
             aya_node_inst = self.marge_clip(clip, aya_node_inst)
-
         return aya_node_inst
 
     def marge_clip(self, clip, aya_node_inst):
@@ -145,8 +147,11 @@ class MidiToAyaNode:
             #print(f"Result shape is:{self.aya_node.shape}")
 
             array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
-            np.savez(save_directory + "/" + self.file_name, **array_dict)
-            return True, "処理が正常に終了しました。"
+            if len(array_dict) > 1:
+                np.savez(save_directory + "/" + self.file_name, **array_dict)
+                return True, "処理が正常に終了しました。"
+            else:
+                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
         else:
             return False, self.error_reason
 
@@ -158,6 +163,15 @@ class MidiToAyaNode:
         except OSError or IndexError or ValueError or mido.midifiles.meta.KeySignatureError or EOFError or KeyError or ZeroDivisionError:
             self.error_reason = f"{self.directory}/{ self.file_name}でテンポ変換中にエラーが発生。処理を中断します。"
             self.is_error = True
+
+    def get_tempo(self, start: float):
+        tempo = 0
+        for i in range(len(self.tempo_change_time)):
+            if start >= self.tempo_change_time[i]:
+                tempo = self.tempo[i]
+
+        return tempo
+
 
 
 class AyaNodeToMidi:
