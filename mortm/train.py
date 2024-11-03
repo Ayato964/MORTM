@@ -91,10 +91,10 @@ def update_log(model, writer, global_step):
 
         writer.add_scalar(f"Parameter Value/{name}", param.norm(), global_step)
 
-def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
-           trans_layer=6, load_model_directory:str = None, use_rpr=False,
-           num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
-           position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
+def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
+                       trans_layer=6, load_model_directory:str = None, use_rpr=False,
+                       num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
+                       position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
     loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True,
                         num_workers=num_workers, collate_fn=collate_fn)
@@ -140,7 +140,7 @@ def _train(save_directory, ayato_dataset, message: Messenger, vocab_size: int, n
 
                 padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
                 #print(padding_mask_in)
-                output = model(input_ids, padding_mask_in)
+                output = model(inputs_seq=input_ids, input_padding_mask=padding_mask_in)
 
                 outputs = output.view(-1, output.size(-1)).to(progress.get_device())
                 targets = targets.reshape(-1).long()
@@ -227,22 +227,22 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
 
             print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
 
-        model, loss = _train(save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
-                             load_model_directory=load_model_directory,
-                             d_model=d_model,
-                             dim_feedforward=dim_feedforward,
-                             trans_layer=trans_layer,
-                             num_heads=num_heads,
-                             position_length=position_length,
-                             dropout=dropout,
-                             accumulation_steps=accumulation_steps,
-                             batch_size=batch_size,
-                             num_workers=num_workers,
-                             warmup_steps=warmup_steps,
-                             is_save_training_progress=is_save_training_progress,
-                             lr_param=lr_param,
-                             use_rpr=use_rpr
-                             )  # 20エポック分機械学習を行う。
+        model, loss = _train_self_tuning(save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
+                                         load_model_directory=load_model_directory,
+                                         d_model=d_model,
+                                         dim_feedforward=dim_feedforward,
+                                         trans_layer=trans_layer,
+                                         num_heads=num_heads,
+                                         position_length=position_length,
+                                         dropout=dropout,
+                                         accumulation_steps=accumulation_steps,
+                                         batch_size=batch_size,
+                                         num_workers=num_workers,
+                                         warmup_steps=warmup_steps,
+                                         is_save_training_progress=is_save_training_progress,
+                                         lr_param=lr_param,
+                                         use_rpr=use_rpr
+                                         )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",
                                  f"MORTM.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")

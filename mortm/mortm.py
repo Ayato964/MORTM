@@ -18,8 +18,11 @@ class MORTM(nn.Module):
 
     def __init__(self, vocab_size, progress: LearningProgress, trans_layer=6, num_heads=8, d_model=512,
                  dim_feedforward=1024, dropout=0.1,
-                 position_length=2048, use_rpr=True):
+                 position_length=2048, use_rpr=True, use_decoder=False):
         super(MORTM, self).__init__()
+
+        if use_decoder:
+            print("Use decoder mode!")
 
         self.progress = progress
         self.trans_layer = trans_layer
@@ -35,9 +38,9 @@ class MORTM(nn.Module):
         if not use_rpr:
             self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
                                                               num_encoder_layers=self.trans_layer,
-                                                              num_decoder_layers=0,
+                                                              num_decoder_layers= self.trans_layer if use_decoder else 0, #デコーダーは使うときと使わない時がある。
                                                               dropout=self.dropout, dim_feedforward=dim_feedforward,
-                                                              custom_decoder=DummyDecoder()
+                                                              custom_decoder=None if use_decoder else DummyDecoder()
                                                               ).to(self.progress.get_device())
         else:
             encoder_norm = nn.LayerNorm(self.d_model)
@@ -45,8 +48,11 @@ class MORTM(nn.Module):
             encoder = TransformerEncoderRPR(encoder_layer, self.trans_layer, encoder_norm)
             self.transformer = nn.Transformer(
                 d_model=self.d_model, nhead=self.num_heads, num_encoder_layers=self.trans_layer,
-                num_decoder_layers=0, dropout=self.dropout, # activation=self.ff_activ,
-                dim_feedforward=self.dim_feedforward, custom_decoder=DummyDecoder(), custom_encoder=encoder
+                num_decoder_layers=self.trans_layer if use_decoder else 0,
+                dropout=self.dropout, # activation=self.ff_activ,
+                dim_feedforward=self.dim_feedforward,
+                custom_decoder=None if use_decoder else DummyDecoder(),
+                custom_encoder=encoder
             ).to(device=progress.get_device())
 
             print("Use RPR Transformer")
@@ -56,7 +62,7 @@ class MORTM(nn.Module):
         self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
-    def forward(self, inputs_seq, input_padding_mask=None):
+    def forward(self, inputs_seq, tgt_seq=None, tgt_mask=None, input_padding_mask=None, tgt_padding_mask=None):
         mask = self.transformer.generate_square_subsequent_mask(inputs_seq.shape[1]).to(self.progress.get_device())
 
         inputs_em: Tensor = self.embedding(inputs_seq)
@@ -64,9 +70,15 @@ class MORTM(nn.Module):
 
         inputs_pos: Tensor = self.positional(inputs_em)
 
-        #print(inputs_pos.shape, tgt_pos.shape)
-        out: Tensor = self.transformer(inputs_pos, inputs_pos, src_mask=mask,
-                                       src_key_padding_mask=input_padding_mask, tgt_key_padding_mask=input_padding_mask)
+        if tgt_seq is not None:
+            tgt_e = self.embedding(tgt_seq)
+            tgt_e = tgt_e.permute(1, 0, 2)
+            tgt_p = self.positional(tgt_e)
+        else:
+            tgt_p = inputs_pos
+
+        out: Tensor = self.transformer(inputs_pos, tgt_p, src_mask=mask, tgt_mask=tgt_mask,
+                                       src_key_padding_mask=input_padding_mask, tgt_key_padding_mask=tgt_padding_mask)
 
         out.permute(1, 0, 2)
 

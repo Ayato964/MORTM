@@ -25,7 +25,10 @@ class MORTM_DataSets(Dataset):
 
         for i in range(len(music_seq) - 1):
             aya_node = music_seq[f'array{i + 1}']
-            self.musics_seq = self.musics_seq + [aya_node.tolist()]
+            if len(aya_node) < 2000:
+                self.musics_seq = self.musics_seq + [aya_node.tolist()]
+            else:
+                print(f"旋律の数が理論値こ超えている。\n　これは妙だな! \n aya_node ->{len(aya_node)}")
         pass
 
     def split_seq_data(self):
