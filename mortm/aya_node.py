@@ -46,6 +46,10 @@ class Token:
     def de_convert(self, number: int, tempo: int):
         pass
 
+    @abstractmethod
+    def set_tokens(self, tokens: dict):
+        pass
+
     def __call__(self, back_notes: Note = None, note: Note= None, token:str=None, tempo: int= 120, *args, **kwargs):
         if self.convert_type == 0:
             symbol: int = self.get_token(back_notes, note, tempo)
@@ -69,12 +73,18 @@ class Token:
 
 class StartRE(Token):
 
+    def set_tokens(self, tokens: dict):
+        max_length = 192
+        tokens_length = len(tokens)
+        for i in range(max_length + 1):
+            tokens[f's_{i}'] = tokens_length + i
+
     def de_convert(self, number: int, tempo):
-        print(ct_beat_to_time(number, tempo))
+        #print(ct_beat_to_time(number, tempo))
         return ct_beat_to_time(number, tempo)
 
     def get_range(self) -> int:
-        return 192
+        return 193
 
     def get_token(self, back_notes: Note, note: Note, tempo) -> int:
         now_start = ct_time_to_beat(note.start, tempo)
@@ -96,11 +106,17 @@ class StartRE(Token):
 
 class Pitch(Token):
 
+    def set_tokens(self, tokens: dict):
+        max_length = 127
+        tokens_length = len(tokens)
+        for i in range(max_length + 1):
+            tokens[f'p_{i}'] = tokens_length + i
+
     def de_convert(self, number: int, tempo):
         return number
 
     def get_range(self) -> int:
-        return 128
+        return 129
 
     def get_token(self, back_notes: Note, note: Note, tempo) -> int:
         p: int = note.pitch
@@ -109,6 +125,12 @@ class Pitch(Token):
 
 class Velocity(Token):
 
+
+    def set_tokens(self, tokens: dict):
+        max_length = 127
+        tokens_length = len(tokens)
+        for i in range(max_length + 1):
+            tokens[f'v_{i}'] = tokens_length + i
 
     def de_convert(self, number: int, tempo):
         return number
@@ -122,6 +144,12 @@ class Velocity(Token):
 
 
 class Duration(Token):
+
+    def set_tokens(self, tokens: dict):
+        max_length = 192
+        tokens_length = len(tokens)
+        for i in range(max_length + 1):
+            tokens[f'd_{i}'] = tokens_length + i
 
     def de_convert(self, number: int, tempo):
         return ct_beat_to_time(number, tempo)

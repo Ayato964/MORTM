@@ -36,16 +36,15 @@ class Tokenizer:
         if load_data is None:
             # 特殊トークン
             self.special_token_position = 3
-            p = self.special_token_position
-            for t in token:
-                t.token_position = p
-                p += t.get_range()
             self.token_list = token
             self.tokens: dict = dict()
-            self.token_max: dict = self._init_mx_dict(p)
             self.tokens[constants.PADDING_TOKEN] = 0
             self.tokens[constants.START_SEQ_TOKEN] = 1
             self.tokens[constants.END_SEQ_TOKEN] = 2
+            for t in token:
+                t.set_tokens(self.tokens)
+
+            self.token_max: dict = self._init_mx_dict(len(self.tokens))
             self.is_converter = False
         else:
             self.is_converter = True

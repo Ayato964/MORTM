@@ -39,7 +39,7 @@ directory, md_file = find_midi_files(datasets)
 
 #mes: Messenger = gmail_messanger.GmailMessanger()
 
-tokenizer = Tokenizer(get_token_converter(120, TO_TOKEN))
+tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
 
 count = 0
 reasons = dict()
@@ -52,8 +52,8 @@ for i in range(len(md_file)):
 
     print(f"\r Save Count:{count} Step;{i}/{len(md_file)} Result:{reason}  Loaded:[{md_file[i]}] ", end="")
 
-    #if count - 1 >= 20000:
-    #    break
+    if count - 1 >= 1:
+        break
 
 tokenizer.save("out/vocab/")
 print(len(tokenizer.tokens))

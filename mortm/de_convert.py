@@ -38,7 +38,11 @@ def get_note_b5(tokens: Tensor, back_note: Note, tokenizer: Tokenizer, token_con
             start = shift
         end = start + duration
 
+        print(pitch, start, end)
+
         note = Note(pitch=int(pitch), velocity=100, start=start, end=end)
+
+
         return note
     else:
         return None
