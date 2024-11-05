@@ -1,14 +1,14 @@
-from AGSM.convert import ConvTempo
-from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
+from typing import List, Any
+
 import mido
 import numpy as np
-from numpy import ndarray
-from typing import List, Callable
+from AGSM.convert import ConvTempo
+from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
 
 from . import constants
-from .aya_node import Token, Pitch, Velocity, Duration, Shift, Start
-from . import aya_node
+from .aya_node import Token
 from .tokenizer import Tokenizer
+
 
 class MidiToAyaNode:
 
@@ -81,6 +81,42 @@ class MidiToAyaNode:
                 self.is_error = True
                 self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
 
+    def expansion_midi(self) -> List[Any]:
+        converts = []
+        key = 5
+        for i in range(key):
+            midi = self.get_midi_change_scale(i + 1)
+            converts.append(MidiToAyaNode(self.tokenizer, self.directory, f"{self.file_name}_scale_{i + 1}",
+                                          self.program_list, midi_data=midi))
+            midi = self.get_midi_change_scale(-(i + 1))
+            converts.append(MidiToAyaNode(self.tokenizer, self.directory, f"{self.file_name}_scale_{-(i+1)}",
+                                          self.program_list, midi_data=midi))
+
+        return converts
+
+    def get_midi_change_scale(self, scale_up_key):
+        midi = PrettyMIDI()
+
+        for ins in self.midi_data.instruments:
+            ins: Instrument = ins
+            new_inst = Instrument(program=ins.program)
+            for note in ins.notes:
+                note: Note = note
+                pitch = note.pitch + scale_up_key
+                if pitch > 127:
+                    pitch -= 12
+                if pitch < 0:
+                    pitch += 12
+
+                start = note.start
+                end = note.end
+                velo = note.velocity
+                new_note = Note(pitch=pitch, velocity=velo, start=start, end=end)
+                new_inst.notes.append(new_note)
+
+            midi.instruments.append(new_inst)
+
+        return midi
 
     def ct_aya_node(self, inst: Instrument) -> list:
 

@@ -83,13 +83,20 @@ def collate_fn(batch):
     return batch
 
 
-
 def update_log(model, writer, global_step):
     for name, param in model.named_parameters():
         if param.grad is not None:
             writer.add_scalar(f"Gradient Norm/{name}", param.grad.norm(), global_step)
 
         writer.add_scalar(f"Parameter Value/{name}", param.norm(), global_step)
+
+
+def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
+    per = sequence / batch_size * 100
+    block = int(per / 100 * 50)
+    bar = f" \033[32m{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
+    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
+
 
 def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
                        trans_layer=6, load_model_directory:str = None, use_rpr=False,
@@ -187,18 +194,11 @@ def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_
     return model, loss_val
 
 
-def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
-    per = sequence / batch_size * 100
-    block = int(per / 100 * 50)
-    bar = f" \033[32m{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
-    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
-
-
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=True,
                 trans_layer=9, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1,
                 dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000,
-                accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress()):
+                accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(),):
 
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
