@@ -14,5 +14,6 @@ model = train_mortm("out/np/turing/", "out/model", "test",
                     517, 5, "out/vocab/vocab_max.json",
                     begin_tuning_epoch=1,
                     fine_turing_mode=True,
+                    is_save_training_progress=True,
                     load_model_directory="out/model/MORTM.1.1-b1-Horn.pth")
 
