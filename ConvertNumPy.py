@@ -1,6 +1,6 @@
-'''
+"""
 要確認
-'''
+"""
 #from mortm import gmail_messanger
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN
 from mortm.convert import MidiToAyaNode
@@ -52,7 +52,7 @@ for i in range(len(md_file)):
 
     print(f"\r Save Count:{count} Step;{i}/{len(md_file)} Result:{reason}  Loaded:[{md_file[i]}] ", end="")
 
-    #if count - 1 >= 100:
+    #if count - 1 >= 20000:
     #    break
 
 tokenizer.save("out/vocab/")

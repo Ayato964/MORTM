@@ -148,6 +148,7 @@ def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_
                 padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
                 #print(padding_mask_in)
                 output = model(inputs_seq=input_ids, input_padding_mask=padding_mask_in)
+                #print(model.softmax(output)[: -1, :][-1, :].argmax())
 
                 outputs = output.view(-1, output.size(-1)).to(progress.get_device())
                 targets = targets.reshape(-1).long()
@@ -194,9 +195,122 @@ def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_
     return model, loss_val
 
 
+def _train_fine_turing(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
+                       trans_layer=6, load_model_directory:str = None, use_rpr=False, begin_tuning_epoch=3,
+                       num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
+                       position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
+
+    loader = DataLoader(ayato_dataset, batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
+
+    pre_model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
+                  d_model=d_model, dim_feedforward=dim_feedforward,
+                  dropout=dropout, position_length=position_length, use_rpr=use_rpr).to(progress.get_device())
+    pre_model.load_state_dict(torch.load(load_model_directory))
+
+    model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
+                      d_model=d_model, dim_feedforward=dim_feedforward,
+                      dropout=dropout, position_length=position_length, use_rpr=use_rpr, use_decoder=True).to(progress.get_device())
+
+    model_dict = model.state_dict()
+
+    for param_name, param in pre_model.state_dict().items():
+        if param_name in model_dict and "decoder" not in param_name:
+            param.requires_grad = False
+            model_dict[param_name].copy_(param.data)
+        else:
+            print(param_name)
+    model.load_state_dict(model_dict)
+
+
+
+    criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
+
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
+    scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
+
+    loss_val = None
+    mail_bool = True
+    for epoch in range(num_epochs):
+        try:
+            print(f"epoch {epoch + 1} start....")
+
+            if epoch + 1 == begin_tuning_epoch:
+                model_dict = model.state_dict()
+                for param_name, param in model_dict.items():
+                    param.requires_grad = True
+                model.load_state_dict(model_dict)
+                print("ファインチューニングをここから開始します。")
+
+            count = 1
+            epoch_loss = 0.0
+            verification_loss = 0.0
+
+            model.train()
+            optimizer.zero_grad()
+
+            for inputs in loader:  # seqにはbatch_size分の楽曲が入っている
+                #print(f"learning sequence {count}")
+                begin_time = time.time()
+                input_ids: Tensor = inputs[:, :-1].to(progress.get_device())
+                targets: Tensor = inputs[:, 1:].to(progress.get_device())
+
+                padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
+                tgt_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
+                #print(padding_mask_in)
+                output = model(inputs_seq=input_ids, tgt_seq=targets, tgt_mask=tgt_mask,  input_padding_mask=padding_mask_in)
+
+                #print(model.softmax(output)[: -1, :][-1, :].argmax())
+
+                outputs = output.view(-1, output.size(-1)).to(progress.get_device())
+                targets = targets.reshape(-1).long()
+                loss = criterion(outputs, targets)  # 損失を計算
+                epoch_loss += loss.item()
+                loss = loss / accumulation_steps
+                loss.backward()  # 逆伝播
+
+                #update_log(model, writer, count)
+
+                if count % accumulation_steps == 0:  #実質バッチサイズは64である
+                    progress.step_optimizer(optimizer, model, accumulation_steps)
+                    scheduler.step()
+
+                count += 1
+                end_time = time.time()
+
+                if mail_bool and message is not None:
+                    _send_prediction_end_time(message, len(loader), begin_time, end_time, vocab_size, num_epochs,
+                                              trans_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
+                    mail_bool = False
+
+                if (count + 1) % message.step_by_message_count == 0:
+                    message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
+                                                                       f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
+
+
+                progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss)
+
+
+            message.send_message("機械学習の途中経過について",
+                                 f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
+            loss_val = epoch_loss / count
+
+            if is_save_training_progress:
+                torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}.pth") #エポック終了時に途中経過を保存
+                print("途中経過を保存しました。")
+        except torch.cuda.OutOfMemoryError:
+            torch.save(model.state_dict(), f"{save_directory}/MORTM.error_end.{epoch}.pth")
+
+    return model, loss_val
+
+
+
+
+    pass
+
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
-                message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=True,
-                trans_layer=9, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1,
+                message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=True, fine_turing_mode=False,
+                trans_layer=9, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1, begin_tuning_epoch=3,
                 dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(),):
 
@@ -226,23 +340,41 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
             #weight_tensor = weight_tensor / weight_tensor.sum()
 
             print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
-
-        model, loss = _train_self_tuning(save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
-                                         load_model_directory=load_model_directory,
-                                         d_model=d_model,
-                                         dim_feedforward=dim_feedforward,
-                                         trans_layer=trans_layer,
-                                         num_heads=num_heads,
-                                         position_length=position_length,
-                                         dropout=dropout,
-                                         accumulation_steps=accumulation_steps,
-                                         batch_size=batch_size,
-                                         num_workers=num_workers,
-                                         warmup_steps=warmup_steps,
-                                         is_save_training_progress=is_save_training_progress,
-                                         lr_param=lr_param,
-                                         use_rpr=use_rpr
-                                         )  # 20エポック分機械学習を行う。
+        if not fine_turing_mode:
+            model, loss = _train_self_tuning(save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
+                                             load_model_directory=load_model_directory,
+                                             d_model=d_model,
+                                             dim_feedforward=dim_feedforward,
+                                             trans_layer=trans_layer,
+                                             num_heads=num_heads,
+                                             position_length=position_length,
+                                             dropout=dropout,
+                                             accumulation_steps=accumulation_steps,
+                                             batch_size=batch_size,
+                                             num_workers=num_workers,
+                                             warmup_steps=warmup_steps,
+                                             is_save_training_progress=is_save_training_progress,
+                                             lr_param=lr_param,
+                                             use_rpr=use_rpr
+                                             )  # 20エポック分機械学習を行う。
+        else:
+            model, loss = _train_fine_turing(save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
+                                             load_model_directory=load_model_directory,
+                                             d_model=d_model,
+                                             dim_feedforward=dim_feedforward,
+                                             trans_layer=trans_layer,
+                                             num_heads=num_heads,
+                                             position_length=position_length,
+                                             dropout=dropout,
+                                             accumulation_steps=accumulation_steps,
+                                             batch_size=batch_size,
+                                             num_workers=num_workers,
+                                             warmup_steps=warmup_steps,
+                                             is_save_training_progress=is_save_training_progress,
+                                             lr_param=lr_param,
+                                             use_rpr=use_rpr,
+                                             begin_tuning_epoch=begin_tuning_epoch
+                                             )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",
                                  f"MORTM.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
@@ -256,6 +388,8 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                                  "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
         print("オーバーフローしました。")
     pass
+
+
 
 class VerificationLoss:
 

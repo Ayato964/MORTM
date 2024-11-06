@@ -63,7 +63,10 @@ class MORTM(nn.Module):
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
     def forward(self, inputs_seq, tgt_seq=None, tgt_mask=None, input_padding_mask=None, tgt_padding_mask=None):
-        mask = self.transformer.generate_square_subsequent_mask(inputs_seq.shape[1]).to(self.progress.get_device())
+        if tgt_seq is None:
+            mask = self.transformer.generate_square_subsequent_mask(inputs_seq.shape[1]).to(self.progress.get_device())
+        else:
+            mask = None
 
         inputs_em: Tensor = self.embedding(inputs_seq)
         inputs_em = inputs_em.permute(1, 0, 2)

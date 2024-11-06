@@ -1,9 +1,14 @@
 
+import  numpy as np
+import torch
+from mortm.de_convert import ct_tokens_to_midi_b5
+from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN
 from mortm.convert import MidiToAyaNode
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.de_convert import ct_tokens_to_midi_b5
 
-tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
+tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
-con = MidiToAyaNode(tokenizer, directory="data/other", file_name="2ndtime.mid", program_list=[65, 66])
-con_lists = con.expansion_midi()
-print(len(con_lists))
+sample = np.load("out/np/turing/grooving_hard.mid.npz")['array3']
+print(sample)
+midi = ct_tokens_to_midi_b5(tokenizer, torch.tensor(sample, dtype=torch.long), "out/sample.mid")

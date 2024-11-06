@@ -10,6 +10,9 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 #message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp')
 
-model = train_mortm("out/np/corecct/", "out/model", "test",
-                    267, 3, "out/vocab/vocab_max.json",
-                    position_length=2500, dim_feedforward=2500, batch_size=2, accumulation_steps=1)
+model = train_mortm("out/np/turing/", "out/model", "test",
+                    517, 5, "out/vocab/vocab_max.json",
+                    begin_tuning_epoch=1,
+                    fine_turing_mode=True,
+                    load_model_directory="out/model/MORTM.1.1-b1-Horn.pth")
+

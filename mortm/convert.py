@@ -84,13 +84,14 @@ class MidiToAyaNode:
     def expansion_midi(self) -> List[Any]:
         converts = []
         key = 5
-        for i in range(key):
-            midi = self.get_midi_change_scale(i + 1)
-            converts.append(MidiToAyaNode(self.tokenizer, self.directory, f"{self.file_name}_scale_{i + 1}",
-                                          self.program_list, midi_data=midi))
-            midi = self.get_midi_change_scale(-(i + 1))
-            converts.append(MidiToAyaNode(self.tokenizer, self.directory, f"{self.file_name}_scale_{-(i+1)}",
-                                          self.program_list, midi_data=midi))
+        if not self.is_error:
+            for i in range(key):
+                midi = self.get_midi_change_scale(i + 1)
+                converts.append(MidiToAyaNode(self.tokenizer, self.directory, f"{self.file_name}_scale_{i + 1}",
+                                              self.program_list, midi_data=midi))
+                midi = self.get_midi_change_scale(-(i + 1))
+                converts.append(MidiToAyaNode(self.tokenizer, self.directory, f"{self.file_name}_scale_{-(i+1)}",
+                                              self.program_list, midi_data=midi))
 
         return converts
 
@@ -167,7 +168,7 @@ class MidiToAyaNode:
 
                 clip_time = 0.0
                 split_count += 1
-        if len(clip) > 0:
+        if len(clip) > 50:
             clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
             aya_node_inst = self.marge_clip(clip, aya_node_inst)
         return aya_node_inst
