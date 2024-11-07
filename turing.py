@@ -1,4 +1,4 @@
-from mortm.convert import MidiToAyaNode
+from mortm.convert import MidiToAyaNode, MidiToAyaNode_TGT
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
 import numpy
 import os
@@ -11,7 +11,7 @@ directory = "./data/other/"
 file_name = os.listdir(directory)
 
 for file in file_name:
-    con = MidiToAyaNode(tokenizer, directory, file, program_list=[65, 66])
+    con = MidiToAyaNode_TGT(tokenizer, directory, file, program_list=[65, 66])
     con_list:List[MidiToAyaNode] = con.expansion_midi()
     con.convert()
 

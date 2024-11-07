@@ -12,16 +12,16 @@ from mortm.tokenizer import get_token_converter
 from mortm.de_convert import ct_tokens_to_midi_b5, ct_token_to_midi_1_0
 model_directory = "out/model/"
 
-tokenizer = token.Tokenizer(token=get_token_converter(120, TO_MUSIC), load_data="out/vocab/vocab_list.json")
+tokenizer = token.Tokenizer(token=get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
 model = MORTM(
     progress=_DefaultLearningProgress(),
-    vocab_size=267,
-    position_length=8000,
-    trans_layer=9, num_heads=16, d_model=1024,
-    dim_feedforward=2048
+    vocab_size=517,
+    position_length=8500,
+    trans_layer=9, num_heads=32, d_model=1024,
+    dim_feedforward=4096
 )
-model.load_state_dict(torch.load("out/model/MORTM.error_end.1.2.0406.pth"))
+model.load_state_dict(torch.load("out/model/MORTM.test_0.003646567325616731.pth"))
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 

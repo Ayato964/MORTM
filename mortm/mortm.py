@@ -123,7 +123,7 @@ class MORTM(nn.Module):
             with torch.no_grad():
                 mask = self.transformer.generate_square_subsequent_mask(input_tensor.shape[1]).to(
                     self.progress.get_device())
-                scores = self(input_tensor)  # (1, sequence_length, vocab_size)
+                scores = self(input_tensor, tgt_seq=input_tensor[:, 1:])  # (1, sequence_length, vocab_size)
 
             # 最新のトークンのスコアを取得 (最後のトークンに対するスコア)
             logits = scores[:, -1, :]  # (1, vocab_size)
