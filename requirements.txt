@@ -1,0 +1,7 @@
+torch~=2.3.1+cu118
+numpy~=1.26.4
+MORTM~=1.1b2
+mido~=1.3.2
+AGSM~=0.1.0
+pretty_midi~=0.2.10
+setuptools~=70.0.0

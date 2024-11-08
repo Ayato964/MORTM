@@ -62,9 +62,11 @@ class MORTM(nn.Module):
         self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
-    def forward(self, inputs_seq, tgt_seq=None, tgt_mask=None, input_padding_mask=None, tgt_padding_mask=None):
-        if tgt_seq is None:
+    def forward(self, inputs_seq, tgt_seq=None, src_mask=None, tgt_mask=None, input_padding_mask=None, tgt_padding_mask=None):
+        if tgt_seq is None or src_mask is None:
             mask = self.transformer.generate_square_subsequent_mask(inputs_seq.shape[1]).to(self.progress.get_device())
+        elif src_mask is not None:
+            mask = src_mask
         else:
             mask = None
 
@@ -88,7 +90,7 @@ class MORTM(nn.Module):
         score:Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
 
-    def top_k_sampling_length(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
+    def top_k_sampling_length_encoder(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
         self.eval()
         """
         MORTMモデルにトップKサンプリングと温度シーケンスを実装する関数
@@ -123,7 +125,9 @@ class MORTM(nn.Module):
             with torch.no_grad():
                 mask = self.transformer.generate_square_subsequent_mask(input_tensor.shape[1]).to(
                     self.progress.get_device())
-                scores = self(input_tensor, tgt_seq=input_tensor[:, 1:])  # (1, sequence_length, vocab_size)
+                print(input_tensor.shape)
+                scores = self(input_tensor)  # (1, sequence_length, vocab_size)
+                print(f"SCORE: {scores.shape}")
 
             # 最新のトークンのスコアを取得 (最後のトークンに対するスコア)
             logits = scores[:, -1, :]  # (1, vocab_size)
@@ -156,6 +160,79 @@ class MORTM(nn.Module):
             # 次のステップの入力として準備
             input_sequence = torch.tensor(generated_sequence, dtype=torch.long, device=self.progress.get_device())
 
+        return input_sequence
+
+    def top_k_sampling_length_decoder(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
+        self.eval()
+        """
+        MORTMモデルにトップKサンプリングと温度シーケンスを実装する関数
+
+        Args:
+            input_sequence: 1次元の入力シーケンス (List[int] or torch.Tensor)。
+            temperature: 温度パラメータ。デフォルトは1.0。
+            top_k: サンプリングする上位K個のトークンの数。デフォルトは3。
+            max_length: 生成するシーケンスの最大長さ。デフォルトは100。
+
+        Returns:
+            1次元の生成されたシーケンス (torch.Tensor)。
+        """
+
+        # 入力シーケンスをtorch.tensorに変換
+        if not isinstance(input_sequence, torch.Tensor):
+            input_sequence = torch.tensor(input_sequence, dtype=torch.long, device=self.progress.get_device())
+
+        # 入力シーケンスの長さを取得
+        input_length = input_sequence.size(0)
+
+        # 生成されたシーケンスを格納するリスト
+        generated_sequence = [11]
+
+        # 生成をループ
+        for i in range(max_length):
+            # モデルに渡すための入力の準備 (2次元に変換)
+            tgt = torch.tensor(generated_sequence, device=self.progress.get_device()).unsqueeze(0)  # (1, sequence_length)
+            src = input_sequence.unsqueeze(0)
+            #print(f"I{i} input_tensor")
+
+            # モデルに入力して次のトークンのスコアを取得 (3次元で返ってくる)
+            with torch.no_grad():
+                mask = self.transformer.generate_square_subsequent_mask(tgt.shape[1]).to(
+                    self.progress.get_device())
+                print(src.shape)
+                scores = self(src, tgt_seq=tgt)  # (1, sequence_length, vocab_size)
+                print(f"SCORE: {scores.shape}")
+
+            # 最新のトークンのスコアを取得 (最後のトークンに対するスコア)
+            logits = scores[:, -1, :]  # (1, vocab_size)
+
+            # 温度の適用
+            logits = logits / temperature
+            logits = logits[-1, :]
+
+            # ソフトマックスを適用して確率を取得
+            probs = self.softmax(logits)  # (vocab_size)
+
+            # トップKの確率でトークンをフィルタリング
+            sorted_probs, sorted_indices = torch.topk(probs, top_k)
+            #print(sorted_probs, sorted_indices)
+
+            # 再度正規化
+            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+
+            # トークンをサンプリング
+            sampled_index = torch.multinomial(sorted_probs, 1).item()  # サンプリングされたインデックスを取得
+
+            # ソートされたインデックスから元のインデックスに変換
+            next_token = sorted_indices[sampled_index].item()
+
+            #            print(next_token)
+
+            # シーケンスにトークンを追加
+            generated_sequence.append(next_token)
+
+            # 次のステップの入力として準備
+#            input_sequence = torch.tensor(generated_sequence, dtype=torch.long, device=self.progress.get_device())
+        input_sequence = torch.cat((input_sequence, torch.tensor(generated_sequence, device=self.progress.get_device())))
         return input_sequence
 
     def top_p_sampling_length(self, input_seq, p=0.8, max_length=20, temperature=0.2):

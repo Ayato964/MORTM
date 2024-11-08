@@ -9,8 +9,24 @@ from mortm.tokenizer import TO_TOKEN, TO_MUSIC
 
 from mortm.progress import _DefaultLearningProgress
 from mortm.tokenizer import get_token_converter
-from mortm.de_convert import ct_tokens_to_midi_b5, ct_token_to_midi_1_0
-model_directory = "out/model/"
+from mortm.de_convert import ct_tokens_to_midi_b5
+
+'''
+MORTMのバージョンは常に新しくなる為、モデルのバージョンとvocab_list.jsonを確認してください。
+うまくメロディが生成できない場合や、エラーが発生する場合、以下の項目を確認してください。
+
+1.model.load_state_dictでエラーが発生する。
+    -ハイパーパラメータが正しいか確認してください。モデルのバージョンによって、パラメータが異なる可能性があります。
+    -CPUを使っているか、GPUを使っているかを確認してください。
+    もし、CPUを使っている場合、 torch.load("model/ *** ", map_location="cpu")を設定してください。
+    
+2. 生成する時にエラーが発生する
+    - 配列構造が不正である可能性があります。サンプリングに入力する配列は1次元配列になるはずです。
+    
+3. 意味不明なメロディが生成される。
+    - 生成できたが、メロディとして成り立っていない場合、vocab_list.jsonが古い場合があります。
+    モデルによって異なるので、再度確認してください。
+'''
 
 tokenizer = token.Tokenizer(token=get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
@@ -19,25 +35,42 @@ model = MORTM(
     vocab_size=517,
     position_length=8500,
     trans_layer=9, num_heads=32, d_model=1024,
-    dim_feedforward=4096
+    dim_feedforward=4096,
+    use_decoder=True
 )
-model.load_state_dict(torch.load("out/model/MORTM.test_0.003646567325616731.pth"))
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.load_state_dict(torch.load("out/model/MORTM.train.1.0.0658.pth")) # モデルをロードする。
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
-# メロディ生成の実行
+'''
+既存の楽曲からその続きを生成する場合、以下を実行し、NPZから解凍してください。
+システム的な事情でarray1からメロディが記録されています。
+
+！MIDIから直接旋律を生成することはできません。！
+!実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
+'''
+
 np_notes = np.load("out/np/Sample.mid.npz")
 
 start = np_notes[f'array1'][:-1]
 
+'''
+一から、もしくはメロディをプログラマーが設定したい場合、以下を実行します。
+シーケンスは数値の配列です。tokenizerで文字列からトークンに変換してください。
+'''
 #start = [tokenizer.get(constants.START_SEQ_TOKEN)]
 
-print(f"First:{start}")
+print(f"First:{start}") # ロードしたシーケンスを表示
 
+'''
+シーケンスの生成は以下の2つから選べます。
+1. Top P sampling
+    -これは、確率の閾値Pを設定し、それ以上に該当するトークンからサンプリングを行います。複数存在する場合、ランダムでトークンを選びます。
+2. Top K sampling
+    - これは、確率の高い順番からK個のトークンを取得し、サンプリングを行います。複数存在する場合、ランダムでトークンを選びます。
+'''
 #gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=2.0)
-gene = model.top_k_sampling_with_temperature_sequence(start, max_length=500, temperature=0.8, top_k=5)
-
-#gene = model.generate_by_length(start, max_length=20)
+gene = model.top_k_sampling_length_decoder(start, max_length=10, temperature=0.9, top_k=5)
 
 output = gene
 for t in output:
@@ -45,4 +78,4 @@ for t in output:
     print(f"{t}  {tokenizer.rev_get(t.tolist())}")
 
 
-midi = ct_token_to_midi_1_0(tokenizer, output, "out/generate_test.midi")
+midi = ct_tokens_to_midi_b5(tokenizer, output, "out/generate_test.midi") #生成したトークンをMIDIに変換する。

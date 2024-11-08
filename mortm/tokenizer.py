@@ -2,6 +2,7 @@ import json
 from typing import List
 from numpy import ndarray
 
+import re
 from . import constants
 from .aya_node import Token, Start,Shift,Pitch,Velocity,Duration, StartRE
 
@@ -99,3 +100,15 @@ class Tokenizer:
         self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
         print(self.rev_tokens)
         pass
+
+    def begin_token(self, token_type):
+        for i in range(len(self.rev_tokens)):
+            if token_type in self.rev_tokens[i] :
+                return i
+        return "NOT FOUND"
+
+    def end_token(self, token_type):
+        for i in range(len(self.rev_tokens)):
+            token = len(self.rev_tokens) - 1 - i
+            if token_type in self.rev_tokens[token]:
+                return token

@@ -58,7 +58,6 @@ class MORTM_DataSets(Dataset):
             else:
                 self.tgt_seq = self.tgt_seq + [tgt_data]
 
-
         print(f"clear! train shape is:{self._get_shape(self.tgt_seq)}")
 
     def _get_shape(self, lst):
@@ -89,4 +88,28 @@ class MORTM_DataSets(Dataset):
             if len(t) < max_length:
                 for _ in range(max_length - len(t)):
                     t.append(0)
+        pass
+
+
+class MORTMTuringDataset(Dataset):
+    def __init__(self, progress: LearningProgress):
+        self.musics_seq: list = []
+        self.tgt_seq: list = []
+        self.progress = progress
+
+    def __len__(self):
+        return len(self.musics_seq)
+
+    def __getitem__(self, item):
+        return (torch.tensor(self.musics_seq[item], dtype=torch.long, device=self.progress.get_device()),
+                torch.tensor(self.tgt_seq[item], dtype=torch.long, device=self.progress.get_device()))
+
+    def add_data(self, music_seq: np.ndarray):
+        for i in range(len(music_seq)):
+            aya_dict = music_seq[f'array{i}']
+            if isinstance(aya_dict, np.ndarray):
+                aya_dict = aya_dict.item()
+            self.musics_seq = self.musics_seq + [aya_dict['src']]
+            self.tgt_seq = self.tgt_seq + [aya_dict['tgt']]
+
         pass

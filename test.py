@@ -1,19 +1,21 @@
-
-import  numpy as np
 import torch
-from mortm.de_convert import ct_tokens_to_midi_b5
-from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN
-from mortm.convert import MidiToAyaNode, MidiToAyaNode_TGT
-from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.de_convert import ct_tokens_to_midi_b5
+import random
 
-tokenizer = Tokenizer(get_token_converter(TO_TOKEN), load_data="out/vocab/vocab_list.json")
+def create_mask(tensor):
+    # インデックスの値が200 ~ 400および401 ~ 500である位置を取得
+    indices_1 = (tensor >= 200) & (tensor <= 400)  # 200 ~ 400
+    indices_2 = (tensor >= 401) & (tensor <= 500)  # 401 ~ 500
 
-con = MidiToAyaNode_TGT(tokenizer, "./data/other/", "DontDreamOfAnybodyButMe.mid", [65, 66])
-con()
+    # 20%の確率でインデックスにマスクをかけるためのブール型テンソルを作成
+    mask_1 = torch.tensor([random.random() < 0.4 if val else False for val in indices_1])
+    mask_2 = torch.tensor([random.random() < 0.4 if val else False for val in indices_2])
 
-is_saved, reason = con.save("out/")
-print(is_saved, reason)
+    # マスクを結合
+    combined_mask = mask_1 | mask_2
 
-seq = np.load("./out/DontDreamOfAnybodyButMe.mid.npz", allow_pickle=True)
-print(seq['array1'])
+    return combined_mask
+
+# サンプルテンソルの作成
+tensor = torch.tensor([1, 100, 400, 200, 500, 300])  # 長さ6のテンソル
+masked_tensor = create_mask(tensor)
+print(masked_tensor)

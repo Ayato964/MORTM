@@ -5,18 +5,20 @@ import numpy as np
 from AGSM.convert import ConvTempo
 from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
 from abc import abstractmethod, ABC
-
+from typing import TypeVar, Generic
 from . import constants
 from .aya_node import Token
 from .tokenizer import Tokenizer
 
-
+T = TypeVar("T")
 class _AbstractMidiToAyaNode(ABC):
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None, ):
+
+    def __init__(self, instance: Generic[T],  tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None,):
         self.program_list = program_list
         self.directory = directory
         self.file_name = file_name
         self.is_error = False
+        self.instance = instance
         self.token_converter: List[Token] = tokenizer.token_list
         self.error_reason: str = "不明なエラー"
         self.tokenizer = tokenizer
@@ -73,10 +75,10 @@ class _AbstractMidiToAyaNode(ABC):
         if not self.is_error:
             for i in range(key):
                 midi = self.get_midi_change_scale(i + 1)
-                converts.append(MidiToAyaNode(self.tokenizer, self.directory, f"{self.file_name}_scale_{i + 1}",
+                converts.append(self.instance(self.tokenizer, self.directory, f"{self.file_name}_scale_{i + 1}",
                                               self.program_list, midi_data=midi))
                 midi = self.get_midi_change_scale(-(i + 1))
-                converts.append(MidiToAyaNode(self.tokenizer, self.directory, f"{self.file_name}_scale_{-(i + 1)}",
+                converts.append(self.instance(self.tokenizer, self.directory, f"{self.file_name}_scale_{-(i + 1)}",
                                               self.program_list, midi_data=midi))
 
         return converts
@@ -97,11 +99,10 @@ class _AbstractMidiToAyaNode(ABC):
     def convert(self):
         pass
 
-
 class MidiToAyaNode(_AbstractMidiToAyaNode):
 
     def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
-        super().__init__(tokenizer, directory, file_name, program_list, midi_data)
+        super().__init__(MidiToAyaNode, tokenizer, directory, file_name, program_list, midi_data)
         self.aya_node = [0]
 
     def convert(self):
@@ -242,8 +243,8 @@ class MidiToAyaNode_TGT(_AbstractMidiToAyaNode):
         else:
             return False, self.error_reason
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list):
-        super().__init__(tokenizer, directory, file_name, program_list)
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
+        super().__init__(MidiToAyaNode_TGT, tokenizer, directory, file_name, program_list, midi_data)
         self.aya_node: List[dict] = []
 
     def convert(self):
@@ -315,12 +316,11 @@ class MidiToAyaNode_TGT(_AbstractMidiToAyaNode):
                     clip_dict['tgt'] = clip.tolist()
                     aya_node_inst = np.append(aya_node_inst, clip_dict)
                     clip_dict = dict()
+                    clip = np.array([], dtype=int)
 
                 is_seq = not is_seq
-                clip = np.array([], dtype=int)
                 clip_time = 0.0
                 split_count += 1
-        print(aya_node_inst.tolist())
         return aya_node_inst.tolist()
 
     def marge_clip(self, clip, aya_node_inst):

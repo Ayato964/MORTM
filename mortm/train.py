@@ -11,6 +11,7 @@ import math
 import os
 import time
 from abc import abstractmethod
+from typing import  Callable
 
 import torch
 from torch import Tensor
@@ -24,7 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
-from .datasets import MORTM_DataSets
+from .datasets import MORTM_DataSets, MORTMTuringDataset
 from .mortm import MORTM
 from .noam import noam_lr
 from .loss import MORTCrossEntropyLoss
@@ -52,14 +53,15 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
 
 
 # デバイスを取得
-def _set_train_data(directory, datasets, progress: LearningProgress):
+def _set_train_data(directory, datasets, progress: LearningProgress, is_fine_turing=False):
     print("Starting load....")
-    mortm_datasets = MORTM_DataSets(progress)
+    mortm_datasets = MORTM_DataSets(progress) if not is_fine_turing else MORTMTuringDataset(progress)
     loss_count = 0
+    loss_data = 1 if not is_fine_turing else 0
     for dataset in datasets:
         print(f"Load [{directory + dataset}]")
-        np_load_data = np.load(directory + dataset)
-        if len(np_load_data) > 1:
+        np_load_data = np.load(directory + dataset, allow_pickle=True)
+        if len(np_load_data) > loss_data:
             mortm_datasets.add_data(np_load_data)
             print(f"最初の5音:{mortm_datasets.musics_seq[-1][:5]}")
         else:
@@ -99,7 +101,7 @@ def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
 
 
 def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
-                       trans_layer=6, load_model_directory:str = None, use_rpr=False,
+                       trans_layer=6, load_model_directory:str = None, use_rpr=False, src_mask_method: Callable[[Tensor], Tensor]=None,
                        num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
                        position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
@@ -140,15 +142,13 @@ def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_
                 input_ids: Tensor = inputs[:, :-1].to(progress.get_device())
                 targets: Tensor = inputs[:, 1:].to(progress.get_device())
 
-                #inputs_mask = model.mortm_X.generate_square_subsequent_mask(input_ids.shape[1]).to(device)
-                #targets_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
-
-                #print(input_ids.shape, targets.shape)
 
                 padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
-                #print(padding_mask_in)
-                output = model(inputs_seq=input_ids, input_padding_mask=padding_mask_in)
-                #print(model.softmax(output)[: -1, :][-1, :].argmax())
+
+                src_mask = None if src_mask_method is None else src_mask_method(input_ids)
+
+                output = model(inputs_seq=input_ids, src_mask=src_mask, input_padding_mask=padding_mask_in)
+
 
                 outputs = output.view(-1, output.size(-1)).to(progress.get_device())
                 targets = targets.reshape(-1).long()
@@ -196,11 +196,11 @@ def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_
 
 
 def _train_fine_turing(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
-                       trans_layer=6, load_model_directory:str = None, use_rpr=False, begin_tuning_epoch=3,
+                       trans_layer=6, load_model_directory:str = None, use_rpr=False, begin_tuning_epoch=3, src_mask_method: Callable[[Tensor], Tensor]=None,
                        num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
                        position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
-    loader = DataLoader(ayato_dataset, batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
+    loader = DataLoader(ayato_dataset, batch_size, shuffle=True, num_workers=num_workers)
 
     pre_model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
                   d_model=d_model, dim_feedforward=dim_feedforward,
@@ -249,16 +249,16 @@ def _train_fine_turing(save_directory, ayato_dataset, message: Messenger, vocab_
             model.train()
             optimizer.zero_grad()
 
-            for inputs in loader:  # seqにはbatch_size分の楽曲が入っている
+            for inputs, targets in loader:  # seqにはbatch_size分の楽曲が入っている
                 #print(f"learning sequence {count}")
                 begin_time = time.time()
-                input_ids: Tensor = inputs[:, :-1].to(progress.get_device())
-                targets: Tensor = inputs[:, 1:].to(progress.get_device())
 
-                padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
+                padding_mask_in: Tensor = _get_padding_mask(inputs, progress)
                 tgt_mask = model.transformer.generate_square_subsequent_mask(targets.shape[1]).to(progress.get_device())
                 #print(padding_mask_in)
-                output = model(inputs_seq=input_ids, tgt_seq=targets, tgt_mask=tgt_mask,  input_padding_mask=padding_mask_in)
+
+                src_mask = None if src_mask_method is None else src_mask_method(inputs)
+                output = model(inputs_seq=inputs, src_mask=src_mask, tgt_seq=targets, tgt_mask=tgt_mask, input_padding_mask=padding_mask_in)
 
                 #print(model.softmax(output)[: -1, :][-1, :].argmax())
 
@@ -311,7 +311,7 @@ def _train_fine_turing(save_directory, ayato_dataset, message: Messenger, vocab_
 def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=True, fine_turing_mode=False,
                 trans_layer=9, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1, begin_tuning_epoch=3,
-                dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000,
+                dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(),):
 
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -320,7 +320,7 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
     print(f"ToDay is{datetime.date.today()}! start generating MORTEM_Model.{version}_{today_date}")
 
     datasets = os.listdir(dataset_directory)
-    train_data = _set_train_data(dataset_directory, datasets, progress)
+    train_data = _set_train_data(dataset_directory, datasets, progress, fine_turing_mode)
 
     try:
         with open(weight_directory, 'r') as file:
@@ -355,7 +355,8 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                                              warmup_steps=warmup_steps,
                                              is_save_training_progress=is_save_training_progress,
                                              lr_param=lr_param,
-                                             use_rpr=use_rpr
+                                             use_rpr=use_rpr,
+                                             src_mask_method=src_mask_method
                                              )  # 20エポック分機械学習を行う。
         else:
             model, loss = _train_fine_turing(save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
@@ -373,7 +374,8 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
                                              is_save_training_progress=is_save_training_progress,
                                              lr_param=lr_param,
                                              use_rpr=use_rpr,
-                                             begin_tuning_epoch=begin_tuning_epoch
+                                             begin_tuning_epoch=begin_tuning_epoch,
+                                             src_mask_method=src_mask_method
                                              )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",
