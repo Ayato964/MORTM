@@ -45,7 +45,7 @@ class Token:
         pass
 
     @abstractmethod
-    def de_convert(self, number: int, tempo: int):
+    def de_convert(self, number: int, back_note:Note, note: Note, tempo: int):
         pass
 
     @abstractmethod
@@ -63,25 +63,24 @@ class Token:
                 my_token = f"{self.token_type}_{symbol}"
         else:
             if token is None:
-                return None, None
+                return None
             split = token.split("_")
             if split[0] == self.token_type:
-                my_token = self.de_convert(int(float(split[-1])), tempo)
-                return split[0], my_token
+                self.de_convert(int(float(split[-1])), back_notes, note, tempo)
+                return split[0]
             else:
-                return None, None
+                return None
 
         return my_token
 
 
 class MeasureToken(Token):
 
-
     def get_range(self) -> int:
         return 1
 
-    def de_convert(self, number: int, tempo: int):
-        return None
+    def de_convert(self, number: int, b, n, tempo: int):
+        pass
 
     def set_tokens(self, tokens: dict):
         tokens[f'm_start'] = len(tokens)
@@ -90,14 +89,13 @@ class MeasureToken(Token):
         measure1 = 60 / tempo * 4
         if back_notes is not None:
             note_measure = note.start // measure1
-            back_note_measure = note.start // measure1
+            back_note_measure = back_notes.start // measure1
             if note_measure > back_note_measure:
                 return "start"
             else:
                 return None
         else:
             return "start"
-
 
 
 class StartRE(Token):
@@ -108,9 +106,9 @@ class StartRE(Token):
         for i in range(max_length + 1):
             tokens[f's_{i}'] = tokens_length + i
 
-    def de_convert(self, number: int, tempo):
-        #print(ct_beat_to_time(number, tempo))
-        return ct_beat_to_time(number, tempo)
+    def de_convert(self, number: int, back_note, note: Note, tempo):
+        shift = ct_beat_to_time(number, tempo)
+        note.start = shift if back_note is None else shift + back_note.start
 
     def get_range(self) -> int:
         return 193
@@ -141,8 +139,8 @@ class Pitch(Token):
         for i in range(max_length + 1):
             tokens[f'p_{i}'] = tokens_length + i
 
-    def de_convert(self, number: int, tempo):
-        return number
+    def de_convert(self, number: int, back_note, note: Note, tempo):
+        note.pitch = number
 
     def get_range(self) -> int:
         return 129
@@ -160,8 +158,8 @@ class Velocity(Token):
         for i in range(max_length + 1):
             tokens[f'v_{i}'] = tokens_length + i
 
-    def de_convert(self, number: int, tempo):
-        return number
+    def de_convert(self, number: int, b, n: Note, tempo):
+        n.velocity = number
 
     def get_token(self, back_notes: Note, note: Note, tempo) -> int:
         v: int = note.velocity
@@ -179,8 +177,9 @@ class Duration(Token):
         for i in range(max_length + 1):
             tokens[f'd_{i}'] = tokens_length + i
 
-    def de_convert(self, number: int, tempo):
-        return ct_beat_to_time(number, tempo)
+    def de_convert(self, number: int, back_note: Note, note: Note, tempo):
+        duration = ct_beat_to_time(number, tempo)
+        note.end = note.start + duration
 
     def get_token(self, back_notes: Note, note: Note, tempo) -> int:
         start = ct_time_to_beat(note.start, tempo)

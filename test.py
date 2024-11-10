@@ -1,21 +1,19 @@
+from mortm.tokenizer import Tokenizer, TO_TOKEN, get_token_converter
+from mortm.convert import MidiToAyaNode
+from mortm.de_convert import ct_tokens_to_midi_b5
+
 import torch
-import random
+tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
+datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
 
-def create_mask(tensor):
-    # インデックスの値が200 ~ 400および401 ~ 500である位置を取得
-    indices_1 = (tensor >= 200) & (tensor <= 400)  # 200 ~ 400
-    indices_2 = (tensor >= 401) & (tensor <= 500)  # 401 ~ 500
+con = MidiToAyaNode(tokenizer, "out/", file_name="Sample.mid", program_list=[0, 1,2,3,4,5,6,7,8,9,10])
+con.convert()
 
-    # 20%の確率でインデックスにマスクをかけるためのブール型テンソルを作成
-    mask_1 = torch.tensor([random.random() < 0.4 if val else False for val in indices_1])
-    mask_2 = torch.tensor([random.random() < 0.4 if val else False for val in indices_2])
+node = con.aya_node[1]
 
-    # マスクを結合
-    combined_mask = mask_1 | mask_2
+tokenizer.rev_mode()
 
-    return combined_mask
-
-# サンプルテンソルの作成
-tensor = torch.tensor([1, 100, 400, 200, 500, 300])  # 長さ6のテンソル
-masked_tensor = create_mask(tensor)
-print(masked_tensor)
+for i in node:
+    print(i, tokenizer.rev_get(i))
+tokenizer.save("out/vocab/")
+#midi = ct_tokens_to_midi_b5(tokenizer, torch.tensor(node), "out/d.mid")

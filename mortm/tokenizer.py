@@ -4,7 +4,7 @@ from numpy import ndarray
 
 import re
 from . import constants
-from .aya_node import Token, Start,Shift,Pitch,Velocity,Duration, StartRE
+from .aya_node import Token, Start,Shift,Pitch,Velocity,Duration, StartRE, MeasureToken
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -14,6 +14,7 @@ DURATION_TYPE = 'd'
 '''指示トークン'''
 START_TYPE = 's'
 SHIFT_TYPE = 'h'
+MEASURE_TYPE = 'm'
 
 '''変換の向き'''
 TO_TOKEN = 0
@@ -22,8 +23,7 @@ TO_MUSIC = 1
 def get_token_converter(convert: int) -> List[Token]:
     register: List[Token] = list()
 
-    #register.append(Shift(tempo, SHIFT_TYPE, convert))
-    #register.append(Start(tempo, START_TYPE, convert))
+    register.append(MeasureToken(MEASURE_TYPE, convert))
     register.append(StartRE( START_TYPE, convert))
     register.append(Pitch( PITCH_TYPE, convert))
     #register.append(Velocity(tempo, VELOCITY_TYPE))

@@ -169,11 +169,18 @@ class MidiToAyaNode(_AbstractMidiToAyaNode):
         for note in sorted_notes:
             note: Note = note
 
-            if back_note is None:
-                clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
-
             tempo = self.get_tempo(note.start)
             measure_time = (60 / tempo) * 4
+
+            if clip_time >= measure_time * 8 * split_count:
+                aya_node_inst = self.marge_clip(clip, aya_node_inst)
+
+                clip = np.array([], dtype=int)
+                back_note = None
+                split_count += 1
+
+            if back_note is None:
+                clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
 
             for conv in self.token_converter:
                 conv: Token = conv
@@ -186,14 +193,6 @@ class MidiToAyaNode(_AbstractMidiToAyaNode):
             back_note = note
             clip_time = note.start
 
-            if clip_time >= measure_time * 8 * split_count:
-                aya_node_inst = self.marge_clip(clip, aya_node_inst)
-
-                clip = np.array([], dtype=int)
-                back_note = None
-
-                clip_time = 0.0
-                split_count += 1
         if len(clip) > 50:
             clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
             aya_node_inst = self.marge_clip(clip, aya_node_inst)
@@ -292,11 +291,23 @@ class MidiToAyaNode_TGT(_AbstractMidiToAyaNode):
         for note in sorted_notes:
             note: Note = note
 
-            if back_note is None:
-                clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
-
             tempo = self.get_tempo(note.start)
             measure_time = (60 / tempo) * 4
+
+            if clip_time >= measure_time * 4 * split_count:
+                if is_seq:
+                    clip_dict['src'] = clip.tolist()
+                else:
+                    clip_dict['tgt'] = clip.tolist()
+                    aya_node_inst = np.append(aya_node_inst, clip_dict)
+
+                clip_dict = dict()
+                clip = np.array([], dtype=int)
+                is_seq = not is_seq
+                split_count += 1
+
+            if back_note is None:
+                clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
 
             for conv in self.token_converter:
                 conv: Token = conv
@@ -309,18 +320,7 @@ class MidiToAyaNode_TGT(_AbstractMidiToAyaNode):
             back_note = note
             clip_time = note.start
 
-            if clip_time >= measure_time * 4 * split_count:
-                if is_seq:
-                    clip_dict['src'] = clip.tolist()
-                else:
-                    clip_dict['tgt'] = clip.tolist()
-                    aya_node_inst = np.append(aya_node_inst, clip_dict)
 
-                clip_dict = dict()
-                clip = np.array([], dtype=int)
-                is_seq = not is_seq
-                clip_time = 0.0
-                split_count += 1
         return aya_node_inst.tolist()
 
     def marge_clip(self, clip, aya_node_inst):
