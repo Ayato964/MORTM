@@ -68,7 +68,7 @@ class Token:
             if split[0] == self.token_type:
                 try:
                     symbol = int(float(split[-1]))
-                except ValueError | TypeError:
+                except (ValueError, TypeError):
                     symbol = split[-1]
                 self.de_convert(symbol, back_notes, note, tempo)
                 return split[0]
