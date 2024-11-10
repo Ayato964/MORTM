@@ -45,7 +45,7 @@ class Token:
         pass
 
     @abstractmethod
-    def de_convert(self, number: int, back_note:Note, note: Note, tempo: int):
+    def de_convert(self, number: int | str, back_note:Note, note: Note, tempo: int):
         pass
 
     @abstractmethod
@@ -66,7 +66,10 @@ class Token:
                 return None
             split = token.split("_")
             if split[0] == self.token_type:
-                self.de_convert(int(float(split[-1])), back_notes, note, tempo)
+                symbol = split[-1]
+                if not isinstance(symbol, str):
+                    symbol = int(float(symbol))
+                self.de_convert(symbol, back_notes, note, tempo)
                 return split[0]
             else:
                 return None
