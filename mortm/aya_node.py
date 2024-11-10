@@ -13,6 +13,8 @@ def ct_time_to_beat(time: float, tempo: int) -> int:
     beat, sub = calc_time_to_beat(time, b64)
 
     return beat
+
+
 def ct_beat_to_time(beat: float, tempo: int) -> float:
     b4 = 60 / tempo
     b8 = b4 / 2
@@ -35,7 +37,7 @@ class Token:
         self.convert_type = convert_type
 
     @abstractmethod
-    def get_token(self, back_notes: Note, note: Note, tempo:int) -> int:
+    def get_token(self, back_notes: Note, note: Note, tempo: int) -> int | str | None:
         pass
 
     @abstractmethod
@@ -50,10 +52,11 @@ class Token:
     def set_tokens(self, tokens: dict):
         pass
 
-    def __call__(self, back_notes: Note = None, note: Note= None, token:str=None, tempo: int= 120, *args, **kwargs):
+    def __call__(self, back_notes: Note = None, note: Note = None, token: str = None, tempo: int = 120, *args,
+                 **kwargs):
         if self.convert_type == 0:
-            symbol: int = self.get_token(back_notes, note, tempo)
-            if symbol == -999:
+            symbol: int | str | None = self.get_token(back_notes, note, tempo)
+            if symbol == -999 or symbol is None:
                 my_token = None
                 pass
             else:
@@ -69,6 +72,32 @@ class Token:
                 return None, None
 
         return my_token
+
+
+class MeasureToken(Token):
+
+
+    def get_range(self) -> int:
+        return 1
+
+    def de_convert(self, number: int, tempo: int):
+        return None
+
+    def set_tokens(self, tokens: dict):
+        tokens[f'm_start'] = len(tokens)
+
+    def get_token(self, back_notes: Note, note: Note, tempo: int) -> int or None or str:
+        measure1 = 60 / tempo * 4
+        if back_notes is not None:
+            note_measure = note.start // measure1
+            back_note_measure = note.start // measure1
+            if note_measure > back_note_measure:
+                return "start"
+            else:
+                return None
+        else:
+            return "start"
+
 
 
 class StartRE(Token):
@@ -124,7 +153,6 @@ class Pitch(Token):
 
 
 class Velocity(Token):
-
 
     def set_tokens(self, tokens: dict):
         max_length = 127

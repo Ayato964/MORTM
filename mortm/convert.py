@@ -315,9 +315,9 @@ class MidiToAyaNode_TGT(_AbstractMidiToAyaNode):
                 else:
                     clip_dict['tgt'] = clip.tolist()
                     aya_node_inst = np.append(aya_node_inst, clip_dict)
-                    clip_dict = dict()
-                    clip = np.array([], dtype=int)
 
+                clip_dict = dict()
+                clip = np.array([], dtype=int)
                 is_seq = not is_seq
                 clip_time = 0.0
                 split_count += 1

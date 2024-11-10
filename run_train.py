@@ -13,11 +13,10 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
-model = train_mortm("out/np/turing/", "out/model", "test",
+model = train_mortm("out/np/datasets/", "out/model", "test",
                     517, 5, "out/vocab/vocab_max.json",
                     begin_tuning_epoch=2,
-                    fine_turing_mode=True,
                     is_save_training_progress=True,
-                    src_mask_method=get_masks(tokenizer, METRIC_RANDOM_MASK), #ファインチューニング
+                    #src_mask_method=get_masks(tokenizer, METRIC_RANDOM_MASK), #ファインチューニング
                     load_model_directory="out/model/MORTM.1.1-b1-Horn.pth")
 

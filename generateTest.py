@@ -36,9 +36,9 @@ model = MORTM(
     position_length=8500,
     trans_layer=9, num_heads=32, d_model=1024,
     dim_feedforward=4096,
-    use_decoder=True
+
 )
-model.load_state_dict(torch.load("out/model/MORTM.train.1.0.0658.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.1.1-b1-Horn.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -70,7 +70,7 @@ print(f"First:{start}") # ロードしたシーケンスを表示
     - これは、確率の高い順番からK個のトークンを取得し、サンプリングを行います。複数存在する場合、ランダムでトークンを選びます。
 '''
 #gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=2.0)
-gene = model.top_k_sampling_length_decoder(start, max_length=10, temperature=0.9, top_k=5)
+gene = model.top_k_sampling_length_encoder(start, max_length=500, temperature=0.9, top_k=5)
 
 output = gene
 for t in output:

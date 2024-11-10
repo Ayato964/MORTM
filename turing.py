@@ -14,12 +14,16 @@ for file in file_name:
     con = MidiToAyaNode_TGT(tokenizer, directory, file, program_list=[65, 66])
     con_list:List[MidiToAyaNode] = con.expansion_midi()
     con.convert()
+    is_saved, reason = con.save("./out/np/turing/")
+    print(is_saved, reason)
 
+'''
     for c in con_list:
         c.convert()
         is_saved, reason = c.save("./out/np/turing/")
         print(reason)
 
     is_saved, reason = con.save("./out/np/turing/")
+'''
 
 tokenizer.save("./out/vocab/")
