@@ -9,7 +9,7 @@ from mortm.tokenizer import TO_TOKEN, TO_MUSIC
 
 from mortm.progress import _DefaultLearningProgress
 from mortm.tokenizer import get_token_converter
-from mortm.de_convert import ct_tokens_to_midi_b5
+from mortm.de_convert import ct_token_to_midi
 
 '''
 MORTMのバージョンは常に新しくなる為、モデルのバージョンとvocab_list.jsonを確認してください。
@@ -32,13 +32,13 @@ tokenizer = token.Tokenizer(token=get_token_converter(TO_MUSIC), load_data="out/
 
 model = MORTM(
     progress=_DefaultLearningProgress(),
-    vocab_size=517,
+    vocab_size=518,
     position_length=8500,
     trans_layer=9, num_heads=32, d_model=1024,
     dim_feedforward=4096,
 
 )
-model.load_state_dict(torch.load("out/model/MORTM.1.1-b1-Horn.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.train.0.2.1822.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -50,7 +50,7 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/np/Sample.mid.npz")
+np_notes = np.load("out/Sample.mid.npz")
 
 start = np_notes[f'array1'][:-1]
 
@@ -70,7 +70,8 @@ print(f"First:{start}") # ロードしたシーケンスを表示
     - これは、確率の高い順番からK個のトークンを取得し、サンプリングを行います。複数存在する場合、ランダムでトークンを選びます。
 '''
 #gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=2.0)
-gene = model.top_k_sampling_length_encoder(start, max_length=500, temperature=0.9, top_k=5)
+#gene, p = model.top_k_sampling_length_encoder(start, max_length=500, temperature=0.9, top_k=8)
+gene = model.argmax_sampling_encoder(start, max_length=500)
 
 output = gene
 for t in output:
@@ -78,4 +79,4 @@ for t in output:
     print(f"{t}  {tokenizer.rev_get(t.tolist())}")
 
 
-midi = ct_tokens_to_midi_b5(tokenizer, output, "out/generate_test.midi") #生成したトークンをMIDIに変換する。
+midi = ct_token_to_midi(tokenizer, output, "out/generate_test.midi") #生成したトークンをMIDIに変換する。

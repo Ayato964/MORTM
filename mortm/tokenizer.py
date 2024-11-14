@@ -43,7 +43,7 @@ class Tokenizer:
             self.tokens[constants.START_SEQ_TOKEN] = 1
             self.tokens[constants.END_SEQ_TOKEN] = 2
             for t in token:
-                t.set_tokens(self.tokens)
+                t._set_tokens(self.tokens)
 
             self.token_max: dict = self._init_mx_dict(len(self.tokens))
             self.is_converter = False
@@ -53,6 +53,8 @@ class Tokenizer:
             with open(load_data, 'r') as file:
                 self.tokens: dict = json.load(file)
                 self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
+            for token in self.token_list:
+                (token.set_token_range(self.rev_tokens))
 
     def _init_mx_dict(self, mx) -> dict:
         my_dict = dict()

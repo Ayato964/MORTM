@@ -36,6 +36,9 @@ class Token:
         self.token_position = 0
         self.convert_type = convert_type
 
+        self.start = 0
+        self.end = 0
+
     @abstractmethod
     def get_token(self, back_notes: Note, note: Note, tempo: int) -> int | str | None:
         pass
@@ -49,7 +52,7 @@ class Token:
         pass
 
     @abstractmethod
-    def set_tokens(self, tokens: dict):
+    def _set_tokens(self, tokens: dict):
         pass
 
     def __call__(self, back_notes: Note = None, note: Note = None, token: str = None, tempo: int = 120, *args,
@@ -77,6 +80,26 @@ class Token:
 
         return my_token
 
+    def set_tokens(self, tokens:dict):
+        self.start = len(tokens)
+        self._set_tokens(tokens)
+        self.end = len(tokens) - 1
+
+    @abstractmethod
+    def is_my_token(self, seq):
+        pass
+
+    def set_token_range(self, rev_tokens):
+        is_counting = False
+        for i in range(len(rev_tokens)):
+
+            if self.token_type in rev_tokens[i]:
+                self.start = i
+                is_counting = True
+            elif is_counting:
+                self.end = i - 1
+        pass
+
 
 class MeasureToken(Token):
 
@@ -86,7 +109,7 @@ class MeasureToken(Token):
     def de_convert(self, number: int, b, n, tempo: int):
         pass
 
-    def set_tokens(self, tokens: dict):
+    def _set_tokens(self, tokens: dict):
         tokens[f'm_start'] = len(tokens)
 
     def get_token(self, back_notes: Note, note: Note, tempo: int) -> int or None or str:
@@ -104,7 +127,7 @@ class MeasureToken(Token):
 
 class StartRE(Token):
 
-    def set_tokens(self, tokens: dict):
+    def _set_tokens(self, tokens: dict):
         max_length = 192
         tokens_length = len(tokens)
         for i in range(max_length + 1):
@@ -137,7 +160,7 @@ class StartRE(Token):
 
 class Pitch(Token):
 
-    def set_tokens(self, tokens: dict):
+    def _set_tokens(self, tokens: dict):
         max_length = 127
         tokens_length = len(tokens)
         for i in range(max_length + 1):
@@ -156,7 +179,7 @@ class Pitch(Token):
 
 class Velocity(Token):
 
-    def set_tokens(self, tokens: dict):
+    def _set_tokens(self, tokens: dict):
         max_length = 127
         tokens_length = len(tokens)
         for i in range(max_length + 1):
@@ -175,7 +198,7 @@ class Velocity(Token):
 
 class Duration(Token):
 
-    def set_tokens(self, tokens: dict):
+    def _set_tokens(self, tokens: dict):
         max_length = 192
         tokens_length = len(tokens)
         for i in range(max_length + 1):

@@ -32,9 +32,9 @@ ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 6
 
 
 
-datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+#datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
 #datasets = "G:\情報科学科\研究室\datasets\MMD_MIDI"
-#datasets = "data/other"
+datasets = "data/other"
 directory, md_file = find_midi_files(datasets)
 
 
@@ -47,14 +47,14 @@ reasons = dict()
 for i in range(len(md_file)):
     con = MidiToAyaNode(tokenizer, directory[i], md_file[i], BRASS)
     con.convert()
-    is_saved, reason = con.save("out/np/datasets")
+    is_saved, reason = con.save("out/np/turing/")
     if is_saved:
         count += 1
 
     print(f"\r Save Count:{count} Step;{i}/{len(md_file)} Result:{reason}  Loaded:[{md_file[i]}] ", end="")
 
-    #if count - 1 >= 20000:
-    #    break
+    if count - 1 >= 10:
+        break
 
 tokenizer.save("out/vocab/")
 print(len(tokenizer.tokens))
