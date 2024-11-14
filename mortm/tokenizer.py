@@ -114,3 +114,8 @@ class Tokenizer:
             token = len(self.rev_tokens) - 1 - i
             if token_type in self.rev_tokens[token]:
                 return token
+
+    def get_token_converter(self, token_type) -> Token:
+        for token in self.token_list:
+            if token_type == token.token_type:
+                return token

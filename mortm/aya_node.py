@@ -92,12 +92,16 @@ class Token:
     def set_token_range(self, rev_tokens):
         is_counting = False
         for i in range(len(rev_tokens)):
-
             if self.token_type in rev_tokens[i]:
-                self.start = i
+                if not is_counting:
+                    self.start = i
                 is_counting = True
             elif is_counting:
                 self.end = i - 1
+                is_counting = False
+                break
+        if is_counting:
+            self.end = len(rev_tokens) - 1
         pass
 
 

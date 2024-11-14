@@ -6,7 +6,7 @@ from typing import List
 from torch.distributions import Categorical
 from torch import Tensor
 from .mortm import MORTM
-from .tokenizer import Tokenizer
+from .tokenizer import Tokenizer, PITCH_TYPE
 from .train import _set_train_data
 from .progress import _DefaultLearningProgress, LearningProgress
 from .datasets import MORTM_DataSets
@@ -31,6 +31,7 @@ def get_convert_measure_list(sequence):
     segments = []
     start_idx = None
     for i, val in enumerate(sequence):
+        #print(i, val)
         if val == 3:
             if start_idx is not None and i > start_idx:
                 segments.append(sequence[start_idx:i])
@@ -61,8 +62,13 @@ def compose_sequence_reward(sequence: Tensor, tokenizer: Tokenizer):
     return reward
 
 
-def compose_measure_reward(measure, tokenizer):
+def compose_measure_reward(measure, tokenizer: Tokenizer):
     reward = 0
+    pitch_token: Token = tokenizer.get_token_converter(PITCH_TYPE)
+    measure = measure[(pitch_token.start <= measure) & (measure <= pitch_token.end)]
+
+    for token in enumerate(measure):
+        pass
 
     return reward
 
@@ -70,6 +76,7 @@ def compose_measure_reward(measure, tokenizer):
 def _reward_function(base_seq, sequence, tokenizer: Tokenizer):
     seq = remove_subsequence_tensor(sequence, base_seq)
     measure_list = get_convert_measure_list(seq)
+    print(measure_list)
     reward = 0
     for measure in measure_list:
         reward += (compose_sequence_reward(measure, tokenizer)
@@ -79,6 +86,7 @@ def _reward_function(base_seq, sequence, tokenizer: Tokenizer):
 
 def calculate_scst_loss(log_probs, sample_reward, baseline_reward):
     loss = - (sample_reward - baseline_reward) * log_probs.sum()
+    print(sample_reward - baseline_reward)
     return loss
 
 
