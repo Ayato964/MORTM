@@ -22,14 +22,13 @@ class MORTM_DataSets(Dataset):
         return torch.tensor(self.musics_seq[item], dtype=torch.long, device=self.progress.get_device())
 
     def add_data(self, music_seq: np.ndarray):
-
+        suc_count = 0
         for i in range(len(music_seq) - 1):
             aya_node = music_seq[f'array{i + 1}']
-            if len(aya_node) < 2000:
+            if 300 < len(aya_node) < 2000 or 2 in aya_node:
                 self.musics_seq = self.musics_seq + [aya_node.tolist()]
-            else:
-                print(f"旋律の数が理論値こ超えている。\n　これは妙だな! \n aya_node ->{len(aya_node)}")
-        pass
+                suc_count += 1
+        return suc_count
 
     def split_seq_data(self):
         new_music_seq = [[]]

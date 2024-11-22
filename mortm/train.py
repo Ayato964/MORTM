@@ -28,8 +28,8 @@ from .progress import LearningProgress, _DefaultLearningProgress
 from .datasets import MORTM_DataSets, MORTMTuringDataset
 from .mortm import MORTM
 from .noam import noam_lr
-from .loss import MORTCrossEntropyLoss
-
+from .loss import ReinforceCrossEntropy
+from .tokenizer import Tokenizer
 IS_DEBUG = False
 
 
@@ -57,13 +57,16 @@ def _set_train_data(directory, datasets, progress: LearningProgress, is_fine_tur
     print("Starting load....")
     mortm_datasets = MORTM_DataSets(progress) if not is_fine_turing else MORTMTuringDataset(progress)
     loss_count = 0
+    count = 0
+    dataset_length = 0
     loss_data = 1 if not is_fine_turing else 0
     for dataset in datasets:
-        print(f"Load [{directory + dataset}]")
+        count += 1
+
         np_load_data = np.load(directory + dataset, allow_pickle=True)
         if len(np_load_data) > loss_data:
-            mortm_datasets.add_data(np_load_data)
-            print(f"最初の5音:{mortm_datasets.musics_seq[-1][:5]}")
+            dataset_length += mortm_datasets.add_data(np_load_data)
+            print(f"\r {count}/{len(datasets)} | Dataset Length:{dataset_length} | Load[{directory + dataset}]", end="")
         else:
             loss_count += 1
     print("load Successful!!")
@@ -92,15 +95,30 @@ def update_log(model, writer, global_step):
 
         writer.add_scalar(f"Parameter Value/{name}", param.norm(), global_step)
 
+def get_color(criterion: ReinforceCrossEntropy):
+    if criterion.te < 0.1:
+        return "\033[32m"
+    elif criterion.te < 0.25:
+        return "\033[33m"
+    elif criterion.te < 0.5:
+        return "\033[34m"
+    elif criterion.te < 0.75:
+        return "\033[35m"
+    elif criterion.te < 0.95:
+        return "\033[36m"
+    else:
+        return "\033[37m"
 
-def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
+def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss, criterion:ReinforceCrossEntropy):
     per = sequence / batch_size * 100
     block = int(per / 100 * 50)
-    bar = f" \033[32m{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
+    color_bar = get_color(criterion)
+    #color_bar = "\033[32m"
+    bar = f" {color_bar}{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
     print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
 
 
-def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
+def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
                        trans_layer=6, load_model_directory:str = None, use_rpr=False, src_mask_method: Callable[[Tensor], Tensor]=None,
                        num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
                        position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
@@ -115,8 +133,8 @@ def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_
     if load_model_directory is not None:
         model.load_state_dict(torch.load(load_model_directory))
 
-    criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
-
+    #criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
+    criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=7000, weight=weight.to(progress.get_device()))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
@@ -163,6 +181,8 @@ def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_
                 if count % accumulation_steps == 0:  #実質バッチサイズは64である
                     progress.step_optimizer(optimizer, model, accumulation_steps)
                     scheduler.step()
+                    criterion.step()
+                    torch.cuda.empty_cache()
 
                 count += 1
                 end_time = time.time()
@@ -174,22 +194,27 @@ def _train_self_tuning(save_directory, ayato_dataset, message: Messenger, vocab_
 
                 if (count + 1) % message.step_by_message_count == 0:
                     message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
-                                                                       f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。")
+                                                                       f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。\n"
+                                                                       f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-                progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss)
+                progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss, criterion)
 
 
             message.send_message("機械学習の途中経過について",
-                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
+                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。"
+                                     f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
             loss_val = epoch_loss / count
             writer.add_scalar('Loss/train', epoch_loss / count, epoch)  # 損失値を記録
 
             if is_save_training_progress:
                 torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}.pth") #エポック終了時に途中経過を保存
                 print("途中経過を保存しました。")
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError or RuntimeError:
             torch.save(model.state_dict(), f"{save_directory}/MORTM.error_end.{epoch}.pth")
+            message.send_message("オーバーフローしました・。", f"{epoch}エポック中にオーバーフローが発生しました。\n"
+                                                              f"次のエポックに移行します。\n"
+                                                              f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
     writer.close()
 
     return model, loss_val
@@ -308,7 +333,7 @@ def _train_fine_turing(save_directory, ayato_dataset, message: Messenger, vocab_
 
     pass
 
-def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
+def train_mortm(tokenizer, dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=True, fine_turing_mode=False,
                 trans_layer=9, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1, begin_tuning_epoch=3,
                 dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
@@ -341,7 +366,7 @@ def train_mortm(dataset_directory, save_directory, version: str, vocab_size: int
 
             print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
         if not fine_turing_mode:
-            model, loss = _train_self_tuning(save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
+            model, loss = _train_self_tuning(tokenizer,save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
                                              load_model_directory=load_model_directory,
                                              d_model=d_model,
                                              dim_feedforward=dim_feedforward,

@@ -15,7 +15,8 @@ def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, prog
     token_converter_list = tokenizer.token_list
     for token_id in seq:
         token = tokenizer.rev_get(token_id.item())
-
+        if token_id == 2:
+            break
         for con in token_converter_list:
             token_type = con(token=token, back_notes=back_note, note=note)
             if token_type == DURATION_TYPE:

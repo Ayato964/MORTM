@@ -166,7 +166,7 @@ class MORTM(nn.Module):
         return input_sequence, torch.tensor(log_prob_list, device=self.progress.get_device())
 
     def argmax_sampling_encoder(self, input_sequence, max_length=500):
-        self.eval()
+        #self.eval()
         """
         MORTMモデルにトップKサンプリングと温度シーケンスを実装する関数
 
@@ -179,6 +179,7 @@ class MORTM(nn.Module):
         Returns:
             1次元の生成されたシーケンス (torch.Tensor)。
         """
+        log_prob_list = []
         # 入力シーケンスをtorch.tensorに変換
         if not isinstance(input_sequence, torch.Tensor):
             input_sequence = torch.tensor(input_sequence, dtype=torch.long, device=self.progress.get_device())
@@ -193,15 +194,13 @@ class MORTM(nn.Module):
         for i in range(max_length):
             # モデルに渡すための入力の準備 (2次元に変換)
             input_tensor = input_sequence.unsqueeze(0)  # (1, sequence_length)
-            #print(f"I{i} input_tensor")
+
             print(f"\r Generating...{i / max_length * 100}%", end="")
             # モデルに入力して次のトークンのスコアを取得 (3次元で返ってくる)
-            with torch.no_grad():
-                mask = self.transformer.generate_square_subsequent_mask(input_tensor.shape[1]).to(
-                    self.progress.get_device())
-                #print(input_tensor.shape)
-                scores = self(input_tensor)  # (1, sequence_length, vocab_size)
-                #print(f"SCORE: {scores.shape}")
+            mask = self.transformer.generate_square_subsequent_mask(input_tensor.shape[1]).to(
+                self.progress.get_device())
+
+            scores = self(input_tensor)  # (1, sequence_length, vocab_size)
 
             # 最新のトークンのスコアを取得 (最後のトークンに対するスコア)
             logits = scores[:, -1, :]  # (1, vocab_size)
@@ -209,14 +208,18 @@ class MORTM(nn.Module):
 
             # ソフトマックスを適用して確率を取得
             probs: Tensor = self.softmax(logits)  # (vocab_size)
-            next_token = probs.argmax(dim=-1)
+            d = Categorical(probs)
+            next_token = d.sample()
+
+            log_probs = d.log_prob(next_token)
+            log_prob_list.append(log_probs)
             # シーケンスにトークンを追加
             generated_sequence.append(next_token)
 
             # 次のステップの入力として準備
             input_sequence = torch.tensor(generated_sequence, dtype=torch.long, device=self.progress.get_device())
 
-        return input_sequence
+        return input_sequence, torch.stack(log_prob_list).to(self.progress.get_device())
 
 
     def top_k_sampling_length_decoder(self, input_sequence, temperature=1.0, top_k=3, max_length=100):

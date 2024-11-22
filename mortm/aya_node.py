@@ -30,6 +30,10 @@ def calc_time_to_beat(time, beat_time) -> (int, int):
     return main_beat, sub_time
 
 
+def _get_symbol(token: str):
+    split = token.split("_")
+    return int(float(split[-1]))
+
 class Token:
     def __init__(self, token_type: str, convert_type: int):
         self.token_type = token_type

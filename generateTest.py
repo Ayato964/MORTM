@@ -38,7 +38,7 @@ model = MORTM(
     dim_feedforward=4096,
 
 )
-model.load_state_dict(torch.load("out/model/MORTM1.1-b2_Horn.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTMv3.1.1-b2-Horn.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -50,7 +50,7 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/np/Sample.mid.npz")
+np_notes = np.load("out/Sample.mid.npz")
 
 start = np_notes[f'array1'][:-1]
 
@@ -69,9 +69,9 @@ print(f"First:{start}") # ロードしたシーケンスを表示
 2. Top K sampling
     - これは、確率の高い順番からK個のトークンを取得し、サンプリングを行います。複数存在する場合、ランダムでトークンを選びます。
 '''
-#gene = model.top_p_sampling(start, tokenizer, max_length=20, temperature=2.0)
-#gene, p = model.top_k_sampling_length_encoder(start, max_length=500, temperature=0.9, top_k=8)
-gene = model.argmax_sampling_encoder(start, max_length=500)
+
+gene, p = model.top_k_sampling_length_encoder(start, max_length=500, temperature=0.9, top_k=8)
+#gene = model.argmax_sampling_encoder(start, max_length=500)
 
 output = gene
 for t in output:

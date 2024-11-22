@@ -133,11 +133,9 @@ class MidiToAyaNode(_AbstractMidiToAyaNode):
             for inst in self.midi_data.instruments:
                 inst: Instrument = inst
                 if not inst.is_drum and inst.program in self.program_list:
-                    #print(f"Instrument Number:{inst.program}")
                     aya_node_inst = self.ct_aya_node(inst)
 
                     self.aya_node = self.aya_node + aya_node_inst
-                    #print(self.aya_node)
                     program_count += 1
 
             if program_count == 0:
@@ -206,7 +204,6 @@ class MidiToAyaNode(_AbstractMidiToAyaNode):
 
     def save(self, save_directory: str) -> [bool, str]:
         if not self.is_error:
-            #print(f"Result shape is:{self.aya_node.shape}")
 
             array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
             if len(array_dict) > 1:
@@ -231,7 +228,6 @@ class MidiToAyaNode_TGT(_AbstractMidiToAyaNode):
 
     def save(self, save_directory: str) -> [bool, str]:
         if not self.is_error:
-            #print(f"Result shape is:{self.aya_node.shape}")
 
             array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
             if len(array_dict) > 1:
@@ -253,11 +249,9 @@ class MidiToAyaNode_TGT(_AbstractMidiToAyaNode):
             for inst in self.midi_data.instruments:
                 inst: Instrument = inst
                 if not inst.is_drum and inst.program in self.program_list:
-                    #print(f"Instrument Number:{inst.program}")
                     aya_node_inst = self.ct_aya_node(inst)
 
                     self.aya_node = self.aya_node + aya_node_inst
-                    #print(self.aya_node)
                     program_count += 1
 
             if program_count == 0:

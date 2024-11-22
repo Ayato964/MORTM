@@ -1,58 +1,40 @@
-from torch.nn.modules.loss import _Loss
-import torch
+import math
+
+
 from torch.nn import CrossEntropyLoss, Softmax
 from torch import Tensor
-
-from . import constants
-
-
-class MORTCrossEntropyLoss(_Loss):
-
-    def __init__(self, device, penalty=0.1, ignore_index=0, weight=None):
-        super().__init__()
-        self.device = device
-        self.cross: CrossEntropyLoss = CrossEntropyLoss(ignore_index=ignore_index, weight=weight).to(device)
-        self.softmax: Softmax = Softmax(dim=-1).to(device)
-        self.penalty = penalty
-
-    def forward(self, outputs: Tensor, targets: Tensor):
-        '''
-        Scoreは通常予測トークンの確率分布(Vocab_size分)がシーケンスの長さの分はいっている。
-        MORTM専用のクロスエントロピーは、確率分布のうち、S -> P -> V -> D -> Hの順番を遵守していないバッチに対して
-        強い減点を与えることを目的としている。
-
-        :param outputs:
-        :param targets:
-        :return:
-        '''
-        score: Tensor = self.softmax(outputs).to(self.device)
-        score: Tensor = torch.argmax(score, dim=1).to(self.device)
-        score: Tensor = self.get_group_tensor(score).to(self.device)
-
-        t_score: Tensor = self.get_group_tensor(targets.to(self.device)).to(self.device)
-
-        mask = (score != 0) & (t_score != 0)  # 両方とも0でない位置だけを選択
-        diff_count = torch.sum(score[mask] != t_score[mask])
-
-        total_tokens = len(score)  # 評価対象となるトークンの数
-        if total_tokens > 0:
-            error_percentage = diff_count.item() / total_tokens  # 間違いの割合を計算
-        else:
-            error_percentage = 0  # トークンがない場合はエラーはゼロ
-
-        print(f"間違えた割合：{error_percentage} シーケンスの長さ{total_tokens}")
+from typing import Optional
+from .reinforcement import  _reward_function
+from .tokenizer import Tokenizer
 
 
-        return self.cross(outputs, targets) + error_percentage * self.penalty * 10
+class ReinforceCrossEntropy(CrossEntropyLoss):
 
-    def get_group_tensor(self, input_tensor: Tensor) -> Tensor:
-        output_tensor = torch.zeros_like(input_tensor).to(device=self.device)
-        # 各範囲に対してグループ番号を割り当て
-        output_tensor[torch.isin(input_tensor, torch.tensor(constants.PITCH_GROUP).to(self.device)).to(self.device)] = 1
-        output_tensor[torch.isin(input_tensor, torch.tensor(constants.VELOCITY_GROUP).to(self.device)).to(self.device)] = 2
-        output_tensor[torch.isin(input_tensor, torch.tensor(constants.DURATION_GROUP).to(self.device)).to(self.device)] = 3
-        output_tensor[torch.isin(input_tensor, torch.tensor(constants.START_GROUP).to(self.device)).to(self.device)] = 4
-        output_tensor[torch.isin(input_tensor, torch.tensor(constants.SHIFT_GROUP).to(self.device)).to(self.device)] = 5
-        output_tensor[torch.isin(input_tensor, torch.tensor([1, 2]).to(self.device)).to(self.device)] = 5
-        output_tensor[torch.isin(input_tensor, torch.tensor([0]).to(self.device)).to(self.device)] = 0
-        return output_tensor
+    def __init__(self, tokenizer: Tokenizer, k=1, warmup=100, weight: Optional[Tensor] = None, size_average=None,
+                 ignore_index: int = -100,
+                 reduce=None, reduction: str = 'mean', label_smoothing: float = 0.0) -> None:
+        super().__init__(weight=weight, size_average=size_average, ignore_index=ignore_index, reduce=reduce,
+                         reduction=reduction, label_smoothing=label_smoothing)
+        self.softmax = Softmax(dim=1)
+        self.tokenizer = tokenizer
+        self.cs: float = 0
+        self.te: float = 1
+        self.stepup = 0
+        self.k = k
+        self.warmup = warmup
+
+        self.step()
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        score: Tensor = self.softmax(input)
+        seq = score.argmax(dim=1)
+        l = _reward_function(None, seq, self.tokenizer)
+
+        return self.cs * super().forward(input, target) + self.te * l
+
+    def step(self):
+
+        self.stepup += 1
+        self.te =0.5 * (1 + math.cos(math.pi * (self.stepup - (2 * self.warmup)) / (2 * self.warmup)))
+        self.cs = 1 - self.te
+        pass
