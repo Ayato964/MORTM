@@ -10,17 +10,21 @@ from mortm.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
 from mortm.gmail_messanger import GmailMessanger, Messenger
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=50000)
+message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
 
 tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
-model = train_mortm(tokenizer, "out/np/datasets/", "out/model", "1.1-b3",
+model = train_mortm(tokenizer, "out/np/datasets/", "out/model", "1.1-b4",
                     518, 50, "out/vocab/vocab_max.json",
                     is_save_training_progress=True,
-                    warmup_steps=12000,
-                    message=message,
+                    d_model=1024,
+                    dim_feedforward=2048,
+                    trans_layer=12,
+                    warmup_steps=4000,
+                    num_heads=64,
+                    batch_size=1,
+                    accumulation_steps=32,
+                    message=message)
 
-
-
-                    load_model_directory="out/model/MORTMv3.1.1-b2-Horn.pth")
+                    #load_model_directory="out/model/MORTM.error_end.29.pth")
 

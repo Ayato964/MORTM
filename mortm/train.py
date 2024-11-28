@@ -134,7 +134,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
         model.load_state_dict(torch.load(load_model_directory))
 
     #criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
-    criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=7000, weight=weight.to(progress.get_device()))
+    criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=5000, weight=weight.to(progress.get_device()))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
@@ -181,7 +181,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
                 if count % accumulation_steps == 0:  #実質バッチサイズは64である
                     progress.step_optimizer(optimizer, model, accumulation_steps)
                     scheduler.step()
-                    criterion.step()
+                    #criterion.step()
                     torch.cuda.empty_cache()
 
                 count += 1

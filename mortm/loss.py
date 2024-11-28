@@ -17,13 +17,13 @@ class ReinforceCrossEntropy(CrossEntropyLoss):
                          reduction=reduction, label_smoothing=label_smoothing)
         self.softmax = Softmax(dim=1)
         self.tokenizer = tokenizer
-        self.cs: float = 0
-        self.te: float = 1
+        self.cs: float = 1
+        self.te: float = 0
         self.stepup = 0
         self.k = k
         self.warmup = warmup
 
-        self.step()
+        #self.step()
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
         score: Tensor = self.softmax(input)

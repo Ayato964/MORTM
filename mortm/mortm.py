@@ -135,7 +135,6 @@ class MORTM(nn.Module):
             # 温度の適用
             logits = logits / temperature
             logits = logits[-1, :]
-
             # ソフトマックスを適用して確率を取得
             probs = self.softmax(logits)  # (vocab_size)
 
@@ -205,6 +204,7 @@ class MORTM(nn.Module):
             # 最新のトークンのスコアを取得 (最後のトークンに対するスコア)
             logits = scores[:, -1, :]  # (1, vocab_size)
             logits = logits[-1, :]
+
 
             # ソフトマックスを適用して確率を取得
             probs: Tensor = self.softmax(logits)  # (vocab_size)
@@ -295,25 +295,33 @@ class MORTM(nn.Module):
         input_sequence = torch.cat((input_sequence, torch.tensor(generated_sequence, device=self.progress.get_device())))
         return input_sequence
 
-    def top_p_sampling_length(self, input_seq, p=0.8, max_length=20, temperature=0.2):
+    def top_p_sampling_length(self, input_seq, p=0.8, max_length=20, temperature=1.0):
         self.eval()
         if not isinstance(input_seq, torch.Tensor):
             input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
 
         generated = input_seq.tolist()
-        for _ in range(max_length):
+        for i in range(max_length):
+ #           print(f"INPUTS:   {input_seq}")
+
+            input_seq = input_seq.unsqueeze(0)
             logits= self(input_seq)
+            logits = logits[:, -1, :][-1, :]
             token = self.top_p_sampling(logits, p=p, temperature=temperature)
             generated.append(token)
+            input_seq = torch.tensor(generated, dtype=torch.long, device=self.progress.get_device())
+            if token == 2:
+                print("終了宣言されたため、処理を中断します。")
+                break
+            print(f"\r Generating... {i / max_length}%", end="")
 
-        input_seq = torch.tensor(generated, dtype=torch.long, device=self.progress.get_device())
         return input_seq
 
     def top_p_sampling(self, logits, p=0.9, temperature=1.0)-> int:
 
         logits = logits / temperature
         # logitsをソフトマックスで確率分布に変換
-        probs = self.softmax(logits, dim=-1)
+        probs = self.softmax(logits)
         # 確率の降順に並べ替え、そのインデックスを取得
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
 

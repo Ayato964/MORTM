@@ -25,7 +25,7 @@ class MORTM_DataSets(Dataset):
         suc_count = 0
         for i in range(len(music_seq) - 1):
             aya_node = music_seq[f'array{i + 1}']
-            if 300 < len(aya_node) < 2000 or 2 in aya_node:
+            if 100 < len(aya_node) < 1500 or 2 in aya_node:
                 self.musics_seq = self.musics_seq + [aya_node.tolist()]
                 suc_count += 1
         return suc_count
