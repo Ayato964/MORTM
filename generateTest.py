@@ -34,11 +34,11 @@ model = MORTM(
     progress=_DefaultLearningProgress(),
     vocab_size=518,
     position_length=8500,
-    trans_layer=9, num_heads=32, d_model=1024,
-    dim_feedforward=4096,
+    trans_layer=12, num_heads=64, d_model=1024,
+    dim_feedforward=2048,
 
 )
-model.load_state_dict(torch.load("out/model/MORTMv3.1.1b3-Horn.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.error_end.30.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -50,9 +50,9 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/Sample2.mid.npz")
+np_notes = np.load("out/Sample.mid.npz")
 
-start = np_notes[f'array1'][:-1]
+start = np_notes[f'array1'][:66]
 
 '''
 一から、もしくはメロディをプログラマーが設定したい場合、以下を実行します。
@@ -71,8 +71,8 @@ print(f"First:{start}") # ロードしたシーケンスを表示
 '''
 
 #gene, p = model.top_k_sampling_length_encoder(start, max_length=500, temperature=1.2, top_k=8)
-gene = model.top_p_sampling_length(start, max_length=500, temperature=1.1, p=0.95)
-#gene = model.argmax_sampling_encoder(start, max_length=500)
+gene = model.top_p_sampling_length(start, max_length=500, temperature=1.2, p=0.95)
+#gene = model.argmax_sampling_encoder(start, max_length=500, )
 
 output = gene
 for t in output:
