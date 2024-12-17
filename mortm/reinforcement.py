@@ -1,18 +1,11 @@
 import math
 
 import torch
-from torch.utils.data import DataLoader
-import torch.optim as optim
 from typing import List
 from torch import Tensor
-from .mortm import MORTM
 from .tokenizer import Tokenizer, PITCH_TYPE
 
-#from .train import _set_train_data
-from .progress import _DefaultLearningProgress, LearningProgress
-from .datasets import MORTM_DataSets
 from .aya_node import Token, _get_symbol
-import os
 
 
 def remove_subsequence_tensor(a, b):
@@ -62,7 +55,7 @@ def compose_sequence_reward(sequence: Tensor, tokenizer: Tokenizer):
         if len(token_list) <= token_count:
             token_count = 0
 
-    reward = _calc_loss(reward_count if token_count == 0 else 10, 0, 0.01)
+    reward = _calc_loss(reward_count if token_count == 0 else 10, 0, 1e-4)
 
     return reward
 
@@ -94,12 +87,13 @@ def compose_measure_reward(measure, tokenizer: Tokenizer, last_duration):
             duration += _get_symbol(tokenizer.rev_get(measure[i].item()))
 
         i += 1
-    reward = _calc_loss(duration, 64, 0.001)
+    reward = _calc_loss(duration, 64, 1e-5)
+
     return reward, ld
 
 
 def _calc_loss(x, n:int, k:float):
-    return math.e ** k * abs(x - n) - 1
+    return math.e ** (k * abs(x - n)) - 1
 
 
 def _reward_function(base_seq, sequence, tokenizer: Tokenizer):
@@ -124,59 +118,3 @@ def calc_mortm_loss(probs: Tensor, reward):
     loss = -(reward * probs.sum()) / 200
     return loss
 
-
-def re_train(epoch, model: MORTM, dataset_directory:str, tokenizer: Tokenizer,
-             lr=8e-6, progress:LearningProgress =_DefaultLearningProgress(), goal_loss= 1.0):
-    direct = os.listdir(dataset_directory)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    dataset:MORTM_DataSets = _set_train_data(dataset_directory, direct, progress, is_fine_turing=False)
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
-
-    for e in range(1, epoch + 1):
-        model.train()
-        optimizer.zero_grad()
-
-        for seq in loader:
-            is_reinforcement_goal = False
-            reinforce_counter = 0
-            while not is_reinforcement_goal:
-                input_seq: Tensor = seq.clone().to(progress.get_device())
-                input_seq = input_seq.squeeze(0)
-                input_seq = input_seq[:-1]
-                model.eval()
-                # サンプル
-                #sample, log_probs = model.top_k_sampling_length_encoder(seq, temperature=0.9, top_k=8, max_length=500)
-
-                # ベースライン(argmax)
-                baseline, log_probs = model.argmax_sampling_encoder(input_seq, max_length=200)
-
- #               sample_reward = _reward_function(seq, sample, tokenizer)
-                baseline_reward = _reward_function(input_seq, baseline, tokenizer)
-
-
-                model.train()
-                #loss = calculate_scst_loss(log_probs, sample_reward, baseline_reward)
-                loss = calc_mortm_loss(log_probs, baseline_reward)
-                print(f"現在の損失は[{loss: 4f}]になっています。")
-
-                loss.backward()
-#                for param in model.parameters():
-#                     print(param.grad)  # 勾配がNoneなら問題あり
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
-                print("更新中...")
-                optimizer.step()
-                print("リセット中....")
-                optimizer.zero_grad()
-                if reinforce_counter % 1000 == 0:
-                    torch.save(model.state_dict(), f"./out/model/MORTM.re.{epoch}.{reinforce_counter}_loss.{loss:.4f}.pth")
-
-                if loss < goal_loss:
-                    is_reinforcement_goal = True
-                    print("次のStepに移動します。")
-                    torch.save(model.state_dict(), f"./out/model/MORTM.re.{epoch}.{reinforce_counter}_loss.{loss:.4f}.pth")
-
-                del loss  # 損失を削除
-                torch.cuda.empty_cache()
-                reinforce_counter += 1
-
-            pass
