@@ -7,7 +7,7 @@ from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
 from abc import abstractmethod, ABC
 from typing import TypeVar, Generic
 from . import constants
-from .aya_node import Token
+from .aya_node import Token, MusicToken
 from .tokenizer import Tokenizer
 
 T = TypeVar("T")
@@ -19,7 +19,7 @@ class _AbstractMidiToAyaNode(ABC):
         self.file_name = file_name
         self.is_error = False
         self.instance = instance
-        self.token_converter: List[Token] = tokenizer.token_list
+        self.token_converter: List[Token] = tokenizer.music_token_list
         self.error_reason: str = "不明なエラー"
         self.tokenizer = tokenizer
 
@@ -99,10 +99,10 @@ class _AbstractMidiToAyaNode(ABC):
     def convert(self):
         pass
 
-class MidiToAyaNode(_AbstractMidiToAyaNode):
+class MIDIToSequence(_AbstractMidiToAyaNode):
 
     def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
-        super().__init__(MidiToAyaNode, tokenizer, directory, file_name, program_list, midi_data)
+        super().__init__(MIDIToSequence, tokenizer, directory, file_name, program_list, midi_data)
         self.aya_node = [0]
 
     def convert(self):
@@ -177,13 +177,17 @@ class MidiToAyaNode(_AbstractMidiToAyaNode):
                 back_note = None
                 split_count += 1
 
-            if back_note is None:
-                clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
+            for conv in self.tokenizer.special_token_list:
+                conv: Token = conv
+                token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo)
+                if token is not None:
+                    token_id = self.tokenizer.get(token)
+                    clip = np.append(clip, token_id)
 
             for conv in self.token_converter:
                 conv: Token = conv
 
-                token = conv(back_notes=back_note, note=note, tempo=tempo)
+                token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo)
                 if token is not None:
                     token_id = self.tokenizer.get(token)
                     clip = np.append(clip, token_id)
@@ -192,7 +196,7 @@ class MidiToAyaNode(_AbstractMidiToAyaNode):
             clip_time = note.start
 
         if len(clip) > 50:
-            clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
+            clip = np.append(clip, self.tokenizer.get("<TE>"))
             aya_node_inst = self.marge_clip(clip, aya_node_inst)
         return aya_node_inst
 
@@ -222,103 +226,3 @@ class MidiToAyaNode(_AbstractMidiToAyaNode):
         except OSError or IndexError or ValueError or mido.midifiles.meta.KeySignatureError or EOFError or KeyError or ZeroDivisionError:
             self.error_reason = f"{self.directory}/{self.file_name}でテンポ変換中にエラーが発生。処理を中断します。"
             self.is_error = True
-
-
-class MidiToAyaNode_TGT(_AbstractMidiToAyaNode):
-
-    def save(self, save_directory: str) -> [bool, str]:
-        if not self.is_error:
-
-            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
-            if len(array_dict) > 1:
-                np.savez(save_directory + "/" + self.file_name, **array_dict)
-                return True, "処理が正常に終了しました。"
-            else:
-                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
-        else:
-            return False, self.error_reason
-
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
-        super().__init__(MidiToAyaNode_TGT, tokenizer, directory, file_name, program_list, midi_data)
-        self.aya_node: List[dict] = []
-
-    def convert(self):
-        if not self.is_error:
-            program_count = 0
-
-            for inst in self.midi_data.instruments:
-                inst: Instrument = inst
-                if not inst.is_drum and inst.program in self.program_list:
-                    aya_node_inst = self.ct_aya_node(inst)
-
-                    self.aya_node = self.aya_node + aya_node_inst
-                    program_count += 1
-
-            if program_count == 0:
-                self.is_error = True
-                self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
-
-    def ct_aya_node(self, inst: Instrument) -> list:
-
-        """
-            Instrumentsから1音ずつ取り出し、Tokenizerで変換する。
-            clip = [<START>, S, P, V, D, H, S, P, V, D, H ...<END>]
-            さらに60秒ごとにスプリットし、以下のような配列構造を作る。
-            aya_node_inst = [clip_1, clip_2 ... clip_n]
-
-            よって、二次元配列のndarrayを返す。
-            :param inst: インストゥルメント
-            :return: 60秒にクリッピングされた旋律の配列(2次元)
-            """
-
-        clip = np.array([], dtype=int)
-        clip_dict: dict = dict()
-        aya_node_inst = np.array([], dtype=object)
-        is_seq = True
-        back_note = None
-
-        clip_time: float = 0
-        split_count: int = 1
-
-        sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
-
-        for note in sorted_notes:
-            note: Note = note
-
-            tempo = self.get_tempo(note.start)
-            measure_time = (60 / tempo) * 4
-
-            if clip_time >= measure_time * 4 * split_count:
-                if is_seq:
-                    clip_dict['src'] = clip.tolist()
-                else:
-                    clip_dict['tgt'] = clip.tolist()
-                    aya_node_inst = np.append(aya_node_inst, clip_dict)
-
-                clip_dict = dict()
-                clip = np.array([], dtype=int)
-                is_seq = not is_seq
-                split_count += 1
-
-            if back_note is None:
-                clip = np.append(clip, self.tokenizer.get(constants.START_SEQ_TOKEN))
-
-            for conv in self.token_converter:
-                conv: Token = conv
-
-                token = conv(back_notes=back_note, note=note, tempo=tempo)
-                if token is not None:
-                    token_id = self.tokenizer.get(token)
-                    clip = np.append(clip, token_id)
-
-            back_note = note
-            clip_time = note.start
-
-
-        return aya_node_inst.tolist()
-
-    def marge_clip(self, clip, aya_node_inst):
-        #clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
-        aya_node_inst.append(clip)
-
-        return aya_node_inst

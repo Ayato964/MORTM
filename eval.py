@@ -4,8 +4,8 @@ import mortm.eval as ev
 from mortm.mortm import MORTM
 from mortm.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
 from mortm.progress import _DefaultLearningProgress
-import numpy as np
-tokenizer = Tokenizer(token=get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
+
+tokenizer = Tokenizer(music_token=get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
 model = MORTM(
     progress=_DefaultLearningProgress(),
@@ -15,5 +15,5 @@ model = MORTM(
     dim_feedforward=4096,)
 model.load_state_dict(torch.load("out/model/MORTMv3.1.1b3-Horn.pth")) # モデルをロードする。
 
-eval = ev.EvalPianoRoll(model, "out/generate_test.midi")
+eval = ev.EvalPianoRoll(model, "out/Sample4_1.05.midi")
 eval.view()

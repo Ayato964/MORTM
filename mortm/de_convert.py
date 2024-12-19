@@ -12,7 +12,7 @@ def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, prog
     inst: Instrument = Instrument(program=program)
     note = Note(pitch=0, velocity=100, start=0, end=0)
     back_note = None
-    token_converter_list = tokenizer.token_list
+    token_converter_list = tokenizer.music_token_list
     for token_id in seq:
         token = tokenizer.rev_get(token_id.item())
         if token_id == 2:

@@ -45,7 +45,7 @@ def compose_sequence_reward(sequence: Tensor, tokenizer: Tokenizer):
     '''
 
     reward_count = 0
-    token_list: List[Token] = tokenizer.token_list[1:]
+    token_list: List[Token] = tokenizer.music_token_list[1:]
     token_count = 0
     for seq in enumerate(sequence):
         if not token_list[token_count].is_my_token(seq):

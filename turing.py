@@ -1,4 +1,4 @@
-from mortm.convert import MidiToAyaNode, MidiToAyaNode_TGT
+from mortm.convert import MIDIToSequence, MidiToAyaNode_TGT
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
 import numpy
 import os
@@ -12,7 +12,7 @@ file_name = os.listdir(directory)
 
 for file in file_name:
     con = MidiToAyaNode_TGT(tokenizer, directory, file, program_list=[65, 66])
-    con_list:List[MidiToAyaNode] = con.expansion_midi()
+    con_list:List[MIDIToSequence] = con.expansion_midi()
     con.convert()
     is_saved, reason = con.save("./out/np/turing/")
     print(is_saved, reason)

@@ -30,7 +30,7 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
     モデルによって異なるので、再度確認してください。
 '''
 
-tokenizer = token.Tokenizer(token=get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
+tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
 model = MORTM(
     progress=_DefaultLearningProgress(),

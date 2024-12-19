@@ -4,7 +4,7 @@ from numpy import ndarray
 
 import re
 from . import constants
-from .aya_node import Token, Start,Shift,Pitch,Velocity,Duration, StartRE, MeasureToken
+from .aya_node import Token, MusicToken, SpecialToken, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -20,41 +20,49 @@ MEASURE_TYPE = 'm'
 TO_TOKEN = 0
 TO_MUSIC = 1
 
-def get_token_converter(convert: int) -> List[Token]:
-    register: List[Token] = list()
 
-    register.append(MeasureToken(MEASURE_TYPE, convert))
+def get_token_converter(convert: int) -> List[MusicToken]:
+    register: List[MusicToken] = list()
+
     register.append(StartRE( START_TYPE, convert))
     register.append(Pitch( PITCH_TYPE, convert))
-    #register.append(Velocity(tempo, VELOCITY_TYPE))
     register.append(Duration(DURATION_TYPE, convert))
 
     return register
 
 
+def get_special_token_converter(convert: int) -> List[SpecialToken]:
+    register: List[SpecialToken] = list()
+
+    register.append(TrackStart(convert))
+    register.append(TrackEnd(convert))
+    register.append(MeasureToken(convert))
+
+    return register
+
 class Tokenizer:
-    def __init__(self, token: List[Token], load_data: str = None):
+    def __init__(self,special_token: List[SpecialToken], music_token: List[MusicToken], load_data: str = None):
         if load_data is None:
-            # 特殊トークン
-            self.special_token_position = 3
-            self.token_list = token
+
+            self.music_token_list = music_token
+            self.special_token_list = special_token
             self.tokens: dict = dict()
             self.tokens[constants.PADDING_TOKEN] = 0
-            self.tokens[constants.START_SEQ_TOKEN] = 1
-            self.tokens[constants.END_SEQ_TOKEN] = 2
-            for t in token:
-                t._set_tokens(self.tokens)
+            for t in special_token:
+                t.set_tokens(self.tokens)
+            for t in music_token:
+                t.set_tokens(self.tokens)
 
             self.token_max: dict = self._init_mx_dict(len(self.tokens))
             self.is_converter = False
         else:
             self.is_converter = True
-            self.token_list = token
+            self.music_token_list = music_token
             with open(load_data, 'r') as file:
                 self.tokens: dict = json.load(file)
                 self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
-            for token in self.token_list:
-                (token.set_token_range(self.rev_tokens))
+            #for token in self.token_list:
+            #    (token.set_token_range(self.rev_tokens))
 
     def _init_mx_dict(self, mx) -> dict:
         my_dict = dict()
@@ -77,7 +85,7 @@ class Tokenizer:
             return self.tokens[token]
 
     def get_length(self, token_type: str):
-        for t in self.token_list:
+        for t in self.music_token_list:
             if t.token_type == token_type:
                 p = t.token_position
                 t.token_position += 1
@@ -97,7 +105,7 @@ class Tokenizer:
 
     def rev_mode(self):
         self.is_converter = True
-        for li in self.token_list:
+        for li in self.music_token_list:
             li.convert_type = TO_MUSIC
         self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
         print(self.rev_tokens)
@@ -116,6 +124,6 @@ class Tokenizer:
                 return token
 
     def get_token_converter(self, token_type) -> Token:
-        for token in self.token_list:
+        for token in self.music_token_list:
             if token_type == token.token_type:
                 return token

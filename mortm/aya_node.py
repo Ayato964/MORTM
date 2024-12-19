@@ -1,5 +1,4 @@
-from pretty_midi.pretty_midi import Note
-
+from pretty_midi import Note, Instrument
 from abc import abstractmethod
 
 
@@ -44,11 +43,7 @@ class Token:
         self.end = 0
 
     @abstractmethod
-    def get_token(self, back_notes: Note, note: Note, tempo: int) -> int | str | None:
-        pass
-
-    @abstractmethod
-    def get_range(self) -> int:
+    def get_token(self, inst:Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
         pass
 
     @abstractmethod
@@ -59,31 +54,6 @@ class Token:
     def _set_tokens(self, tokens: dict):
         pass
 
-    def __call__(self, back_notes: Note = None, note: Note = None, token: str = None, tempo: int = 120, *args,
-                 **kwargs):
-        if self.convert_type == 0:
-            symbol: int | str | None = self.get_token(back_notes, note, tempo)
-            if symbol == -999 or symbol is None:
-                my_token = None
-                pass
-            else:
-                my_token = f"{self.token_type}_{symbol}"
-        else:
-            if token is None:
-                return None
-            split = token.split("_")
-            if split[0] == self.token_type:
-                try:
-                    symbol = int(float(split[-1]))
-                except (ValueError, TypeError):
-                    symbol = split[-1]
-                self.de_convert(symbol, back_notes, note, tempo)
-                return split[0]
-            else:
-                return None
-
-        return my_token
-
     def set_tokens(self, tokens:dict):
         self.start = len(tokens)
         self._set_tokens(tokens)
@@ -93,47 +63,106 @@ class Token:
     def is_my_token(self, seq):
         pass
 
-    def set_token_range(self, rev_tokens):
-        is_counting = False
-        for i in range(len(rev_tokens)):
-            if self.token_type in rev_tokens[i]:
-                if not is_counting:
-                    self.start = i
-                is_counting = True
-            elif is_counting:
-                self.end = i - 1
-                is_counting = False
-                break
-        if is_counting:
-            self.end = len(rev_tokens) - 1
+    @abstractmethod
+    def __call__(self, inst:Instrument=None,  back_notes: Note = None, note: Note = None, token:str =None, tempo=120, *args, **kwargs):
         pass
 
+class SpecialToken(Token):
 
-class MeasureToken(Token):
-
-    def get_range(self) -> int:
-        return 1
-
-    def de_convert(self, number: int, b, n, tempo: int):
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int):
         pass
 
     def _set_tokens(self, tokens: dict):
-        tokens[f'm_start'] = len(tokens)
+        tokens[self.token_type] = len(tokens)
 
-    def get_token(self, back_notes: Note, note: Note, tempo: int) -> int or None or str:
+    def is_my_token(self, seq):
+        pass
+
+    @abstractmethod
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+        pass
+
+    def __call__(self, inst:Instrument=None, back_notes: Note = None, note: Note = None, token:str =None, tempo=120, *args, **kwargs):
+        if self.convert_type == 0:
+            return self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo)
+        else:
+            return token == self.token_type
+
+
+class MusicToken(Token):
+
+    def __call__(self,inst:Instrument=None, back_notes: Note = None, note: Note = None, token:str =None, tempo=120, *args, **kwargs,):
+        if self.convert_type == 0:
+            return f"{self.token_type}_{self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo)}"
+        else:
+            if token is None:
+                return None
+            split = token.split("_")
+            if split[0] == self.token_type:
+                self.de_convert(split[1], back_notes, note, tempo)
+                return split[0]
+            else:
+                return None
+
+    @abstractmethod
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+        pass
+
+    @abstractmethod
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int):
+        pass
+
+    @abstractmethod
+    def _set_tokens(self, tokens: dict):
+        pass
+
+    @abstractmethod
+    def is_my_token(self, seq):
+        pass
+
+
+class MeasureToken(SpecialToken):
+    def __init__(self, convert_type: int):
+
+        super().__init__("<SME>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int or None or str:
         measure1 = 60 / tempo * 4
         if back_notes is not None:
             note_measure = note.start // measure1
             back_note_measure = back_notes.start // measure1
             if note_measure > back_note_measure:
-                return "start"
+                return self.token_type
             else:
                 return None
         else:
-            return "start"
+            return self.token_type
 
 
-class StartRE(Token):
+class TrackStart(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<TS>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+        if inst.notes[0] == note:
+            return self.token_type
+        else:
+            return None
+
+
+class TrackEnd(SpecialToken):
+
+    def __init__(self, convert_type: int):
+        super().__init__("<TE>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+        if inst.notes[-1] == note:
+            return self.token_type
+        else:
+            return None
+
+
+class StartRE(MusicToken):
 
     def _set_tokens(self, tokens: dict):
         max_length = 192
@@ -145,10 +174,7 @@ class StartRE(Token):
         shift = ct_beat_to_time(number, tempo)
         note.start = shift if back_note is None else shift + back_note.start
 
-    def get_range(self) -> int:
-        return 193
-
-    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo) -> int:
         now_start = ct_time_to_beat(note.start, tempo)
         if back_notes is not None:
             back_start = ct_time_to_beat(back_notes.start, tempo)
@@ -166,7 +192,10 @@ class StartRE(Token):
         return shift
 
 
-class Pitch(Token):
+class Pitch(MusicToken):
+
+    def is_my_token(self, seq):
+        pass
 
     def _set_tokens(self, tokens: dict):
         max_length = 127
@@ -177,34 +206,12 @@ class Pitch(Token):
     def de_convert(self, number: int, back_note, note: Note, tempo):
         note.pitch = number
 
-    def get_range(self) -> int:
-        return 129
-
-    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo) -> int:
         p: int = note.pitch
         return p
 
 
-class Velocity(Token):
-
-    def _set_tokens(self, tokens: dict):
-        max_length = 127
-        tokens_length = len(tokens)
-        for i in range(max_length + 1):
-            tokens[f'v_{i}'] = tokens_length + i
-
-    def de_convert(self, number: int, b, n: Note, tempo):
-        n.velocity = number
-
-    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
-        v: int = note.velocity
-        return v
-
-    def get_range(self) -> int:
-        return 128
-
-
-class Duration(Token):
+class Duration(MusicToken):
 
     def _set_tokens(self, tokens: dict):
         max_length = 192
@@ -216,7 +223,7 @@ class Duration(Token):
         duration = ct_beat_to_time(number, tempo)
         note.end = note.start + duration
 
-    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo) -> int:
         start = ct_time_to_beat(note.start, tempo)
         end = ct_time_to_beat(note.end, tempo)
         d = int(max(abs(end - start), 1))
@@ -225,47 +232,3 @@ class Duration(Token):
             d = 191
 
         return d
-
-    def get_range(self) -> int:
-        return 192
-
-
-class Start(Token):
-
-    def de_convert(self, number: int, tempo):
-        return ct_beat_to_time(number, tempo)
-
-    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
-        s = ct_time_to_beat(note.start, tempo)
-        return s % 64
-
-    def get_range(self) -> int:
-        return 64
-
-
-class Shift(Token):
-
-    def de_convert(self, number: int, tempo):
-        b4 = 60 / tempo
-        b8 = b4 / 2
-        b16 = b8 / 2
-        b32 = b16 / 2
-        b64 = b32 / 2
-        return b64 * 64 * number
-
-    def get_token(self, back_notes: Note, note: Note, tempo) -> int:
-        if back_notes is None:
-            return 0
-        else:
-            back_start = ct_time_to_beat(back_notes.start, tempo)
-            note_start = ct_time_to_beat(note.start, tempo)
-
-            shift = int(abs((back_start // 64) - (note_start // 64)))
-
-            if shift > 3:
-                shift = 3
-
-        return shift
-
-    def get_range(self) -> int:
-        return 4

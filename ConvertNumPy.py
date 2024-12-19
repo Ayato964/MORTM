@@ -3,7 +3,7 @@
 """
 #from mortm import gmail_messanger
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN
-from mortm.convert import MidiToAyaNode
+from mortm.convert import MIDIToSequence
 import os
 #from mortm.messager import Messenger
 
@@ -45,7 +45,7 @@ tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
 count = 0
 reasons = dict()
 for i in range(len(md_file)):
-    con = MidiToAyaNode(tokenizer, directory[i], md_file[i], BRASS)
+    con = MIDIToSequence(tokenizer, directory[i], md_file[i], BRASS)
     con.convert()
     is_saved, reason = con.save("out/np/turing/")
     if is_saved:
