@@ -7,7 +7,7 @@ from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
 from abc import abstractmethod, ABC
 from typing import TypeVar, Generic
 from . import constants
-from .aya_node import Token, MusicToken
+from .token import Token, MusicToken
 from .tokenizer import Tokenizer
 
 T = TypeVar("T")
@@ -22,7 +22,6 @@ class _AbstractMidiToAyaNode(ABC):
         self.token_converter: List[Token] = tokenizer.music_token_list
         self.error_reason: str = "不明なエラー"
         self.tokenizer = tokenizer
-
         if midi_data is not None:
             self.midi_data: PrettyMIDI = midi_data
         else:
@@ -159,8 +158,7 @@ class MIDIToSequence(_AbstractMidiToAyaNode):
         aya_node_inst = []
         back_note = None
 
-        clip_time: float = 0
-        split_count: int = 1
+        clip_count = 0
 
         sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
 
@@ -168,40 +166,31 @@ class MIDIToSequence(_AbstractMidiToAyaNode):
             note: Note = note
 
             tempo = self.get_tempo(note.start)
-            measure_time = (60 / tempo) * 4
-
-            if clip_time >= measure_time * 8 * split_count:
-                aya_node_inst = self.marge_clip(clip, aya_node_inst)
-
-                clip = np.array([], dtype=int)
-                back_note = None
-                split_count += 1
-
-            for conv in self.tokenizer.special_token_list:
-                conv: Token = conv
-                token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo)
-                if token is not None:
-                    token_id = self.tokenizer.get(token)
-                    clip = np.append(clip, token_id)
 
             for conv in self.token_converter:
                 conv: Token = conv
 
                 token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo)
+
                 if token is not None:
+                    if conv.token_type == "<SME>":
+                        clip_count += 1
+                    if clip_count >= 8:
+                        aya_node_inst = self.marge_clip(clip, aya_node_inst)
+                        clip = np.array([], dtype=int)
+                        back_note = None
+                        clip_count = 0
+
                     token_id = self.tokenizer.get(token)
                     clip = np.append(clip, token_id)
 
             back_note = note
-            clip_time = note.start
 
-        if len(clip) > 50:
-            clip = np.append(clip, self.tokenizer.get("<TE>"))
+        if len(clip) > 4:
             aya_node_inst = self.marge_clip(clip, aya_node_inst)
         return aya_node_inst
 
     def marge_clip(self, clip, aya_node_inst):
-        #clip = np.append(clip, self.tokenizer.get(constants.END_SEQ_TOKEN))
         aya_node_inst.append(clip)
 
         return aya_node_inst

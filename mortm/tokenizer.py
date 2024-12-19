@@ -4,7 +4,7 @@ from numpy import ndarray
 
 import re
 from . import constants
-from .aya_node import Token, MusicToken, SpecialToken, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd
+from .token import Token, MusicToken, SpecialToken, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -21,35 +21,27 @@ TO_TOKEN = 0
 TO_MUSIC = 1
 
 
-def get_token_converter(convert: int) -> List[MusicToken]:
-    register: List[MusicToken] = list()
+def get_token_converter(convert: int) -> List[Token]:
+    register: List[Token] = list()
 
+    register.append(TrackStart(convert))
+
+    register.append(MeasureToken(convert))
     register.append(StartRE( START_TYPE, convert))
     register.append(Pitch( PITCH_TYPE, convert))
     register.append(Duration(DURATION_TYPE, convert))
 
-    return register
-
-
-def get_special_token_converter(convert: int) -> List[SpecialToken]:
-    register: List[SpecialToken] = list()
-
-    register.append(TrackStart(convert))
     register.append(TrackEnd(convert))
-    register.append(MeasureToken(convert))
 
     return register
 
 class Tokenizer:
-    def __init__(self,special_token: List[SpecialToken], music_token: List[MusicToken], load_data: str = None):
+    def __init__(self,music_token: List[Token], load_data: str = None):
         if load_data is None:
 
             self.music_token_list = music_token
-            self.special_token_list = special_token
             self.tokens: dict = dict()
             self.tokens[constants.PADDING_TOKEN] = 0
-            for t in special_token:
-                t.set_tokens(self.tokens)
             for t in music_token:
                 t.set_tokens(self.tokens)
 

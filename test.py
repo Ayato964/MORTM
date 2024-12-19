@@ -1,9 +1,9 @@
 import torch
-from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN, TrackStart, TrackEnd, get_special_token_converter
+from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN, TrackStart, TrackEnd
 from mortm.convert import MIDIToSequence
 
-tokenizer = Tokenizer(special_token=get_special_token_converter(TO_TOKEN), music_token=get_token_converter(TO_TOKEN))
-seq = MIDIToSequence(tokenizer, "./out", "Sample1_1.2.midi", [1])
+tokenizer = Tokenizer(music_token=get_token_converter(TO_TOKEN))
+seq = MIDIToSequence(tokenizer, "./data/generate", "Sample2.mid", [0])
 seq()
 
 print(seq.aya_node)

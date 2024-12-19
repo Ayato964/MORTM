@@ -3,7 +3,7 @@ from pretty_midi import Instrument, Note, PrettyMIDI
 from typing import List
 
 from .tokenizer import Tokenizer, PITCH_TYPE, START_TYPE, SHIFT_TYPE, VELOCITY_TYPE, DURATION_TYPE
-from .aya_node import Token
+from .token import Token
 
 
 def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, program=1):
