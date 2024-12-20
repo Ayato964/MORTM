@@ -4,7 +4,7 @@ from numpy import ndarray
 
 import re
 from . import constants
-from .token import Token, MusicToken, SpecialToken, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd
+from .token import Token, MusicToken, SpecialToken, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd, Blank
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -27,8 +27,9 @@ def get_token_converter(convert: int) -> List[Token]:
     register.append(TrackStart(convert))
 
     register.append(MeasureToken(convert))
-    register.append(StartRE( START_TYPE, convert))
-    register.append(Pitch( PITCH_TYPE, convert))
+    register.append(Blank(convert))
+    register.append(StartRE(START_TYPE, convert))
+    register.append(Pitch(PITCH_TYPE, convert))
     register.append(Duration(DURATION_TYPE, convert))
 
     register.append(TrackEnd(convert))
@@ -53,8 +54,6 @@ class Tokenizer:
             with open(load_data, 'r') as file:
                 self.tokens: dict = json.load(file)
                 self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
-            #for token in self.token_list:
-            #    (token.set_token_range(self.rev_tokens))
 
     def _init_mx_dict(self, mx) -> dict:
         my_dict = dict()

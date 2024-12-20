@@ -6,8 +6,7 @@ from AGSM.convert import ConvTempo
 from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
 from abc import abstractmethod, ABC
 from typing import TypeVar, Generic
-from . import constants
-from .token import Token, MusicToken
+from .token import Token
 from .tokenizer import Tokenizer
 
 T = TypeVar("T")
@@ -206,12 +205,3 @@ class MIDIToSequence(_AbstractMidiToAyaNode):
                 return False, "オブジェクトが何らかの理由で見つかりませんでした。"
         else:
             return False, self.error_reason
-
-    def ct_tempo(self):
-        try:
-            ct = ConvTempo(directory=self.directory + "/" + self.file_name, midi_data=self.midi_data, change_tempo=120)
-            ct.convert()
-            self.midi_data = ct.midi_data
-        except OSError or IndexError or ValueError or mido.midifiles.meta.KeySignatureError or EOFError or KeyError or ZeroDivisionError:
-            self.error_reason = f"{self.directory}/{self.file_name}でテンポ変換中にエラーが発生。処理を中断します。"
-            self.is_error = True

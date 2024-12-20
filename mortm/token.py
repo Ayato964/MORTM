@@ -33,6 +33,8 @@ def _get_symbol(token: str):
     split = token.split("_")
     return int(float(split[-1]))
 
+
+
 class Token:
     def __init__(self, token_type: str, convert_type: int):
         self.token_type = token_type
@@ -160,12 +162,28 @@ class TrackEnd(SpecialToken):
             return self.token_type
         else:
             return None
+class Blank(SpecialToken):
+
+    def __init__(self, convert_type: int):
+        super().__init__("<BLANK>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+        measure1 = 60 / tempo * 4
+        if back_notes is not None:
+            note_measure = note.start // measure1
+            back_note_measure = back_notes.start // measure1
+            if note_measure > back_note_measure + 1:
+                return self.token_type
+            else:
+                return None
+        else:
+            return None
 
 
 class StartRE(MusicToken):
 
     def _set_tokens(self, tokens: dict):
-        max_length = 192
+        max_length = 64
         tokens_length = len(tokens)
         for i in range(max_length + 1):
             tokens[f's_{i}'] = tokens_length + i
@@ -175,21 +193,29 @@ class StartRE(MusicToken):
         note.start = shift if back_note is None else shift + back_note.start
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo) -> int:
+        measure1 = 60 / tempo * 4
         now_start = ct_time_to_beat(note.start, tempo)
         if back_notes is not None:
-            back_start = ct_time_to_beat(back_notes.start, tempo)
+            note_measure = note.start // measure1
+            back_note_measure = back_notes.start // measure1
+            if note_measure > back_note_measure:
+                shift = int(now_start)
+                if shift < 0:
+                    print("WHATS!?!?!?!?!?")
+                print(shift % 64)
+                return shift % 64
+            else:
+                back_start = ct_time_to_beat(back_notes.start, tempo)
+                shift = int(now_start - back_start)
+                if shift < 0:
+                    print("WHATS!?!?!?!?!?")
+                return shift
         else:
-            back_start = 0
-        shift = int(now_start - back_start)
+            shift = int(now_start)
+            if shift < 0:
+                print("WHATS!?!?!?!?!?")
+            return shift % 64
 
-        if shift < 0:
-            print("WHATS!?!?!?!?!?")
-
-        if shift > 192:
-            shift = 128 + shift % 64
-        if back_notes is None:
-            shift = shift % 64
-        return shift
 
 
 class Pitch(MusicToken):
