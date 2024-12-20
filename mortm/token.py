@@ -34,7 +34,6 @@ def _get_symbol(token: str):
     return int(float(split[-1]))
 
 
-
 class Token:
     def __init__(self, token_type: str, convert_type: int):
         self.token_type = token_type
@@ -45,18 +44,18 @@ class Token:
         self.end = 0
 
     @abstractmethod
-    def get_token(self, inst:Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
         pass
 
     @abstractmethod
-    def de_convert(self, number: int | str, back_note:Note, note: Note, tempo: int):
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int):
         pass
 
     @abstractmethod
     def _set_tokens(self, tokens: dict):
         pass
 
-    def set_tokens(self, tokens:dict):
+    def set_tokens(self, tokens: dict):
         self.start = len(tokens)
         self._set_tokens(tokens)
         self.end = len(tokens) - 1
@@ -66,8 +65,10 @@ class Token:
         pass
 
     @abstractmethod
-    def __call__(self, inst:Instrument=None,  back_notes: Note = None, note: Note = None, token:str =None, tempo=120, *args, **kwargs):
+    def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
+                 tempo=120, *args, **kwargs):
         pass
+
 
 class SpecialToken(Token):
 
@@ -84,7 +85,8 @@ class SpecialToken(Token):
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
         pass
 
-    def __call__(self, inst:Instrument=None, back_notes: Note = None, note: Note = None, token:str =None, tempo=120, *args, **kwargs):
+    def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
+                 tempo=120, *args, **kwargs):
         if self.convert_type == 0:
             return self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo)
         else:
@@ -93,7 +95,8 @@ class SpecialToken(Token):
 
 class MusicToken(Token):
 
-    def __call__(self,inst:Instrument=None, back_notes: Note = None, note: Note = None, token:str =None, tempo=120, *args, **kwargs,):
+    def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
+                 tempo=120, *args, **kwargs, ):
         if self.convert_type == 0:
             return f"{self.token_type}_{self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo)}"
         else:
@@ -162,6 +165,8 @@ class TrackEnd(SpecialToken):
             return self.token_type
         else:
             return None
+
+
 class Blank(SpecialToken):
 
     def __init__(self, convert_type: int):
@@ -178,6 +183,23 @@ class Blank(SpecialToken):
                 return None
         else:
             return None
+
+
+class SequenceEnd(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<ESEQ>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+        return None
+
+
+class Continue(SpecialToken):
+
+    def __init__(self, convert_type: int):
+        super().__init__("<CONTINUE>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+        return None
 
 
 class StartRE(MusicToken):
@@ -202,7 +224,7 @@ class StartRE(MusicToken):
                 shift = int(now_start)
                 if shift < 0:
                     print("WHATS!?!?!?!?!?")
-                print(shift % 64)
+                #print(shift % 64)
                 return shift % 64
             else:
                 back_start = ct_time_to_beat(back_notes.start, tempo)
@@ -215,7 +237,6 @@ class StartRE(MusicToken):
             if shift < 0:
                 print("WHATS!?!?!?!?!?")
             return shift % 64
-
 
 
 class Pitch(MusicToken):

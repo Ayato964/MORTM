@@ -4,7 +4,7 @@ from numpy import ndarray
 
 import re
 from . import constants
-from .token import Token, MusicToken, SpecialToken, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd, Blank
+from .token import Token, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd, Blank, SequenceEnd, Continue
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -25,6 +25,7 @@ def get_token_converter(convert: int) -> List[Token]:
     register: List[Token] = list()
 
     register.append(TrackStart(convert))
+    register.append(Continue(convert))
 
     register.append(MeasureToken(convert))
     register.append(Blank(convert))
@@ -32,6 +33,7 @@ def get_token_converter(convert: int) -> List[Token]:
     register.append(Pitch(PITCH_TYPE, convert))
     register.append(Duration(DURATION_TYPE, convert))
 
+    register.append(SequenceEnd(convert))
     register.append(TrackEnd(convert))
 
     return register

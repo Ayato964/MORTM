@@ -3,7 +3,7 @@
 """
 #from mortm import gmail_messanger
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN
-from mortm.convert import MIDIToSequence
+from mortm.convert import MidiToSequece
 import os
 #from mortm.messager import Messenger
 
@@ -24,7 +24,7 @@ def find_midi_files(root_folder):
 
 
 
-BRASS = [65, 66]
+SAX = [65, 66]
 PIANO = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 GUITAR = [25, 26, 27, 28, 29, 30, 31, 32]
 
@@ -32,9 +32,9 @@ ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 6
 
 
 
-#datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
 #datasets = "G:\情報科学科\研究室\datasets\MMD_MIDI"
-datasets = "data/other"
+#datasets = "data/other"
 directory, md_file = find_midi_files(datasets)
 
 
@@ -45,9 +45,9 @@ tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
 count = 0
 reasons = dict()
 for i in range(len(md_file)):
-    con = MIDIToSequence(tokenizer, directory[i], md_file[i], BRASS)
+    con = MidiToSequece(tokenizer, directory[i], md_file[i], SAX)
     con.convert()
-    is_saved, reason = con.save("out/np/turing/")
+    is_saved, reason = con.save("out/np/datasets/")
     if is_saved:
         count += 1
 
