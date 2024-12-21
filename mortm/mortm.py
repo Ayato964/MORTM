@@ -338,7 +338,7 @@ class DummyDecoder(nn.Module):
 
 class RPRTransformerDecoder(nn.Module):
     def __init__(self,d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps,  num_decoder_layer:int):
-        super().__init__(RPRTransformerDecoder)
+        super(RPRTransformerDecoder, self).__init__()
         self.num_layer = num_decoder_layer
         self.layers = _get_clones(RPRTransformerDecoderLayer(d_model=d_model, dim_ff=dim_ff,
                                                              num_head=num_head, dropout=dropout,
@@ -373,7 +373,7 @@ class RPRTransformerDecoder(nn.Module):
 
 class RPRTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps):
-        super().__init__(RPRTransformerDecoderLayer)
+        super(RPRTransformerDecoderLayer, self).__init__()
         self.multi_head_attention: MultiheadAttention = MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_head,
@@ -424,7 +424,7 @@ class RPRTransformerDecoderLayer(nn.Module):
                     key_padding_mask: Optional[Tensor],
                     is_causal: bool = False,
                     ):
-        y = self.multi_head_attention(y,y,y, attn_mask, key_padding_mask, is_causal, need_weights=True)[0]
+        y = self.multi_head_attention(y,y,y, attn_mask=attn_mask, key_padding_mask=key_padding_mask, is_causal=is_causal, need_weights=False)[0]
 
         return self.dropout1(y)
 
@@ -435,7 +435,7 @@ class RPRTransformerDecoderLayer(nn.Module):
                   key_padding_mask: Optional[Tensor],
                   is_causal: bool = False,
                   ):
-        y = self.rpr_attention(y, mem, mem,key_padding_mask=key_padding_mask,need_weights=False, attn_mask=attn_mask)
+        y = self.rpr_attention(y, mem, mem,key_padding_mask=key_padding_mask,need_weights=False, attn_mask=attn_mask)[0]
         return self.dropout2(y)
 
     def ff_block(self, y: Tensor):

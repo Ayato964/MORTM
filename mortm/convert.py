@@ -280,7 +280,7 @@ class MidiToSequece(_AbstractMidiToAyaNode):
         if np.isin(1, value):
             key = value
             value = np.array([], dtype=int)
-        elif np.sum(key==2) > self.context - 1:
+        elif np.sum(key==3) > self.context - 1:
             new_value = np.append(value, self.tokenizer.get("<ESEQ>"))
             new_value = np.insert(new_value, 0, self.tokenizer.get("<CONTINUE>"))
             clip = {
@@ -288,7 +288,7 @@ class MidiToSequece(_AbstractMidiToAyaNode):
                 'value': new_value.copy()
             }
             self.add_sequence(clip)
-            indices = np.where(key==2)[0][1]
+            indices = np.where(key==3)[0][1]
             key = key[indices:]
             key = np.concatenate((key, value))
             value = np.array([], dtype=int)

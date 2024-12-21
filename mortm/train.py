@@ -25,7 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
-from .datasets import MORTM_DataSets, MORTMTuringDataset
+from .datasets import MORTM_DataSets
 from .mortm import MORTM
 from .noam import noam_lr
 from .loss import ReinforceCrossEntropy
@@ -53,13 +53,13 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
 
 
 # デバイスを取得
-def _set_train_data(directory, datasets, progress: LearningProgress, is_fine_turing=False):
+def _set_train_data(directory, datasets, progress: LearningProgress):
     print("Starting load....")
-    mortm_datasets = MORTM_DataSets(progress) if not is_fine_turing else MORTMTuringDataset(progress)
+    mortm_datasets = MORTM_DataSets(progress)
     loss_count = 0
     count = 0
     dataset_length = 0
-    loss_data = 1 if not is_fine_turing else 0
+    loss_data = 4
     for dataset in datasets:
         count += 1
 
@@ -112,8 +112,8 @@ def get_color(criterion: ReinforceCrossEntropy):
 def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss, criterion:ReinforceCrossEntropy):
     per = sequence / batch_size * 100
     block = int(per / 100 * 50)
-    color_bar = get_color(criterion)
-    #color_bar = "\033[32m"
+    #color_bar = get_color(criterion)
+    color_bar = "\033[32m"
     bar = f" {color_bar}{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
     print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
 
@@ -124,7 +124,8 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
                        position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
     loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True,
-                        num_workers=num_workers, collate_fn=collate_fn)
+                        num_workers=num_workers, #collate_fn=collate_fn
+                        )
 
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, progress=progress, num_heads=num_heads, e_layer=e_layer, d_layer=d_layer,
@@ -133,7 +134,8 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
     if load_model_directory is not None:
         model.load_state_dict(torch.load(load_model_directory))
 
-    criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=10, weight=weight.to(progress.get_device()))
+    #criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=10, weight=weight.to(progress.get_device()))
+    criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
@@ -144,7 +146,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
     loss_val = None
     mail_bool = True
     for epoch in range(num_epochs):
-        criterion.step()
+        #criterion.step()
         try:
             print(f"epoch {epoch + 1} start....")
             count = 1
@@ -154,22 +156,17 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
             model.train()
             optimizer.zero_grad()
 
-            for inputs in loader:  # seqにはbatch_size分の楽曲が入っている
+            for src, tgt in loader:  # seqにはbatch_size分の楽曲が入っている
                 #print(f"learning sequence {count}")
                 begin_time = time.time()
-                input_ids: Tensor = inputs[:, :-1].to(progress.get_device())
-                targets: Tensor = inputs[:, 1:].to(progress.get_device())
 
+                padding_mask_in: Tensor = _get_padding_mask(src, progress)
+                padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-                padding_mask_in: Tensor = _get_padding_mask(input_ids, progress)
-
-                src_mask = None if src_mask_method is None else src_mask_method(input_ids)
-
-                output = model(inputs_seq=input_ids, src_mask=src_mask, input_padding_mask=padding_mask_in)
-
+                output = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg)
 
                 outputs = output.view(-1, output.size(-1)).to(progress.get_device())
-                targets = targets.reshape(-1).long()
+                targets = tgt.reshape(-1).long()
 
                 loss = criterion(outputs, targets)  # 損失を計算
                 epoch_loss += loss.item()
@@ -221,7 +218,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
 
 
 def train_mortm(tokenizer, dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
-                message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=True, fine_turing_mode=False,
+                message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
                 e_layer=9, d_layer=12, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1, begin_tuning_epoch=3,
                 dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(),):
@@ -232,7 +229,7 @@ def train_mortm(tokenizer, dataset_directory, save_directory, version: str, voca
     print(f"ToDay is{datetime.date.today()}! start generating MORTEM_Model.{version}_{today_date}")
 
     datasets = os.listdir(dataset_directory)
-    train_data = _set_train_data(dataset_directory, datasets, progress, fine_turing_mode)
+    train_data = _set_train_data(dataset_directory, datasets, progress)
 
     try:
         with open(weight_directory, 'r') as file:

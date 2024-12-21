@@ -1,63 +1,56 @@
-"""
-要確認
-"""
-#from mortm import gmail_messanger
-from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN
-from mortm.convert import MidiToSequece
 import os
-#from mortm.messager import Messenger
-
+import numpy as np
+from multiprocessing import Process, Manager
+from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.convert import MidiToSequece
 
 def find_midi_files(root_folder):
     midi_files = []
     direc = []
-    # Walk through the directory
     for defpath, surnames, filenames in os.walk(root_folder):
         for file in filenames:
-            # Check if the file is a MIDI file
             if file.lower().endswith(('.mid', '.midi')):
-                # Get the full path and add it to the list
                 midi_files.append(file)
                 direc.append(defpath)
-
     return direc, midi_files
 
+def convert(pid, tokenizer, directory, md_file, program, progress):
+    local_count = 0
+    for i in range(len(md_file)):
+        con = MidiToSequece(tokenizer, directory[i], md_file[i], program)
+        con.convert()
+        is_saved, reason = con.save("out/np/datasets/")
+        if is_saved:
+            local_count += 1
+        print(f"Process#{pid}: Running... {local_count}  {reason}")
+    progress[pid] = local_count
 
+if __name__ == "__main__":
+    THREAD_VALUE = 10
+    SAX = [65, 66]
 
-SAX = [65, 66]
-PIANO = [0, 1, 2, 3, 4, 5, 6, 7, 8]
-GUITAR = [25, 26, 27, 28, 29, 30, 31, 32]
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    directory, md_file = find_midi_files(datasets)
 
-ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 67, 68]
+    directory = np.array_split(directory, THREAD_VALUE)
+    md_file = np.array_split(md_file, THREAD_VALUE)
 
+    tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
 
+    with Manager() as manager:
+        progress = manager.dict()  # 共有辞書
+        processes = []
+        for t in range(THREAD_VALUE):
+            p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
+            processes.append(p)
+            p.start()
 
-#datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-#datasets = "G:\情報科学科\研究室\datasets\MMD_MIDI"
-datasets = "data/other"
-directory, md_file = find_midi_files(datasets)
+        for p in processes:
+            p.join()
 
+        total_count = sum(progress.values())
+        print(f"Total converted files: {total_count}")
 
-#mes: Messenger = gmail_messanger.GmailMessanger()
-
-tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
-
-count = 0
-reasons = dict()
-for i in range(len(md_file)):
-    con = MidiToSequece(tokenizer, directory[i], md_file[i], SAX)
-    con.convert()
-    is_saved, reason = con.save("out/np/datasets/")
-    if is_saved:
-        count += 1
-
-    print(f"\r Save Count:{count} Step;{i}/{len(md_file)} Result:{reason}  Loaded:[{md_file[i]}] ", end="")
-
-    if count - 1 >= 10:
-        break
-
-tokenizer.save("out/vocab/")
-print(len(tokenizer.tokens))
-print(tokenizer.token_max)
-
-#mes.send_message("データセットの前処理が完了しました。", f"ボキャブラリーサイズは{len(tokenizer.tokens)}です")
+    tokenizer.save("out/vocab/")
+    print(len(tokenizer.tokens))
+    print(tokenizer.token_max)
