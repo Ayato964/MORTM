@@ -190,16 +190,16 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
 
                 if (count + 1) % message.step_by_message_count == 0:
                     message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
-                                                                       f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。\n"
-                                                                       f"損失関数スケジューラーは{criterion.cs}です。")
+                                                                       f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。\n")
+                                                                       #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
                 progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss, criterion)
 
 
             message.send_message("機械学習の途中経過について",
-                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。"
-                                     f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
+                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
+                                     #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
             loss_val = epoch_loss / count
             writer.add_scalar('Loss/train', epoch_loss / count, epoch)  # 損失値を記録
 
@@ -209,8 +209,8 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
         except torch.cuda.OutOfMemoryError or RuntimeError:
             torch.save(model.state_dict(), f"{save_directory}/MORTM.error_end.{epoch}.pth")
             message.send_message("オーバーフローしました・。", f"{epoch}エポック中にオーバーフローが発生しました。\n"
-                                                              f"次のエポックに移行します。\n"
-                                                              f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
+                                                              f"次のエポックに移行します。\n")
+                                                              #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
     writer.close()
 
     return model, loss_val
