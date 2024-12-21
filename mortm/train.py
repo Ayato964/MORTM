@@ -119,7 +119,7 @@ def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss, c
 
 
 def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
-                       trans_layer=6, load_model_directory:str = None, use_rpr=False, src_mask_method: Callable[[Tensor], Tensor]=None,
+                       e_layer, d_layer, load_model_directory:str = None, src_mask_method: Callable[[Tensor], Tensor]=None,
                        num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
                        position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
@@ -127,13 +127,12 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
                         num_workers=num_workers, collate_fn=collate_fn)
 
     print("Creating Model....")
-    model = MORTM(vocab_size=vocab_size, progress=progress, trans_layer=trans_layer, num_heads=num_heads,
+    model = MORTM(vocab_size=vocab_size, progress=progress, num_heads=num_heads, e_layer=e_layer, d_layer=d_layer,
                   d_model=d_model, dim_feedforward=dim_feedforward,
-                  dropout=dropout, position_length=position_length, use_rpr=use_rpr).to(progress.get_device())
+                  dropout=dropout, position_length=position_length).to(progress.get_device())
     if load_model_directory is not None:
         model.load_state_dict(torch.load(load_model_directory))
 
-    #criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())  # 損失関数を定義
     criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=10, weight=weight.to(progress.get_device()))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
@@ -189,7 +188,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
 
                 if mail_bool and message is not None:
                     _send_prediction_end_time(message, len(loader), begin_time, end_time, vocab_size, num_epochs,
-                                              trans_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
+                                              e_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
                     mail_bool = False
 
                 if (count + 1) % message.step_by_message_count == 0:
@@ -223,7 +222,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
 
 def train_mortm(tokenizer, dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, use_rpr=True, fine_turing_mode=False,
-                trans_layer=9, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1, begin_tuning_epoch=3,
+                e_layer=9, d_layer=12, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1, begin_tuning_epoch=3,
                 dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(),):
 
@@ -257,7 +256,8 @@ def train_mortm(tokenizer, dataset_directory, save_directory, version: str, voca
                                              load_model_directory=load_model_directory,
                                              d_model=d_model,
                                              dim_feedforward=dim_feedforward,
-                                             trans_layer=trans_layer,
+                                             e_layer=e_layer,
+                                             d_layer=d_layer,
                                              num_heads=num_heads,
                                              position_length=position_length,
                                              dropout=dropout,
@@ -267,7 +267,6 @@ def train_mortm(tokenizer, dataset_directory, save_directory, version: str, voca
                                              warmup_steps=warmup_steps,
                                              is_save_training_progress=is_save_training_progress,
                                              lr_param=lr_param,
-                                             use_rpr=use_rpr,
                                              src_mask_method=src_mask_method
                                              )  # 20エポック分機械学習を行う。
 

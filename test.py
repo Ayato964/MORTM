@@ -1,8 +1,17 @@
 import torch
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN
-from mortm.convert import MidiToSequece
+from mortm.convert import MIDIToSequence
+from mortm.de_convert import ct_token_to_midi
 import numpy as  np
+
 tokenizer = Tokenizer(music_token=get_token_converter(TO_TOKEN))
 
-node = np.load("./out/np/datasets/0004e1e213c9ccb9758dce0d227bd2ad.mid.npz", allow_pickle=True)
-print(node['array_1'])
+con = MIDIToSequence(tokenizer, "data/generate", "Sample2.mid", [0])
+
+con()
+
+i, r = con.save("out/")
+print(con.aya_node)
+print(i, r)
+tokenizer.rev_mode()
+ct_token_to_midi(tokenizer, con.aya_node[1], save_directory="out/generate.mid", tempo=180, program=65)

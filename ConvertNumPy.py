@@ -32,9 +32,9 @@ ALL = [1, 2, 3, 4, 5, 6, 7, 8, 25, 26, 27, 28, 29, 30, 31, 32, 57, 58, 65, 66, 6
 
 
 
-datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+#datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
 #datasets = "G:\情報科学科\研究室\datasets\MMD_MIDI"
-#datasets = "data/other"
+datasets = "data/other"
 directory, md_file = find_midi_files(datasets)
 
 

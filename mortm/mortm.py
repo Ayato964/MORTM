@@ -1,93 +1,78 @@
+from typing import Optional
+
 import torch
 from torch import Tensor
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttention
 
 from .PositionalEncoding import PositionalEncoding
-from .RelativePositionalRepresentations import CustomTransformerEncoder
-from .rpr import TransformerEncoderLayerRPR, TransformerEncoderRPR
+from .rpr import MultiHeadAttentionRPR
 from .progress import LearningProgress
 from torch.distributions import Categorical
 
-class MORTM(nn.Module):
-    token_dict = {
-        'SHIFT': [1, 6],
-        'START': [7, 38],
-        'PITCH': [39, 166],
-        'DURATION': [167, 266]
-    }
 
-    def __init__(self, vocab_size, progress: LearningProgress, trans_layer=6, num_heads=8, d_model=512,
-                 dim_feedforward=1024, dropout=0.1,
-                 position_length=2048, use_rpr=True, use_decoder=False):
+class MORTM(nn.Module):
+    def __init__(self, vocab_size, progress: LearningProgress, d_layer=12, e_layer=9, num_heads=16, d_model=1024,
+                 dim_feedforward=4096, dropout=0.2,
+                 position_length=8500):
         super(MORTM, self).__init__()
 
-        if use_decoder:
-            print("Use decoder mode!")
-
         self.progress = progress
-        self.trans_layer = trans_layer
+        self.e_layer = e_layer
+        self.d_layer = d_layer
         self.num_heads = num_heads
         self.d_model = d_model
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
 
-        #位置エンコーディングを作成
-        #self.positional: LearnablePositionalEncoding = LearnablePositionalEncoding(self.d_model, progress, dropout, position_length).to(self.progress.get_device())
-        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length).to(self.progress.get_device())
-        #Transformerの設定
-        if not use_rpr:
-            self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
-                                                              num_encoder_layers=self.trans_layer,
-                                                              num_decoder_layers= self.trans_layer if use_decoder else 0, #デコーダーは使うときと使わない時がある。
-                                                              dropout=self.dropout, dim_feedforward=dim_feedforward,
-                                                              custom_decoder=None if use_decoder else DummyDecoder()
-                                                              ).to(self.progress.get_device())
-        else:
-            encoder_norm = nn.LayerNorm(self.d_model)
-            encoder_layer = TransformerEncoderLayerRPR(self.d_model, self.num_heads, self.dim_feedforward, self.dropout, er_len=position_length)
-            encoder = TransformerEncoderRPR(encoder_layer, self.trans_layer, encoder_norm)
-            self.transformer = nn.Transformer(
-                d_model=self.d_model, nhead=self.num_heads, num_encoder_layers=self.trans_layer,
-                num_decoder_layers=self.trans_layer if use_decoder else 0,
-                dropout=self.dropout, # activation=self.ff_activ,
-                dim_feedforward=self.dim_feedforward,
-                custom_decoder=None if use_decoder else DummyDecoder(),
-                custom_encoder=encoder
-            ).to(device=progress.get_device())
+        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length).to(
+            self.progress.get_device())
 
-            print("Use RPR Transformer")
+        #Transformerの設定
+        decoder = RPRTransformerDecoder(d_model=d_model, dim_ff=dim_feedforward,
+                                        num_head=num_heads, dropout=dropout,
+                                        batch_first=False, bias=True,
+                                        layer_norm_eps=1e-5, num_decoder_layer=d_layer)
+        self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
+                                                          num_encoder_layers=self.e_layer,
+                                                          num_decoder_layers=d_layer,
+                                                          dropout=self.dropout, dim_feedforward=dim_feedforward,
+                                                          custom_decoder=decoder,
+                                                          ).to(self.progress.get_device())
+
+        print("Use RPR Transformer")
         print(f"Input Vocab Size:{vocab_size}")
         self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
 
         self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
-    def forward(self, inputs_seq, tgt_seq=None, src_mask=None, tgt_mask=None, input_padding_mask=None, tgt_padding_mask=None):
-        if tgt_seq is None or src_mask is None:
-            mask = self.transformer.generate_square_subsequent_mask(inputs_seq.shape[1]).to(self.progress.get_device())
-        elif src_mask is not None:
-            mask = src_mask
+    def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
+                tgt_padding_mask=None):
+        if tgt_mask is None:
+            mask = self.transformer.generate_square_subsequent_mask(tgt.shape[1]).to(self.progress.get_device())
         else:
-            mask = None
+            mask = tgt_mask
 
-        inputs_em: Tensor = self.embedding(inputs_seq)
-        inputs_em = inputs_em.permute(1, 0, 2)
+        sec_e: Tensor = self.embedding(src)
+        sec_e = sec_e.permute(1, 0, 2)
 
-        inputs_pos: Tensor = self.positional(inputs_em)
+        src_p: Tensor = self.positional(sec_e)
 
-        if tgt_seq is not None:
-            tgt_e = self.embedding(tgt_seq)
+        if tgt is not None:
+            tgt_e = self.embedding(tgt)
             tgt_e = tgt_e.permute(1, 0, 2)
             tgt_p = self.positional(tgt_e)
         else:
-            tgt_p = inputs_pos
+            tgt_p = src_p
 
-        out: Tensor = self.transformer(inputs_pos, tgt_p, src_mask=mask, tgt_mask=tgt_mask,
+        out: Tensor = self.transformer(src_p, tgt_p, src_mask=src_mask, tgt_mask=mask,
                                        src_key_padding_mask=input_padding_mask, tgt_key_padding_mask=tgt_padding_mask)
 
         out.permute(1, 0, 2)
 
-        score:Tensor = self.Wout(out)
+        score: Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
 
     def top_k_sampling_length_encoder(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
@@ -154,7 +139,7 @@ class MORTM(nn.Module):
 
             log_probs = torch.log(topk_probs[sampled_index])
             log_prob_list.append(log_probs)
-#            print(next_token)
+            #            print(next_token)
 
             # シーケンスにトークンを追加
             generated_sequence.append(next_token)
@@ -205,7 +190,6 @@ class MORTM(nn.Module):
             logits = scores[:, -1, :]  # (1, vocab_size)
             logits = logits[-1, :]
 
-
             # ソフトマックスを適用して確率を取得
             probs: Tensor = self.softmax(logits)  # (vocab_size)
             d = Categorical(probs)
@@ -220,7 +204,6 @@ class MORTM(nn.Module):
             input_sequence = torch.tensor(generated_sequence, dtype=torch.long, device=self.progress.get_device())
 
         return input_sequence, torch.stack(log_prob_list).to(self.progress.get_device())
-
 
     def top_k_sampling_length_decoder(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
         self.eval()
@@ -250,7 +233,8 @@ class MORTM(nn.Module):
         # 生成をループ
         for i in range(max_length):
             # モデルに渡すための入力の準備 (2次元に変換)
-            tgt = torch.tensor(generated_sequence, device=self.progress.get_device()).unsqueeze(0)  # (1, sequence_length)
+            tgt = torch.tensor(generated_sequence, device=self.progress.get_device()).unsqueeze(
+                0)  # (1, sequence_length)
             src = input_sequence.unsqueeze(0)
             #print(f"I{i} input_tensor")
 
@@ -291,8 +275,9 @@ class MORTM(nn.Module):
             generated_sequence.append(next_token)
 
             # 次のステップの入力として準備
-#            input_sequence = torch.tensor(generated_sequence, dtype=torch.long, device=self.progress.get_device())
-        input_sequence = torch.cat((input_sequence, torch.tensor(generated_sequence, device=self.progress.get_device())))
+        #            input_sequence = torch.tensor(generated_sequence, dtype=torch.long, device=self.progress.get_device())
+        input_sequence = torch.cat(
+            (input_sequence, torch.tensor(generated_sequence, device=self.progress.get_device())))
         return input_sequence
 
     def top_p_sampling_length(self, input_seq, p=0.8, max_length=20, temperature=1.0):
@@ -302,10 +287,10 @@ class MORTM(nn.Module):
 
         generated = input_seq.tolist()
         for i in range(max_length):
- #           print(f"INPUTS:   {input_seq}")
+            #           print(f"INPUTS:   {input_seq}")
 
             input_seq = input_seq.unsqueeze(0)
-            logits= self(input_seq)
+            logits = self(input_seq)
             logits = logits[:, -1, :][-1, :]
             token = self.top_p_sampling(logits, p=p, temperature=temperature)
             generated.append(token)
@@ -317,7 +302,7 @@ class MORTM(nn.Module):
 
         return input_seq
 
-    def top_p_sampling(self, logits, p=0.9, temperature=1.0)-> int:
+    def top_p_sampling(self, logits, p=0.9, temperature=1.0) -> int:
 
         logits = logits / temperature
         # logitsをソフトマックスで確率分布に変換
@@ -350,3 +335,112 @@ class DummyDecoder(nn.Module):
 
     def forward(self, tgt, memory, tgt_mask, memory_mask, tgt_key_padding_mask, memory_key_padding_mask, **kwargs):
         return memory
+
+class RPRTransformerDecoder(nn.Module):
+    def __init__(self,d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps,  num_decoder_layer:int):
+        super().__init__(RPRTransformerDecoder)
+        self.num_layer = num_decoder_layer
+        self.layers = _get_clones(RPRTransformerDecoderLayer(d_model=d_model, dim_ff=dim_ff,
+                                                             num_head=num_head, dropout=dropout,
+                                                             batch_first=batch_first, bias=bias,
+                                                             layer_norm_eps=layer_norm_eps), self.num_layer)
+        self.norm = LayerNorm(d_model, eps=1e-5, bias=True)
+    def forward(self, tgt: Tensor,
+        memory: Tensor,
+        tgt_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        tgt_is_causal: Optional[bool] = None,
+        memory_is_causal: bool = False, **kwargs) -> Tensor:
+
+        output = tgt
+        for mod in self.layers:
+            mod: RPRTransformerDecoderLayer
+            output = mod(
+                output,
+                memory,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                tgt_is_causal=tgt_is_causal,
+                memory_is_causal=memory_is_causal,
+            )
+            pass
+        return self.norm(output)
+
+
+class RPRTransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps):
+        super().__init__(RPRTransformerDecoderLayer)
+        self.multi_head_attention: MultiheadAttention = MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_head,
+            dropout=dropout,
+            batch_first=batch_first,
+            bias=bias
+        )
+        self.rpr_attention: MultiHeadAttentionRPR = MultiHeadAttentionRPR(
+            embed_dim=d_model,
+            num_heads=num_head,
+            dropout=dropout
+        )
+        self.linear1 = nn.Linear(d_model, dim_ff, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_ff, d_model, bias=bias)
+
+        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
+        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
+        self.norm3 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self,
+        tgt: Tensor,
+        memory: Tensor,
+        tgt_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        tgt_is_causal: bool = False,
+        memory_is_causal: bool = False,
+        )-> Tensor:
+
+        y = tgt
+
+        y = y + self.multi_block(self.norm1(y), tgt_mask, tgt_key_padding_mask, tgt_is_causal) # マルチヘッドアテンションを適用
+
+        y = y + self.rpr_block(self.norm2(y), memory, memory_mask, memory_key_padding_mask, memory_is_causal) #相対位置マルチヘッドアテンションを適用
+
+        y = y + self.ff_block(self.norm3(y)) # フィードフォワード層を適用
+
+        return y
+
+    def multi_block(self,
+                    y: Tensor,
+                    attn_mask: Optional[Tensor],
+                    key_padding_mask: Optional[Tensor],
+                    is_causal: bool = False,
+                    ):
+        y = self.multi_head_attention(y,y,y, attn_mask, key_padding_mask, is_causal, need_weights=True)[0]
+
+        return self.dropout1(y)
+
+    def rpr_block(self,
+                  y: Tensor,
+                  mem: Tensor,
+                  attn_mask: Optional[Tensor],
+                  key_padding_mask: Optional[Tensor],
+                  is_causal: bool = False,
+                  ):
+        y = self.rpr_attention(y, mem, mem,key_padding_mask=key_padding_mask,need_weights=False, attn_mask=attn_mask)
+        return self.dropout2(y)
+
+    def ff_block(self, y: Tensor):
+        y = self.linear1(y)
+        y = F.relu(y)
+        y = self.dropout(y)
+        y = self.linear2(y)
+        return self.dropout3(y)

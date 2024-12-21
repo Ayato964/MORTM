@@ -20,7 +20,7 @@ def ct_beat_to_time(beat: float, tempo: int) -> float:
     b16 = b8 / 2
     b32 = b16 / 2
     b64 = b32 / 2
-    return beat * b64
+    return float(beat) * b64
 
 
 def calc_time_to_beat(time, beat_time) -> (int, int):
@@ -32,6 +32,17 @@ def calc_time_to_beat(time, beat_time) -> (int, int):
 def _get_symbol(token: str):
     split = token.split("_")
     return int(float(split[-1]))
+
+
+class ShiftTimeContainer:
+    def __init__(self, time, tempo):
+        self.measure_start_time = time
+        self.shift_measure = False
+        self.tempo = tempo
+
+    def shift(self):
+        self.measure_start_time += (60 / self.tempo) * 4
+        self.shift_measure = True
 
 
 class Token:
@@ -48,7 +59,7 @@ class Token:
         pass
 
     @abstractmethod
-    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int):
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):
         pass
 
     @abstractmethod
@@ -72,7 +83,7 @@ class Token:
 
 class SpecialToken(Token):
 
-    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int):
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):
         pass
 
     def _set_tokens(self, tokens: dict):
@@ -86,7 +97,7 @@ class SpecialToken(Token):
         pass
 
     def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
-                 tempo=120, *args, **kwargs):
+                 tempo=120, container: ShiftTimeContainer = None, *args, **kwargs):
         if self.convert_type == 0:
             return self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo)
         else:
@@ -96,7 +107,7 @@ class SpecialToken(Token):
 class MusicToken(Token):
 
     def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
-                 tempo=120, *args, **kwargs, ):
+                 tempo=120, container: ShiftTimeContainer = None,*args, **kwargs, ):
         if self.convert_type == 0:
             return f"{self.token_type}_{self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo)}"
         else:
@@ -104,7 +115,7 @@ class MusicToken(Token):
                 return None
             split = token.split("_")
             if split[0] == self.token_type:
-                self.de_convert(split[1], back_notes, note, tempo)
+                self.de_convert(split[1], back_notes, note, tempo, container)
                 return split[0]
             else:
                 return None
@@ -114,7 +125,7 @@ class MusicToken(Token):
         pass
 
     @abstractmethod
-    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int):
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):
         pass
 
     @abstractmethod
@@ -210,9 +221,13 @@ class StartRE(MusicToken):
         for i in range(max_length + 1):
             tokens[f's_{i}'] = tokens_length + i
 
-    def de_convert(self, number: int, back_note, note: Note, tempo):
+    def de_convert(self, number: int, back_note, note: Note, tempo, container: ShiftTimeContainer):
         shift = ct_beat_to_time(number, tempo)
-        note.start = shift if back_note is None else shift + back_note.start
+        if not container.shift_measure:
+            note.start = shift if back_note is None else shift + back_note.start
+        else:
+            note.start = container.measure_start_time + shift
+            container.shift_measure = False
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo) -> int:
         measure1 = 60 / tempo * 4
@@ -250,8 +265,8 @@ class Pitch(MusicToken):
         for i in range(max_length + 1):
             tokens[f'p_{i}'] = tokens_length + i
 
-    def de_convert(self, number: int, back_note, note: Note, tempo):
-        note.pitch = number
+    def de_convert(self, number: int, back_note, note: Note, tempo, container: ShiftTimeContainer):
+        note.pitch = int(number)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo) -> int:
         p: int = note.pitch
@@ -266,7 +281,7 @@ class Duration(MusicToken):
         for i in range(max_length + 1):
             tokens[f'd_{i}'] = tokens_length + i
 
-    def de_convert(self, number: int, back_note: Note, note: Note, tempo):
+    def de_convert(self, number: int, back_note: Note, note: Note, tempo, container: ShiftTimeContainer):
         duration = ct_beat_to_time(number, tempo)
         note.end = note.start + duration
 
