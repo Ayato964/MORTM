@@ -75,7 +75,7 @@ class MORTM(nn.Module):
         score: Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
 
-    def top_k_sampling_length_encoder(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
+    def _top_k_sampling_length_encoder(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
         self.eval()
         """
         MORTMモデルにトップKサンプリングと温度シーケンスを実装する関数
@@ -149,138 +149,7 @@ class MORTM(nn.Module):
 
         return input_sequence, torch.tensor(log_prob_list, device=self.progress.get_device())
 
-    def argmax_sampling_encoder(self, input_sequence, max_length=500):
-        #self.eval()
-        """
-        MORTMモデルにトップKサンプリングと温度シーケンスを実装する関数
-
-        Args:
-            input_sequence: 1次元の入力シーケンス (List[int] or torch.Tensor)。
-            temperature: 温度パラメータ。デフォルトは1.0。
-            top_k: サンプリングする上位K個のトークンの数。デフォルトは3。
-            max_length: 生成するシーケンスの最大長さ。デフォルトは100。
-
-        Returns:
-            1次元の生成されたシーケンス (torch.Tensor)。
-        """
-        log_prob_list = []
-        # 入力シーケンスをtorch.tensorに変換
-        if not isinstance(input_sequence, torch.Tensor):
-            input_sequence = torch.tensor(input_sequence, dtype=torch.long, device=self.progress.get_device())
-
-        # 入力シーケンスの長さを取得
-        input_length = input_sequence.size(0)
-
-        # 生成されたシーケンスを格納するリスト
-        generated_sequence = input_sequence.tolist()
-
-        # 生成をループ
-        for i in range(max_length):
-            # モデルに渡すための入力の準備 (2次元に変換)
-            input_tensor = input_sequence.unsqueeze(0)  # (1, sequence_length)
-
-            print(f"\r Generating...{i / max_length * 100}%", end="")
-            # モデルに入力して次のトークンのスコアを取得 (3次元で返ってくる)
-            mask = self.transformer.generate_square_subsequent_mask(input_tensor.shape[1]).to(
-                self.progress.get_device())
-
-            scores = self(input_tensor)  # (1, sequence_length, vocab_size)
-
-            # 最新のトークンのスコアを取得 (最後のトークンに対するスコア)
-            logits = scores[:, -1, :]  # (1, vocab_size)
-            logits = logits[-1, :]
-
-            # ソフトマックスを適用して確率を取得
-            probs: Tensor = self.softmax(logits)  # (vocab_size)
-            d = Categorical(probs)
-            next_token = d.sample()
-
-            log_probs = d.log_prob(next_token)
-            log_prob_list.append(log_probs)
-            # シーケンスにトークンを追加
-            generated_sequence.append(next_token)
-
-            # 次のステップの入力として準備
-            input_sequence = torch.tensor(generated_sequence, dtype=torch.long, device=self.progress.get_device())
-
-        return input_sequence, torch.stack(log_prob_list).to(self.progress.get_device())
-
-    def top_k_sampling_length_decoder(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
-        self.eval()
-        """
-        MORTMモデルにトップKサンプリングと温度シーケンスを実装する関数
-
-        Args:
-            input_sequence: 1次元の入力シーケンス (List[int] or torch.Tensor)。
-            temperature: 温度パラメータ。デフォルトは1.0。
-            top_k: サンプリングする上位K個のトークンの数。デフォルトは3。
-            max_length: 生成するシーケンスの最大長さ。デフォルトは100。
-
-        Returns:
-            1次元の生成されたシーケンス (torch.Tensor)。
-        """
-
-        # 入力シーケンスをtorch.tensorに変換
-        if not isinstance(input_sequence, torch.Tensor):
-            input_sequence = torch.tensor(input_sequence, dtype=torch.long, device=self.progress.get_device())
-
-        # 入力シーケンスの長さを取得
-        input_length = input_sequence.size(0)
-
-        # 生成されたシーケンスを格納するリスト
-        generated_sequence = [11]
-
-        # 生成をループ
-        for i in range(max_length):
-            # モデルに渡すための入力の準備 (2次元に変換)
-            tgt = torch.tensor(generated_sequence, device=self.progress.get_device()).unsqueeze(
-                0)  # (1, sequence_length)
-            src = input_sequence.unsqueeze(0)
-            #print(f"I{i} input_tensor")
-
-            # モデルに入力して次のトークンのスコアを取得 (3次元で返ってくる)
-            with torch.no_grad():
-                mask = self.transformer.generate_square_subsequent_mask(tgt.shape[1]).to(
-                    self.progress.get_device())
-                print(src.shape)
-                scores = self(src, tgt_seq=tgt)  # (1, sequence_length, vocab_size)
-                print(f"SCORE: {scores.shape}")
-
-            # 最新のトークンのスコアを取得 (最後のトークンに対するスコア)
-            logits = scores[:, -1, :]  # (1, vocab_size)
-
-            # 温度の適用
-            logits = logits / temperature
-            logits = logits[-1, :]
-
-            # ソフトマックスを適用して確率を取得
-            probs = self.softmax(logits)  # (vocab_size)
-
-            # トップKの確率でトークンをフィルタリング
-            sorted_probs, sorted_indices = torch.topk(probs, top_k)
-            #print(sorted_probs, sorted_indices)
-
-            # 再度正規化
-            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-
-            # トークンをサンプリング
-            sampled_index = torch.multinomial(sorted_probs, 1).item()  # サンプリングされたインデックスを取得
-
-            # ソートされたインデックスから元のインデックスに変換
-            next_token = sorted_indices[sampled_index].item()
-
-            #            print(next_token)
-
-            # シーケンスにトークンを追加
-            generated_sequence.append(next_token)
-
-            # 次のステップの入力として準備
-        #            input_sequence = torch.tensor(generated_sequence, dtype=torch.long, device=self.progress.get_device())
-        input_sequence = torch.cat(
-            (input_sequence, torch.tensor(generated_sequence, device=self.progress.get_device())))
-        return input_sequence
-
-    def top_p_sampling_length(self, input_seq, p=0.8, max_length=20, temperature=1.0):
+    def _top_p_sampling_length(self, input_seq, p=0.8, max_length=20, temperature=1.0):
         self.eval()
         if not isinstance(input_seq, torch.Tensor):
             input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
@@ -301,6 +170,27 @@ class MORTM(nn.Module):
             print(f"\r Generating... {i / max_length}%", end="")
 
         return input_seq
+
+    def top_p_sampling_measure(self, input_seq, p=0.9, max_measure=20, temperature=1.0):
+        self.eval()
+        if not isinstance(input_seq, torch.Tensor):
+            input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
+        seg: Tensor = self.split_tensor_at_value(input_seq, 3, include_split=True)[-1]
+        tgt = torch.tensor([2], dtype=torch.long, device=self.progress.get_device())
+        tgt = torch.concatenate((tgt, seg)).to(self.progress.get_device())
+        src = seg[:-1].squeeze()
+
+        for i in range(max_measure):
+            while tgt[-1] != 391 or tgt[-1] != 392:
+                logit = self(src=src.unsqueeze(0), tgt=tgt.unsqueeze(0))
+                token = self.top_p_sampling(logit[:, -1, :][-1, :], p=p, temperature=temperature)
+                tgt = torch.concatenate((tgt, torch.tensor([token], dtype=torch.long,
+                                                           device=self.progress.get_device())), dim=0)
+            if tgt[-1] == 392:
+                break
+            src = torch.concatenate((src, tgt[1:-1]))
+
+        return src
 
     def top_p_sampling(self, logits, p=0.9, temperature=1.0) -> int:
 
@@ -327,6 +217,53 @@ class MORTM(nn.Module):
 
         # インデックスを元の順序に戻す
         return sorted_indices[sampled_index].item()
+
+    def split_tensor_at_value(self, tensor: Tensor, split_value, include_split=True):
+        """
+        指定した値を基準にテンソルを分割します。
+
+        Args:
+            tensor (torch.Tensor): 1次元のテンソルを想定しています。
+            split_value (int or float): 分割の基準となる値。
+            include_split (bool, optional): 分割値を各セグメントに含めるかどうか。デフォルトは True。
+
+        Returns:
+            List[torch.Tensor]: 分割されたテンソルのリスト。
+        """
+        if tensor.dim() != 1:
+            raise ValueError("この関数は1次元のテンソルに対してのみ動作します。")
+
+        # 分割値が存在するインデックスを取得
+        split_indices = (tensor == split_value).nonzero(as_tuple=True)[0]
+
+        if len(split_indices) == 0:
+            # 分割値が見つからない場合、元のテンソルをそのまま返す
+            return [tensor]
+
+        segments = []
+        num_splits = len(split_indices)
+
+        for i in range(num_splits):
+            start = split_indices[i]
+            if include_split:
+                start = start  # 分割値を含める場合
+            else:
+                start = split_indices[i] + 1  # 分割値を含めない場合
+
+            if i + 1 < num_splits:
+                end = split_indices[i + 1]
+            else:
+                end = len(tensor)
+
+            if include_split:
+                end = end  # 次の分割値の位置まで含める
+            else:
+                end = end  # 次の分割値の位置まで含めない
+
+            segment = tensor[start:end]
+            segments.append(segment)
+
+        return segments
 
 
 class DummyDecoder(nn.Module):
