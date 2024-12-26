@@ -34,13 +34,13 @@ tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC), load_data
 
 model = MORTM(
     progress=_DefaultLearningProgress(),
-    vocab_size=518,
+    vocab_size=393,
     position_length=8500,
-    trans_layer=9, num_heads=32, d_model=1024,
+    e_layer=6, d_layer=9, num_heads=32, d_model=1024,
     dim_feedforward=4096,
 
 )
-model.load_state_dict(torch.load("out/model/MORTMv3.1.1-b4_Sax.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.train.0.0.0182.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -72,12 +72,9 @@ print(f"First:{start}") # ロードしたシーケンスを表示
     - これは、確率の高い順番からK個のトークンを取得し、サンプリングを行います。複数存在する場合、ランダムでトークンを選びます。
 '''
 
-#gene, p = model.top_k_sampling_length_encoder(start, max_length=500, temperature=1.2, top_k=8)
-#gene = model.top_p_sampling_length(start, max_length=500, temperature=1.2, p=0.95)
-#gene = model.argmax_sampling_encoder(start, max_length=500, )
-gene = generate_note(100, start, model, t=1.05, p=0.95)
-
-
+#gene = generate_note(100, start, model, t=1.05, p=0.95)
+'''
+gene = model.top_p_sampling_measure(start, p=0.95, max_measure=2, temperature=1.0)
 output = gene
 for t in output:
     t: torch.Tensor = t
@@ -85,3 +82,5 @@ for t in output:
 
 
 midi = ct_token_to_midi(tokenizer, output, "out/generate_test.midi") #生成したトークンをMIDIに変換する。
+
+'''

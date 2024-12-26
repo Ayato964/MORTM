@@ -25,12 +25,12 @@ class _DefaultLearningProgress(LearningProgress):
 
     def step_optimizer(self, optimizer, model, accumulation_steps, **kwargs):
         norm = self.get_gradient_norm(model)
-        if not (0.1 < norm < 3.0):
+        if not (1e-4 < norm < 3.0):
             print(
                 f"\033[31m 警告\033[0m：NORMが既定値から逸脱しています。学習率、またはバッチサイズを調整してください。({norm:.4f})")
 
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3)
 
         optimizer.step()  # オプティマイザを更新
         optimizer.zero_grad()
