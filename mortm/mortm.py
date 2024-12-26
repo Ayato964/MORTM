@@ -175,10 +175,12 @@ class MORTM(nn.Module):
         self.eval()
         if not isinstance(input_seq, torch.Tensor):
             input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
-        seg: Tensor = self.split_tensor_at_value(input_seq, 3, include_split=True)[-1]
+        seg: Tensor = self.split_tensor_at_value(input_seq, 3, include_split=True)
         tgt = torch.tensor([2], dtype=torch.long, device=self.progress.get_device())
-        tgt = torch.concatenate((tgt, seg)).to(self.progress.get_device())
-        src = seg[:-1].squeeze()
+        tgt = torch.concatenate((tgt, seg[-1])).to(self.progress.get_device())
+        point = 0 if len(seg[:-1]) - 4 <= 0 else len(seg[:-1]) - 4
+        src = seg[point:-1].squeeze()
+        generated = src.clone()
 
         for i in range(max_measure):
             while tgt[-1] != 391 or tgt[-1] != 392:
@@ -188,9 +190,13 @@ class MORTM(nn.Module):
                                                            device=self.progress.get_device())), dim=0)
             if tgt[-1] == 392:
                 break
+            generated = torch.concatenate((generated, tgt[1: -1]))
             src = torch.concatenate((src, tgt[1:-1]))
+            seg = self.split_tensor_at_value(src, 3, include_split=True)
+            point = 0 if len(seg) - 4 <= 0 else len(seg) - 4
+            src = seg[point:].squeeze()
 
-        return src
+        return generated
 
     def top_p_sampling(self, logits, p=0.9, temperature=1.0) -> int:
 
