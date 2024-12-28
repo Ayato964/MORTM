@@ -30,7 +30,8 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
     モデルによって異なるので、再度確認してください。
 '''
 
-tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
+tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
+tokenizer.rev_mode()
 
 model = MORTM(
     progress=_DefaultLearningProgress(),
@@ -44,6 +45,8 @@ model.load_state_dict(torch.load("out/model/MORTM.train.0.0.0182.pth")) # モデ
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
+np_note = np.load("out/np/datasets/0f21d92658925633165637256d037437.mid.npz", allow_pickle=True)['array_2'].tolist()
+start = np_note['key']
 '''
 既存の楽曲からその続きを生成する場合、以下を実行し、NPZから解凍してください。
 システム的な事情でarray1からメロディが記録されています。
@@ -52,9 +55,9 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/Sample.mid.npz")
+#np_notes = np.load("out/np/Sample.mid.npz")
 
-start = np_notes[f'array1'][:-1]
+#start = np_notes[f'array1'][:-15]
 
 '''
 一から、もしくはメロディをプログラマーが設定したい場合、以下を実行します。
@@ -73,7 +76,7 @@ print(f"First:{start}") # ロードしたシーケンスを表示
 '''
 
 #gene = generate_note(100, start, model, t=1.05, p=0.95)
-'''
+
 gene = model.top_p_sampling_measure(start, p=0.95, max_measure=2, temperature=1.0)
 output = gene
 for t in output:
@@ -82,5 +85,3 @@ for t in output:
 
 
 midi = ct_token_to_midi(tokenizer, output, "out/generate_test.midi") #生成したトークンをMIDIに変換する。
-
-'''

@@ -5,7 +5,7 @@ from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttention
-
+import numpy as np
 from .PositionalEncoding import PositionalEncoding
 from .rpr import MultiHeadAttentionRPR
 from .progress import LearningProgress
@@ -70,7 +70,7 @@ class MORTM(nn.Module):
         out: Tensor = self.transformer(src_p, tgt_p, src_mask=src_mask, tgt_mask=mask,
                                        src_key_padding_mask=input_padding_mask, tgt_key_padding_mask=tgt_padding_mask)
 
-        out.permute(1, 0, 2)
+        out = out.permute(1, 0, 2)
 
         score: Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
@@ -179,15 +179,22 @@ class MORTM(nn.Module):
         tgt = torch.tensor([2], dtype=torch.long, device=self.progress.get_device())
         tgt = torch.concatenate((tgt, seg[-1])).to(self.progress.get_device())
         point = 0 if len(seg[:-1]) - 4 <= 0 else len(seg[:-1]) - 4
-        src = seg[point:-1].squeeze()
+
+        src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
+
+        for i in range(point, len(seg[point:-1])):
+            src = torch.concatenate((src, seg[i]))
         generated = src.clone()
 
         for i in range(max_measure):
             while tgt[-1] != 391 or tgt[-1] != 392:
                 logit = self(src=src.unsqueeze(0), tgt=tgt.unsqueeze(0))
-                token = self.top_p_sampling(logit[:, -1, :][-1, :], p=p, temperature=temperature)
+                outputs = logit.view(-1, logit.size(-1)).to(self.progress.get_device())
+                print(outputs[1].argmax())
+                token = self.top_p_sampling(outputs[-1], p=p, temperature=temperature)
                 tgt = torch.concatenate((tgt, torch.tensor([token], dtype=torch.long,
                                                            device=self.progress.get_device())), dim=0)
+                print(tgt)
             if tgt[-1] == 392:
                 break
             generated = torch.concatenate((generated, tgt[1: -1]))
@@ -350,6 +357,8 @@ class RPRTransformerDecoderLayer(nn.Module):
         tgt_is_causal: bool = False,
         memory_is_causal: bool = False,
         )-> Tensor:
+        if tgt_is_causal is None:
+            tgt_is_causal = False
 
         y = tgt
 

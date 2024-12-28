@@ -158,17 +158,21 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
 
             for src, tgt in loader:  # seqにはbatch_size分の楽曲が入っている
                 #print(f"learning sequence {count}")
+                correct: Tensor = tgt[:, 1:]
+                tgt = tgt[:, :-1]
                 begin_time = time.time()
 
                 padding_mask_in: Tensor = _get_padding_mask(src, progress)
                 padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-                output = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg)
+                outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg)
 
-                outputs = output.view(-1, output.size(-1)).to(progress.get_device())
-                targets = tgt.reshape(-1).long()
+                outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
+                correct = correct.reshape(-1).long()
 
-                loss = criterion(outputs, targets)  # 損失を計算
+                #print(outputs.shape, correct.shape)
+
+                loss = criterion(outputs, correct)  # 損失を計算
                 epoch_loss += loss.item()
                 loss = loss / accumulation_steps
                 loss.backward()  # 逆伝播
