@@ -53,9 +53,9 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
 
 
 # デバイスを取得
-def _set_train_data(directory, datasets, progress: LearningProgress):
+def _set_train_data(directory, datasets, positional_length, progress: LearningProgress):
     print("Starting load....")
-    mortm_datasets = MORTM_DataSets(progress)
+    mortm_datasets = MORTM_DataSets(progress, positional_length)
     loss_count = 0
     count = 0
     dataset_length = 0
@@ -135,7 +135,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
         model.load_state_dict(torch.load(load_model_directory))
 
     #criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=10, weight=weight.to(progress.get_device()))
-    criterion = nn.CrossEntropyLoss(ignore_index=0, weight=weight.to(progress.get_device())).to(progress.get_device())
+    criterion = nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device())
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
@@ -226,7 +226,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
 
 def train_mortm(tokenizer, dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
-                e_layer=9, d_layer=12, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1, begin_tuning_epoch=3,
+                e_layer=9, d_layer=12, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1,
                 dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(),):
 
@@ -236,10 +236,12 @@ def train_mortm(tokenizer, dataset_directory, save_directory, version: str, voca
     print(f"ToDay is{datetime.date.today()}! start generating MORTEM_Model.{version}_{today_date}")
 
     datasets = os.listdir(dataset_directory)
-    train_data = _set_train_data(dataset_directory, datasets, progress)
+    train_data = _set_train_data(dataset_directory, datasets, position_length, progress)
 
     try:
+
         with open(weight_directory, 'r') as file:
+            '''
             freq_dict = json.load(file)
             # 逆数を取り、頻出度が0の場合は小さい値に設定
             epsilon = 1e-11  # 非ゼロの小さい値を設定しておく
@@ -256,7 +258,9 @@ def train_mortm(tokenizer, dataset_directory, save_directory, version: str, voca
             #weight_tensor = weight_tensor / weight_tensor.sum()
 
             print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
-            model, loss = _train_self_tuning(tokenizer,save_directory, train_data, message, vocab_size, num_epochs, weight_tensor, progress=progress,
+            '''
+
+            model, loss = _train_self_tuning(tokenizer,save_directory, train_data, message, vocab_size, num_epochs, None, progress=progress,
                                              load_model_directory=load_model_directory,
                                              d_model=d_model,
                                              dim_feedforward=dim_feedforward,

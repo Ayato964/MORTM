@@ -212,7 +212,7 @@ class MidiToSequece(_AbstractMidiToAyaNode):
         super().__init__(MidiToSequece, tokenizer, directory, file_name, program_list)
         self.sequence_dict: dict = dict()
         self.sequence_count = 0
-        self.context = 4
+        self.context = 8
 
     def add_sequence(self, seq_pare: dict):
         self.sequence_dict[f'array_{self.sequence_count}'] = seq_pare

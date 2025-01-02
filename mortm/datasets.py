@@ -11,10 +11,11 @@ from .progress import LearningProgress
 
 
 class MORTM_DataSets(Dataset):
-    def __init__(self, progress: LearningProgress):
+    def __init__(self, progress: LearningProgress, positional_length):
         self.key: list = list()
         self.value: list = list()
         self.progress = progress
+        self.positional_length = positional_length
 
     def __len__(self):
         return len(self.key)
@@ -27,7 +28,7 @@ class MORTM_DataSets(Dataset):
         suc_count = 0
         for i in range(len(music_seq) - 1):
             seq = music_seq[f'array_{i + 1}'].tolist()
-            if 0 < len(seq['key']) < 220:
+            if (100 < len(seq['key']) < self.positional_length) or 4 in seq['key']:
                 self.key.append(seq['key'].tolist())
                 self.value.append(seq['value'].tolist())
                 suc_count += 1
