@@ -95,9 +95,10 @@ def _get_padding_mask(input_ids, progress: LearningProgress):
 
 def collate_fn(batch):
     # バッチ内のテンソルの長さを揃える（パディングする）
-    src, tgt = batch
-    src = pad_sequence(src, batch_first=True, padding_value=0)
-    tgt = pad_sequence(tgt, batch_first=True, padding_value=0)
+    src_list = [item[0] for item in batch]  # 各タプルのsrcを抽出
+    tgt_list = [item[1] for item in batch]  # 各タプルのtgtを抽出
+    src = pad_sequence(src_list, batch_first=True, padding_value=0)
+    tgt = pad_sequence(tgt_list, batch_first=True, padding_value=0)
     return (src, tgt)
 
 
