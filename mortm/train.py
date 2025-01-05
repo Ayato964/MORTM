@@ -52,6 +52,17 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
                          )
 
 
+def find_npz_files(root_folder):
+    midi_files = []
+    direc = []
+    for defpath, surnames, filenames in os.walk(root_folder):
+        for file in filenames:
+            if file.lower().endswith('.npz'):
+                midi_files.append(file)
+                direc.append(defpath)
+    return direc, midi_files
+
+
 # デバイスを取得
 def _set_train_data(directory, datasets, positional_length, progress: LearningProgress):
     print("Starting load....")
@@ -60,13 +71,13 @@ def _set_train_data(directory, datasets, positional_length, progress: LearningPr
     count = 0
     dataset_length = 0
     loss_data = 4
-    for dataset in datasets:
+    for i in range(len(datasets)):
         count += 1
 
-        np_load_data = np.load(directory + dataset, allow_pickle=True)
+        np_load_data = np.load(f"{directory[i]}/{datasets[i]}", allow_pickle=True)
         if len(np_load_data) > loss_data:
             dataset_length += mortm_datasets.add_data(np_load_data)
-            print(f"\r {count}/{len(datasets)} | Dataset Length:{dataset_length} | Load[{directory + dataset}]", end="")
+            print(f"\r {count}/{len(datasets)} | Dataset Length:{dataset_length} | Load[{directory[i]}/{datasets[i]}]", end="")
         else:
             loss_count += 1
     print("load Successful!!")
@@ -84,8 +95,10 @@ def _get_padding_mask(input_ids, progress: LearningProgress):
 
 def collate_fn(batch):
     # バッチ内のテンソルの長さを揃える（パディングする）
-    batch = pad_sequence(batch, batch_first=True, padding_value=0)
-    return batch
+    src, tgt = batch
+    src = pad_sequence(src, batch_first=True, padding_value=0)
+    tgt = pad_sequence(tgt, batch_first=True, padding_value=0)
+    return (src, tgt)
 
 
 def update_log(model, writer, global_step):
@@ -124,7 +137,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
                        position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
     loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True,
-                        num_workers=num_workers, #collate_fn=collate_fn
+                        num_workers=num_workers, collate_fn=collate_fn
                         )
 
     print("Creating Model....")
@@ -224,19 +237,19 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
 
 
 
-def train_mortm(tokenizer, dataset_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
+def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
                 e_layer=9, d_layer=12, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1,
                 dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
-                accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(),):
+                accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(), ):
 
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
 
     print(f"ToDay is{datetime.date.today()}! start generating MORTEM_Model.{version}_{today_date}")
 
-    datasets = os.listdir(dataset_directory)
-    train_data = _set_train_data(dataset_directory, datasets, position_length, progress)
+    directory, filename = find_npz_files(root_directory)
+    train_data = _set_train_data(directory, filename, position_length, progress)
 
     try:
 
