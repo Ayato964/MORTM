@@ -34,7 +34,7 @@ class MultiHeadAttentionRPR(Module):
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
         self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
-
+        self.batch_first = False
         self.num_heads = num_heads
         self.dropout = dropout
         self.head_dim = embed_dim // num_heads
@@ -86,7 +86,7 @@ class MultiHeadAttentionRPR(Module):
             xavier_normal_(self.bias_v)
 
     def forward(self, query, key, value, key_padding_mask=None,
-                need_weights=True, attn_mask=None):
+                need_weights=True, attn_mask=None, is_causal=False):
 
         if hasattr(self, '_qkv_same_embed_dim') and self._qkv_same_embed_dim is False:
             # return F.multi_head_attention_forward(
