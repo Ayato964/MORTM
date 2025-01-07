@@ -216,7 +216,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
 
                 if (count + 1) % 200000 == 0:
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}_{count}.pth")
-
+                    print("途中経過を保存しました。")
 
             message.send_message("機械学習の途中経過について",
                                      f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")

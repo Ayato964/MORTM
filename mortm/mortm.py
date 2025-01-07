@@ -178,7 +178,7 @@ class MORTM(nn.Module):
         seg: Tensor = self.split_tensor_at_value(input_seq, 3, include_split=True)
         tgt = torch.tensor([2], dtype=torch.long, device=self.progress.get_device())
         tgt = torch.concatenate((tgt, seg[-1])).to(self.progress.get_device())
-        point = 0 if len(seg[:-1]) - 4 <= 0 else len(seg[:-1]) - 4
+        point = 0 if len(seg[:-1]) - 8 <= 0 else len(seg[:-1]) - 8
 
         src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
 
@@ -187,21 +187,23 @@ class MORTM(nn.Module):
         generated = src.clone()
 
         for i in range(max_measure):
-            while tgt[-1] != 391 or tgt[-1] != 392:
+            while not (tgt[-1] == 391 or tgt[-1] == 392):
                 logit = self(src=src.unsqueeze(0), tgt=tgt.unsqueeze(0))
                 outputs = logit.view(-1, logit.size(-1)).to(self.progress.get_device())
-                print(outputs[1].argmax())
                 token = self.top_p_sampling(outputs[-1], p=p, temperature=temperature)
                 tgt = torch.concatenate((tgt, torch.tensor([token], dtype=torch.long,
                                                            device=self.progress.get_device())), dim=0)
-                print(tgt)
+
             if tgt[-1] == 392:
                 break
             generated = torch.concatenate((generated, tgt[1: -1]))
             src = torch.concatenate((src, tgt[1:-1]))
+            tgt = torch.tensor([2], device=self.progress.get_device())
             seg = self.split_tensor_at_value(src, 3, include_split=True)
-            point = 0 if len(seg) - 4 <= 0 else len(seg) - 4
-            src = seg[point:].squeeze()
+            if len(seg) > 8 :
+                src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
+                for i in seg[1:]:
+                    src = torch.concatenate((src, i))
 
         return generated
 
@@ -362,32 +364,32 @@ class RPRTransformerDecoderLayer(nn.Module):
 
         y = tgt
 
-        y = y + self.multi_block(self.norm1(y), tgt_mask, tgt_key_padding_mask, tgt_is_causal) # マルチヘッドアテンションを適用
+        y = y + self.rpr_block(self.norm1(y), tgt_mask, tgt_key_padding_mask, tgt_is_causal) #相対位置マルチヘッドアテンションを適用
 
-        y = y + self.rpr_block(self.norm2(y), memory, memory_mask, memory_key_padding_mask, memory_is_causal) #相対位置マルチヘッドアテンションを適用
+        y = y + self.multi_block(self.norm2(y), memory, memory_mask, memory_key_padding_mask, memory_is_causal) # マルチヘッドアテンションを適用
 
         y = y + self.ff_block(self.norm3(y)) # フィードフォワード層を適用
 
         return y
 
-    def multi_block(self,
+    def rpr_block(self,
                     y: Tensor,
                     attn_mask: Optional[Tensor],
                     key_padding_mask: Optional[Tensor],
                     is_causal: bool = False,
                     ):
-        y = self.multi_head_attention(y,y,y, attn_mask=attn_mask, key_padding_mask=key_padding_mask, is_causal=is_causal, need_weights=False)[0]
+        y = self.rpr_attention(y,y,y, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=False)[0]
 
         return self.dropout1(y)
 
-    def rpr_block(self,
+    def multi_block(self,
                   y: Tensor,
                   mem: Tensor,
                   attn_mask: Optional[Tensor],
                   key_padding_mask: Optional[Tensor],
                   is_causal: bool = False,
                   ):
-        y = self.rpr_attention(y, mem, mem,key_padding_mask=key_padding_mask,need_weights=False, attn_mask=attn_mask)[0]
+        y = self.multi_head_attention(y, mem, mem, attn_mask=attn_mask, key_padding_mask=key_padding_mask,need_weights=False, is_causal=is_causal)[0]
         return self.dropout2(y)
 
     def ff_block(self, y: Tensor):
