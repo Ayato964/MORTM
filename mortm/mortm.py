@@ -4,12 +4,30 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttention
+from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttention, TransformerEncoder, TransformerEncoderLayer
 import numpy as np
 from .PositionalEncoding import PositionalEncoding
 from .rpr import MultiHeadAttentionRPR
 from .progress import LearningProgress
 from torch.distributions import Categorical
+
+def generate_square_subsequent_mask(
+    sz: int,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    r"""Generate a square causal mask for the sequence.
+
+    The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0).
+    """
+    if device is None:
+        device = torch.device("cpu")
+    if dtype is None:
+        dtype = torch.float32
+    return torch.triu(
+        torch.full((sz, sz), float("-inf"), dtype=dtype, device=device),
+        diagonal=1,
+    )
 
 
 class MORTM(nn.Module):
@@ -30,16 +48,17 @@ class MORTM(nn.Module):
             self.progress.get_device())
 
         #Transformerの設定
-        decoder = RPRTransformerDecoder(d_model=d_model, dim_ff=dim_feedforward,
-                                        num_head=num_heads, dropout=dropout,
-                                        batch_first=False, bias=True,
-                                        layer_norm_eps=1e-5, num_decoder_layer=d_layer)
-        self.transformer: nn.Transformer = nn.Transformer(d_model=self.d_model, nhead=num_heads,  #各種パラメーターの設計
-                                                          num_encoder_layers=self.e_layer,
-                                                          num_decoder_layers=d_layer,
-                                                          dropout=self.dropout, dim_feedforward=dim_feedforward,
-                                                          custom_decoder=decoder,
-                                                          ).to(self.progress.get_device())
+        self.decoder = MORTMDecoder(d_model=d_model, dim_ff=dim_feedforward,
+                               num_head=num_heads, dropout=dropout,
+                               batch_first=False, bias=True,
+                               layer_norm_eps=1e-5, num_decoder_layer=d_layer)
+        encoder_layer = MORTMEncoderLayer(
+            d_model=d_model, dim_ff=dim_feedforward,
+            num_head=num_heads, dropout=dropout,
+            batch_first=False, bias=True,
+            layer_norm_eps=1e-5
+        )
+        self.encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=e_layer, norm=LayerNorm(d_model, 1e-5, bias=True))
 
         print("Use RPR Transformer")
         print(f"Input Vocab Size:{vocab_size}")
@@ -51,7 +70,7 @@ class MORTM(nn.Module):
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
                 tgt_padding_mask=None):
         if tgt_mask is None:
-            mask = self.transformer.generate_square_subsequent_mask(tgt.shape[1]).to(self.progress.get_device())
+            mask = generate_square_subsequent_mask(tgt.shape[1]).to(self.progress.get_device())
         else:
             mask = tgt_mask
 
@@ -67,8 +86,9 @@ class MORTM(nn.Module):
         else:
             tgt_p = src_p
 
-        out: Tensor = self.transformer(src_p, tgt_p, src_mask=src_mask, tgt_mask=mask,
-                                       src_key_padding_mask=input_padding_mask, tgt_key_padding_mask=tgt_padding_mask)
+        memory = self.encoder(src=src_p, mask=src_mask, src_key_padding_mask=input_padding_mask)
+
+        out = self.decoder(tgt=tgt_p, memory=memory, tgt_mask=mask, tgt_key_padding_mask=tgt_padding_mask)
 
         out = out.permute(1, 0, 2)
 
@@ -288,14 +308,22 @@ class DummyDecoder(nn.Module):
     def forward(self, tgt, memory, tgt_mask, memory_mask, tgt_key_padding_mask, memory_key_padding_mask, **kwargs):
         return memory
 
-class RPRTransformerDecoder(nn.Module):
+
+class MORTMEncoderLayer(TransformerEncoderLayer):
+    def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps):
+        super(MORTMEncoderLayer, self).__init__(d_model=d_model, dim_feedforward=dim_ff, nhead=num_head, dropout=dropout,
+                                                batch_first=batch_first, bias=bias, layer_norm_eps=layer_norm_eps)
+        self.self_attn = MultiHeadAttentionRPR(embed_dim=d_model, num_heads=num_head, dropout=dropout, bias=bias)
+
+
+class MORTMDecoder(nn.Module):
     def __init__(self,d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps,  num_decoder_layer:int):
-        super(RPRTransformerDecoder, self).__init__()
+        super(MORTMDecoder, self).__init__()
         self.num_layer = num_decoder_layer
-        self.layers = _get_clones(RPRTransformerDecoderLayer(d_model=d_model, dim_ff=dim_ff,
-                                                             num_head=num_head, dropout=dropout,
-                                                             batch_first=batch_first, bias=bias,
-                                                             layer_norm_eps=layer_norm_eps), self.num_layer)
+        self.layers = _get_clones(MORTMDecoderLayer(d_model=d_model, dim_ff=dim_ff,
+                                                    num_head=num_head, dropout=dropout,
+                                                    batch_first=batch_first, bias=bias,
+                                                    layer_norm_eps=layer_norm_eps), self.num_layer)
         self.norm = LayerNorm(d_model, eps=1e-5, bias=True)
     def forward(self, tgt: Tensor,
         memory: Tensor,
@@ -308,7 +336,7 @@ class RPRTransformerDecoder(nn.Module):
 
         output = tgt
         for mod in self.layers:
-            mod: RPRTransformerDecoderLayer
+            mod: MORTMDecoderLayer
             output = mod(
                 output,
                 memory,
@@ -323,9 +351,9 @@ class RPRTransformerDecoder(nn.Module):
         return self.norm(output)
 
 
-class RPRTransformerDecoderLayer(nn.Module):
+class MORTMDecoderLayer(nn.Module):
     def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps):
-        super(RPRTransformerDecoderLayer, self).__init__()
+        super(MORTMDecoderLayer, self).__init__()
         self.multi_head_attention: MultiheadAttention = MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_head,
