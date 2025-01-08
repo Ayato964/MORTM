@@ -16,10 +16,6 @@ def generate_square_subsequent_mask(
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
-    r"""Generate a square causal mask for the sequence.
-
-    The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0).
-    """
     if device is None:
         device = torch.device("cpu")
     if dtype is None:
@@ -94,102 +90,6 @@ class MORTM(nn.Module):
 
         score: Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
-
-    def _top_k_sampling_length_encoder(self, input_sequence, temperature=1.0, top_k=3, max_length=100):
-        self.eval()
-        """
-        MORTMモデルにトップKサンプリングと温度シーケンスを実装する関数
-
-        Args:
-            input_sequence: 1次元の入力シーケンス (List[int] or torch.Tensor)。
-            temperature: 温度パラメータ。デフォルトは1.0。
-            top_k: サンプリングする上位K個のトークンの数。デフォルトは3。
-            max_length: 生成するシーケンスの最大長さ。デフォルトは100。
-
-        Returns:
-            1次元の生成されたシーケンス (torch.Tensor)。
-        """
-        log_prob_list = []
-        # 入力シーケンスをtorch.tensorに変換
-        if not isinstance(input_sequence, torch.Tensor):
-            input_sequence = torch.tensor(input_sequence, dtype=torch.long, device=self.progress.get_device())
-
-        # 入力シーケンスの長さを取得
-        input_length = input_sequence.size(0)
-
-        # 生成されたシーケンスを格納するリスト
-        generated_sequence = input_sequence.tolist()
-
-        # 生成をループ
-        for i in range(max_length):
-            # モデルに渡すための入力の準備 (2次元に変換)
-            input_tensor = input_sequence.unsqueeze(0)  # (1, sequence_length)
-            #print(f"I{i} input_tensor")
-            print(f"\r Generating...{i / max_length * 100}%", end="")
-            # モデルに入力して次のトークンのスコアを取得 (3次元で返ってくる)
-            with torch.no_grad():
-                mask = self.transformer.generate_square_subsequent_mask(input_tensor.shape[1]).to(
-                    self.progress.get_device())
-                #print(input_tensor.shape)
-                scores = self(input_tensor)  # (1, sequence_length, vocab_size)
-                #print(f"SCORE: {scores.shape}")
-
-            # 最新のトークンのスコアを取得 (最後のトークンに対するスコア)
-            logits = scores[:, -1, :]  # (1, vocab_size)
-
-            # 温度の適用
-            logits = logits / temperature
-            logits = logits[-1, :]
-            # ソフトマックスを適用して確率を取得
-            probs = self.softmax(logits)  # (vocab_size)
-
-            # トップKの確率でトークンをフィルタリング
-            topk_probs, topk_indices = torch.topk(probs, top_k)
-            #print(sorted_probs, sorted_indices)
-
-            # 再度正規化
-            topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
-
-            # トークンをサンプリング
-            distribution = Categorical(topk_probs)
-            sampled_index = distribution.sample()
-
-            # ソートされたインデックスから元のインデックスに変換
-            next_token = topk_indices[sampled_index].item()
-
-            log_probs = torch.log(topk_probs[sampled_index])
-            log_prob_list.append(log_probs)
-            #            print(next_token)
-
-            # シーケンスにトークンを追加
-            generated_sequence.append(next_token)
-
-            # 次のステップの入力として準備
-            input_sequence = torch.tensor(generated_sequence, dtype=torch.long, device=self.progress.get_device())
-
-        return input_sequence, torch.tensor(log_prob_list, device=self.progress.get_device())
-
-    def _top_p_sampling_length(self, input_seq, p=0.8, max_length=20, temperature=1.0):
-        self.eval()
-        if not isinstance(input_seq, torch.Tensor):
-            input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
-
-        generated = input_seq.tolist()
-        for i in range(max_length):
-            #           print(f"INPUTS:   {input_seq}")
-
-            input_seq = input_seq.unsqueeze(0)
-            logits = self(input_seq)
-            logits = logits[:, -1, :][-1, :]
-            token = self.top_p_sampling(logits, p=p, temperature=temperature)
-            generated.append(token)
-            input_seq = torch.tensor(generated, dtype=torch.long, device=self.progress.get_device())
-            if token == 2:
-                print("終了宣言されたため、処理を中断します。")
-                break
-            print(f"\r Generating... {i / max_length}%", end="")
-
-        return input_seq
 
     def top_p_sampling_measure(self, input_seq, p=0.9, max_measure=20, temperature=1.0):
         self.eval()
