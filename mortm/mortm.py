@@ -28,7 +28,7 @@ def generate_square_subsequent_mask(
 
 class MORTM(nn.Module):
     def __init__(self, vocab_size, progress: LearningProgress, d_layer=12, e_layer=9, num_heads=16, d_model=1024,
-                 dim_feedforward=4096, dropout=0.2,
+                 dim_feedforward=4096, dropout=0.2, decoder_only:bool=False,
                  position_length=8500):
         super(MORTM, self).__init__()
 
@@ -39,15 +39,15 @@ class MORTM(nn.Module):
         self.d_model = d_model
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
-
+        self.decoder_only = decoder_only
         self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length).to(
             self.progress.get_device())
-
         #Transformerの設定
-        self.decoder = MORTMDecoder(d_model=d_model, dim_ff=dim_feedforward,
-                               num_head=num_heads, dropout=dropout,
-                               batch_first=False, bias=True,
-                               layer_norm_eps=1e-5, num_decoder_layer=d_layer)
+        if not decoder_only:
+            self.decoder = MORTMDecoder(d_model=d_model, dim_ff=dim_feedforward,
+                                   num_head=num_heads, dropout=dropout,
+                                   batch_first=False, bias=True,
+                                   layer_norm_eps=1e-5, num_decoder_layer=d_layer)
         encoder_layer = MORTMEncoderLayer(
             d_model=d_model, dim_ff=dim_feedforward,
             num_head=num_heads, dropout=dropout,
@@ -65,8 +65,10 @@ class MORTM(nn.Module):
 
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
                 tgt_padding_mask=None):
-        if tgt_mask is None:
+        if tgt_mask is None and not self.decoder_only:
             mask = generate_square_subsequent_mask(tgt.shape[1]).to(self.progress.get_device())
+        elif self.decoder_only:
+            mask = generate_square_subsequent_mask(src.shape[1]).to(self.progress.get_device())
         else:
             mask = tgt_mask
 
@@ -82,9 +84,11 @@ class MORTM(nn.Module):
         else:
             tgt_p = src_p
 
-        memory = self.encoder(src=src_p, mask=src_mask, src_key_padding_mask=input_padding_mask)
-
-        out = self.decoder(tgt=tgt_p, memory=memory, tgt_mask=mask, tgt_key_padding_mask=tgt_padding_mask)
+        if not self.decoder_only:
+            memory = self.encoder(src=src_p, mask=src_mask, src_key_padding_mask=input_padding_mask)
+            out = self.decoder(tgt=tgt_p, memory=memory, tgt_mask=mask, tgt_key_padding_mask=tgt_padding_mask)
+        else:
+            out = self.encoder(src=src_p, mask=mask, src_key_padding_mask=input_padding_mask)
 
         out = out.permute(1, 0, 2)
 
@@ -120,7 +124,7 @@ class MORTM(nn.Module):
             src = torch.concatenate((src, tgt[1:-1]))
             tgt = torch.tensor([2], device=self.progress.get_device())
             seg = self.split_tensor_at_value(src, 3, include_split=True)
-            if len(seg) > 8 :
+            if len(seg) > 8:
                 src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
                 for i in seg[1:]:
                     src = torch.concatenate((src, i))

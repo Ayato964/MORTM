@@ -1,18 +1,15 @@
+import math
+
 import torch
 from torch.nn import Embedding
 import torch
 from torch import Tensor
-from transformers import AutoModel, AutoTokenizer
 from pretty_midi import PrettyMIDI, Instrument, Note
 import umap
-import matplotlib.pyplot as plt
-import seaborn as sns
 import plotly.express as px
 import pandas as pd
-from tqdm import tqdm
 from numpy import ndarray
-
-import mido
+import numpy as np
 import matplotlib.pyplot as plt
 from .mortm import MORTM
 from .tokenizer import Tokenizer
@@ -24,7 +21,7 @@ class AbstractEval:
         self.mortm = mortm
 
     @abstractmethod
-    def view(self):
+    def view(self, *args, **kwargs):
         pass
 
 
@@ -35,7 +32,7 @@ class EvalEmbedding(AbstractEval):
         self.emb.eval()
         self.tokenizer = tokenizer
 
-    def view(self, note:ndarray=None):
+    def view(self, note:ndarray | None = None):
         if note is None:
             emb_list:Tensor = self.get_embedding_list().squeeze(0).to("cpu")
             emb_list: ndarray = emb_list.detach().numpy()
@@ -90,6 +87,147 @@ class EvalEmbedding(AbstractEval):
     def get_embedding_list(self):
         tokens = torch.tensor([i for i in range(len(self.tokenizer.tokens))]).unsqueeze(0).to(self.mortm.progress.get_device())
         return self.emb(tokens)
+
+class EvalSoftMaxScale(AbstractEval):
+
+    def __init__(self, mortm: MORTM, tokenizer: Tokenizer):
+        super().__init__(mortm)
+        self.tokenizer = tokenizer
+        self.progress = mortm.progress
+
+    def view(self, input_seq):
+        # _get_softmax_matrix により softmax の出力リストを取得する
+        sm: list = self._get_softmax_matrix(input_seq)
+
+        num_plots = len(sm)
+        top_k = 10  # 各分布で上位10件を表示
+
+        # サブプロットを自動で配置するため、行数と列数を決定します
+        cols = math.ceil(math.sqrt(num_plots))
+        rows = math.ceil(num_plots / cols)
+
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3))
+        axes = np.array(axes).reshape(-1)  # サブプロットの配列を1次元に変換
+
+        for i, distribution in enumerate(sm):
+            # distribution が PyTorch の Tensor なら、NumPy array に変換
+            if hasattr(distribution, 'detach'):
+                distribution = distribution.detach().cpu().numpy()
+
+            # 降順ソートして上位 top_k 件取得
+            sorted_indices = np.argsort(distribution)[::-1]
+            sorted_probs = distribution[sorted_indices]
+
+            top_indices = sorted_indices[:top_k]
+            top_probs = sorted_probs[:top_k]
+
+            # トークンID を対応するトークン名に変換
+            # 例: 135 -> "p_65" （self.tokenizer.rev_get(135) が "p_65" を返す）
+            token_names = [self.tokenizer.rev_get(tok_id) for tok_id in top_indices]
+
+            # 棒グラフを描画
+            ax = axes[i]
+            ax.bar(range(top_k), top_probs, tick_label=token_names)
+            ax.set_xlabel("Token")
+            ax.set_ylabel("Probability")
+            ax.set_title(f"Time step {i}")
+            ax.tick_params(axis='x', rotation=45)
+
+        # 余ったサブプロットがあれば削除
+        for j in range(i + 1, len(axes)):
+            fig.delaxes(axes[j])
+
+        plt.tight_layout()
+        plt.show()
+
+    def _get_softmax_matrix(self, input_seq) -> list:
+        self.mortm.eval()
+        if not isinstance(input_seq, torch.Tensor):
+            input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
+        sm = []
+        max_measure = 3
+        seg: Tensor = self.split_tensor_at_value(input_seq, 3, include_split=True)
+        tgt = torch.tensor([2], dtype=torch.long, device=self.progress.get_device())
+        tgt = torch.concatenate((tgt, seg[-1])).to(self.progress.get_device())
+        point = 0 if len(seg[:-1]) - 8 <= 0 else len(seg[:-1]) - 8
+
+        src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
+
+        for i in range(point, len(seg[point:-1])):
+            src = torch.concatenate((src, seg[i]))
+        generated = src.clone()
+
+        for i in range(max_measure):
+            while not (tgt[-1] == 391 or tgt[-1] == 392):
+                logit = self.mortm(src=src.unsqueeze(0), tgt=tgt.unsqueeze(0))
+                outputs = logit.view(-1, logit.size(-1)).to(self.mortm.progress.get_device())
+                if tgt[-1] in range(5, 69):
+                    sm.append(self.mortm.softmax(outputs[-1]))
+                token = self.mortm.top_p_sampling(outputs[-1], p=0.95, temperature=1.0)
+                tgt = torch.concatenate((tgt, torch.tensor([token], dtype=torch.long,
+                                                           device=self.progress.get_device())), dim=0)
+
+            if tgt[-1] == 392:
+                break
+            generated = torch.concatenate((generated, tgt[1: -1]))
+            src = torch.concatenate((src, tgt[1:-1]))
+            tgt = torch.tensor([2], device=self.progress.get_device())
+            seg = self.split_tensor_at_value(src, 3, include_split=True)
+            if len(seg) > 8:
+                src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
+                for i in seg[1:]:
+                    src = torch.concatenate((src, i))
+        return sm
+
+    def split_tensor_at_value(self, tensor: Tensor, split_value, include_split=True):
+        """
+        指定した値を基準にテンソルを分割します。
+
+        Args:
+            tensor (torch.Tensor): 1次元のテンソルを想定しています。
+            split_value (int or float): 分割の基準となる値。
+            include_split (bool, optional): 分割値を各セグメントに含めるかどうか。デフォルトは True。
+
+        Returns:
+            List[torch.Tensor]: 分割されたテンソルのリスト。
+        """
+        if tensor.dim() != 1:
+            raise ValueError("この関数は1次元のテンソルに対してのみ動作します。")
+
+        # 分割値が存在するインデックスを取得
+        split_indices = (tensor == split_value).nonzero(as_tuple=True)[0]
+
+        if len(split_indices) == 0:
+            # 分割値が見つからない場合、元のテンソルをそのまま返す
+            return [tensor]
+
+        segments = []
+        num_splits = len(split_indices)
+
+        for i in range(num_splits):
+            start = split_indices[i]
+            if include_split:
+                start = start  # 分割値を含める場合
+            else:
+                start = split_indices[i] + 1  # 分割値を含めない場合
+
+            if i + 1 < num_splits:
+                end = split_indices[i + 1]
+            else:
+                end = len(tensor)
+
+            if include_split:
+                end = end  # 次の分割値の位置まで含める
+            else:
+                end = end  # 次の分割値の位置まで含めない
+
+            segment = tensor[start:end]
+            segments.append(segment)
+
+        return segments
+
+
+
 
 class EvalPianoRoll(AbstractEval):
     def __init__(self, mortm: MORTM, midi_data: str):

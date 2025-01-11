@@ -5,7 +5,7 @@ from mortm.de_convert import ct_token_to_midi
 import numpy as  np
 
 tokenizer = Tokenizer(music_token=get_token_converter(TO_TOKEN))
-
+tokenizer.save("./out/vocab")
 con = MidiToSequece(tokenizer, "data/generate", "Sample2.mid", [0])
 
 con()
