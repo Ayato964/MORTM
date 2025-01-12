@@ -15,7 +15,7 @@ from typing import  Callable
 
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 import torch.nn as nn
 import numpy as np
 from torch.optim.lr_scheduler import LambdaLR
@@ -131,15 +131,40 @@ def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss, c
     bar = f" {color_bar}{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
     print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
 
+def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.CrossEntropyLoss, progress: LearningProgress):
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for src, tgt in val_loader:
+            correct: Tensor = tgt[:, 1:]
+            tgt = tgt[:, :-1]
 
-def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
-                       e_layer, d_layer, load_model_directory:str = None, src_mask_method: Callable[[Tensor], Tensor]=None,
+            padding_mask_in: Tensor = _get_padding_mask(src, progress)
+            padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
+
+            outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg)
+
+            outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
+            correct = correct.reshape(-1).long()
+
+            loss = criterion(outputs, correct)  # 損失を計算
+            val_loss += loss.item()
+        model.train()
+    return val_loss / len(val_loader)
+
+def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
+                       e_layer, d_layer, load_model_directory:str = None, train_dataset_split:float = 0.9,
                        num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
                        position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
 
-    loader = DataLoader(ayato_dataset, batch_size=batch_size, shuffle=True,
+    train_size = int(train_dataset_split * len(mortm_dataset))
+    val_size = len(mortm_dataset) - train_size
+    train_dataset, val_dataset = random_split(mortm_dataset, [train_size, val_size])
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                         num_workers=num_workers, collate_fn=collate_fn
                         )
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True,
+                            num_workers=num_workers, collate_fn=collate_fn)
 
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, progress=progress, num_heads=num_heads, e_layer=e_layer, d_layer=d_layer,
@@ -170,7 +195,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
             model.train()
             optimizer.zero_grad()
 
-            for src, tgt in loader:  # seqにはbatch_size分の楽曲が入っている
+            for src, tgt in train_loader:  # seqにはbatch_size分の楽曲が入っている
                 #print(f"learning sequence {count}")
                 correct: Tensor = tgt[:, 1:]
                 tgt = tgt[:, :-1]
@@ -202,24 +227,29 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
                 end_time = time.time()
 
                 if mail_bool and message is not None:
-                    _send_prediction_end_time(message, len(loader), begin_time, end_time, vocab_size, num_epochs,
+                    _send_prediction_end_time(message, len(train_loader), begin_time, end_time, vocab_size, num_epochs,
                                               e_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
                     mail_bool = False
 
                 if (count + 1) % message.step_by_message_count == 0:
                     message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
-                                                                       f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。\n")
+                                                                       f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。\n"
+                                                                       f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
                                                                        #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-                progress_bar(epoch, num_epochs, count, len(loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss, criterion)
+                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss, criterion)
 
                 if (count + 1) % 50000 / batch_size == 0:
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}_{count}.pth")
                     print("途中経過を保存しました。")
 
+                if (count + 1) % 10000 / batch_size == 0:
+                    verification_loss = get_verification_loss(model, val_loader, criterion, progress)
+
             message.send_message("機械学習の途中経過について",
-                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。")
+                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。\n"
+                                     f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
                                      #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
             loss_val = epoch_loss / count
             writer.add_scalar('Loss/train', epoch_loss / count, epoch)  # 損失値を記録
@@ -239,7 +269,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, ayato_dataset, mess
 
 
 def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
-                message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
+                message: Messenger = _DefaultMessenger(), load_model_directory: str=None, train_dataset_split = 0.9,
                 e_layer=9, d_layer=12, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1,
                 dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(), ):
@@ -289,7 +319,7 @@ def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_s
                                              warmup_steps=warmup_steps,
                                              is_save_training_progress=is_save_training_progress,
                                              lr_param=lr_param,
-                                             src_mask_method=src_mask_method
+                                             train_dataset_split= train_dataset_split
                                              )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",

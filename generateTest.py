@@ -40,7 +40,7 @@ model = MORTM(
     dim_feedforward=3072,
 
 )
-model.load_state_dict(torch.load("out/model/MORTM.2.0-b4-SMALL-LITE_0.4687381123652983.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.train.5.0.2523.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 

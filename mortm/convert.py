@@ -208,8 +208,8 @@ class MIDIToSequence(_AbstractMidiToAyaNode):
 
 
 class MidiToSequece(_AbstractMidiToAyaNode):
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list):
-        super().__init__(MidiToSequece, tokenizer, directory, file_name, program_list)
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
+        super().__init__(MidiToSequece, tokenizer, directory, file_name, program_list, midi_data=midi_data)
         self.sequence_dict: dict = dict()
         self.sequence_count = 0
         self.context = 8
@@ -221,7 +221,7 @@ class MidiToSequece(_AbstractMidiToAyaNode):
     def save(self, save_directory: str) -> [bool, str]:
         if not self.is_error:
             if len(self.sequence_dict) > 2:
-                np.savez(save_directory + self.file_name, **self.sequence_dict)
+                np.savez(save_directory + "/" + self.file_name, **self.sequence_dict)
                 return True, "正常に終了しました。"
             else:
                 return False, "オブジェクトが何らかの理由で見つかりませんでした。"

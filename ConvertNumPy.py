@@ -19,17 +19,38 @@ def convert(pid, tokenizer, directory, md_file, program, progress):
     for i in range(len(md_file)):
         con = MidiToSequece(tokenizer, directory[i], md_file[i], program)
         con.convert()
-        is_saved, reason = con.save("out/np/datasets/")
+        is_saved, reason = con.save("out/np/datasets_large/")
         if is_saved:
             local_count += 1
         print(f"Process#{pid}: Running... {local_count}  {reason}")
     progress[pid] = local_count
 
+
+def convert_ex(pid, tokenizer, directory, md_file, program, progress):
+    local_count = 0
+    for i in range(len(md_file)):
+        con = MidiToSequece(tokenizer, directory[i], md_file[i], program)
+        ex_midi = con.expansion_midi()
+        con.convert()
+        is_saved, reason = con.save("out/np/datasets_small/")
+
+        for ex in ex_midi:
+            ex.convert()
+            is_saved, reason = ex.save("out/np/datasets_small/")
+            print(f"Process#{pid}: データ拡張中...{is_saved}  {reason}")
+
+        if is_saved:
+            local_count += 1
+        print(f"Process#{pid}: Running... {local_count}  {reason}")
+    progress[pid] = local_count
+
+
 if __name__ == "__main__":
     THREAD_VALUE = 10
     SAX = [65, 66]
 
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    #datasets_large = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    datasets = "./data/other"
     directory, md_file = find_midi_files(datasets)
 
     directory = np.array_split(directory, THREAD_VALUE)
@@ -41,7 +62,7 @@ if __name__ == "__main__":
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
+            p = Process(target=convert_ex, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
             processes.append(p)
             p.start()
 
