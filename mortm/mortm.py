@@ -27,9 +27,9 @@ def generate_square_subsequent_mask(
 
 
 class MORTM(nn.Module):
-    def __init__(self, vocab_size, progress: LearningProgress, d_layer=12, e_layer=9, num_heads=16, d_model=1024,
-                 dim_feedforward=4096, dropout=0.2, decoder_only:bool=False,
-                 position_length=8500):
+    def __init__(self, vocab_size, progress: LearningProgress, d_layer=15, e_layer=15, num_heads=12, d_model=768,
+                 dim_feedforward=3072, dropout=0.2, decoder_only:bool=False,
+                 position_length=400):
         super(MORTM, self).__init__()
 
         self.progress = progress

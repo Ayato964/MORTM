@@ -270,8 +270,8 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
 def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, train_dataset_split = 0.9,
-                e_layer=9, d_layer=12, num_heads=32, d_model=1024, is_save_training_progress=False, lr_param=2e-1,
-                dim_feedforward=4096, dropout=0.2, position_length=8500, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
+                e_layer=15, d_layer=15, num_heads=12, d_model=768, is_save_training_progress=False, lr_param=2e-1,
+                dim_feedforward=3072, dropout=0.2, position_length=320, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(), ):
 
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'

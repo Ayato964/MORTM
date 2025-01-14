@@ -35,10 +35,6 @@ tokenizer.rev_mode()
 model = MORTM(
     progress=_DefaultLearningProgress(),
     vocab_size=393,
-    position_length=400,
-    e_layer=15, d_layer=15, num_heads=12, d_model=768,
-    dim_feedforward=3072,
-
 )
 model.load_state_dict(torch.load("out/model/MORTM.2.0-SMALL-LITE_0.25.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定

@@ -2,7 +2,7 @@ import os
 import numpy as np
 from multiprocessing import Process, Manager
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.convert import MidiToSequece
+from mortm.convert import MIDI2PareSeq
 
 def find_midi_files(root_folder):
     midi_files = []
@@ -17,7 +17,7 @@ def find_midi_files(root_folder):
 def convert(pid, tokenizer, directory, md_file, program, progress):
     local_count = 0
     for i in range(len(md_file)):
-        con = MidiToSequece(tokenizer, directory[i], md_file[i], program)
+        con = MIDI2PareSeq(tokenizer, directory[i], md_file[i], program)
         con.convert()
         is_saved, reason = con.save("out/np/datasets_large/")
         if is_saved:
@@ -29,7 +29,7 @@ def convert(pid, tokenizer, directory, md_file, program, progress):
 def convert_ex(pid, tokenizer, directory, md_file, program, progress):
     local_count = 0
     for i in range(len(md_file)):
-        con = MidiToSequece(tokenizer, directory[i], md_file[i], program)
+        con = MIDI2PareSeq(tokenizer, directory[i], md_file[i], program)
         ex_midi = con.expansion_midi()
         con.convert()
         is_saved, reason = con.save("out/np/datasets_small/")

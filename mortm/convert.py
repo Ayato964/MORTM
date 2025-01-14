@@ -98,10 +98,10 @@ class _AbstractMidiToAyaNode(ABC):
     def convert(self):
         pass
 
-class MIDIToSequence(_AbstractMidiToAyaNode):
+class MIDI2Seq(_AbstractMidiToAyaNode):
 
     def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
-        super().__init__(MIDIToSequence, tokenizer, directory, file_name, program_list, midi_data)
+        super().__init__(MIDI2Seq, tokenizer, directory, file_name, program_list, midi_data)
         self.aya_node = [0]
 
     def convert(self):
@@ -207,9 +207,9 @@ class MIDIToSequence(_AbstractMidiToAyaNode):
             return False, self.error_reason
 
 
-class MidiToSequece(_AbstractMidiToAyaNode):
+class MIDI2PareSeq(_AbstractMidiToAyaNode):
     def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
-        super().__init__(MidiToSequece, tokenizer, directory, file_name, program_list, midi_data=midi_data)
+        super().__init__(MIDI2PareSeq, tokenizer, directory, file_name, program_list, midi_data=midi_data)
         self.sequence_dict: dict = dict()
         self.sequence_count = 0
         self.context = 8
