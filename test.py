@@ -1,17 +1,25 @@
-import torch
-from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC, TO_TOKEN
-from mortm.convert import MIDIToSequence, MidiToSequece
-from mortm.de_convert import ct_token_to_midi
-import numpy as  np
+from pretty_midi import PrettyMIDI, Instrument, Note
 
-tokenizer = Tokenizer(music_token=get_token_converter(TO_TOKEN))
-tokenizer.save("./out/vocab")
-con = MidiToSequece(tokenizer, "data/generate", "Sample2.mid", [0])
+def convert(inst: Instrument, v: int):
+    new_inst = Instrument(inst.program)
 
-con()
+    for note in inst.notes:
+        note: Note
+        new_inst.notes.append(Note(pitch=note.pitch + v, velocity=note.velocity, start=note.start, end=note.end))
 
-i, r = con.save("out/")
-print(con.sequence_dict)
-print(i, r)
-tokenizer.rev_mode()
-#ct_token_to_midi(tokenizer, con.aya_node[1], save_directory="out/generate.mid", tempo=180, program=65)
+    return new_inst
+
+
+midi = PrettyMIDI("./data/generate/Sample.mid")
+inst: list = midi.instruments
+new_midi = PrettyMIDI()
+
+for i in inst:
+    i: Instrument
+    if not i.is_drum:
+        new_inst = convert(i, 2)
+        new_midi.instruments.append(new_inst)
+    else:
+        new_midi.instruments.append(i)
+
+new_midi.write("./data/generate/Sample_add2.mid")

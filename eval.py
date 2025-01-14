@@ -15,11 +15,11 @@ model = MORTM(
     position_length=400,
     e_layer=15, d_layer=15, num_heads=12, d_model=768,
     dim_feedforward=3072,)
-model.load_state_dict(torch.load("out/model/MORTM.2.0-b4-SMALL-LITE_0.4687381123652983.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.2.0-SMALL-LITE_0.25.pth")) # モデルをロードする。
 model.to(_DefaultLearningProgress().get_device())
 
 eval = ev.EvalSoftMaxScale(model, tokenizer)
-np_notes = np.load("out/np/Sample.mid.npz")
+np_notes = np.load("out/np/Sample_add2.mid.npz")
 
 start = np_notes[f'array1'][:-1]
 
