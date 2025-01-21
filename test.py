@@ -23,3 +23,5 @@ for i in inst:
         new_midi.instruments.append(i)
 
 new_midi.write("./data/generate/Sample_add2.mid")
+
+

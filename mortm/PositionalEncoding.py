@@ -76,27 +76,3 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         x = x + self.pe[:x.size(0), :]
         return self.dropout(x)
-
-
-class LearnablePositionalEncoding(nn.Module):
-    def __init__(self, d_model, progress: LearningProgress, dropout=0.1, max_len=8000):
-        super(LearnablePositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout).to(progress.get_device())
-        self.embedding = nn.Embedding(max_len, d_model).to(progress.get_device())
-
-        # 埋め込み行列の初期化
-        self._reset_parameters()
-
-    def forward(self, x):
-        batch_size, seq_len, _ = x.size()
-        positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        positional_encoding = self.embedding(positions)
-        x = x + positional_encoding
-
-        return self.dropout(x)
-
-    def _reset_parameters(self):
-        """
-        学習可能なパラメータを初期化する関数
-        """
-        nn.init.trunc_normal_(self.embedding.weight, std=.02)

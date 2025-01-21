@@ -2,7 +2,7 @@ import os
 import numpy as np
 from multiprocessing import Process, Manager
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.convert import MIDI2PareSeq
+from mortm.convert import MIDI2PareSeq, PareSeqToCatSeq
 
 def find_midi_files(root_folder):
     midi_files = []
@@ -14,12 +14,36 @@ def find_midi_files(root_folder):
                 direc.append(defpath)
     return direc, midi_files
 
+
+def find_seq_files(root_folder):
+    midi_files = []
+    direc = []
+    for defpath, surnames, filenames in os.walk(root_folder):
+        for file in filenames:
+            if file.lower().endswith(('.npz')):
+                midi_files.append(file)
+                direc.append(defpath)
+    return direc, midi_files
+
+
 def convert(pid, tokenizer, directory, md_file, program, progress):
     local_count = 0
     for i in range(len(md_file)):
         con = MIDI2PareSeq(tokenizer, directory[i], md_file[i], program)
         con.convert()
         is_saved, reason = con.save("out/np/datasets_large/")
+        if is_saved:
+            local_count += 1
+        print(f"Process#{pid}: Running... {local_count}  {reason}")
+    progress[pid] = local_count
+
+
+def pare_convert(pid, tokenizer, directory, md_file, program, progress):
+    local_count = 0
+    for i in range(len(md_file)):
+        con = PareSeqToCatSeq(tokenizer, directory[i], md_file[i])
+        con.convert()
+        is_saved, reason = con.save("out/np/datasets_small_decoder/")
         if is_saved:
             local_count += 1
         print(f"Process#{pid}: Running... {local_count}  {reason}")
@@ -50,8 +74,9 @@ if __name__ == "__main__":
     SAX = [65, 66]
 
     #datasets_large = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    datasets = "./data/other"
-    directory, md_file = find_midi_files(datasets)
+    #datasets = "./data/other"
+    datasets = "./out/np/datasets_small"
+    directory, md_file = find_seq_files(datasets)
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
@@ -62,7 +87,7 @@ if __name__ == "__main__":
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            p = Process(target=convert_ex, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
+            p = Process(target=pare_convert, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
             processes.append(p)
             p.start()
 

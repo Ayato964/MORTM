@@ -304,3 +304,23 @@ class MIDI2PareSeq(_AbstractMidiToAyaNode):
             value = np.array([], dtype=int)
 
         return key, value
+
+
+class PareSeqToCatSeq:
+    def save(self, directory):
+        if len(self.cat_seq) > 2:
+            np.savez(directory + "/" + self.file_name, *self.cat_seq)
+            return True, "正常に終了しました。"
+        else:
+            return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+
+    def convert(self):
+        for i in range(len(self.pare_seq)):
+            key = self.pare_seq[f'array_{i}'].tolist()['key']
+            value = self.pare_seq[f'array_{i}'].tolist()['value']
+            self.cat_seq.append(np.concatenate((key, value)))
+
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str):
+        self.file_name = file_name
+        self.pare_seq = np.load(directory + "/" + file_name, allow_pickle=True)
+        self.cat_seq = []

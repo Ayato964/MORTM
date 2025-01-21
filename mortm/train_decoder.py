@@ -1,10 +1,3 @@
-'''
-MORTMの学習を行う際にこのモジュールを使います。
-train_mortmメソッドを呼び出し、引数の型に合ったオブジェクトを代入してください。
-最低でも、「データセット(Tokenizerで変換したもの)のディレクトリ」、「モデルの出力先のディレクトリ」,
-「モデルのバージョン」,「ボキャブラリーサイズ」,「エポック回数」、「各トークンの出現回数のリスト」が必要です。
-'''
-
 import datetime
 import json
 import math
@@ -25,12 +18,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
-from .datasets import MORTM_DataSets
+from .datasets import MORTM_SEQDataset
 from .mortm import MORTM
 from .noam import noam_lr
 from .loss import ReinforceCrossEntropy
 from .tokenizer import Tokenizer
-IS_DEBUG = False
+
 
 
 def _send_prediction_end_time(message, loader_len, begin_time, end_time,
@@ -52,6 +45,7 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
                          )
 
 
+
 def find_npz_files(root_folder):
     midi_files = []
     direc = []
@@ -62,11 +56,9 @@ def find_npz_files(root_folder):
                 direc.append(defpath)
     return direc, midi_files
 
-
-# デバイスを取得
 def _set_train_data(directory, datasets, positional_length, progress: LearningProgress):
     print("Starting load....")
-    mortm_datasets = MORTM_DataSets(progress, positional_length)
+    mortm_datasets = MORTM_SEQDataset(progress, positional_length)
     loss_count = 0
     count = 0
     dataset_length = 0
@@ -87,6 +79,15 @@ def _set_train_data(directory, datasets, positional_length, progress: LearningPr
     return mortm_datasets
 
 
+def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss, criterion:ReinforceCrossEntropy):
+    per = sequence / batch_size * 100
+    block = int(per / 100 * 50)
+    #color_bar = get_color(criterion)
+    color_bar = "\033[32m"
+    bar = f" {color_bar}{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
+    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
+
+
 def _get_padding_mask(input_ids, progress: LearningProgress):
     # input_ids が Tensor であることを仮定
     pad_id = (input_ids != 0).to(torch.float)
@@ -96,54 +97,20 @@ def _get_padding_mask(input_ids, progress: LearningProgress):
 
 def collate_fn(batch):
     # バッチ内のテンソルの長さを揃える（パディングする）
-    src_list = [item[0] for item in batch]  # 各タプルのsrcを抽出
-    tgt_list = [item[1] for item in batch]  # 各タプルのtgtを抽出
-    src = pad_sequence(src_list, batch_first=True, padding_value=0)
-    tgt = pad_sequence(tgt_list, batch_first=True, padding_value=0)
-    return (src, tgt)
+    src = pad_sequence(batch, batch_first=True, padding_value=0)
+    return src
 
-
-def update_log(model, writer, global_step):
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            writer.add_scalar(f"Gradient Norm/{name}", param.grad.norm(), global_step)
-
-        writer.add_scalar(f"Parameter Value/{name}", param.norm(), global_step)
-
-def get_color(criterion: ReinforceCrossEntropy):
-    if criterion.te < 0.1:
-        return "\033[32m"
-    elif criterion.te < 0.25:
-        return "\033[33m"
-    elif criterion.te < 0.5:
-        return "\033[34m"
-    elif criterion.te < 0.75:
-        return "\033[35m"
-    elif criterion.te < 0.95:
-        return "\033[36m"
-    else:
-        return "\033[37m"
-
-def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss, criterion:ReinforceCrossEntropy):
-    per = sequence / batch_size * 100
-    block = int(per / 100 * 50)
-    #color_bar = get_color(criterion)
-    color_bar = "\033[32m"
-    bar = f" {color_bar}{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
-    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
 
 def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.CrossEntropyLoss, progress: LearningProgress):
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
-        for src, tgt in val_loader:
-            correct: Tensor = tgt[:, 1:]
-            tgt = tgt[:, :-1]
-
+        for src in val_loader:
+            correct = get_correct_src(src, progress)
+            src = src[:, :-1]
             padding_mask_in: Tensor = _get_padding_mask(src, progress)
-            padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-            outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg)
+            outputs: Tensor = model(src=src, input_padding_mask=padding_mask_in)
 
             outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
             correct = correct.reshape(-1).long()
@@ -152,6 +119,19 @@ def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.Cr
             val_loss += loss.item()
         model.train()
     return val_loss / len(val_loader)
+
+
+def get_correct_src(src: Tensor, progress) -> Tensor:
+    if not isinstance(src, Tensor):
+        print(src)
+        src = torch.tensor(src, device=progress.get_device())
+    batch, ind = torch.nonzero(src == 2, as_tuple=True)
+    result = []
+    for b, i in zip(batch.tolist(), ind.tolist()):
+        new_sequence = torch.cat((src[b, :i], src[b, i+1:]))
+        result.append(new_sequence)
+    return torch.stack([r for r in result]).to(progress.get_device())
+
 
 def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
                        e_layer, d_layer, load_model_directory:str = None, train_dataset_split:float = 0.9,
@@ -162,15 +142,16 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
     val_size = len(mortm_dataset) - train_size
     train_dataset, val_dataset = random_split(mortm_dataset, [train_size, val_size])
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                        num_workers=num_workers, collate_fn=collate_fn
-                        )
+                              num_workers=num_workers, collate_fn=collate_fn
+                              )
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True,
                             num_workers=num_workers, collate_fn=collate_fn)
 
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, progress=progress, num_heads=num_heads, e_layer=e_layer, d_layer=d_layer,
-                  d_model=d_model, dim_feedforward=dim_feedforward,
+                  d_model=d_model, dim_feedforward=dim_feedforward, decoder_only=True,
                   dropout=dropout, position_length=position_length).to(progress.get_device())
+
     if load_model_directory is not None:
         model.load_state_dict(torch.load(load_model_directory))
 
@@ -197,28 +178,22 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
             model.train()
             optimizer.zero_grad()
 
-            for src, tgt in train_loader:  # seqにはbatch_size分の楽曲が入っている
+            for src in train_loader:  # seqにはbatch_size分の楽曲が入っている
                 #print(f"learning sequence {count}")
-                correct: Tensor = tgt[:, 1:]
-                tgt = tgt[:, :-1]
                 begin_time = time.time()
+                correct = get_correct_src(src, progress)
+                src = src[:, :-1]
 
                 padding_mask_in: Tensor = _get_padding_mask(src, progress)
-                padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
-
-                outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg)
+                outputs: Tensor = model(src=src, input_padding_mask=padding_mask_in)
 
                 outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
                 correct = correct.reshape(-1).long()
-
-                #print(outputs.shape, correct.shape)
 
                 loss = criterion(outputs, correct)  # 損失を計算
                 epoch_loss += loss.item()
                 loss = loss / accumulation_steps
                 loss.backward()  # 逆伝播
-
-                update_log(model, writer, count)
 
                 if count % accumulation_steps == 0:  #実質バッチサイズは64である
                     progress.step_optimizer(optimizer, model, accumulation_steps)
@@ -237,7 +212,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                     message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
                                                                        f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。\n"
                                                                        f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
-                                                                       #f"損失関数スケジューラーは{criterion.cs}です。")
+                    #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
                 progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss, criterion)
@@ -249,14 +224,14 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                 if (count + 1) % (10000 / batch_size) == 0:
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress)
                     writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss / count,
-                                                                  "Verification": verification_loss}, all_count)
+                                                                   "Verification": verification_loss}, all_count)
 
                 all_count += 1
 
             message.send_message("機械学習の途中経過について",
-                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。\n"
-                                     f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
-                                     #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
+                                 f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。\n"
+                                 f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
+            #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
             loss_val = epoch_loss / count
             writer.add_scalar('EpochLoss', epoch_loss / count, epoch)  # 損失値を記録
 
@@ -267,16 +242,15 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
             torch.save(model.state_dict(), f"{save_directory}/MORTM.error_end.{epoch}.pth")
             message.send_message("オーバーフローしました・。", f"{epoch}エポック中にオーバーフローが発生しました。\n"
                                                               f"次のエポックに移行します。\n")
-                                                              #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
+            #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
     writer.close()
 
     return model, loss_val
 
 
-
 def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, train_dataset_split = 0.9,
-                e_layer=15, d_layer=15, num_heads=12, d_model=768, is_save_training_progress=False, lr_param=2e-1,
+                e_layer=15, num_heads=12, d_model=768, is_save_training_progress=False, lr_param=2e-1,
                 dim_feedforward=3072, dropout=0.2, position_length=320, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(), ):
 
@@ -291,31 +265,12 @@ def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_s
     try:
 
         with open(weight_directory, 'r') as file:
-            '''
-            freq_dict = json.load(file)
-            # 逆数を取り、頻出度が0の場合は小さい値に設定
-            epsilon = 1e-11  # 非ゼロの小さい値を設定しておく
-            weights = []
-
-            for i in range(len(freq_dict)):
-                freq = freq_dict[str(i)]  # JSONのキーは文字列なのでstrに変換
-                if freq == 0:
-                    weights.append(epsilon)
-                else:
-                    weights.append(1.0 / (math.log(freq + 1.0) + epsilon))  # 対数スケーリングを適用
-            # テンソルに変換
-            weight_tensor = torch.tensor(weights)
-            #weight_tensor = weight_tensor / weight_tensor.sum()
-
-            print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
-            '''
-
             model, loss = _train_self_tuning(tokenizer,save_directory, train_data, message, vocab_size, num_epochs, None, progress=progress,
                                              load_model_directory=load_model_directory,
                                              d_model=d_model,
                                              dim_feedforward=dim_feedforward,
                                              e_layer=e_layer,
-                                             d_layer=d_layer,
+                                             d_layer=e_layer,
                                              num_heads=num_heads,
                                              position_length=position_length,
                                              dropout=dropout,
@@ -329,7 +284,7 @@ def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_s
                                              )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",
-                                 f"MORTM.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
+                             f"MORTM.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
 
         torch.save(model.state_dict(), f"{save_directory}/MORTM.{version}_{loss}.pth")  # できたモデルをセーブする
 
@@ -337,17 +292,6 @@ def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_s
 
     except torch.cuda.OutOfMemoryError:
         message.send_message("エラーが発生し、処理を中断しました",
-                                 "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
+                             "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
         print("オーバーフローしました。")
     pass
-
-
-
-class VerificationLoss:
-
-    def __init__(self, datasets: MORTM_DataSets):
-        self.dataloader = DataLoader(dataset=datasets, collate_fn=collate_fn, shuffle=False)
-
-    def __call__(self, *args, **kwargs):
-        pass
-

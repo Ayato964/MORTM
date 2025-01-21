@@ -11,6 +11,7 @@ from .rpr import MultiHeadAttentionRPR
 from .progress import LearningProgress
 from torch.distributions import Categorical
 
+
 def generate_square_subsequent_mask(
     sz: int,
     device: Optional[torch.device] = None,
@@ -24,6 +25,7 @@ def generate_square_subsequent_mask(
         torch.full((sz, sz), float("-inf"), dtype=dtype, device=device),
         diagonal=1,
     )
+
 
 
 class MORTM(nn.Module):
@@ -40,7 +42,7 @@ class MORTM(nn.Module):
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
         self.decoder_only = decoder_only
-        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length).to(
+        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length * 2).to(
             self.progress.get_device())
         #Transformerの設定
         if not decoder_only:
