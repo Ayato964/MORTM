@@ -106,7 +106,7 @@ def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.Cr
     val_loss = 0.0
     with torch.no_grad():
         for src in val_loader:
-            correct = get_correct_src(src, progress)
+            correct, loss_mask = get_correct_src2(src, progress)
             src = src[:, :-1]
             padding_mask_in: Tensor = _get_padding_mask(src, progress)
 
@@ -114,23 +114,41 @@ def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.Cr
 
             outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
             correct = correct.reshape(-1).long()
-
+            loss_mask = loss_mask.reshape(-1).long()
             loss = criterion(outputs, correct)  # 損失を計算
-            val_loss += loss.item()
+            loss = loss * loss_mask
+            loss = loss.sum() / loss_mask.sum()
+
+            val_loss += loss
         model.train()
     return val_loss / len(val_loader)
 
 
-def get_correct_src(src: Tensor, progress) -> Tensor:
+
+
+def get_correct_src2(src: Tensor, progress) -> [Tensor, Tensor]:
     if not isinstance(src, Tensor):
         print(src)
         src = torch.tensor(src, device=progress.get_device())
     batch, ind = torch.nonzero(src == 2, as_tuple=True)
     result = []
+    masks = []
     for b, i in zip(batch.tolist(), ind.tolist()):
         new_sequence = torch.cat((src[b, :i], src[b, i+1:]))
         result.append(new_sequence)
-    return torch.stack([r for r in result]).to(progress.get_device())
+
+        pad_first = torch.where(src[b] == 0)[0]
+        mask = torch.zeros(len(src[b, :i])) #Lossに含まない部分を計算
+        if pad_first.numel() != 0:
+            pad_first = pad_first[0]
+            loss = torch.ones(len(src[b, i+1:pad_first])) #Lossを産出する部分
+            pad = torch.zeros(len(src[b, pad_first:])) #PaddingによるLossを算出しない部分
+            masks.append(torch.cat((mask, loss, pad)))
+        else:
+            loss = torch.ones(len(src[b, i+1:])) #Lossを算出する部分
+            masks.append(torch.cat((mask, loss)))
+
+    return torch.stack([r for r in result]).to(progress.get_device()), torch.stack([m for m in masks]).to(progress.get_device())
 
 
 def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
@@ -181,7 +199,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
             for src in train_loader:  # seqにはbatch_size分の楽曲が入っている
                 #print(f"learning sequence {count}")
                 begin_time = time.time()
-                correct = get_correct_src(src, progress)
+                correct, loss_mask = get_correct_src2(src, progress)
                 src = src[:, :-1]
 
                 padding_mask_in: Tensor = _get_padding_mask(src, progress)
@@ -189,9 +207,11 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
                 outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
                 correct = correct.reshape(-1).long()
-
+                loss_mask = loss_mask.reshape(-1).long()
                 loss = criterion(outputs, correct)  # 損失を計算
-                epoch_loss += loss.item()
+                loss = loss * loss_mask
+                loss = loss.sum() / loss_mask.sum()
+                epoch_loss += loss
                 loss = loss / accumulation_steps
                 loss.backward()  # 逆伝播
 
