@@ -174,7 +174,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
         model.load_state_dict(torch.load(load_model_directory))
 
     #criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=10, weight=weight.to(progress.get_device()))
-    criterion = nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device())
+    criterion = nn.CrossEntropyLoss(ignore_index=0, reduction="none").to(progress.get_device())
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
