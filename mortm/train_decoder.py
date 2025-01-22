@@ -237,7 +237,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
                 progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss, criterion)
 
-                if (count + 1) % (50000 / batch_size) == 0:
+                if (count + 1) % (100000 / batch_size) == 0:
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}_{count}.pth")
                     print("途中経過を保存しました。")
 

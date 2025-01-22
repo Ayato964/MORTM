@@ -43,7 +43,7 @@ def pare_convert(pid, tokenizer, directory, md_file, program, progress):
     for i in range(len(md_file)):
         con = PareSeqToCatSeq(tokenizer, directory[i], md_file[i])
         con.convert()
-        is_saved, reason = con.save("out/np/datasets_small_decoder/")
+        is_saved, reason = con.save("out/np/datasets_large_decoder/")
         if is_saved:
             local_count += 1
         print(f"Process#{pid}: Running... {local_count}  {reason}")
@@ -73,9 +73,9 @@ if __name__ == "__main__":
     THREAD_VALUE = 10
     SAX = [65, 66]
 
-    #datasets_large = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
     #datasets = "./data/other"
-    datasets = "./out/np/datasets_small"
+    datasets = "./out/np/datasets_large"
     directory, md_file = find_seq_files(datasets)
 
     directory = np.array_split(directory, THREAD_VALUE)
