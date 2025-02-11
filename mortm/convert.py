@@ -212,7 +212,7 @@ class MIDI2PareSeq(_AbstractMidiToAyaNode):
         super().__init__(MIDI2PareSeq, tokenizer, directory, file_name, program_list, midi_data=midi_data)
         self.sequence_dict: dict = dict()
         self.sequence_count = 0
-        self.context = 8
+        self.context = 16
 
     def add_sequence(self, seq_pare: dict):
         self.sequence_dict[f'array_{self.sequence_count}'] = seq_pare
@@ -258,7 +258,7 @@ class MIDI2PareSeq(_AbstractMidiToAyaNode):
                         token_id = self.tokenizer.get(token)
                         value = np.append(value, token_id)
                         self.step(key, value)
-                        key = np.array([], dtype=int)
+                        key = np.array([self.tokenizer.get("<BLANK>")], dtype=int)
                         value = np.array([self.tokenizer.get("<SME>")], dtype=int)
                         back_note = None
                     elif token == "<SME>":

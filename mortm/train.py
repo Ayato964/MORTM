@@ -30,6 +30,7 @@ from .mortm import MORTM
 from .noam import noam_lr
 from .loss import ReinforceCrossEntropy
 from .tokenizer import Tokenizer
+from .epoch import EpochObserver
 IS_DEBUG = False
 
 
@@ -143,7 +144,7 @@ def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.Cr
             padding_mask_in: Tensor = _get_padding_mask(src, progress)
             padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-            outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg)
+            outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg, tgt_is_causal=True)
 
             outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
             correct = correct.reshape(-1).long()
@@ -191,7 +192,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
         try:
             print(f"epoch {epoch + 1} start....")
             count = 1
-            epoch_loss = 0.0
+            epoch_loss = EpochObserver(500)
             verification_loss = 0.0
 
             model.train()
@@ -206,7 +207,8 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                 padding_mask_in: Tensor = _get_padding_mask(src, progress)
                 padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-                outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg)
+                outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in,
+                                        tgt_padding_mask=padding_mask_tg, tgt_is_causal=True)
 
                 outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
                 correct = correct.reshape(-1).long()
@@ -214,7 +216,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                 #print(outputs.shape, correct.shape)
 
                 loss = criterion(outputs, correct)  # 損失を計算
-                epoch_loss += loss.item()
+                epoch_loss.add(loss.item())
                 loss = loss / accumulation_steps
                 loss.backward()  # 逆伝播
 
@@ -235,33 +237,34 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
                 if (count + 1) % message.step_by_message_count == 0:
                     message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
-                                                                       f"learning sequence {count}結果は、\n {epoch_loss / count:.4f}でした。\n"
+                                                                       f"learning sequence {count}結果は、\n {epoch_loss.get():.4f}でした。\n"
                                                                        f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
                                                                        #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss / count, scheduler.get_last_lr(), verification_loss, criterion)
+                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr(), verification_loss, criterion)
 
-                if (count + 1) % (50000 / batch_size) == 0:
-                    torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}_{count}.pth")
+                if (count + 1) % int(50000 / batch_size) == 0:
+                    torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
                     print("途中経過を保存しました。")
 
-                if (count + 1) % (10000 / batch_size) == 0:
+                if (count + 1) % int(10000 / batch_size) == 0:
+                    print("検証損失を求めています")
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress)
-                    writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss / count,
+                    writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss.get(),
                                                                   "Verification": verification_loss}, all_count)
 
                 all_count += 1
 
             message.send_message("機械学習の途中経過について",
-                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss / count:.4f}でした。\n"
+                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
                                      f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
                                      #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
-            loss_val = epoch_loss / count
-            writer.add_scalar('EpochLoss', epoch_loss / count, epoch)  # 損失値を記録
+            loss_val = verification_loss
+            writer.add_scalar('EpochLoss', epoch_loss.get(), epoch)  # 損失値を記録
 
             if is_save_training_progress:
-                torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{epoch_loss / count:.4f}.pth") #エポック終了時に途中経過を保存
+                torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}.pth") #エポック終了時に途中経過を保存
                 print("途中経過を保存しました。")
         except torch.cuda.OutOfMemoryError or RuntimeError:
             torch.save(model.state_dict(), f"{save_directory}/MORTM.error_end.{epoch}.pth")

@@ -1,8 +1,5 @@
 from typing import Optional
 
-import torch
-import torch.nn as nn
-
 from torch.nn import functional as F
 from torch.nn.parameter import Parameter
 from torch.nn import Module
@@ -11,8 +8,71 @@ from torch.nn.modules.linear import Linear
 from torch.nn.modules.dropout import Dropout
 from torch.nn.modules.normalization import LayerNorm
 from torch.nn.init import *
+from typing import Optional, Tuple
 
 from torch.nn.functional import linear, softmax, dropout
+
+import torch
+import torch.nn as nn
+import math
+# FlashAttention2 の関数（flash_attn_func）をインポート
+# （ライブラリがダウンロード済みであると仮定）
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    raise ImportError("FlashAttention2 のライブラリが必要です。インストールしてください。")
+
+def zero_pad_kv(K: torch.Tensor, V: torch.Tensor, pad_mask: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+    """
+    K, V : torch.Tensor
+        キーおよびバリューのテンソル。形状は (seq_len, batch_size, hidden_dim) と仮定する。
+    pad_mask : torch.Tensor
+        パディングマスク。形状は (batch_size, seq_len) または (seq_len, batch_size) の Boolean テンソルとする。
+        True: 有効トークン、False: パディングトークン
+
+    Returns
+    -------
+    (K_zeroed, V_zeroed) : tuple of torch.Tensor
+        パディング位置の値を0に置き換えた K と V。
+    """
+    if pad_mask is None:
+        return K, V
+    # もし pad_mask の shape が (batch_size, seq_len) となっている場合、(seq_len, batch_size) に転置する
+    if pad_mask.shape[0] == K.shape[1]:
+        pad_mask = pad_mask.transpose(0, 1)  # 転置して (seq_len, batch_size) にする
+
+    # ここで pad_mask の shape は (seq_len, batch_size) になっている前提
+    # 最後の次元に unsqueeze して (seq_len, batch_size, 1) にする（hidden_dim 軸へのブロードキャスト用）
+    mask = pad_mask.to(K.dtype).unsqueeze(-1)
+
+    # マスクが True の位置は 1, False の位置は 0 となるので、それを乗じるとパディング部分は全て 0 になる
+    K_zeroed = K * mask
+    V_zeroed = V * mask
+
+    return K_zeroed, V_zeroed
+
+
+def _check_arg_device(x: Optional[torch.Tensor]) -> bool:
+    if x is not None:
+        return x.device.type in [
+            "cpu",
+            "cuda",
+            torch.utils.backend_registration._privateuse1_backend_name,
+        ]
+    return True
+
+
+def _is_make_fx_tracing():
+    if not torch.jit.is_scripting():
+        torch_dispatch_mode_stack = (
+            torch.utils._python_dispatch._get_current_dispatch_mode_stack()
+        )
+        return any(
+            type(x) == torch.fx.experimental.proxy_tensor.ProxyTorchDispatchMode
+            for x in torch_dispatch_mode_stack
+        )
+    else:
+        return False
 
 
 class MultiHeadAttentionRPR(Module):
@@ -399,3 +459,218 @@ def _skew(qe):
 
     srel = qe[:, 1:, :]
     return srel
+
+
+class FlashMultiheadAttention(nn.Module):
+    r"""FlashAttention2 を利用した MultiheadAttention モジュール
+
+    この実装は、入力マスク（attn_mask, key_padding_mask）がない場合に、
+    FlashAttention2 の高速実装（flash_attn_func）を利用します。
+    ※もし追加のマスクが与えられた場合や、入力 dtype が fp16/bf16 でない場合は、
+    従来の multi_head_attention_forward にフォールバックします。
+
+    セルフアテンション、クロスアテンションの両方に対応しており、
+    causal マスク（is_causal=True）については flash_attn_func の内部で適用します。
+    """
+    __constants__ = ["batch_first"]
+
+    def __init__(
+            self,
+            embed_dim: int,
+            num_heads: int,
+            dropout: float = 0.0,
+            bias: bool = True,
+            add_bias_kv: bool = False,
+            add_zero_attn: bool = False,
+            kdim: Optional[int] = None,
+            vdim: Optional[int] = None,
+            batch_first: bool = False,
+            device: Optional[torch.device] = None,
+            dtype: Optional[torch.dtype] = None,
+            use_flash_attn: bool = True,  # FlashAttention2 使用フラグ
+    ) -> None:
+        if embed_dim <= 0 or num_heads <= 0:
+            raise ValueError(f"embed_dim と num_heads は 0 より大きくなければなりません; got embed_dim={embed_dim}, num_heads={num_heads}")
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+        self._qkv_same_embed_dim = (self.kdim == embed_dim and self.vdim == embed_dim)
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.batch_first = batch_first
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim * num_heads != self.embed_dim:
+            raise ValueError("embed_dim は num_heads で割り切れる必要があります")
+        self.use_flash_attn = use_flash_attn
+
+        if not self._qkv_same_embed_dim:
+            self.q_proj_weight = Parameter(torch.empty((embed_dim, embed_dim), **factory_kwargs))
+            self.k_proj_weight = Parameter(torch.empty((embed_dim, self.kdim), **factory_kwargs))
+            self.v_proj_weight = Parameter(torch.empty((embed_dim, self.vdim), **factory_kwargs))
+            self.register_parameter("in_proj_weight", None)
+        else:
+            self.in_proj_weight = Parameter(torch.empty((3 * embed_dim, embed_dim), **factory_kwargs))
+            self.register_parameter("q_proj_weight", None)
+            self.register_parameter("k_proj_weight", None)
+            self.register_parameter("v_proj_weight", None)
+        if bias:
+            self.in_proj_bias = Parameter(torch.empty(3 * embed_dim, **factory_kwargs))
+        else:
+            self.register_parameter("in_proj_bias", None)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
+        if add_bias_kv:
+            self.bias_k = Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
+            self.bias_v = Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
+        else:
+            self.bias_k = None
+            self.bias_v = None
+
+        self.add_zero_attn = add_zero_attn
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        if self._qkv_same_embed_dim:
+            xavier_uniform_(self.in_proj_weight)
+        else:
+            xavier_uniform_(self.q_proj_weight)
+            xavier_uniform_(self.k_proj_weight)
+            xavier_uniform_(self.v_proj_weight)
+        if self.in_proj_bias is not None:
+            constant_(self.in_proj_bias, 0.0)
+            constant_(self.out_proj.bias, 0.0)
+        if self.bias_k is not None:
+            xavier_uniform_(self.bias_k)
+        if self.bias_v is not None:
+            xavier_uniform_(self.bias_v)
+
+    def forward(
+            self,
+            query: Tensor,
+            key: Tensor,
+            value: Tensor,
+            key_padding_mask: Optional[Tensor] = None,
+            need_weights: bool = True,
+            attn_mask: Optional[Tensor] = None,
+            average_attn_weights: bool = True,
+            is_causal: bool = False,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        is_batched = query.dim() == 3
+        use_flash = True
+        key, value = zero_pad_kv(key, value, key_padding_mask)
+        '''
+        is_batched = query.dim() == 3
+        if (attn_mask is not None) or (key_padding_mask is not None):
+            use_flash = False
+        else:
+            use_flash = self.use_flash_attn
+        if use_flash and query.dtype not in [torch.float16, torch.bfloat16]:
+            use_flash = False
+
+        key_padding_mask = F._canonical_mask(
+            mask=key_padding_mask,
+            mask_name="key_padding_mask",
+            other_type=F._none_or_dtype(attn_mask),
+            other_name="attn_mask",
+            target_type=query.dtype,
+        )
+
+        attn_mask = F._canonical_mask(
+            mask=attn_mask,
+            mask_name="attn_mask",
+            other_type=None,
+            other_name="",
+            target_type=query.dtype,
+            check_other=False,
+        )
+        '''
+        if self.batch_first and is_batched:
+            # make sure that the transpose op does not affect the "is" property
+            if key is value:
+                if query is key:
+                    query = key = value = query.transpose(1, 0)
+                else:
+                    query, key = (x.transpose(1, 0) for x in (query, key))
+                    value = key
+            else:
+                query, key, value = (x.transpose(1, 0) for x in (query, key, value))
+
+        if not use_flash:
+            if not self._qkv_same_embed_dim:
+                attn_output, attn_output_weights = F.multi_head_attention_forward(
+                    query,
+                    key,
+                    value,
+                    self.embed_dim,
+                    self.num_heads,
+                    self.in_proj_weight,
+                    self.in_proj_bias,
+                    self.bias_k,
+                    self.bias_v,
+                    self.add_zero_attn,
+                    self.dropout,
+                    self.out_proj.weight,
+                    self.out_proj.bias,
+                    training=self.training,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=need_weights,
+                    attn_mask=attn_mask,
+                    use_separate_proj_weight=True,
+                    q_proj_weight=self.q_proj_weight,
+                    k_proj_weight=self.k_proj_weight,
+                    v_proj_weight=self.v_proj_weight,
+                    average_attn_weights=average_attn_weights,
+                    is_causal=is_causal,
+                )
+            else:
+                attn_output, attn_output_weights = F.multi_head_attention_forward(
+                    query,
+                    key,
+                    value,
+                    self.embed_dim,
+                    self.num_heads,
+                    self.in_proj_weight,
+                    self.in_proj_bias,
+                    self.bias_k,
+                    self.bias_v,
+                    self.add_zero_attn,
+                    self.dropout,
+                    self.out_proj.weight,
+                    self.out_proj.bias,
+                    training=self.training,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=need_weights,
+                    attn_mask=attn_mask,
+                    average_attn_weights=average_attn_weights,
+                    is_causal=is_causal,
+                )
+        else:
+            if query.dim() == 3:
+                # (seq_len, batch, embed_dim) -> (batch, seq_len, embed_dim)
+                query = query.transpose(0, 1)
+                key = key.transpose(0, 1)
+                value = value.transpose(0, 1)
+            if  query.dtype not in [torch.float16, torch.bfloat16]:
+                query = query.half()
+                key = key.half()
+                value = value.half()
+            # 次に、embed_dim を (num_heads, head_dim) に分割する
+            query = query.view(query.size(0), query.size(1), self.num_heads, self.head_dim)
+            key = key.view(key.size(0), key.size(1), self.num_heads, self.head_dim)
+            value = value.view(value.size(0), value.size(1), self.num_heads, self.head_dim)
+            softmax_scale = 1.0 / math.sqrt(self.head_dim)
+            attn_output = flash_attn_func(query, key, value, self.dropout, softmax_scale, causal=is_causal)
+
+            attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), -1)
+
+            # もし元の入力が batch_first=False だったなら、(batch, seq_len, embed_dim) -> (seq_len, batch, embed_dim)
+            if not self.batch_first:
+                attn_output = attn_output.transpose(0, 1)
+
+            attn_output_weights = None
+
+        if self.batch_first and is_batched:
+            return attn_output.transpose(1, 0), attn_output_weights
+        else:
+            return attn_output, attn_output_weights
