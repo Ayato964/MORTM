@@ -15,12 +15,21 @@ from torch.nn.functional import linear, softmax, dropout
 import torch
 import torch.nn as nn
 import math
+from einops import rearrange
+from flash_attn.bert_padding import pad_input, unpad_input
+from flash_attn.modules.mha import FlashSelfAttention, FlashCrossAttention
+
+
 # FlashAttention2 の関数（flash_attn_func）をインポート
 # （ライブラリがダウンロード済みであると仮定）
 try:
     from flash_attn import flash_attn_func
 except ImportError:
     raise ImportError("FlashAttention2 のライブラリが必要です。インストールしてください。")
+
+def print_stats(name, tensor):
+    print(f"{name}: min={tensor.min().item()}, max={tensor.max().item()}, mean={tensor.mean().item()}")
+
 
 def zero_pad_kv(K: torch.Tensor, V: torch.Tensor, pad_mask: torch.Tensor) -> (torch.Tensor, torch.Tensor):
     """
@@ -385,6 +394,8 @@ def multi_head_attention_forward_rpr(query,                       # type: Tensor
                                                dtype=key_padding_mask.dtype,
                                                device=key_padding_mask.device)], dim=1)
 
+
+
     attn_output_weights = torch.bmm(q, k.transpose(1, 2))
     assert list(attn_output_weights.size()) == [bsz * num_heads, tgt_len, src_len]
 
@@ -461,73 +472,41 @@ def _skew(qe):
     return srel
 
 
-class FlashMultiheadAttention(nn.Module):
-    r"""FlashAttention2 を利用した MultiheadAttention モジュール
-
-    この実装は、入力マスク（attn_mask, key_padding_mask）がない場合に、
-    FlashAttention2 の高速実装（flash_attn_func）を利用します。
-    ※もし追加のマスクが与えられた場合や、入力 dtype が fp16/bf16 でない場合は、
-    従来の multi_head_attention_forward にフォールバックします。
-
-    セルフアテンション、クロスアテンションの両方に対応しており、
-    causal マスク（is_causal=True）については flash_attn_func の内部で適用します。
-    """
-    __constants__ = ["batch_first"]
-
-    def __init__(
-            self,
-            embed_dim: int,
-            num_heads: int,
-            dropout: float = 0.0,
-            bias: bool = True,
-            add_bias_kv: bool = False,
-            add_zero_attn: bool = False,
-            kdim: Optional[int] = None,
-            vdim: Optional[int] = None,
-            batch_first: bool = False,
-            device: Optional[torch.device] = None,
-            dtype: Optional[torch.dtype] = None,
-            use_flash_attn: bool = True,  # FlashAttention2 使用フラグ
-    ) -> None:
-        if embed_dim <= 0 or num_heads <= 0:
-            raise ValueError(f"embed_dim と num_heads は 0 より大きくなければなりません; got embed_dim={embed_dim}, num_heads={num_heads}")
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
+class FlashSelfAttentionM(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None, vdim=None, er_len=None):
+        super(FlashSelfAttentionM, self).__init__()
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
-        self._qkv_same_embed_dim = (self.kdim == embed_dim and self.vdim == embed_dim)
+        self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
+        self.batch_first = False
         self.num_heads = num_heads
         self.dropout = dropout
-        self.batch_first = batch_first
         self.head_dim = embed_dim // num_heads
-        if self.head_dim * num_heads != self.embed_dim:
-            raise ValueError("embed_dim は num_heads で割り切れる必要があります")
-        self.use_flash_attn = use_flash_attn
+        assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
 
-        if not self._qkv_same_embed_dim:
-            self.q_proj_weight = Parameter(torch.empty((embed_dim, embed_dim), **factory_kwargs))
-            self.k_proj_weight = Parameter(torch.empty((embed_dim, self.kdim), **factory_kwargs))
-            self.v_proj_weight = Parameter(torch.empty((embed_dim, self.vdim), **factory_kwargs))
-            self.register_parameter("in_proj_weight", None)
-        else:
-            self.in_proj_weight = Parameter(torch.empty((3 * embed_dim, embed_dim), **factory_kwargs))
-            self.register_parameter("q_proj_weight", None)
-            self.register_parameter("k_proj_weight", None)
-            self.register_parameter("v_proj_weight", None)
+        self.in_proj_weight = Parameter(torch.empty(3 * embed_dim, embed_dim))
+
+        if self._qkv_same_embed_dim is False:
+            self.q_proj_weight = Parameter(torch.Tensor(embed_dim, embed_dim))
+            self.k_proj_weight = Parameter(torch.Tensor(embed_dim, self.kdim))
+            self.v_proj_weight = Parameter(torch.Tensor(embed_dim, self.vdim))
+
         if bias:
-            self.in_proj_bias = Parameter(torch.empty(3 * embed_dim, **factory_kwargs))
+            self.in_proj_bias = Parameter(torch.empty(3 * embed_dim))
         else:
-            self.register_parameter("in_proj_bias", None)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
+            self.register_parameter('in_proj_bias', None)
+        self.out_proj = Linear(embed_dim, embed_dim, bias=bias)
+
         if add_bias_kv:
-            self.bias_k = Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
-            self.bias_v = Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
+            self.bias_k = Parameter(torch.empty(1, 1, embed_dim))
+            self.bias_v = Parameter(torch.empty(1, 1, embed_dim))
         else:
-            self.bias_k = None
-            self.bias_v = None
+            self.bias_k = self.bias_v = None
 
         self.add_zero_attn = add_zero_attn
+        self.fsa = FlashSelfAttention(attention_dropout=dropout, softmax_scale=1.0 / math.sqrt(self.head_dim))
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -537,140 +516,349 @@ class FlashMultiheadAttention(nn.Module):
             xavier_uniform_(self.q_proj_weight)
             xavier_uniform_(self.k_proj_weight)
             xavier_uniform_(self.v_proj_weight)
+
         if self.in_proj_bias is not None:
-            constant_(self.in_proj_bias, 0.0)
-            constant_(self.out_proj.bias, 0.0)
+            constant_(self.in_proj_bias, 0.)
+            constant_(self.out_proj.bias, 0.)
         if self.bias_k is not None:
-            xavier_uniform_(self.bias_k)
+            xavier_normal_(self.bias_k)
         if self.bias_v is not None:
-            xavier_uniform_(self.bias_v)
+            xavier_normal_(self.bias_v)
 
-    def forward(
-            self,
-            query: Tensor,
-            key: Tensor,
-            value: Tensor,
-            key_padding_mask: Optional[Tensor] = None,
-            need_weights: bool = True,
-            attn_mask: Optional[Tensor] = None,
-            average_attn_weights: bool = True,
-            is_causal: bool = False,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
-        is_batched = query.dim() == 3
-        use_flash = True
-        key, value = zero_pad_kv(key, value, key_padding_mask)
-        '''
-        is_batched = query.dim() == 3
-        if (attn_mask is not None) or (key_padding_mask is not None):
-            use_flash = False
-        else:
-            use_flash = self.use_flash_attn
-        if use_flash and query.dtype not in [torch.float16, torch.bfloat16]:
-            use_flash = False
+    def forward(self, query, key, value, key_padding_mask=None,
+                need_weights=True, attn_mask=None, is_causal=False):
 
-        key_padding_mask = F._canonical_mask(
-            mask=key_padding_mask,
-            mask_name="key_padding_mask",
-            other_type=F._none_or_dtype(attn_mask),
-            other_name="attn_mask",
-            target_type=query.dtype,
-        )
+        qkv_same = torch.equal(query, key) and torch.equal(key, value)
+        kv_same = torch.equal(key, value)
 
-        attn_mask = F._canonical_mask(
-            mask=attn_mask,
-            mask_name="attn_mask",
-            other_type=None,
-            other_name="",
-            target_type=query.dtype,
-            check_other=False,
-        )
-        '''
-        if self.batch_first and is_batched:
-            # make sure that the transpose op does not affect the "is" property
-            if key is value:
-                if query is key:
-                    query = key = value = query.transpose(1, 0)
+        batch, tgt_len, embed_dim = query.size()
+        assert embed_dim == self.embed_dim
+        assert list(query.size()) == [batch, tgt_len, embed_dim]
+        assert key.size() == value.size()
+
+        head_dim = self.head_dim
+        assert head_dim * self.num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        scaling = float(head_dim) ** -0.5
+
+        use_separate_proj_weight = hasattr(self, '_qkv_same_embed_dim') and self._qkv_same_embed_dim is False
+        #print_stats("before:Q", query)
+        #print_stats("before:K", key)
+        #print_stats("before:V", value)
+        if use_separate_proj_weight is not True:
+
+            if qkv_same:
+                # self-attention
+                q, k, v = linear(query, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1)
+
+            elif kv_same:
+                # encoder-decoder attention
+                # This is inline in_proj function with in_proj_weight and in_proj_bias
+                _b = self.in_proj_bias
+                _start = 0
+                _end = embed_dim
+                _w = self.in_proj_weight[_start:_end, :]
+                if _b is not None:
+                    _b = _b[_start:_end]
+                q = linear(query, _w, _b)
+
+                if key is None:
+                    assert value is None
+                    k = None
+                    v = None
                 else:
-                    query, key = (x.transpose(1, 0) for x in (query, key))
-                    value = key
+
+                    # This is inline in_proj function with in_proj_weight and in_proj_bias
+                    _b = self.in_proj_bias
+                    _start = embed_dim
+                    _end = None
+                    _w = self.in_proj_weight[_start:, :]
+                    if _b is not None:
+                        _b = _b[_start:]
+                    k, v = linear(key, _w, _b).chunk(2, dim=-1)
+
             else:
-                query, key, value = (x.transpose(1, 0) for x in (query, key, value))
+                # This is inline in_proj function with in_proj_weight and in_proj_bias
+                _b = self.in_proj_bias
+                _start = 0
+                _end = embed_dim
+                _w = self.in_proj_weight[_start:_end, :]
+                if _b is not None:
+                    _b = _b[_start:_end]
+                q = linear(query, _w, _b)
 
-        if not use_flash:
-            if not self._qkv_same_embed_dim:
-                attn_output, attn_output_weights = F.multi_head_attention_forward(
-                    query,
-                    key,
-                    value,
-                    self.embed_dim,
-                    self.num_heads,
-                    self.in_proj_weight,
-                    self.in_proj_bias,
-                    self.bias_k,
-                    self.bias_v,
-                    self.add_zero_attn,
-                    self.dropout,
-                    self.out_proj.weight,
-                    self.out_proj.bias,
-                    training=self.training,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=need_weights,
-                    attn_mask=attn_mask,
-                    use_separate_proj_weight=True,
-                    q_proj_weight=self.q_proj_weight,
-                    k_proj_weight=self.k_proj_weight,
-                    v_proj_weight=self.v_proj_weight,
-                    average_attn_weights=average_attn_weights,
-                    is_causal=is_causal,
-                )
+                # This is inline in_proj function with in_proj_weight and in_proj_bias
+                _b = self.in_proj_bias
+                _start = embed_dim
+                _end = embed_dim * 2
+                _w = self.in_proj_weight[_start:_end, :]
+                if _b is not None:
+                    _b = _b[_start:_end]
+                k = linear(key, _w, _b)
+
+                # This is inline in_proj function with in_proj_weight and in_proj_bias
+                _b = self.in_proj_bias
+                _start = embed_dim * 2
+                _end = None
+                _w = self.in_proj_weight[_start:, :]
+                if _b is not None:
+                    _b = _b[_start:]
+                v = linear(value, _w, _b)
+        else:
+            q_proj_weight_non_opt = torch.jit._unwrap_optional(self.q_proj_weight)
+            len1, len2 = q_proj_weight_non_opt.size()
+            assert len1 == embed_dim and len2 == query.size(-1)
+
+            k_proj_weight_non_opt = torch.jit._unwrap_optional(self.k_proj_weight)
+            len1, len2 = k_proj_weight_non_opt.size()
+            assert len1 == embed_dim and len2 == key.size(-1)
+
+            v_proj_weight_non_opt = torch.jit._unwrap_optional(self.v_proj_weight)
+            len1, len2 = v_proj_weight_non_opt.size()
+            assert len1 == embed_dim and len2 == value.size(-1)
+
+            if self.in_proj_bias is not None:
+                q = linear(query, q_proj_weight_non_opt, self.in_proj_bias[0:embed_dim])
+                k = linear(key, k_proj_weight_non_opt, self.in_proj_bias[embed_dim:(embed_dim * 2)])
+                v = linear(value, v_proj_weight_non_opt, self.in_proj_bias[(embed_dim * 2):])
             else:
-                attn_output, attn_output_weights = F.multi_head_attention_forward(
-                    query,
-                    key,
-                    value,
-                    self.embed_dim,
-                    self.num_heads,
-                    self.in_proj_weight,
-                    self.in_proj_bias,
-                    self.bias_k,
-                    self.bias_v,
-                    self.add_zero_attn,
-                    self.dropout,
-                    self.out_proj.weight,
-                    self.out_proj.bias,
-                    training=self.training,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=need_weights,
-                    attn_mask=attn_mask,
-                    average_attn_weights=average_attn_weights,
-                    is_causal=is_causal,
-                )
+                q = linear(query, q_proj_weight_non_opt, self.in_proj_bias)
+                k = linear(key, k_proj_weight_non_opt, self.in_proj_bias)
+                v = linear(value, v_proj_weight_non_opt, self.in_proj_bias)
+        #q = q * scaling
+        if  query.dtype not in [torch.float16, torch.bfloat16]:
+            q = q.half()
+            k = k.half()
+            v = v.half()
+        #print_stats("linear: Q", query)
+        #print_stats("linear: K", key)
+        #print_stats("linear: V", value)
+
+
+        q = rearrange(q, "b s (h d) -> b s h d", h=self.num_heads)
+        k = rearrange(k, "b s (h d) -> b s h d", h=self.num_heads)
+        v = rearrange(v, "b s (h d) -> b s h d", h=self.num_heads)
+
+        qkv = torch.stack([q, k, v], dim=2)  # 形状: (batch, tgt_len, 3, H, D)
+        #print_stats("QKV", qkv)
+
+        #qkv = rearrange(qkv, "b s three h d -> b s (three h d)", three=3)  # 形状: (batch, tgt_len, 3*h*d)
+        if key_padding_mask is not None:
+            qkv_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(qkv, key_padding_mask)
         else:
-            if query.dim() == 3:
-                # (seq_len, batch, embed_dim) -> (batch, seq_len, embed_dim)
-                query = query.transpose(0, 1)
-                key = key.transpose(0, 1)
-                value = value.transpose(0, 1)
-            if  query.dtype not in [torch.float16, torch.bfloat16]:
-                query = query.half()
-                key = key.half()
-                value = value.half()
-            # 次に、embed_dim を (num_heads, head_dim) に分割する
-            query = query.view(query.size(0), query.size(1), self.num_heads, self.head_dim)
-            key = key.view(key.size(0), key.size(1), self.num_heads, self.head_dim)
-            value = value.view(value.size(0), value.size(1), self.num_heads, self.head_dim)
-            softmax_scale = 1.0 / math.sqrt(self.head_dim)
-            attn_output = flash_attn_func(query, key, value, self.dropout, softmax_scale, causal=is_causal)
+            qkv_unpad = qkv
+            cu_seqlens = None
+            max_s = None
+            indices = None
 
-            attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), -1)
-
-            # もし元の入力が batch_first=False だったなら、(batch, seq_len, embed_dim) -> (seq_len, batch, embed_dim)
-            if not self.batch_first:
-                attn_output = attn_output.transpose(0, 1)
-
-            attn_output_weights = None
-
-        if self.batch_first and is_batched:
-            return attn_output.transpose(1, 0), attn_output_weights
+        out = self.fsa(qkv_unpad, causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s)
+        if key_padding_mask is not None:
+            out_flat = rearrange(out, "nnz h d -> nnz (h d)")
+            out = pad_input(out_flat, indices, batch, tgt_len)
         else:
-            return attn_output, attn_output_weights
+            out = rearrange(out, "b s h d -> b s (h d)")
+
+        #out_final: Tensor = rearrange(out, "s b d -> b s d")
+
+        return out, None
+
+
+class FlashCrossAttentionM(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None, vdim=None, er_len=None):
+        super(FlashCrossAttentionM, self).__init__()
+        self.embed_dim = embed_dim
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+        self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
+        self.batch_first = False
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
+
+        self.in_proj_weight = Parameter(torch.empty(3 * embed_dim, embed_dim))
+
+        if self._qkv_same_embed_dim is False:
+            self.q_proj_weight = Parameter(torch.Tensor(embed_dim, embed_dim))
+            self.k_proj_weight = Parameter(torch.Tensor(embed_dim, self.kdim))
+            self.v_proj_weight = Parameter(torch.Tensor(embed_dim, self.vdim))
+
+        if bias:
+            self.in_proj_bias = Parameter(torch.empty(3 * embed_dim))
+        else:
+            self.register_parameter('in_proj_bias', None)
+        self.out_proj = Linear(embed_dim, embed_dim, bias=bias)
+
+        if add_bias_kv:
+            self.bias_k = Parameter(torch.empty(1, 1, embed_dim))
+            self.bias_v = Parameter(torch.empty(1, 1, embed_dim))
+        else:
+            self.bias_k = self.bias_v = None
+
+        self.add_zero_attn = add_zero_attn
+        self.fca = FlashCrossAttention(attention_dropout=dropout, softmax_scale=1.0 / math.sqrt(self.head_dim))
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        if self._qkv_same_embed_dim:
+            xavier_uniform_(self.in_proj_weight)
+        else:
+            xavier_uniform_(self.q_proj_weight)
+            xavier_uniform_(self.k_proj_weight)
+            xavier_uniform_(self.v_proj_weight)
+
+        if self.in_proj_bias is not None:
+            constant_(self.in_proj_bias, 0.)
+            constant_(self.out_proj.bias, 0.)
+        if self.bias_k is not None:
+            xavier_normal_(self.bias_k)
+        if self.bias_v is not None:
+            xavier_normal_(self.bias_v)
+
+    def forward(self, query, key, value, memory_key_padding_mask=None, tgt_key_padding_mask=None,
+                need_weights=True, attn_mask=None, is_causal=False):
+
+
+        qkv_same = torch.equal(query, key) and torch.equal(key, value)
+        kv_same = torch.equal(key, value)
+
+        batch, tgt_len, embed_dim = query.size()
+        assert embed_dim == self.embed_dim
+        assert list(query.size()) == [ batch, tgt_len, embed_dim]
+        assert key.size() == value.size()
+
+        head_dim = self.head_dim
+        assert head_dim * self.num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        #scaling = float(head_dim) ** -0.5
+
+        use_separate_proj_weight = hasattr(self, '_qkv_same_embed_dim') and self._qkv_same_embed_dim is False
+        #print_stats("before:Q", query)
+        #print_stats("before:K", key)
+        #print_stats("before:V", value)
+        if use_separate_proj_weight is not True:
+
+            if qkv_same:
+                # self-attention
+                q, k, v = linear(query, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1)
+
+            elif kv_same:
+                # encoder-decoder attention
+                # This is inline in_proj function with in_proj_weight and in_proj_bias
+                _b = self.in_proj_bias
+                _start = 0
+                _end = embed_dim
+                _w = self.in_proj_weight[_start:_end, :]
+                if _b is not None:
+                    _b = _b[_start:_end]
+                q = linear(query, _w, _b)
+
+                if key is None:
+                    assert value is None
+                    k = None
+                    v = None
+                else:
+
+                    # This is inline in_proj function with in_proj_weight and in_proj_bias
+                    _b = self.in_proj_bias
+                    _start = embed_dim
+                    _end = None
+                    _w = self.in_proj_weight[_start:, :]
+                    if _b is not None:
+                        _b = _b[_start:]
+                    k, v = linear(key, _w, _b).chunk(2, dim=-1)
+
+            else:
+                # This is inline in_proj function with in_proj_weight and in_proj_bias
+                _b = self.in_proj_bias
+                _start = 0
+                _end = embed_dim
+                _w = self.in_proj_weight[_start:_end, :]
+                if _b is not None:
+                    _b = _b[_start:_end]
+                q = linear(query, _w, _b)
+
+                # This is inline in_proj function with in_proj_weight and in_proj_bias
+                _b = self.in_proj_bias
+                _start = embed_dim
+                _end = embed_dim * 2
+                _w = self.in_proj_weight[_start:_end, :]
+                if _b is not None:
+                    _b = _b[_start:_end]
+                k = linear(key, _w, _b)
+
+                # This is inline in_proj function with in_proj_weight and in_proj_bias
+                _b = self.in_proj_bias
+                _start = embed_dim * 2
+                _end = None
+                _w = self.in_proj_weight[_start:, :]
+                if _b is not None:
+                    _b = _b[_start:]
+                v = linear(value, _w, _b)
+        else:
+            q_proj_weight_non_opt = torch.jit._unwrap_optional(self.q_proj_weight)
+            len1, len2 = q_proj_weight_non_opt.size()
+            assert len1 == embed_dim and len2 == query.size(-1)
+
+            k_proj_weight_non_opt = torch.jit._unwrap_optional(self.k_proj_weight)
+            len1, len2 = k_proj_weight_non_opt.size()
+            assert len1 == embed_dim and len2 == key.size(-1)
+
+            v_proj_weight_non_opt = torch.jit._unwrap_optional(self.v_proj_weight)
+            len1, len2 = v_proj_weight_non_opt.size()
+            assert len1 == embed_dim and len2 == value.size(-1)
+
+            if self.in_proj_bias is not None:
+                q = linear(query, q_proj_weight_non_opt, self.in_proj_bias[0:embed_dim])
+                k = linear(key, k_proj_weight_non_opt, self.in_proj_bias[embed_dim:(embed_dim * 2)])
+                v = linear(value, v_proj_weight_non_opt, self.in_proj_bias[(embed_dim * 2):])
+            else:
+                q = linear(query, q_proj_weight_non_opt, self.in_proj_bias)
+                k = linear(key, k_proj_weight_non_opt, self.in_proj_bias)
+                v = linear(value, v_proj_weight_non_opt, self.in_proj_bias)
+        #q = q * scaling
+        if  query.dtype not in [torch.float16, torch.bfloat16]:
+            q = q.half()
+            k = k.half()
+            v = v.half()
+        #print_stats("linear: Q", query)
+        #print_stats("linear: K", key)
+        #print_stats("linear: V", value)
+
+
+        q = rearrange(q, "b s (h d) -> b s h d", h=self.num_heads)
+        k = rearrange(k, "b s (h d) -> b s h d", h=self.num_heads)
+        v = rearrange(v, "b s (h d) -> b s h d", h=self.num_heads)
+
+        if tgt_key_padding_mask is not None:
+            q_unpad, indices_q, cu_seqlens_q, max_s_q, used_seqlens_q = unpad_input(q, tgt_key_padding_mask)
+        else:
+            q_unpad = q
+            cu_seqlens_q = None
+            max_s_q = None
+            indices_q = None
+
+        kv = torch.stack([k, v], dim=2)  # 形状: (batch, tgt_len, 3, H, D)
+        #kv = rearrange(kv, "b s three h d -> b s (three h d)", three=2)  # 形状: (batch, tgt_len, 3*h*d)
+        if memory_key_padding_mask is not None:
+            kv_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(kv, memory_key_padding_mask)
+        else:
+            kv_unpad = kv
+            cu_seqlens = None
+            max_s = None
+
+
+        out = self.fca(q_unpad, kv_unpad, causal=is_causal,
+                       cu_seqlens=cu_seqlens_q,
+                       max_seqlen=max_s_q,
+                       cu_seqlens_k=cu_seqlens,
+                       max_seqlen_k=max_s)
+
+
+        if tgt_key_padding_mask is not None:
+            out_flat = rearrange(out, "nnz h d -> nnz (h d)")
+            out = pad_input(out_flat, indices_q, batch, tgt_len)
+        else:
+            out = rearrange(out, "b s h d -> b s (h d)")
+        #out_final: Tensor = rearrange(out, "s b d -> b s d")
+
+        return out, None

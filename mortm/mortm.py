@@ -4,28 +4,13 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttention, TransformerEncoder, TransformerEncoderLayer
-from flash_attn.modules.mha import FlashSelfAttention, FlashCrossAttention
+from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttention, TransformerEncoder, TransformerEncoderLayer, _generate_square_subsequent_mask
+from typing import Tuple, List
 import numpy as np
 from .PositionalEncoding import PositionalEncoding
-from .attention import FlashMultiheadAttention
+from .attention import FlashSelfAttentionM, FlashCrossAttentionM, MultiHeadAttentionRPR
 from .progress import LearningProgress
-from torch.distributions import Categorical
 
-
-def generate_square_subsequent_mask(
-    sz: int,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> Tensor:
-    if device is None:
-        device = torch.device("cpu")
-    if dtype is None:
-        dtype = torch.float32
-    return torch.triu(
-        torch.full((sz, sz), float("-inf"), dtype=dtype, device=device),
-        diagonal=1,
-    )
 
 
 class MORTM(nn.Module):
@@ -33,7 +18,6 @@ class MORTM(nn.Module):
                  dim_feedforward=3072, dropout=0.2, decoder_only:bool=False,
                  position_length=400):
         super(MORTM, self).__init__()
-
         self.progress = progress
         self.e_layer = e_layer
         self.d_layer = d_layer
@@ -48,12 +32,12 @@ class MORTM(nn.Module):
         if not decoder_only:
             self.decoder = MORTMDecoder(d_model=d_model, dim_ff=dim_feedforward,
                                    num_head=num_heads, dropout=dropout,
-                                   batch_first=False, bias=True,
+                                   batch_first=True, bias=True,
                                    layer_norm_eps=1e-5, num_decoder_layer=d_layer)
         encoder_layer = MORTMEncoderLayer(
             d_model=d_model, dim_ff=dim_feedforward,
             num_head=num_heads, dropout=dropout,
-            batch_first=False, bias=True,
+            batch_first=True, bias=True,
             layer_norm_eps=1e-5
         )
         self.encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=e_layer, norm=LayerNorm(d_model, 1e-5, bias=True))
@@ -67,27 +51,31 @@ class MORTM(nn.Module):
 
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
                 tgt_padding_mask=None, src_is_causal=False, tgt_is_causal=False):
+        if tgt_mask is None and tgt_is_causal:
+            tgt_mask = _generate_square_subsequent_mask(tgt.size(1)).to(self.progress.get_device())
 
         sec_e: Tensor = self.embedding(src)
         sec_e = sec_e.permute(1, 0, 2)
 
         src_p: Tensor = self.positional(sec_e)
+        src_p = src_p.permute(1, 0, 2)
 
         if tgt is not None:
             tgt_e = self.embedding(tgt)
             tgt_e = tgt_e.permute(1, 0, 2)
             tgt_p = self.positional(tgt_e)
+            tgt_p = tgt_p.permute(1, 0, 2)
         else:
             tgt_p = src_p
 
         if not self.decoder_only:
             memory = self.encoder(src=src_p, mask=src_mask, src_key_padding_mask=input_padding_mask, is_causal=src_is_causal)
+
             out = self.decoder(tgt=tgt_p, memory=memory, tgt_mask=tgt_mask,
+                               memory_key_padding_mask=input_padding_mask,
                                tgt_key_padding_mask=tgt_padding_mask, memory_is_causal=src_is_causal, tgt_is_causal=tgt_is_causal)
         else:
             out = self.encoder(src=src_p, mask=tgt_mask, src_key_padding_mask=input_padding_mask, is_casual=src_is_causal)
-
-        out = out.permute(1, 0, 2)
 
         score: Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
@@ -248,7 +236,8 @@ class MORTMEncoderLayer(TransformerEncoderLayer):
     def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps):
         super(MORTMEncoderLayer, self).__init__(d_model=d_model, dim_feedforward=dim_ff, nhead=num_head, dropout=dropout,
                                                 batch_first=batch_first, bias=bias, layer_norm_eps=layer_norm_eps)
-        self.self_attn = FlashMultiheadAttention(embed_dim=d_model, num_heads=num_head, dropout=dropout, bias=bias)
+        self.self_attn = FlashSelfAttentionM(d_model, num_head, dropout)
+        #self.self_attn = MultiheadAttention(d_model, num_head, dropout, batch_first=True)
 
 
 class MORTMDecoder(nn.Module):
@@ -287,20 +276,16 @@ class MORTMDecoder(nn.Module):
 
 
 class MORTMDecoderLayer(nn.Module):
+
     def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps):
         super(MORTMDecoderLayer, self).__init__()
-        self.cross_attention: FlashMultiheadAttention = FlashMultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_head,
-            dropout=dropout,
-            batch_first=batch_first,
-            bias=bias
-        )
-        self.self_attention: FlashMultiheadAttention = FlashMultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_head,
-            dropout=dropout
-        )
+        self.n_head = num_head
+        self.d_model = d_model
+        self.cross_attention: FlashCrossAttentionM = FlashCrossAttentionM(d_model, num_head, dropout)
+        #self.cross_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=True)
+        self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(d_model, num_head, dropout)
+        #self.self_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=True)
+
         self.linear1 = nn.Linear(d_model, dim_ff, bias=bias)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_ff, d_model, bias=bias)
@@ -327,7 +312,9 @@ class MORTMDecoderLayer(nn.Module):
 
         y = y + self.self_block(self.norm1(y), tgt_mask, tgt_key_padding_mask, tgt_is_causal) #相対位置マルチヘッドアテンションを適用
 
-        y = y + self.cross_block(self.norm2(y), memory, memory_mask, memory_key_padding_mask, memory_is_causal) # マルチヘッドアテンションを適用
+        y = y + self.cross_block(self.norm2(y), memory, memory_mask,
+                                 memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
+                                 is_causal=memory_is_causal) # マルチヘッドアテンションを適用
 
         y = y + self.ff_block(self.norm3(y)) # フィードフォワード層を適用
 
@@ -336,10 +323,14 @@ class MORTMDecoderLayer(nn.Module):
     def self_block(self,
                    y: Tensor,
                    attn_mask: Optional[Tensor],
-                   key_padding_mask: Optional[Tensor],
+                   tgt_key_padding_mask: Optional[Tensor],
                    is_causal: bool = False,
                    ):
-        y = self.self_attention(y, y, y, attn_mask=attn_mask, key_padding_mask=key_padding_mask, is_causal=is_causal, need_weights=False)[0]
+
+        #print(y.shape)
+        y, _ = self.self_attention(y, y, y, key_padding_mask=tgt_key_padding_mask,
+                                   need_weights=True, attn_mask=attn_mask, is_causal=is_causal)
+        #print(y.shape)
 
         return self.dropout1(y)
 
@@ -347,10 +338,14 @@ class MORTMDecoderLayer(nn.Module):
                     y: Tensor,
                     mem: Tensor,
                     attn_mask: Optional[Tensor],
-                    key_padding_mask: Optional[Tensor],
+                    memory_key_padding_mask: Optional[Tensor],
+                    tgt_key_padding_mask: Optional[Tensor],
                     is_causal: bool = False,
                     ):
-        y = self.cross_attention(y, mem, mem, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=False, is_causal=is_causal)[0]
+        y, _ = self.cross_attention(y, mem, mem, memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
+                                    attn_mask=attn_mask, is_causal=is_causal)
+        #y, _ = self.cross_attention(y, mem, mem, key_padding_mask=memory_key_padding_mask,
+        #                            attn_mask=attn_mask, is_causal=is_causal)
         return self.dropout2(y)
 
     def ff_block(self, y: Tensor):

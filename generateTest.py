@@ -35,10 +35,12 @@ tokenizer.rev_mode()
 model = MORTM(
     progress=_DefaultLearningProgress(),
     vocab_size=393,
-    decoder_only=True,
-    position_length=320
+    d_layer=18,
+    e_layer=18,
+    num_heads=16,
+    position_length=400
 )
-model.load_state_dict(torch.load("out/model/MORTM.2.5t4-SMALL-0.33.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.2.5t4-SMALL_0.87.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -52,7 +54,7 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/np/Sample.mid.npz")
+np_notes = np.load("out/np/Sample_add2.mid.npz")
 
 start = np_notes[f'array1'][:-1]
 
@@ -74,8 +76,8 @@ print(f"First:{start}") # ロードしたシーケンスを表示
 
 #gene = generate_note(100, start, model, t=1.05, p=0.95)
 
-#gene = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.1)
-gene = model.top_p_sampling_measure_decoder(start, p=0.95, max_measure=20, temperature=1.0)
+gene = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
+#gene = model.top_p_sampling_measure_decoder(start, p=0.95, max_measure=20, temperature=1.0)
 
 output = gene
 for t in output:

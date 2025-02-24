@@ -22,12 +22,11 @@ model = train_mortm(tokenizer, "out/np/datasets_small/", "out/model", "2.5t4-SMA
                     train_dataset_split=0.99,
                     is_save_training_progress=True,
                     position_length=400,
-                    warmup_steps=4000,
                     batch_size=12,
                     d_layer=18,
                     e_layer=18,
                     num_heads=16,
                     accumulation_steps=2,
-                    message=message)
-
-                    #load_model_directory="out/model/MORTM.2.0t4-PreTrained-SMALL_0.56.pth")
+                    message=message,
+                    warmup_steps=1000000,
+                    load_model_directory="out/model/MORTM.2.5t4-SMALL_0.87.pth")
