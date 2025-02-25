@@ -11,7 +11,7 @@ import math
 import os
 import time
 from abc import abstractmethod
-from typing import  Callable
+from typing import  Callable, Optional
 
 import torch
 from torch import Tensor
@@ -21,7 +21,6 @@ import numpy as np
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
-
 
 from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
@@ -157,7 +156,7 @@ def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.Cr
 def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
                        e_layer, d_layer, load_model_directory:str = None, train_dataset_split:float = 0.9,
                        num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
-                       position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param=1):
+                       position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param: Optional[float]=None):
 
     train_size = int(train_dataset_split * len(mortm_dataset))
     val_size = len(mortm_dataset) - train_size
@@ -178,7 +177,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
     #criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=10, weight=weight.to(progress.get_device()))
     criterion = nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device())
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
+    optimizer = torch.optim.Adam(model.parameters(), lr=2e-1 if lr_param is None else lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
 
     print("Start training...")
@@ -224,7 +223,8 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
                 if count % accumulation_steps == 0:  #実質バッチサイズは64である
                     progress.step_optimizer(optimizer, model, accumulation_steps)
-                    scheduler.step()
+                    if lr_param is None:
+                        scheduler.step()
                     torch.cuda.empty_cache()
 
                 count += 1
@@ -242,7 +242,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                                                                        #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr(), verification_loss, criterion)
+                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr() if lr_param is not None else lr_param, verification_loss, criterion)
 
                 if (count + 1) % int(50000 / batch_size) == 0:
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
@@ -279,7 +279,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
 def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, train_dataset_split = 0.9,
-                e_layer=15, d_layer=15, num_heads=12, d_model=768, is_save_training_progress=False, lr_param=2e-1,
+                e_layer=15, d_layer=15, num_heads=12, d_model=768, is_save_training_progress=False, lr_param=None,
                 dim_feedforward=3072, dropout=0.2, position_length=320, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
                 accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(), ):
 

@@ -114,14 +114,14 @@ class MORTM(nn.Module):
 
 
         return generated
-    def top_p_sampling_measure(self, input_seq, p=0.9, max_measure=20, temperature=1.0):
+    def top_p_sampling_measure(self, input_seq, p=0.9, max_measure=20, temperature=1.0, context_measure=8):
         self.eval()
         if not isinstance(input_seq, torch.Tensor):
             input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
         seg: Tensor = self.split_tensor_at_value(input_seq, 3, include_split=True)
         tgt = torch.tensor([2], dtype=torch.long, device=self.progress.get_device())
         tgt = torch.concatenate((tgt, seg[-1])).to(self.progress.get_device())
-        point = 0 if len(seg[:-1]) - 8 <= 0 else len(seg[:-1]) - 8
+        point = 0 if len(seg[:-1]) - context_measure <= 0 else len(seg[:-1]) - context_measure
 
         src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
 
@@ -143,7 +143,7 @@ class MORTM(nn.Module):
             src = torch.concatenate((src, tgt[1:-1]))
             tgt = torch.tensor([2], device=self.progress.get_device())
             seg = self.split_tensor_at_value(src, 3, include_split=True)
-            if len(seg) > 8:
+            if len(seg) > context_measure:
                 src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
                 for i in seg[1:]:
                     src = torch.concatenate((src, i))

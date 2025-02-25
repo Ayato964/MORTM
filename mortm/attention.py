@@ -16,9 +16,11 @@ import torch
 import torch.nn as nn
 import math
 from einops import rearrange
-from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.modules.mha import FlashSelfAttention, FlashCrossAttention
-
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input
+    from flash_attn.modules.mha import FlashSelfAttention, FlashCrossAttention
+except ImportError as i:
+    print(f"モジュールをインストールできませんでした。\n {i.name}")
 
 # FlashAttention2 の関数（flash_attn_func）をインポート
 # （ライブラリがダウンロード済みであると仮定）
