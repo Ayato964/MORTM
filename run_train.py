@@ -17,16 +17,17 @@ message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi
 
 tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
-model = train_mortm(tokenizer, "out/np/datasets_small/", "out/model", "2.5t4-SMALL",
+model = train_mortm(tokenizer, "out/np/datasets_small/", "out/model", "EX3-SMALL",
                     393, 15, "out/vocab/vocab_max.json",
                     train_dataset_split=0.99,
                     is_save_training_progress=True,
                     position_length=400,
-                    batch_size=12,
+                    batch_size=16,
                     d_layer=18,
                     e_layer=18,
                     num_heads=16,
-                    accumulation_steps=2,
+                    #lr_param=2e-9,
+                    accumulation_steps=1,
                     message=message,
-                    warmup_steps=1000000,
-                    load_model_directory="out/model/MORTM.2.5t4-SMALL_0.87.pth")
+                    warmup_steps=4000,)
+                    #load_model_directory="out/model/MORTM.train.8.0.7528_16663.pth")

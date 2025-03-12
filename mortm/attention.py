@@ -16,8 +16,13 @@ import torch
 import torch.nn as nn
 import math
 from einops import rearrange
+
 try:
     from flash_attn.bert_padding import pad_input, unpad_input
+    from flash_attn.flash_attn_interface import (flash_attn_varlen_qkvpacked_func,
+                                                 flash_attn_qkvpacked_func,
+                                                 flash_attn_varlen_kvpacked_func,
+                                                 flash_attn_kvpacked_func)
     from flash_attn.modules.mha import FlashSelfAttention, FlashCrossAttention
 except ImportError as i:
     print(f"モジュールをインストールできませんでした。\n {i.name}")
@@ -28,6 +33,7 @@ try:
     from flash_attn import flash_attn_func
 except ImportError:
     raise ImportError("FlashAttention2 のライブラリが必要です。インストールしてください。")
+
 
 def print_stats(name, tensor):
     print(f"{name}: min={tensor.min().item()}, max={tensor.max().item()}, mean={tensor.mean().item()}")
@@ -99,7 +105,8 @@ class MultiHeadAttentionRPR(Module):
     ----------
     """
 
-    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None, vdim=None, er_len=None):
+    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None,
+                 vdim=None, er_len=None):
         super(MultiHeadAttentionRPR, self).__init__()
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
@@ -133,7 +140,7 @@ class MultiHeadAttentionRPR(Module):
         self.add_zero_attn = add_zero_attn
 
         # Adding RPR embedding matrix
-        if(er_len is not None):
+        if (er_len is not None):
             self.Er = Parameter(torch.rand((er_len, self.head_dim), dtype=torch.float32))
         else:
             self.Er = None
@@ -205,32 +212,33 @@ class MultiHeadAttentionRPR(Module):
                 key_padding_mask=key_padding_mask, need_weights=need_weights,
                 attn_mask=attn_mask, rpr_mat=self.Er)
 
+
 # multi_head_attention_forward_rpr
-def multi_head_attention_forward_rpr(query,                       # type: Tensor
-                                 key,                             # type: Tensor
-                                 value,                           # type: Tensor
-                                 embed_dim_to_check,              # type: int
-                                 num_heads,                       # type: int
-                                 in_proj_weight,                  # type: Tensor
-                                 in_proj_bias,                    # type: Tensor
-                                 bias_k,                          # type: Optional[Tensor]
-                                 bias_v,                          # type: Optional[Tensor]
-                                 add_zero_attn,                   # type: bool
-                                 dropout_p,                       # type: float
-                                 out_proj_weight,                 # type: Tensor
-                                 out_proj_bias,                   # type: Tensor
-                                 training=True,                   # type: bool
-                                 key_padding_mask=None,           # type: Optional[Tensor]
-                                 need_weights=True,               # type: bool
-                                 attn_mask=None,                  # type: Optional[Tensor]
-                                 use_separate_proj_weight=False,  # type: bool
-                                 q_proj_weight=None,              # type: Optional[Tensor]
-                                 k_proj_weight=None,              # type: Optional[Tensor]
-                                 v_proj_weight=None,              # type: Optional[Tensor]
-                                 static_k=None,                   # type: Optional[Tensor]
-                                 static_v=None,                   # type: Optional[Tensor]
-                                 rpr_mat=None
-                                 ):
+def multi_head_attention_forward_rpr(query,  # type: Tensor
+                                     key,  # type: Tensor
+                                     value,  # type: Tensor
+                                     embed_dim_to_check,  # type: int
+                                     num_heads,  # type: int
+                                     in_proj_weight,  # type: Tensor
+                                     in_proj_bias,  # type: Tensor
+                                     bias_k,  # type: Optional[Tensor]
+                                     bias_v,  # type: Optional[Tensor]
+                                     add_zero_attn,  # type: bool
+                                     dropout_p,  # type: float
+                                     out_proj_weight,  # type: Tensor
+                                     out_proj_bias,  # type: Tensor
+                                     training=True,  # type: bool
+                                     key_padding_mask=None,  # type: Optional[Tensor]
+                                     need_weights=True,  # type: bool
+                                     attn_mask=None,  # type: Optional[Tensor]
+                                     use_separate_proj_weight=False,  # type: bool
+                                     q_proj_weight=None,  # type: Optional[Tensor]
+                                     k_proj_weight=None,  # type: Optional[Tensor]
+                                     v_proj_weight=None,  # type: Optional[Tensor]
+                                     static_k=None,  # type: Optional[Tensor]
+                                     static_v=None,  # type: Optional[Tensor]
+                                     rpr_mat=None
+                                     ):
     """
     ----------
     Author: Pytorch
@@ -243,8 +251,6 @@ def multi_head_attention_forward_rpr(query,                       # type: Tensor
     ----------
     type: (...) -> Tuple[Tensor, Optional[Tensor]]
     """
-
-
 
     qkv_same = torch.equal(query, key) and torch.equal(key, value)
     kv_same = torch.equal(key, value)
@@ -345,9 +351,9 @@ def multi_head_attention_forward_rpr(query,                       # type: Tensor
             v = torch.cat([v, bias_v.repeat(1, bsz, 1)])
             if attn_mask is not None:
                 attn_mask = torch.cat([attn_mask,
-                                      torch.zeros((attn_mask.size(0), 1),
-                                                  dtype=attn_mask.dtype,
-                                                  device=attn_mask.device)], dim=1)
+                                       torch.zeros((attn_mask.size(0), 1),
+                                                   dtype=attn_mask.dtype,
+                                                   device=attn_mask.device)], dim=1)
             if key_padding_mask is not None:
                 key_padding_mask = torch.cat(
                     [key_padding_mask, torch.zeros((key_padding_mask.size(0), 1),
@@ -396,13 +402,11 @@ def multi_head_attention_forward_rpr(query,                       # type: Tensor
                                                dtype=key_padding_mask.dtype,
                                                device=key_padding_mask.device)], dim=1)
 
-
-
     attn_output_weights = torch.bmm(q, k.transpose(1, 2))
     assert list(attn_output_weights.size()) == [bsz * num_heads, tgt_len, src_len]
 
     ######### ADDITION OF RPR ###########
-    if(rpr_mat is not None):
+    if (rpr_mat is not None):
         rpr_mat = _get_valid_embedding(rpr_mat, q.shape[1], k.shape[1])
         qe = torch.einsum("hld,md->hlm", q, rpr_mat)
         srel = _skew(qe)
@@ -441,6 +445,7 @@ def multi_head_attention_forward_rpr(query,                       # type: Tensor
     else:
         return attn_output, None
 
+
 def _get_valid_embedding(Er, len_q, len_k):
     """
     ----------
@@ -453,6 +458,7 @@ def _get_valid_embedding(Er, len_q, len_k):
     len_e = Er.shape[0]
     start = max(0, len_e - len_q)
     return Er[start:, :]
+
 
 def _skew(qe):
     """
@@ -467,7 +473,7 @@ def _skew(qe):
     mask = (torch.triu(torch.ones(sz, sz).to(qe.device)) == 1).float().flip(0)
 
     qe = mask * qe
-    qe = F.pad(qe, (1,0, 0,0, 0,0))
+    qe = F.pad(qe, (1, 0, 0, 0, 0, 0))
     qe = torch.reshape(qe, (qe.shape[0], qe.shape[2], qe.shape[1]))
 
     srel = qe[:, 1:, :]
@@ -487,8 +493,8 @@ class QKVLinear(nn.Module):
         self.W_o = nn.Linear(d_model, d_model)
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor):
-        if torch.all(k == v):
-            raise "KeyとValueは常に同じ値になる必要があります。"
+        if not torch.equal(k, v):
+            raise ValueError("KeyとValueは常に同じ値になる必要があります。")
 
         Q = self.W_q(q)
         K = self.W_k(k)
@@ -503,21 +509,22 @@ class QKVLinear(nn.Module):
     def comp(self, o: Tensor):
         out = self.W_o(o)
 
-        return self.drop_out(out)
-
-
+        return out
 
 
 class FlashSelfAttentionM(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.2):
         super(FlashSelfAttentionM, self).__init__()
+        self.batch_first = True
+        self._qkv_same_embed_dim = True
+        self.in_proj_bias = None
+
         self.embed_dim = embed_dim
         self.qkv_block = QKVLinear(embed_dim, num_heads, dropout)
         self.drop = dropout
 
     def forward(self, query, key, value, key_padding_mask=None,
                 need_weights=True, attn_mask=None, is_causal=False):
-
         batch, tgt_len, embed_dim = query.size()
         assert embed_dim == self.embed_dim
         assert list(query.size()) == [batch, tgt_len, embed_dim]
@@ -525,11 +532,10 @@ class FlashSelfAttentionM(nn.Module):
 
         q, k, v = self.qkv_block(q=query, k=key, v=value)
 
-        if  query.dtype not in [torch.float16, torch.bfloat16]:
+        if query.dtype not in [torch.float16, torch.bfloat16]:
             q = q.half()
             k = k.half()
             v = v.half()
-
 
         qkv = torch.stack([q, k, v], dim=2)  # 形状: (batch, tgt_len, 3, H, D)
 
@@ -541,16 +547,22 @@ class FlashSelfAttentionM(nn.Module):
             cu_seqlens = None
             max_s = None
             indices = None
-
-        out = self.fsa(qkv_unpad, causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s)
         if key_padding_mask is not None:
-            out_flat = rearrange(out, "nnz h d -> nnz (h d)")
-            out = pad_input(out_flat, indices, batch, tgt_len)
+            out = flash_attn_varlen_qkvpacked_func(qkv_unpad, dropout_p=self.drop, causal=is_causal,
+                                                   cu_seqlens=cu_seqlens, max_seqlen=max_s) # OK
+        else:
+            out = flash_attn_qkvpacked_func(qkv_unpad, causal=is_causal, dropout_p=self.drop)
+
+
+        if key_padding_mask is not None:
+            out = rearrange(out, "total h d -> total (h d)")
+            out = pad_input(out, indices, batch, tgt_len)
+
         else:
             out = rearrange(out, "b s h d -> b s (h d)")
 
+        out = out.float()
         out = self.qkv_block.comp(out)
-
         return out, None
 
 
@@ -564,26 +576,19 @@ class FlashCrossAttentionM(nn.Module):
 
     def forward(self, query, key, value, memory_key_padding_mask=None, tgt_key_padding_mask=None,
                 need_weights=True, attn_mask=None, is_causal=False):
-
-
         batch, tgt_len, embed_dim = query.size()
         assert embed_dim == self.embed_dim
-        assert list(query.size()) == [ batch, tgt_len, embed_dim]
+        assert list(query.size()) == [batch, tgt_len, embed_dim]
         assert key.size() == value.size()
 
         q, k, v = self.qkv_block(query, key, value)
-        if  query.dtype not in [torch.float16, torch.bfloat16]:
+        if query.dtype not in [torch.float16, torch.bfloat16]:
             q = q.half()
             k = k.half()
             v = v.half()
         #print_stats("linear: Q", query)
         #print_stats("linear: K", key)
         #print_stats("linear: V", value)
-
-
-        q = rearrange(q, "b s (h d) -> b s h d", h=self.num_heads)
-        k = rearrange(k, "b s (h d) -> b s h d", h=self.num_heads)
-        v = rearrange(v, "b s (h d) -> b s h d", h=self.num_heads)
 
         if tgt_key_padding_mask is not None:
             q_unpad, indices_q, cu_seqlens_q, max_s_q, used_seqlens_q = unpad_input(q, tgt_key_padding_mask)
@@ -593,29 +598,34 @@ class FlashCrossAttentionM(nn.Module):
             max_s_q = None
             indices_q = None
 
-        kv = torch.stack([k, v], dim=2)  # 形状: (batch, tgt_len, 3, H, D)
-        #kv = rearrange(kv, "b s three h d -> b s (three h d)", three=2)  # 形状: (batch, tgt_len, 3*h*d)
+        kv = torch.stack([k, v], dim=2)
+        #kv_unpad = rearrange(kv_unpad, "b s three h d -> b s (three h d)", three=2)  # 形状: (batch, tgt_len, 3*h*d)
         if memory_key_padding_mask is not None:
-            kv_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(kv, memory_key_padding_mask)
+            k_unpad, indices, cu_seqlens_k, max_s_k, used_seqlens = unpad_input(kv, memory_key_padding_mask)
+            #v_unpad, _, _, _, _ = unpad_input(v, memory_key_padding_mask)
         else:
-            kv_unpad = kv
-            cu_seqlens = None
-            max_s = None
+            k_unpad = k
+            v_unpad = v
+            cu_seqlens_k = None
+            max_s_k = None
 
-
-        out = self.fca(q_unpad, kv_unpad, causal=is_causal,
-                       cu_seqlens=cu_seqlens_q,
-                       max_seqlen=max_s_q,
-                       cu_seqlens_k=cu_seqlens,
-                       max_seqlen_k=max_s)
-
+        #kv_unpad = torch.stack([k_unpad, v_unpad], dim=1)  # 形状: (batch, tgt_len, 3, H, D)
 
         if tgt_key_padding_mask is not None:
-            out_flat = rearrange(out, "nnz h d -> nnz (h d)")
-            out = pad_input(out_flat, indices_q, batch, tgt_len)
+            out = flash_attn_varlen_kvpacked_func(q_unpad, k_unpad, causal=is_causal, dropout_p=self.drop,
+                                                  cu_seqlens_q=cu_seqlens_q,
+                                                  max_seqlen_q=max_s_q,
+                                                  cu_seqlens_k=cu_seqlens_k,
+                                                  max_seqlen_k=max_s_k)
         else:
-            out = rearrange(out, "b s h d -> b s (h d)")
+            out = flash_attn_kvpacked_func(q_unpad, k_unpad, causal=is_causal, dropout_p=self.drop)
 
+        if tgt_key_padding_mask is not None:
+            out = rearrange(out, "total h d -> total (h d)")
+            out: Tensor = pad_input(out, indices_q, batch, tgt_len)
+        else:
+            out: Tensor = rearrange(out, "b s h d -> b s (h d)")
+
+        out = out.float()
         out = self.qkv_block.comp(out)
-
         return out, None

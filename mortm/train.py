@@ -150,7 +150,7 @@ def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.Cr
 
             loss = criterion(outputs, correct)  # 損失を計算
             val_loss += loss.item()
-        model.train()
+    model.train()
     return val_loss / len(val_loader)
 
 def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
@@ -178,7 +178,10 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
     criterion = nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device())
 
     optimizer = torch.optim.Adam(model.parameters(), lr=2e-1 if lr_param is None else lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
-    scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
+    if lr_param is None:
+        scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
+    else:
+        scheduler = None
 
     print("Start training...")
     writer = SummaryWriter(save_directory + f"/runs/{time.time()}/")
@@ -242,7 +245,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                                                                        #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr() if lr_param is not None else lr_param, verification_loss, criterion)
+                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr() if lr_param is None else lr_param, verification_loss, criterion)
 
                 if (count + 1) % int(50000 / batch_size) == 0:
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
@@ -250,6 +253,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
                 if (count + 1) % int(10000 / batch_size) == 0:
                     print("検証損失を求めています")
+                    torch.cuda.empty_cache()
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress)
                     writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss.get(),
                                                                   "Verification": verification_loss}, all_count)
