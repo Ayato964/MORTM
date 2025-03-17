@@ -105,8 +105,8 @@ def collate_fn(batch):
 
 def update_log(model, writer, global_step):
     for name, param in model.named_parameters():
-        if param.grad is not None:
-            writer.add_scalar(f"Gradient Norm/{name}", param.grad.norm(), global_step)
+        writer.add_scalar(f"params_mean/{name}", param.mean(), global_step)
+        writer.add_scalar(f"params_std/{name}", param.std(), global_step)
 
         writer.add_scalar(f"Parameter Value/{name}", param.norm(), global_step)
 
@@ -170,14 +170,14 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, progress=progress, num_heads=num_heads, e_layer=e_layer, d_layer=d_layer,
                   d_model=d_model, dim_feedforward=dim_feedforward,
-                  dropout=dropout, position_length=position_length).to(progress.get_device())
+                  dropout=dropout, position_length=position_length).to(progress.get_device(), dtype=torch.bfloat16)
     if load_model_directory is not None:
         model.load_state_dict(torch.load(load_model_directory))
 
     #criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=10, weight=weight.to(progress.get_device()))
     criterion = nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device())
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=2e-1 if lr_param is None else lr_param, betas=(0.9, 0.98), weight_decay=1e-6)  # オプティマイザを定義
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-1 if lr_param is None else lr_param, betas=(0.9, 0.98))  # オプティマイザを定義
     if lr_param is None:
         scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
     else:
@@ -194,7 +194,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
         try:
             print(f"epoch {epoch + 1} start....")
             count = 1
-            epoch_loss = EpochObserver(500)
+            epoch_loss = EpochObserver(1000)
             verification_loss = 0.0
 
             model.train()
@@ -222,7 +222,6 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                 loss = loss / accumulation_steps
                 loss.backward()  # 逆伝播
 
-                update_log(model, writer, count)
 
                 if count % accumulation_steps == 0:  #実質バッチサイズは64である
                     progress.step_optimizer(optimizer, model, accumulation_steps)
@@ -257,6 +256,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress)
                     writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss.get(),
                                                                   "Verification": verification_loss}, all_count)
+                    update_log(model, writer, all_count)
 
                 all_count += 1
 

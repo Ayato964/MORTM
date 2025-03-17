@@ -560,8 +560,6 @@ class FlashSelfAttentionM(nn.Module):
 
         else:
             out = rearrange(out, "b s h d -> b s (h d)")
-
-        out = out.float()
         out = self.qkv_block.comp(out)
         return out, None
 
@@ -583,6 +581,7 @@ class FlashCrossAttentionM(nn.Module):
 
         q, k, v = self.qkv_block(query, key, value)
         if query.dtype not in [torch.float16, torch.bfloat16]:
+            print("###")
             q = q.half()
             k = k.half()
             v = v.half()
@@ -591,7 +590,7 @@ class FlashCrossAttentionM(nn.Module):
         #print_stats("linear: V", value)
 
         if tgt_key_padding_mask is not None:
-            q_unpad, indices_q, cu_seqlens_q, max_s_q, used_seqlens_q = unpad_input(q, tgt_key_padding_mask)
+            q_unpad, indices_q, cu_seqlens_q, max_s_q, used_seqlens_q = unpad_input(q, tgt_key_padding_mask) #完全に問題はない
         else:
             q_unpad = q
             cu_seqlens_q = None
@@ -605,6 +604,7 @@ class FlashCrossAttentionM(nn.Module):
             #v_unpad, _, _, _, _ = unpad_input(v, memory_key_padding_mask)
         else:
             k_unpad = k
+            indices = None
             v_unpad = v
             cu_seqlens_k = None
             max_s_k = None
@@ -626,6 +626,5 @@ class FlashCrossAttentionM(nn.Module):
         else:
             out: Tensor = rearrange(out, "b s h d -> b s (h d)")
 
-        out = out.float()
         out = self.qkv_block.comp(out)
         return out, None

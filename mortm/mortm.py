@@ -78,44 +78,9 @@ class MORTM(nn.Module):
             out = self.encoder(src=src_p, mask=tgt_mask, src_key_padding_mask=input_padding_mask, is_casual=src_is_causal)
 
 
-        out = out.permute(1, 0, 2)
         score: Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
 
-    def top_p_sampling_measure_decoder(self, input_seq, p=0.9, max_measure=20, temperature=1.0):
-        self.eval()
-        if not isinstance(input_seq, torch.Tensor):
-            input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
-        seg: Tensor = self.split_tensor_at_value(input_seq, 3, include_split=True)
-        gen = torch.tensor([2], dtype=torch.long, device=self.progress.get_device())
-
-
-        generated = torch.cat([torch.tensor(s) for s in seg[:-1]]).to(self.progress.get_device())
-        src = torch.concatenate([s for s in seg[:-1]])
-        src = torch.concatenate((src, gen, seg[-1])).to(self.progress.get_device())
-
-        for i in range(max_measure):
-            while not (src[-1] == 391 or src[-1] == 392):
-                logit = self(src=src.unsqueeze(0))
-                outputs = logit.view(-1, logit.size(-1)).to(self.progress.get_device())
-                token = self.top_p_sampling(outputs[-1], p=p, temperature=temperature)
-                src = torch.concatenate((src, torch.tensor([token], dtype=torch.long, device=self.progress.get_device())))
-            if src[-1] == 392:
-                break
-
-            seg = self.split_tensor_at_value(src, 3, include_split=True)
-            seg[-2] = seg[-2][:-1]
-            seg[-1] = seg[-1][:-1]
-            generated = torch.cat((generated, seg[-1])).to(self.progress.get_device())
-            #print(f"seg:{seg}   generated:{generated}    src:{src}")
-            if len(seg) > 8:
-                src = torch.cat([seq for seq in seg[len(seg) - 8:]]).to(self.progress.get_device())
-            else:
-                src = torch.cat([seq for seq in seg]).to(self.progress.get_device())
-            src = torch.cat((src, torch.tensor([2], dtype=torch.long, device=self.progress.get_device()))).to(self.progress.get_device())
-
-
-        return generated
     def top_p_sampling_measure(self, input_seq, p=0.9, max_measure=20, temperature=1.0, context_measure=8):
         self.eval()
         if not isinstance(input_seq, torch.Tensor):
@@ -288,9 +253,9 @@ class MORTMDecoderLayer(nn.Module):
         self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(d_model, num_head, dropout)
         #self.self_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=True)
 
-        self.linear1 = nn.Linear(d_model, dim_ff, bias=bias)
+        self.linear1 = nn.Linear(d_model, dim_ff)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_ff, d_model, bias=bias)
+        self.linear2 = nn.Linear(dim_ff, d_model)
 
         self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
         self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
@@ -353,7 +318,7 @@ class MORTMDecoderLayer(nn.Module):
 
     def ff_block(self, y: Tensor):
         y = self.linear1(y)
-        y = F.relu(y)
+        y = F.gelu(y)
         y = self.dropout(y)
         y = self.linear2(y)
         return self.dropout3(y)
