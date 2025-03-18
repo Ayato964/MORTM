@@ -52,7 +52,7 @@ class MORTM(nn.Module):
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
                 tgt_padding_mask=None, src_is_causal=False, tgt_is_causal=False):
         if tgt_mask is None and tgt_is_causal:
-            tgt_mask = _generate_square_subsequent_mask(tgt.size(1)).to(self.progress.get_device())
+            tgt_mask = _generate_square_subsequent_mask(tgt.size(1)).to(self.progress.get_device(), dtype=torch.bfloat16)
 
         sec_e: Tensor = self.embedding(src)
         sec_e = sec_e.permute(1, 0, 2)
@@ -203,8 +203,8 @@ class MORTMEncoderLayer(TransformerEncoderLayer):
     def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps):
         super(MORTMEncoderLayer, self).__init__(d_model=d_model, dim_feedforward=dim_ff, nhead=num_head, dropout=dropout,
                                                 batch_first=batch_first, bias=bias, layer_norm_eps=layer_norm_eps)
-        self.self_attn =FlashSelfAttentionM(d_model, num_head, dropout)
-        #self.self_attn = MultiheadAttention(d_model, num_head, dropout, batch_first=True)
+        #self.self_attn =FlashSelfAttentionM(d_model, num_head, dropout)
+        self.self_attn = MultiheadAttention(d_model, num_head, dropout, batch_first=True).to(dtype=torch.bfloat16)
 
 
 class MORTMDecoder(nn.Module):
@@ -248,10 +248,10 @@ class MORTMDecoderLayer(nn.Module):
         super(MORTMDecoderLayer, self).__init__()
         self.n_head = num_head
         self.d_model = d_model
-        self.cross_attention: FlashCrossAttentionM = FlashCrossAttentionM(d_model, num_head, dropout)
-        #self.cross_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=False)
-        self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(d_model, num_head, dropout)
-        #self.self_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=True)
+        #self.cross_attention: FlashCrossAttentionM = FlashCrossAttentionM(d_model, num_head, dropout)
+        self.cross_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=True).to(dtype=torch.bfloat16)
+        #self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(d_model, num_head, dropout)
+        self.self_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=True).to(dtype=torch.bfloat16)
 
         self.linear1 = nn.Linear(d_model, dim_ff)
         self.dropout = nn.Dropout(dropout)
@@ -309,11 +309,11 @@ class MORTMDecoderLayer(nn.Module):
                     tgt_key_padding_mask: Optional[Tensor],
                     is_causal: bool = False,
                     ):
-        y, _ = self.cross_attention(y, mem, mem, memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
-                                    attn_mask=attn_mask, is_causal=is_causal)
-
-        #y, _ = self.cross_attention(y, mem, mem, key_padding_mask=memory_key_padding_mask,
+        #y, _ = self.cross_attention(y, mem, mem, memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
         #                            attn_mask=attn_mask, is_causal=is_causal)
+
+        y, _ = self.cross_attention(y, mem, mem, key_padding_mask=memory_key_padding_mask,
+                                    is_causal=is_causal)
         return self.dropout2(y)
 
     def ff_block(self, y: Tensor):

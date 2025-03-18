@@ -89,7 +89,7 @@ def _set_train_data(directory, datasets, positional_length, progress: LearningPr
 
 def _get_padding_mask(input_ids, progress: LearningProgress):
     # input_ids が Tensor であることを仮定
-    pad_id = (input_ids != 0).to(torch.float)
+    pad_id = (input_ids != 0).to(torch.bfloat16)
     padding_mask = pad_id.to(progress.get_device())
     return padding_mask
 
