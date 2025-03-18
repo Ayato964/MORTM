@@ -34,7 +34,6 @@ try:
 except ImportError:
     raise ImportError("FlashAttention2 のライブラリが必要です。インストールしてください。")
 
-
 def print_stats(name, tensor):
     print(f"{name}: min={tensor.min().item()}, max={tensor.max().item()}, mean={tensor.mean().item()}")
 
@@ -252,6 +251,8 @@ def multi_head_attention_forward_rpr(query,  # type: Tensor
     type: (...) -> Tuple[Tensor, Optional[Tensor]]
     """
 
+
+
     qkv_same = torch.equal(query, key) and torch.equal(key, value)
     kv_same = torch.equal(key, value)
 
@@ -402,6 +403,8 @@ def multi_head_attention_forward_rpr(query,  # type: Tensor
                                                dtype=key_padding_mask.dtype,
                                                device=key_padding_mask.device)], dim=1)
 
+
+
     attn_output_weights = torch.bmm(q, k.transpose(1, 2))
     assert list(attn_output_weights.size()) == [bsz * num_heads, tgt_len, src_len]
 
@@ -473,7 +476,7 @@ def _skew(qe):
     mask = (torch.triu(torch.ones(sz, sz).to(qe.device)) == 1).float().flip(0)
 
     qe = mask * qe
-    qe = F.pad(qe, (1, 0, 0, 0, 0, 0))
+    qe = F.pad(qe, (1,0, 0,0, 0,0))
     qe = torch.reshape(qe, (qe.shape[0], qe.shape[2], qe.shape[1]))
 
     srel = qe[:, 1:, :]
@@ -492,19 +495,42 @@ class QKVLinear(nn.Module):
 
         self.W_o = nn.Linear(d_model, d_model)
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor):
-        if not torch.equal(k, v):
-            raise ValueError("KeyとValueは常に同じ値になる必要があります。")
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, memory_padding_mask: Tensor=None, key_padding_mask: Tensor=None):
 
-        Q = self.W_q(q)
-        K = self.W_k(k)
-        V = self.W_v(v)
+        if key_padding_mask is not None:
+            q_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(q, key_padding_mask)
+        else:
+            q_unpad = q
+            cu_seqlens = None
+            max_s = None
+            indices = None
 
-        Q = rearrange(Q, "b s (h d) -> b s h d", h=self.num_heads)
-        K = rearrange(K, "b s (h d) -> b s h d", h=self.num_heads)
-        V = rearrange(V, "b s (h d) -> b s h d", h=self.num_heads)
+        if memory_padding_mask is None:
+            k_unpad, _, cu_seqlens_k, max_s_k, _ = unpad_input(k, key_padding_mask)
+            v_unpad, _, _, _, _ = unpad_input(v, key_padding_mask)
+        elif key_padding_mask is not None:
+            k_unpad, _, cu_seqlens_k, max_s_k, _ = unpad_input(k, memory_padding_mask)
+            v_unpad, _, _, _, _ = unpad_input(v, memory_padding_mask)
+        else:
+            k_unpad = k
+            v_unpad = v
+            cu_seqlens_k, max_s_k = (None, None)
 
-        return Q, K, V
+        Q = self.W_q(q_unpad)
+        K = self.W_k(k_unpad)
+        V = self.W_v(v_unpad)
+
+        if key_padding_mask is not None:
+            Q = rearrange(Q, "total (h d) -> total h d", h=self.num_heads)
+            K = rearrange(K, "total (h d) -> total h d", h=self.num_heads)
+            V = rearrange(V, "total (h d) -> total h d", h=self.num_heads)
+        else:
+            Q = rearrange(Q, "b s (h d) -> b s h d", h=self.num_heads)
+            K = rearrange(K, "b s (h d) -> b s h d", h=self.num_heads)
+            V = rearrange(V, "b s (h d) -> b s h d", h=self.num_heads)
+
+
+        return Q, K, V, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k
 
     def comp(self, o: Tensor):
         out = self.W_o(o)
@@ -530,23 +556,16 @@ class FlashSelfAttentionM(nn.Module):
         assert list(query.size()) == [batch, tgt_len, embed_dim]
         assert key.size() == value.size()
 
-        q, k, v = self.qkv_block(q=query, k=key, v=value)
+        q, k, v, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k = self.qkv_block(q=query, k=key, v=value,
+                                                                                    key_padding_mask=key_padding_mask)
 
         if query.dtype not in [torch.float16, torch.bfloat16]:
             q = q.half()
             k = k.half()
             v = v.half()
 
-        qkv = torch.stack([q, k, v], dim=2)  # 形状: (batch, tgt_len, 3, H, D)
+        qkv_unpad = torch.stack([q, k, v], dim=1)
 
-        #qkv = rearrange(qkv, "b s three h d -> b s (three h d)", three=3)  # 形状: (batch, tgt_len, 3*h*d)
-        if key_padding_mask is not None:
-            qkv_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(qkv, key_padding_mask)
-        else:
-            qkv_unpad = qkv
-            cu_seqlens = None
-            max_s = None
-            indices = None
         if key_padding_mask is not None:
             out = flash_attn_varlen_qkvpacked_func(qkv_unpad, dropout_p=self.drop, causal=is_causal,
                                                    cu_seqlens=cu_seqlens, max_seqlen=max_s) # OK
@@ -579,50 +598,28 @@ class FlashCrossAttentionM(nn.Module):
         assert list(query.size()) == [batch, tgt_len, embed_dim]
         assert key.size() == value.size()
 
-        q, k, v = self.qkv_block(query, key, value)
+        q, k, v, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k = self.qkv_block(q=query, k=key, v=value,
+                                                                                    key_padding_mask=tgt_key_padding_mask,
+                                                                                    memory_padding_mask=memory_key_padding_mask)
         if query.dtype not in [torch.float16, torch.bfloat16]:
             print("###")
             q = q.half()
             k = k.half()
             v = v.half()
-        #print_stats("linear: Q", query)
-        #print_stats("linear: K", key)
-        #print_stats("linear: V", value)
 
+        k_unpad = torch.stack([k, v], dim=1)
         if tgt_key_padding_mask is not None:
-            q_unpad, indices_q, cu_seqlens_q, max_s_q, used_seqlens_q = unpad_input(q, tgt_key_padding_mask) #完全に問題はない
-        else:
-            q_unpad = q
-            cu_seqlens_q = None
-            max_s_q = None
-            indices_q = None
-
-        kv = torch.stack([k, v], dim=2)
-        #kv_unpad = rearrange(kv_unpad, "b s three h d -> b s (three h d)", three=2)  # 形状: (batch, tgt_len, 3*h*d)
-        if memory_key_padding_mask is not None:
-            k_unpad, indices, cu_seqlens_k, max_s_k, used_seqlens = unpad_input(kv, memory_key_padding_mask)
-            #v_unpad, _, _, _, _ = unpad_input(v, memory_key_padding_mask)
-        else:
-            k_unpad = k
-            indices = None
-            v_unpad = v
-            cu_seqlens_k = None
-            max_s_k = None
-
-        #kv_unpad = torch.stack([k_unpad, v_unpad], dim=1)  # 形状: (batch, tgt_len, 3, H, D)
-
-        if tgt_key_padding_mask is not None:
-            out = flash_attn_varlen_kvpacked_func(q_unpad, k_unpad, causal=is_causal, dropout_p=self.drop,
-                                                  cu_seqlens_q=cu_seqlens_q,
-                                                  max_seqlen_q=max_s_q,
+            out = flash_attn_varlen_kvpacked_func(q, k_unpad, causal=is_causal, dropout_p=self.drop,
+                                                  cu_seqlens_q=cu_seqlens,
+                                                  max_seqlen_q=max_s,
                                                   cu_seqlens_k=cu_seqlens_k,
                                                   max_seqlen_k=max_s_k)
         else:
-            out = flash_attn_kvpacked_func(q_unpad, k_unpad, causal=is_causal, dropout_p=self.drop)
+            out = flash_attn_kvpacked_func(q, k_unpad, causal=is_causal, dropout_p=self.drop)
 
         if tgt_key_padding_mask is not None:
             out = rearrange(out, "total h d -> total (h d)")
-            out: Tensor = pad_input(out, indices_q, batch, tgt_len)
+            out: Tensor = pad_input(out, indices, batch, tgt_len)
         else:
             out: Tensor = rearrange(out, "b s h d -> b s (h d)")
 
