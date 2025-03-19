@@ -89,7 +89,7 @@ def _set_train_data(directory, datasets, positional_length, progress: LearningPr
 
 def _get_padding_mask(input_ids, progress: LearningProgress):
     # input_ids が Tensor であることを仮定
-    pad_id = (input_ids != 0).to(torch.bfloat16)
+    pad_id = (input_ids != 0).to(torch.float)
     padding_mask = pad_id.to(progress.get_device())
     return padding_mask
 
@@ -170,7 +170,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
     print("Creating Model....")
     model = MORTM(vocab_size=vocab_size, progress=progress, num_heads=num_heads, e_layer=e_layer, d_layer=d_layer,
                   d_model=d_model, dim_feedforward=dim_feedforward,
-                  dropout=dropout, position_length=position_length).to(progress.get_device(), dtype=torch.bfloat16)
+                  dropout=dropout, position_length=position_length).to(progress.get_device())
     if load_model_directory is not None:
         model.load_state_dict(torch.load(load_model_directory))
 
@@ -182,6 +182,8 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
         scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
     else:
         scheduler = None
+
+    scaler = torch.cuda.amp.GradScaler(initial_scale=2**16, growth_interval=1000, backoff_scale_factor=0.9)
 
     print("Start training...")
     writer = SummaryWriter(save_directory + f"/runs/{time.time()}/")
@@ -203,28 +205,28 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
             for src, tgt in train_loader:  # seqにはbatch_size分の楽曲が入っている
                 #print(f"learning sequence {count}")
                 correct: Tensor = tgt[:, 1:]
+                correct = correct.reshape(-1).long()
                 tgt = tgt[:, :-1]
                 begin_time = time.time()
 
                 padding_mask_in: Tensor = _get_padding_mask(src, progress)
                 padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-                outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in,
-                                        tgt_padding_mask=padding_mask_tg, tgt_is_causal=True)
+                with torch.cuda.amp.autocast('cuda', dtype=torch.bfloat16):
+                    outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in,
+                                            tgt_padding_mask=padding_mask_tg, tgt_is_causal=True)
 
-                outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
-                correct = correct.reshape(-1).long()
+                    outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
 
-                #print(outputs.shape, correct.shape)
+                    loss = criterion(outputs.to(dtype=torch.float32), correct)  # 損失を計算
+                    epoch_loss.add(loss.item())
 
-                loss = criterion(outputs, correct)  # 損失を計算
-                epoch_loss.add(loss.item())
-                loss = loss / accumulation_steps
-                loss.backward()  # 逆伝播
+                    loss = loss / accumulation_steps
+                    scaler.scale(loss).backward()  # 逆伝播
 
 
                 if count % accumulation_steps == 0:  #実質バッチサイズは64である
-                    progress.step_optimizer(optimizer, model, accumulation_steps)
+                    progress.step_optimizer(optimizer, model, accumulation_steps, scaler)
                     if lr_param is None:
                         scheduler.step()
                     torch.cuda.empty_cache()

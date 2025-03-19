@@ -428,7 +428,7 @@ def multi_head_attention_forward_rpr(query,  # type: Tensor
             key_padding_mask.unsqueeze(1).unsqueeze(2),
             float('-inf'),
         )
-        key_padding_mask = key_padding_mask.type(dtype=torch.float)
+        key_padding_mask = key_padding_mask.type(dtype=torch.float32)
         attn_output_weights = attn_output_weights.view(bsz * num_heads, tgt_len, src_len)
 
     attn_output_weights = softmax(
@@ -481,6 +481,21 @@ def _skew(qe):
 
     srel = qe[:, 1:, :]
     return srel
+
+
+def get_alibi_slopes(n_heads):
+    def get_slopes_power_of_2(n):
+        start = 2 ** (-2 ** -(math.log2(n) - 3))
+        return [start * (start ** i) for i in range(n)]
+
+    if math.log2(n_heads).is_integer():
+        slopes = get_slopes_power_of_2(n_heads)
+    else:
+        closest_power_of_2 = 2 ** math.floor(math.log2(n_heads))
+        slopes = get_slopes_power_of_2(closest_power_of_2)
+        extra = get_alibi_slopes(2 * closest_power_of_2)[0::2]
+        slopes.extend(extra[: n_heads - closest_power_of_2])
+    return slopes
 
 
 class QKVLinear(nn.Module):
@@ -548,6 +563,7 @@ class FlashSelfAttentionM(nn.Module):
         self.embed_dim = embed_dim
         self.qkv_block = QKVLinear(embed_dim, num_heads, dropout)
         self.drop = dropout
+        self.alibi = torch.tensor(get_alibi_slopes(num_heads), dtype=torch.float32).to('cuda')
 
     def forward(self, query, key, value, key_padding_mask=None,
                 need_weights=True, attn_mask=None, is_causal=False):
@@ -560,6 +576,7 @@ class FlashSelfAttentionM(nn.Module):
                                                                                     key_padding_mask=key_padding_mask)
 
         if query.dtype not in [torch.float16, torch.bfloat16]:
+            print("###")
             q = q.half()
             k = k.half()
             v = v.half()
@@ -568,9 +585,9 @@ class FlashSelfAttentionM(nn.Module):
 
         if key_padding_mask is not None:
             out = flash_attn_varlen_qkvpacked_func(qkv_unpad, dropout_p=self.drop, causal=is_causal,
-                                                   cu_seqlens=cu_seqlens, max_seqlen=max_s) # OK
+                                                   cu_seqlens=cu_seqlens, max_seqlen=max_s, alibi_slopes=self.alibi) # OK
         else:
-            out = flash_attn_qkvpacked_func(qkv_unpad, causal=is_causal, dropout_p=self.drop)
+            out = flash_attn_qkvpacked_func(qkv_unpad, causal=is_causal, dropout_p=self.drop, alibi_slopes=self.alibi)
 
 
         if key_padding_mask is not None:

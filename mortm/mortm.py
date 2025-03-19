@@ -40,31 +40,31 @@ class MORTM(nn.Module):
             batch_first=True, bias=True,
             layer_norm_eps=1e-5
         )
-        self.encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=e_layer, norm=LayerNorm(d_model, 1e-5, bias=True))
+        self.encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=e_layer, norm=LayerNorm(d_model, 1e-5, bias=True, dtype=torch.float32))
 
         print("Use RPR Transformer")
         print(f"Input Vocab Size:{vocab_size}")
         self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
 
-        self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model).to(self.progress.get_device())
+        self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
                 tgt_padding_mask=None, src_is_causal=False, tgt_is_causal=False):
         if tgt_mask is None and tgt_is_causal:
-            tgt_mask = _generate_square_subsequent_mask(tgt.size(1)).to(self.progress.get_device(), dtype=torch.bfloat16)
+            tgt_mask = _generate_square_subsequent_mask(tgt.size(1)).to(self.progress.get_device())
 
         sec_e: Tensor = self.embedding(src)
         sec_e = sec_e.permute(1, 0, 2)
 
         src_p: Tensor = self.positional(sec_e)
-        src_p = src_p.permute(1, 0, 2)
+        #src_p = src_p.permute(1, 0, 2)
 
         if tgt is not None:
             tgt_e = self.embedding(tgt)
             tgt_e = tgt_e.permute(1, 0, 2)
             tgt_p = self.positional(tgt_e)
-            tgt_p = tgt_p.permute(1, 0, 2)
+            #tgt_p = tgt_p.permute(1, 0, 2)
         else:
             tgt_p = src_p
 
@@ -77,7 +77,7 @@ class MORTM(nn.Module):
         else:
             out = self.encoder(src=src_p, mask=tgt_mask, src_key_padding_mask=input_padding_mask, is_casual=src_is_causal)
 
-
+        out = out.permute(1, 0, 2)
         score: Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
 
@@ -204,7 +204,7 @@ class MORTMEncoderLayer(TransformerEncoderLayer):
         super(MORTMEncoderLayer, self).__init__(d_model=d_model, dim_feedforward=dim_ff, nhead=num_head, dropout=dropout,
                                                 batch_first=batch_first, bias=bias, layer_norm_eps=layer_norm_eps)
         #self.self_attn =FlashSelfAttentionM(d_model, num_head, dropout)
-        self.self_attn = MultiheadAttention(d_model, num_head, dropout, batch_first=True).to(dtype=torch.bfloat16)
+        self.self_attn = MultiHeadAttentionRPR(d_model, num_head, dropout)
 
 
 class MORTMDecoder(nn.Module):
@@ -215,7 +215,7 @@ class MORTMDecoder(nn.Module):
                                                     num_head=num_head, dropout=dropout,
                                                     batch_first=batch_first, bias=bias,
                                                     layer_norm_eps=layer_norm_eps), self.num_layer)
-        self.norm = LayerNorm(d_model, eps=1e-5, bias=True)
+        self.norm = LayerNorm(d_model, eps=1e-5, bias=True, dtype=torch.float32)
     def forward(self, tgt: Tensor,
         memory: Tensor,
         tgt_mask: Optional[Tensor] = None,
@@ -249,17 +249,17 @@ class MORTMDecoderLayer(nn.Module):
         self.n_head = num_head
         self.d_model = d_model
         #self.cross_attention: FlashCrossAttentionM = FlashCrossAttentionM(d_model, num_head, dropout)
-        self.cross_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=True).to(dtype=torch.bfloat16)
+        self.cross_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=False)
         #self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(d_model, num_head, dropout)
-        self.self_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=True).to(dtype=torch.bfloat16)
+        self.self_attention = MultiHeadAttentionRPR(d_model, num_head, dropout)
 
         self.linear1 = nn.Linear(d_model, dim_ff)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_ff, d_model)
 
-        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
-        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
-        self.norm3 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias)
+        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
+        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
+        self.norm3 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
@@ -318,7 +318,7 @@ class MORTMDecoderLayer(nn.Module):
 
     def ff_block(self, y: Tensor):
         y = self.linear1(y)
-        y = F.gelu(y)
+        y = F.relu(y)
         y = self.dropout(y)
         y = self.linear2(y)
         return self.dropout3(y)
