@@ -183,7 +183,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
     else:
         scheduler = None
 
-    scaler = torch.cuda.amp.GradScaler(initial_scale=2**16, growth_interval=1000, backoff_scale_factor=0.9)
+    scaler = torch.cuda.amp.GradScaler(init_scale=2**16, growth_interval=1000, backoff_factor=0.9)
 
     print("Start training...")
     writer = SummaryWriter(save_directory + f"/runs/{time.time()}/")
@@ -212,7 +212,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                 padding_mask_in: Tensor = _get_padding_mask(src, progress)
                 padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-                with torch.cuda.amp.autocast('cuda', dtype=torch.bfloat16):
+                with torch.cuda.amp.autocast( dtype=torch.bfloat16):
                     outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in,
                                             tgt_padding_mask=padding_mask_tg, tgt_is_causal=True)
 
