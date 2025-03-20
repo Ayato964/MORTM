@@ -5,7 +5,7 @@ import torch
 class LearningProgress:
 
     @abstractmethod
-    def step_optimizer(self, optimizer, model, accumulation_steps, scaler, **kwargs):
+    def step_optimizer(self, optimizer, model, accumulation_steps, **kwargs):
         pass
 
     @abstractmethod
@@ -22,18 +22,16 @@ class _DefaultLearningProgress(LearningProgress):
             return torch.device('cpu')
         pass
 
-    def step_optimizer(self, optimizer, model, accumulation_steps, scaler, **kwargs):
+    def step_optimizer(self, optimizer, model, accumulation_steps, **kwargs):
         norm = self.get_gradient_norm(model)
         if not (1e-4 < norm < 3.0):
             print(
                 f"\033[31m 警告\033[0m：NORMが既定値から逸脱しています。学習率、またはバッチサイズを調整してください。({norm:.4f})")
 
-        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3)
 
-        scaler.step(optimizer)  # オプティマイザを更新
+        optimizer.step()
         optimizer.zero_grad()
-        scaler.update()
         pass
 
     def get_gradient_norm(self, model):

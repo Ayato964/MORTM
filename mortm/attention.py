@@ -34,6 +34,7 @@ try:
 except ImportError:
     raise ImportError("FlashAttention2 のライブラリが必要です。インストールしてください。")
 
+
 def print_stats(name, tensor):
     print(f"{name}: min={tensor.min().item()}, max={tensor.max().item()}, mean={tensor.mean().item()}")
 
@@ -403,8 +404,6 @@ def multi_head_attention_forward_rpr(query,  # type: Tensor
                                                dtype=key_padding_mask.dtype,
                                                device=key_padding_mask.device)], dim=1)
 
-
-
     attn_output_weights = torch.bmm(q, k.transpose(1, 2))
     assert list(attn_output_weights.size()) == [bsz * num_heads, tgt_len, src_len]
 
@@ -476,7 +475,7 @@ def _skew(qe):
     mask = (torch.triu(torch.ones(sz, sz).to(qe.device)) == 1).float().flip(0)
 
     qe = mask * qe
-    qe = F.pad(qe, (1,0, 0,0, 0,0))
+    qe = F.pad(qe, (1, 0, 0, 0, 0, 0))
     qe = torch.reshape(qe, (qe.shape[0], qe.shape[2], qe.shape[1]))
 
     srel = qe[:, 1:, :]
@@ -484,6 +483,11 @@ def _skew(qe):
 
 
 def get_alibi_slopes(n_heads):
+    """
+    ALiBi のスロープを計算する関数。
+    n_heads が 2 のべき乗の場合はシンプルな幾何級数になり、
+    そうでない場合は補間してスロープを拡張します。
+    """
     def get_slopes_power_of_2(n):
         start = 2 ** (-2 ** -(math.log2(n) - 3))
         return [start * (start ** i) for i in range(n)]
@@ -504,14 +508,16 @@ class QKVLinear(nn.Module):
         self.num_heads = num_heads
         self.drop_out = nn.Dropout(drop_out)
 
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
+        self.W_q = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
+        self.W_k = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
+        self.W_v = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
 
-        self.W_o = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor, memory_padding_mask: Tensor=None, key_padding_mask: Tensor=None):
-
+        q = q.to(dtype=torch.bfloat16)
+        k = k.to(dtype=torch.bfloat16)
+        v = v.to(dtype=torch.bfloat16)
         if key_padding_mask is not None:
             q_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(q, key_padding_mask)
         else:
@@ -520,12 +526,9 @@ class QKVLinear(nn.Module):
             max_s = None
             indices = None
 
-        if memory_padding_mask is None:
-            k_unpad, _, cu_seqlens_k, max_s_k, _ = unpad_input(k, key_padding_mask)
-            v_unpad, _, _, _, _ = unpad_input(v, key_padding_mask)
-        elif key_padding_mask is not None:
-            k_unpad, _, cu_seqlens_k, max_s_k, _ = unpad_input(k, memory_padding_mask)
-            v_unpad, _, _, _, _ = unpad_input(v, memory_padding_mask)
+        if key_padding_mask is not None:
+            k_unpad, _, cu_seqlens_k, max_s_k, _ = unpad_input(k, memory_padding_mask if memory_padding_mask is not None else key_padding_mask)
+            v_unpad, _, _, _, _ = unpad_input(v, memory_padding_mask if memory_padding_mask is not None else key_padding_mask)
         else:
             k_unpad = k
             v_unpad = v
@@ -544,17 +547,16 @@ class QKVLinear(nn.Module):
             K = rearrange(K, "b s (h d) -> b s h d", h=self.num_heads)
             V = rearrange(V, "b s (h d) -> b s h d", h=self.num_heads)
 
-
         return Q, K, V, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k
 
     def comp(self, o: Tensor):
-        out = self.W_o(o)
+        out: Tensor = self.W_o(o)
 
-        return out
+        return out.to(dtype=torch.float32)
 
 
 class FlashSelfAttentionM(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.2):
+    def __init__(self, embed_dim, num_heads, dropout=0.2, progress=None):
         super(FlashSelfAttentionM, self).__init__()
         self.batch_first = True
         self._qkv_same_embed_dim = True
@@ -563,7 +565,8 @@ class FlashSelfAttentionM(nn.Module):
         self.embed_dim = embed_dim
         self.qkv_block = QKVLinear(embed_dim, num_heads, dropout)
         self.drop = dropout
-        self.alibi = torch.tensor(get_alibi_slopes(num_heads), dtype=torch.float32).to('cuda')
+
+        self.alibi_slopes = torch.tensor(get_alibi_slopes(num_heads), dtype=torch.float32, device=progress.get_device())
 
     def forward(self, query, key, value, key_padding_mask=None,
                 need_weights=True, attn_mask=None, is_causal=False):
@@ -575,20 +578,15 @@ class FlashSelfAttentionM(nn.Module):
         q, k, v, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k = self.qkv_block(q=query, k=key, v=value,
                                                                                     key_padding_mask=key_padding_mask)
 
-        if query.dtype not in [torch.float16, torch.bfloat16]:
-            print("###")
-            q = q.half()
-            k = k.half()
-            v = v.half()
-
-        qkv_unpad = torch.stack([q, k, v], dim=1)
+        qkv_unpad = torch.stack([q, k, v], dim=1 if key_padding_mask is not None else 2)
 
         if key_padding_mask is not None:
             out = flash_attn_varlen_qkvpacked_func(qkv_unpad, dropout_p=self.drop, causal=is_causal,
-                                                   cu_seqlens=cu_seqlens, max_seqlen=max_s, alibi_slopes=self.alibi) # OK
+                                                   cu_seqlens=cu_seqlens, max_seqlen=max_s,
+                                                   alibi_slopes=self.alibi_slopes) # OK
         else:
-            out = flash_attn_qkvpacked_func(qkv_unpad, causal=is_causal, dropout_p=self.drop, alibi_slopes=self.alibi)
-
+            out = flash_attn_qkvpacked_func(qkv_unpad, causal=is_causal, dropout_p=self.drop,
+                                            alibi_slopes=self.alibi_slopes)
 
         if key_padding_mask is not None:
             out = rearrange(out, "total h d -> total (h d)")
@@ -618,13 +616,8 @@ class FlashCrossAttentionM(nn.Module):
         q, k, v, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k = self.qkv_block(q=query, k=key, v=value,
                                                                                     key_padding_mask=tgt_key_padding_mask,
                                                                                     memory_padding_mask=memory_key_padding_mask)
-        if query.dtype not in [torch.float16, torch.bfloat16]:
-            print("###")
-            q = q.half()
-            k = k.half()
-            v = v.half()
 
-        k_unpad = torch.stack([k, v], dim=1)
+        k_unpad = torch.stack([k, v], dim=1 if tgt_key_padding_mask is not None else 2)
         if tgt_key_padding_mask is not None:
             out = flash_attn_varlen_kvpacked_func(q, k_unpad, causal=is_causal, dropout_p=self.drop,
                                                   cu_seqlens_q=cu_seqlens,

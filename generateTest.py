@@ -37,10 +37,10 @@ model = MORTM(
     vocab_size=393,
     d_layer=18,
     e_layer=18,
-    num_heads=16,
+    num_heads=12,
     position_length=400
 )
-model.load_state_dict(torch.load("out/model/MORTM.train.10.0.8507_18749.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.EX15_0.41.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -54,7 +54,7 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/np/Sample_add2.mid.npz")
+np_notes = np.load("out/np/Sample.mid.npz")
 
 start = np_notes[f'array1'][:-1]
 

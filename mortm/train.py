@@ -183,7 +183,6 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
     else:
         scheduler = None
 
-    scaler = torch.cuda.amp.GradScaler(init_scale=2**16, growth_interval=1000, backoff_factor=0.9)
 
     print("Start training...")
     writer = SummaryWriter(save_directory + f"/runs/{time.time()}/")
@@ -212,21 +211,20 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                 padding_mask_in: Tensor = _get_padding_mask(src, progress)
                 padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-                with torch.cuda.amp.autocast( dtype=torch.bfloat16):
-                    outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in,
-                                            tgt_padding_mask=padding_mask_tg, tgt_is_causal=True)
+                outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in,
+                                        tgt_padding_mask=padding_mask_tg, tgt_is_causal=True)
 
-                    outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
+                outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
 
-                    loss = criterion(outputs.to(dtype=torch.float32), correct)  # 損失を計算
-                    epoch_loss.add(loss.item())
+                loss = criterion(outputs.to(dtype=torch.float32), correct)  # 損失を計算
+                epoch_loss.add(loss.item())
 
-                    loss = loss / accumulation_steps
-                    scaler.scale(loss).backward()  # 逆伝播
+                loss = loss / accumulation_steps
+                loss.backward()  # 逆伝播
 
 
                 if count % accumulation_steps == 0:  #実質バッチサイズは64である
-                    progress.step_optimizer(optimizer, model, accumulation_steps, scaler)
+                    progress.step_optimizer(optimizer, model, accumulation_steps)
                     if lr_param is None:
                         scheduler.step()
                     torch.cuda.empty_cache()
@@ -248,7 +246,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
                 progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr() if lr_param is None else lr_param, verification_loss, criterion)
 
-                if (count + 1) % int(50000 / batch_size) == 0:
+                if (count + 1) % int(100000 / batch_size) == 0:
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
                     print("途中経過を保存しました。")
 
