@@ -27,27 +27,25 @@ class MORTM(nn.Module):
         self.dropout = dropout
         self.decoder_only = decoder_only
         self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length * 4).to(
-            self.progress.get_device())
+            self.progress.get_device(), dtype=torch.bfloat16)
         #Transformerの設定
         if not decoder_only:
             self.decoder = MORTMDecoder(d_model=d_model, dim_ff=dim_feedforward,
                                    num_head=num_heads, dropout=dropout,
                                    batch_first=True, bias=True,
                                    layer_norm_eps=1e-5, num_decoder_layer=d_layer, progress=progress)
-        encoder_layer = MORTMEncoderLayer(
-            d_model=d_model, dim_ff=dim_feedforward,
-            num_head=num_heads, dropout=dropout,
-            batch_first=True, bias=True,
-            layer_norm_eps=1e-5,
-            progress=progress
-        )
-        self.encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=e_layer, norm=LayerNorm(d_model, 1e-5, bias=True, dtype=torch.float32))
+
+        self.encoder = MORTMEncoder(d_model=d_model, dim_ff=dim_feedforward, num_layer=e_layer,
+                                    num_head=num_heads, dropout=dropout,
+                                    batch_first=True, bias=True,
+                                    layer_norm_eps=1e-5,
+                                    progress=progress)
 
         print("Use RPR Transformer")
         print(f"Input Vocab Size:{vocab_size}")
-        self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
+        self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size, dtype=torch.bfloat16).to(self.progress.get_device())
 
-        self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
+        self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=0, dtype=torch.bfloat16).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
@@ -79,8 +77,8 @@ class MORTM(nn.Module):
             out = self.encoder(src=src_p, mask=tgt_mask, src_key_padding_mask=input_padding_mask, is_casual=src_is_causal)
 
         #out = out.permute(1, 0, 2)
-        score: Tensor = self.Wout(out)
-        return score.to(self.progress.get_device())
+        score: Tensor = self.Wout(out.to(dtype=torch.bfloat16))
+        return score.to(self.progress.get_device(), dtype=torch.float32)
 
     def top_p_sampling_measure(self, input_seq, p=0.9, max_measure=20, temperature=1.0, context_measure=8):
         self.eval()
@@ -200,12 +198,74 @@ class DummyDecoder(nn.Module):
         return memory
 
 
-class MORTMEncoderLayer(TransformerEncoderLayer):
+class MORTMEncoder(nn.Module):
+    def __init__(self, d_model, dim_ff, num_head, num_layer, dropout, batch_first, bias, layer_norm_eps, progress):
+        super(MORTMEncoder, self).__init__()
+        self.num_layer = num_layer
+        self.layers = _get_clones(MORTMEncoderLayer(d_model=d_model, dim_ff=dim_ff, num_head=num_head, dropout=dropout, batch_first=batch_first,
+                                                    bias=bias, layer_norm_eps=layer_norm_eps, progress=progress), self.num_layer)
+
+        self.norm = LayerNorm(d_model, eps=1e-5, bias=True, dtype=torch.float32)
+
+    def forward(self, src, mask, src_key_padding_mask, is_causal):
+        memory = src
+
+        for mod in self.layers:
+            memory = mod(
+                memory,
+                mask,
+                src_key_padding_mask,
+                is_causal
+            )
+
+        return self.norm(memory)
+
+
+class MORTMEncoderLayer(nn.Module):
     def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps, progress):
-        super(MORTMEncoderLayer, self).__init__(d_model=d_model, dim_feedforward=dim_ff, nhead=num_head, dropout=dropout,
-                                                batch_first=batch_first, bias=bias, layer_norm_eps=layer_norm_eps)
+        super(MORTMEncoderLayer, self).__init__()
+
+        self.d_model = d_model
+        self.dim_ff = dim_ff
+        self.dropout = dropout
+
+
         self.self_attn =FlashSelfAttentionM(d_model, num_head, dropout, progress=progress)
-        #self.self_attn = MultiHeadAttentionRPR(d_model, num_head, dropout)
+
+        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
+        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
+
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+
+        self.f_linear = nn.Linear(self.d_model, self.dim_ff)
+        self.f_drop = nn.Dropout(dropout)
+        self.ff_linear = nn.Linear(self.dim_ff, self.d_model)
+
+    def forward(self, memory, mask, src_key_padding_mask, is_causal):
+        y = memory
+
+        y = y + self.self_block(self.norm1(y.to(dtype=torch.float32)), mask, src_key_padding_mask, is_causal)
+
+        y = y + self.ff_block(self.norm2(y))
+
+        return y
+
+    def self_block(self, y, mask, src_key_padding_mask, is_causal):
+
+        y,  _ = self.self_attn(y, key_padding_mask=src_key_padding_mask,
+                               need_weights=True, attn_mask=mask, is_causal=is_causal)
+
+        return self.dropout1(y)
+
+    def ff_block(self, y: Tensor):
+        y = self.f_linear(y)
+        y = F.relu(y)
+        y = self.f_drop(y)
+        y = self.ff_linear(y)
+        return self.dropout2(y)
 
 
 class MORTMDecoder(nn.Module):
@@ -239,7 +299,7 @@ class MORTMDecoder(nn.Module):
                 tgt_is_causal=tgt_is_causal,
                 memory_is_causal=memory_is_causal,
             )
-            pass
+
         return self.norm(output)
 
 
@@ -261,6 +321,7 @@ class MORTMDecoderLayer(nn.Module):
         self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
         self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
         self.norm3 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
+
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
@@ -278,7 +339,7 @@ class MORTMDecoderLayer(nn.Module):
 
         y = tgt
 
-        y = y + self.self_block(self.norm1(y), tgt_mask, tgt_key_padding_mask, tgt_is_causal) #相対位置マルチヘッドアテンションを適用
+        y = y + self.self_block(self.norm1(y.to(dtype=torch.float32)), tgt_mask, tgt_key_padding_mask, tgt_is_causal) #相対位置マルチヘッドアテンションを適用
 
         y = y + self.cross_block(self.norm2(y), memory, memory_mask,
                                  memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
@@ -296,7 +357,7 @@ class MORTMDecoderLayer(nn.Module):
                    ):
 
         #print(y.shape)
-        y, _ = self.self_attention(y, y, y, key_padding_mask=tgt_key_padding_mask,
+        y, _ = self.self_attention(y, key_padding_mask=tgt_key_padding_mask,
                                    need_weights=True, attn_mask=attn_mask, is_causal=is_causal)
         #print(y.shape)
 
@@ -310,7 +371,7 @@ class MORTMDecoderLayer(nn.Module):
                     tgt_key_padding_mask: Optional[Tensor],
                     is_causal: bool = False,
                     ):
-        y, _ = self.cross_attention(y, mem, mem, memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
+        y, _ = self.cross_attention(y, mem, memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
                                     attn_mask=attn_mask, is_causal=is_causal)
 
         #y, _ = self.cross_attention(y, mem, mem, key_padding_mask=memory_key_padding_mask,

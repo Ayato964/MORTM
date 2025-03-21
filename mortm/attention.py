@@ -515,9 +515,9 @@ class QKVLinear(nn.Module):
         self.W_o = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor, memory_padding_mask: Tensor=None, key_padding_mask: Tensor=None):
-        q = q.to(dtype=torch.bfloat16)
-        k = k.to(dtype=torch.bfloat16)
-        v = v.to(dtype=torch.bfloat16)
+        #q = q.to(dtype=torch.bfloat16)
+        #k = k.to(dtype=torch.bfloat16)
+        #v = v.to(dtype=torch.bfloat16)
         if key_padding_mask is not None:
             q_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(q, key_padding_mask)
         else:
@@ -568,14 +568,13 @@ class FlashSelfAttentionM(nn.Module):
 
         self.alibi_slopes = torch.tensor(get_alibi_slopes(num_heads), dtype=torch.float32, device=progress.get_device())
 
-    def forward(self, query, key, value, key_padding_mask=None,
+    def forward(self, memory, key_padding_mask=None,
                 need_weights=True, attn_mask=None, is_causal=False):
-        batch, tgt_len, embed_dim = query.size()
+        batch, tgt_len, embed_dim = memory.size()
         assert embed_dim == self.embed_dim
-        assert list(query.size()) == [batch, tgt_len, embed_dim]
-        assert key.size() == value.size()
-
-        q, k, v, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k = self.qkv_block(q=query, k=key, v=value,
+        assert list(memory.size()) == [batch, tgt_len, embed_dim]
+        memory = memory.to(dtype=torch.bfloat16)
+        q, k, v, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k = self.qkv_block(q=memory, k=memory, v=memory,
                                                                                     key_padding_mask=key_padding_mask)
 
         qkv_unpad = torch.stack([q, k, v], dim=1 if key_padding_mask is not None else 2)
@@ -606,14 +605,15 @@ class FlashCrossAttentionM(nn.Module):
         self.drop = dropout
         self.qkv_block = QKVLinear(embed_dim, num_heads, dropout)
 
-    def forward(self, query, key, value, memory_key_padding_mask=None, tgt_key_padding_mask=None,
+    def forward(self, tgt, memory, memory_key_padding_mask=None, tgt_key_padding_mask=None,
                 need_weights=True, attn_mask=None, is_causal=False):
-        batch, tgt_len, embed_dim = query.size()
+        batch, tgt_len, embed_dim = tgt.size()
         assert embed_dim == self.embed_dim
-        assert list(query.size()) == [batch, tgt_len, embed_dim]
-        assert key.size() == value.size()
+        assert list(tgt.size()) == [batch, tgt_len, embed_dim]
+        tgt = tgt.to(dtype=torch.bfloat16)
+        memory = memory.to(dtype=torch.bfloat16)
 
-        q, k, v, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k = self.qkv_block(q=query, k=key, v=value,
+        q, k, v, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k = self.qkv_block(q=tgt, k=memory, v=memory,
                                                                                     key_padding_mask=tgt_key_padding_mask,
                                                                                     memory_padding_mask=memory_key_padding_mask)
 
