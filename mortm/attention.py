@@ -503,30 +503,24 @@ def get_alibi_slopes(n_heads):
 
 
 class QKVLinear(nn.Module):
-    def __init__(self, d_model, num_heads, drop_out, is_cross_attn=False):
+    def __init__(self, d_model, d_q, d_kv, num_heads, drop_out):
         super(QKVLinear, self).__init__()
         self.num_heads = num_heads
         self.drop_out = nn.Dropout(drop_out)
-        self.is_cross_attn = is_cross_attn
 
-        self.W_q = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
-        self.W_k = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
-        self.W_v = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
-        '''
-        if not is_cross_attn:
-            self.qkv_weight = Parameter(torch.empty(3 * d_model, d_model)).to(dtype=torch.bfloat16)
-            self.qkv_bias = Parameter(torch.empty(3 * d_model)).to(dtype=torch.bfloat16)
-        else:
-            self.q_weight = Parameter(torch.tensor(d_model, d_model)).to(dtype=torch.bfloat16)
-            self.kv_weight = Parameter(torch.Tensor(2 * d_model, d_model)).to(dtype=torch.bfloat16)
+        #self.W_q = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
+        #self.W_k = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
+        #self.W_v = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
 
-            self.q_bias = Parameter(torch.empty(1, 1, d_model)).to(dtype=torch.bfloat16)
-            self.kv_bias = Parameter(torch.empty(2 * d_model)).to(dtype=torch.bfloat16)
-        '''
+        self.W_dkv = nn.Linear(d_model, d_kv, dtype=torch.bfloat16)
+        self.W_dq = nn.Linear(d_model, d_q, dtype=torch.bfloat16)
+
+        self.W_uq = nn.Linear(d_q, d_model, dtype=torch.bfloat16)
+        self.W_uk = nn.Linear(d_kv, d_model, dtype=torch.bfloat16)
+        self.W_uv = nn.Linear(d_kv, d_model, dtype=torch.bfloat16)
 
         self.W_o = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
 
-        #self.reset()
 
     def reset(self):
         if not self.is_cross_attn:
@@ -541,6 +535,13 @@ class QKVLinear(nn.Module):
 
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor, memory_padding_mask: Tensor=None, key_padding_mask: Tensor=None):
+        dkv = self.W_dkv(k)
+        dq = self.W_dq(q)
+
+        q = self.W_uq(dq)
+        k = self.W_uk(dkv)
+        v = self.W_uv(dkv)
+
         if key_padding_mask is not None:
             q_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(q, key_padding_mask)
         else:
@@ -557,9 +558,12 @@ class QKVLinear(nn.Module):
             v_unpad = v
             cu_seqlens_k, max_s_k = (None, None)
 
-        Q = self.W_q(q_unpad)
-        K = self.W_k(k_unpad)
-        V = self.W_v(v_unpad)
+        #Q = self.W_q(q_unpad)
+        #K = self.W_k(k_unpad)
+        #V = self.W_v(v_unpad)
+        Q = q_unpad
+        K = k_unpad
+        V = v_unpad
 
         if key_padding_mask is not None:
             Q = rearrange(Q, "total (h d) -> total h d", h=self.num_heads)
@@ -586,7 +590,7 @@ class FlashSelfAttentionM(nn.Module):
         self.in_proj_bias = None
 
         self.embed_dim = embed_dim
-        self.qkv_block = QKVLinear(embed_dim, num_heads, dropout)
+        self.qkv_block = QKVLinear(embed_dim, 256, 128, num_heads, dropout)
         self.drop = dropout
 
         self.alibi_slopes = torch.tensor(get_alibi_slopes(num_heads), dtype=torch.float32, device=progress.get_device())
@@ -621,12 +625,12 @@ class FlashSelfAttentionM(nn.Module):
 
 
 class FlashCrossAttentionM(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.2, ):
+    def __init__(self, embed_dim, num_heads, dropout=0.2):
         super(FlashCrossAttentionM, self).__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.drop = dropout
-        self.qkv_block = QKVLinear(embed_dim, num_heads, dropout)
+        self.qkv_block = QKVLinear(embed_dim, 256, 128, num_heads, dropout)
 
     def forward(self, tgt, memory, memory_key_padding_mask=None, tgt_key_padding_mask=None,
                 need_weights=True, attn_mask=None, is_causal=False):
