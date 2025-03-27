@@ -27,7 +27,7 @@ class MORTM(nn.Module):
         self.dropout = dropout
         self.decoder_only = decoder_only
         self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length * 4).to(
-            self.progress.get_device(), dtype=torch.bfloat16)
+            self.progress.get_device())
         #Transformerの設定
         if not decoder_only:
             self.decoder = MORTMDecoder(d_model=d_model, dim_ff=dim_feedforward,
@@ -43,9 +43,9 @@ class MORTM(nn.Module):
 
         print("Use RPR Transformer")
         print(f"Input Vocab Size:{vocab_size}")
-        self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size, dtype=torch.bfloat16).to(self.progress.get_device())
+        self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
 
-        self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=0, dtype=torch.bfloat16).to(self.progress.get_device())
+        self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
@@ -77,8 +77,8 @@ class MORTM(nn.Module):
             out = self.encoder(src=src_p, mask=tgt_mask, src_key_padding_mask=input_padding_mask, is_casual=src_is_causal)
 
         #out = out.permute(1, 0, 2)
-        score: Tensor = self.Wout(out.to(dtype=torch.bfloat16))
-        return score.to(self.progress.get_device(), dtype=torch.float32)
+        score: Tensor = self.Wout(out)
+        return score.to(self.progress.get_device())
 
     def top_p_sampling_measure(self, input_seq, p=0.9, max_measure=20, temperature=1.0, context_measure=8):
         self.eval()
@@ -247,7 +247,7 @@ class MORTMEncoderLayer(nn.Module):
     def forward(self, memory, mask, src_key_padding_mask, is_causal):
         y = memory
 
-        y = y + self.self_block(self.norm1(y.to(dtype=torch.float32)), mask, src_key_padding_mask, is_causal)
+        y = y + self.self_block(self.norm1(y), mask, src_key_padding_mask, is_causal)
 
         y = y + self.ff_block(self.norm2(y))
 
@@ -339,7 +339,7 @@ class MORTMDecoderLayer(nn.Module):
 
         y = tgt
 
-        y = y + self.self_block(self.norm1(y.to(dtype=torch.float32)), tgt_mask, tgt_key_padding_mask, tgt_is_causal) #相対位置マルチヘッドアテンションを適用
+        y = y + self.self_block(self.norm1(y), tgt_mask, tgt_key_padding_mask, tgt_is_causal) #相対位置マルチヘッドアテンションを適用
 
         y = y + self.cross_block(self.norm2(y), memory, memory_mask,
                                  memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,

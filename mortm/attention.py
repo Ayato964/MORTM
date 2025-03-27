@@ -503,21 +503,44 @@ def get_alibi_slopes(n_heads):
 
 
 class QKVLinear(nn.Module):
-    def __init__(self, d_model, num_heads, drop_out):
+    def __init__(self, d_model, num_heads, drop_out, is_cross_attn=False):
         super(QKVLinear, self).__init__()
         self.num_heads = num_heads
         self.drop_out = nn.Dropout(drop_out)
+        self.is_cross_attn = is_cross_attn
 
         self.W_q = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
         self.W_k = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
         self.W_v = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
+        '''
+        if not is_cross_attn:
+            self.qkv_weight = Parameter(torch.empty(3 * d_model, d_model)).to(dtype=torch.bfloat16)
+            self.qkv_bias = Parameter(torch.empty(3 * d_model)).to(dtype=torch.bfloat16)
+        else:
+            self.q_weight = Parameter(torch.tensor(d_model, d_model)).to(dtype=torch.bfloat16)
+            self.kv_weight = Parameter(torch.Tensor(2 * d_model, d_model)).to(dtype=torch.bfloat16)
+
+            self.q_bias = Parameter(torch.empty(1, 1, d_model)).to(dtype=torch.bfloat16)
+            self.kv_bias = Parameter(torch.empty(2 * d_model)).to(dtype=torch.bfloat16)
+        '''
 
         self.W_o = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
 
+        #self.reset()
+
+    def reset(self):
+        if not self.is_cross_attn:
+            xavier_uniform_(self.qkv_weight)
+            constant_(self.qkv_bias, 0)
+        else:
+            xavier_uniform_(self.q_weight)
+            xavier_uniform_(self.kv_weight)
+
+            constant_(self.q_bias, 0)
+            constant_(self.kv_bias, 0)
+
+
     def forward(self, q: Tensor, k: Tensor, v: Tensor, memory_padding_mask: Tensor=None, key_padding_mask: Tensor=None):
-        #q = q.to(dtype=torch.bfloat16)
-        #k = k.to(dtype=torch.bfloat16)
-        #v = v.to(dtype=torch.bfloat16)
         if key_padding_mask is not None:
             q_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(q, key_padding_mask)
         else:
@@ -584,7 +607,7 @@ class FlashSelfAttentionM(nn.Module):
                                                    cu_seqlens=cu_seqlens, max_seqlen=max_s,
                                                    alibi_slopes=self.alibi_slopes) # OK
         else:
-            out = flash_attn_qkvpacked_func(qkv_unpad, causal=is_causal, dropout_p=self.drop,
+            out = flash_attn_qkvpacked_func(qkv_unpad, causal=is_causal, dropout_p=0,
                                             alibi_slopes=self.alibi_slopes)
 
         if key_padding_mask is not None:
@@ -625,7 +648,7 @@ class FlashCrossAttentionM(nn.Module):
                                                   cu_seqlens_k=cu_seqlens_k,
                                                   max_seqlen_k=max_s_k)
         else:
-            out = flash_attn_kvpacked_func(q, k_unpad, causal=is_causal, dropout_p=self.drop)
+            out = flash_attn_kvpacked_func(q, k_unpad, causal=is_causal, dropout_p=0)
 
         if tgt_key_padding_mask is not None:
             out = rearrange(out, "total h d -> total (h d)")
