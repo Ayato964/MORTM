@@ -154,6 +154,7 @@ def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.Cr
     return val_loss / len(val_loader)
 
 def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
+                       writer,
                        e_layer, d_layer, load_model_directory:str = None, train_dataset_split:float = 0.9,
                        num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
                        position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param: Optional[float]=None):
@@ -185,7 +186,6 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
 
     print("Start training...")
-    writer = SummaryWriter(save_directory + f"/runs/{time.time()}/")
 
     loss_val = None
     mail_bool = True
@@ -316,8 +316,10 @@ def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_s
 
             print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
             '''
+            writer = SummaryWriter(save_directory + f"/runs/{version}_{today_date}/")
 
             model, loss = _train_self_tuning(tokenizer,save_directory, train_data, message, vocab_size, num_epochs, None, progress=progress,
+                                             writer = writer,
                                              load_model_directory=load_model_directory,
                                              d_model=d_model,
                                              dim_feedforward=dim_feedforward,

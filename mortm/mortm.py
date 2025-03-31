@@ -1,16 +1,22 @@
-from typing import Optional
+from typing import Optional, Literal
 
 import torch
 from torch import Tensor
 import torch.nn as nn
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttention, TransformerEncoder, TransformerEncoderLayer, _generate_square_subsequent_mask
 from typing import Tuple, List
 import numpy as np
 from .PositionalEncoding import PositionalEncoding
-from .attention import FlashSelfAttentionM, FlashCrossAttentionM, MultiHeadAttentionRPR
+from .attention import FlashSelfAttentionM, FlashCrossAttentionM, MultiHeadAttentionRPR, linear
 from .progress import LearningProgress
 
+
+world_size = 1
+rank = 0
+gemm_impl: Literal["bf16", "fp8"] = "bf16"
+attn_impl: Literal["naive", "absorb"] = "absorb"
 
 
 class MORTM(nn.Module):
@@ -310,13 +316,10 @@ class MORTMDecoderLayer(nn.Module):
         self.n_head = num_head
         self.d_model = d_model
         self.cross_attention: FlashCrossAttentionM = FlashCrossAttentionM(d_model, num_head, dropout)
-        #self.cross_attention = MultiheadAttention(d_model, num_head, dropout, batch_first=False)
         self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(d_model, num_head, dropout, progress=progress)
-        #self.self_attention = MultiHeadAttentionRPR(d_model, num_head, dropout)
 
-        self.linear1 = nn.Linear(d_model, dim_ff)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_ff, d_model)
+        #self.ffn = FFN(d_model, dim_ff, dropout)
+        self.ffn = MoE(d_model, dim_ff, 5, 2, 1, 1, )
 
         self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
         self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
@@ -379,8 +382,143 @@ class MORTMDecoderLayer(nn.Module):
         return self.dropout2(y)
 
     def ff_block(self, y: Tensor):
-        y = self.linear1(y)
+        return self.dropout3(self.ffn(y))
+
+
+class FFN(nn.Module):
+
+    def __init__(self, d_model, ff_d, dropout):
+        super(FFN, self).__init__()
+        self.linear1 = nn.Linear(d_model, ff_d)
+        self.dropout1 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(ff_d, d_model)
+
+    def forward(self, x: Tensor):
+        y = self.linear1(x)
         y = F.relu(y)
-        y = self.dropout(y)
+        y = self.dropout1(y)
         y = self.linear2(y)
-        return self.dropout3(y)
+        return y
+
+
+class MLP(nn.Module):
+
+    def __init__(self, dim: int, inter_dim: int):
+        super().__init__()
+        self.w1 = nn.Linear(dim, inter_dim)
+        self.w2 = nn.Linear(inter_dim, dim)
+        self.w3 = nn.Linear(dim, inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class Gate(nn.Module):
+
+    def __init__(self, d_model, num_experts, activated_experts, num_groups, top_k_groups, route_scale=1, score_type="softmax"):
+        """
+        :param d_model: 埋め込み次元数
+        :param num_experts: 専門家の数
+        :param activated_experts: 選ばれる専門家の数(top_k)
+        :param num_groups:　専門家のグループ数
+        :param top_k_groups:　選ばれるグループの数(top_k)
+        :param route_scale: スケーリング係数
+        :param score_type:　スケールのタイプ
+        """
+        super().__init__()
+        self.dim = d_model
+        self.topk = activated_experts
+        self.n_groups = num_groups
+        self.topk_groups = top_k_groups
+        self.score_func = score_type
+        self.route_scale = route_scale
+        self.weight = nn.Parameter(torch.empty(num_experts, d_model))
+        self.bias = nn.Parameter(torch.empty(num_experts)) if self.dim == 7168 else None
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        scores = linear(x, self.weight)
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1, dtype=torch.float32)
+        else:
+            scores = scores.sigmoid()
+        original_scores = scores
+        if self.bias is not None:
+            scores = scores + self.bias
+        if self.n_groups > 1:
+            scores = scores.view(x.size(0), self.n_groups, -1)
+            if self.bias is None:
+                group_scores = scores.amax(dim=-1)
+            else:
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+            mask = scores.new_ones(x.size(0), self.n_groups, dtype=torch.bool).scatter_(1, indices, False)
+            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+        indices = torch.topk(scores, self.topk, dim=-1)[1]
+        weights = original_scores.gather(1, indices)
+        if self.score_func == "sigmoid":
+            weights /= weights.sum(dim=-1, keepdim=True)
+        weights *= self.route_scale
+        return weights.type_as(x), indices
+
+
+class Expert(nn.Module):
+
+    def __init__(self, dim: int, inter_dim: int):
+        super().__init__()
+        self.w1 = nn.Linear(dim, inter_dim)
+        self.w2 = nn.Linear(inter_dim, dim)
+        self.w3 = nn.Linear(dim, inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class MoE(nn.Module):
+    def __init__(self, d_model, dim_ff, num_experts, topk_experts, num_group, topk_groups, route_scale=1):
+        """
+        :param d_model: 埋め込み次元数
+        :param dim_ff: FFNの次元数
+        :param num_experts: 専門家の数
+        :param topk_experts: 選択される専門家の数(top_k)
+        :param num_group: 専門家のグループの数
+        :param topk_groups: 選択される専門家のグループの数(top_k)
+        :param route_scale: スケーリングの値
+        """
+        super().__init__()
+        self.dim = d_model
+        self.n_routed_experts = num_experts
+        self.n_local_experts = self.n_routed_experts // world_size
+        self.n_activated_experts = topk_experts
+        self.experts_start_idx = 0
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.gate = Gate(d_model, num_experts, topk_experts, num_group, topk_groups, route_scale=route_scale)
+
+        self.experts = nn.ModuleList([Expert(d_model, dim_ff) if self.experts_start_idx <= i < self.experts_end_idx else None
+                                      for i in range(self.n_routed_experts)])
+        self.shared_experts = MLP(d_model, dim_ff)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the MoE module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after expert routing and computation.
+        """
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate(x)
+        y = torch.zeros_like(x)
+        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        z = self.shared_experts(x)
+        if world_size > 1:
+            dist.all_reduce(y)
+        return (y + z).view(shape)
