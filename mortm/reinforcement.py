@@ -5,7 +5,7 @@ from typing import List
 from torch import Tensor
 from .tokenizer import Tokenizer, PITCH_TYPE
 
-from .token import Token, _get_symbol
+from .custom_token import Token, _get_symbol
 
 
 def remove_subsequence_tensor(a, b):

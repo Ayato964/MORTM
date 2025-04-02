@@ -49,7 +49,7 @@ class MORTM_DataSets(Dataset):
         suc_count = 0
         for i in range(len(music_seq) - 1):
             seq = music_seq[f'array_{i + 1}'].tolist()
-            if (90 < len(seq['key']) < self.positional_length): # or (4 in seq['key'] and len(seq['key']) < 90):
+            if (90 < len(seq['key']) < self.positional_length) or (4 in seq['key'] and len(seq['key']) < 90):
                 if len(seq['value']) < self.positional_length:
                     self.key.append(seq['key'].tolist())
                     self.value.append(seq['value'].tolist())

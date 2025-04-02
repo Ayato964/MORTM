@@ -4,7 +4,7 @@ from numpy import ndarray
 
 import re
 from . import constants
-from .token import Token, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd, Blank, SequenceEnd, Continue
+from .custom_token import Token, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd, Blank, SequenceEnd, Continue
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'

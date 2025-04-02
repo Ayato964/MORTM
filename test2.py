@@ -1,9 +1,15 @@
-i = input()
+from mortm.convert import MIDI2Seq
+from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.de_convert import ct_token_to_midi
+tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
+con = MIDI2Seq(tokenizer, "data/generate", "blank.mid", program_list=[0])
 
-split = i.split(" ")
-number = []
-for n in split:
-    number.append(int(n))
+con.convert()
 
-number.sort(reverse=True)
-print(number[2])
+a, b = con.save("./out/")
+
+tokenizer.rev_mode()
+
+ct_token_to_midi(tokenizer, con.aya_node[1], "out/test.midi")
+
+print(con.aya_node)

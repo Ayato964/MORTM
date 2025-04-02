@@ -55,7 +55,7 @@ class Token:
         self.end = 0
 
     @abstractmethod
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
 
     @abstractmethod
@@ -77,7 +77,7 @@ class Token:
 
     @abstractmethod
     def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
-                 tempo=120, *args, **kwargs):
+                 tempo=120, container: ShiftTimeContainer = None, *args, **kwargs):
         pass
 
 
@@ -93,13 +93,13 @@ class SpecialToken(Token):
         pass
 
     @abstractmethod
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
 
     def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
                  tempo=120, container: ShiftTimeContainer = None, *args, **kwargs):
         if self.convert_type == 0:
-            return self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo)
+            return self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo, container=container)
         else:
             return token == self.token_type
 
@@ -109,7 +109,7 @@ class MusicToken(Token):
     def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
                  tempo=120, container: ShiftTimeContainer = None,*args, **kwargs, ):
         if self.convert_type == 0:
-            return f"{self.token_type}_{self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo)}"
+            return f"{self.token_type}_{self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo, container=container)}"
         else:
             if token is None:
                 return None
@@ -121,7 +121,7 @@ class MusicToken(Token):
                 return None
 
     @abstractmethod
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
 
     @abstractmethod
@@ -142,14 +142,16 @@ class MeasureToken(SpecialToken):
 
         super().__init__("<SME>", convert_type)
 
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int or None or str:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int or None or str:
         measure1 = 60 / tempo * 4
-        if back_notes is not None:
+        if back_notes is not None and not container.shift_measure:
             note_measure = note.start // measure1
             back_note_measure = back_notes.start // measure1
             if note_measure > back_note_measure:
+                container.shift()
                 return self.token_type
             else:
+
                 return None
         else:
             return self.token_type
@@ -159,7 +161,7 @@ class TrackStart(SpecialToken):
     def __init__(self, convert_type: int):
         super().__init__("<TS>", convert_type)
 
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         if inst.notes[0] == note:
             return self.token_type
         else:
@@ -171,7 +173,7 @@ class TrackEnd(SpecialToken):
     def __init__(self, convert_type: int):
         super().__init__("<TE>", convert_type)
 
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         if inst.notes[-1] == note:
             return self.token_type
         else:
@@ -183,12 +185,13 @@ class Blank(SpecialToken):
     def __init__(self, convert_type: int):
         super().__init__("<BLANK>", convert_type)
 
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         measure1 = 60 / tempo * 4
         if back_notes is not None:
             note_measure = note.start // measure1
-            back_note_measure = back_notes.start // measure1
+            back_note_measure = back_notes.start // measure1 if not container.shift_measure else container.measure_start_time // measure1
             if note_measure > back_note_measure + 1:
+                container.shift()
                 return self.token_type
             else:
                 return None
@@ -200,7 +203,7 @@ class SequenceEnd(SpecialToken):
     def __init__(self, convert_type: int):
         super().__init__("<ESEQ>", convert_type)
 
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         return None
 
 
@@ -209,7 +212,7 @@ class Continue(SpecialToken):
     def __init__(self, convert_type: int):
         super().__init__("<CONTINUE>", convert_type)
 
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int) -> int | str | None:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         return None
 
 
@@ -229,10 +232,10 @@ class StartRE(MusicToken):
             note.start = container.measure_start_time + shift
             container.shift_measure = False
 
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo) -> int:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo, container: ShiftTimeContainer) -> int:
         measure1 = 60 / tempo * 4
         now_start = ct_time_to_beat(note.start, tempo)
-        if back_notes is not None:
+        if back_notes is not None and not container.shift_measure:
             note_measure = note.start // measure1
             back_note_measure = back_notes.start // measure1
             if note_measure > back_note_measure:
@@ -248,7 +251,8 @@ class StartRE(MusicToken):
                     print("WHATS!?!?!?!?!?")
                 return shift
         else:
-            shift = int(now_start)
+            shift = int(now_start - ct_time_to_beat(container.measure_start_time, tempo))
+            container.shift_measure = False
             if shift < 0:
                 print("WHATS!?!?!?!?!?")
             return shift % 64
@@ -268,7 +272,7 @@ class Pitch(MusicToken):
     def de_convert(self, number: int, back_note, note: Note, tempo, container: ShiftTimeContainer):
         note.pitch = int(number)
 
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo) -> int:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo, container: ShiftTimeContainer) -> int:
         p: int = note.pitch
         return p
 
@@ -285,7 +289,7 @@ class Duration(MusicToken):
         duration = ct_beat_to_time(number, tempo)
         note.end = note.start + duration
 
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo) -> int:
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo, container: ShiftTimeContainer) -> int:
         start = ct_time_to_beat(note.start, tempo)
         end = ct_time_to_beat(note.end, tempo)
         d = int(max(abs(end - start), 1))

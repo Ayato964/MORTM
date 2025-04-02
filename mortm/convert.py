@@ -3,11 +3,10 @@ from typing import List, Any
 import mido
 import numpy as np
 from numpy import ndarray
-from AGSM.convert import ConvTempo
 from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
 from abc import abstractmethod, ABC
 from typing import TypeVar, Generic
-from .token import Token
+from .custom_token import Token, ShiftTimeContainer
 from .tokenizer import Tokenizer
 
 T = TypeVar("T")
@@ -160,21 +159,24 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
         clip_count = 0
 
         sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
-
-        for note in sorted_notes:
-            note: Note = note
+        shift_time_container = ShiftTimeContainer(0, 0)
+        note_count = 0
+        while note_count < len(sorted_notes):
+            note: Note = sorted_notes[note_count]
 
             tempo = self.get_tempo(note.start)
+            shift_time_container.tempo = tempo
 
             for conv in self.token_converter:
                 conv: Token = conv
 
-                token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo)
+                token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo, container=shift_time_container)
 
                 if token is not None:
                     if conv.token_type == "<SME>":
                         clip_count += 1
                     if clip_count >= 8:
+                        clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                         aya_node_inst = self.marge_clip(clip, aya_node_inst)
                         clip = np.array([], dtype=int)
                         back_note = None
@@ -182,13 +184,18 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
 
                     token_id = self.tokenizer.get(token)
                     clip = np.append(clip, token_id)
-
+                    if conv.token_type == "<BLANK>":
+                        break
             back_note = note
+            if not shift_time_container.shift_measure:
+                note_count += 1
 
         if len(clip) > 4:
             aya_node_inst = self.marge_clip(clip, aya_node_inst)
         return aya_node_inst
 
+    def get_next_measure(self) -> float:
+        pass
     def marge_clip(self, clip, aya_node_inst):
         aya_node_inst.append(clip)
 
