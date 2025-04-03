@@ -21,8 +21,8 @@ class MORTM_SEQDataset(Dataset):
 
     def add_data(self, music_seq: np.ndarray):
         suc_count = 0
-        for i in range(len(music_seq)):
-            seq = music_seq[f'arr_{i}']
+        for i in range(len(music_seq) - 1):
+            seq = music_seq[f'array{i + 1}'].tolist()
             if 90 < len(seq) < self.positional_length:
                 self.seq.append(seq)
                 suc_count += 1

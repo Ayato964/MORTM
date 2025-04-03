@@ -24,7 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
-from .datasets import MORTM_DataSets
+from .datasets import MORTM_DataSets, MORTM_SEQDataset
 from .mortm import MORTM
 from .noam import noam_lr
 from .loss import ReinforceCrossEntropy
@@ -66,7 +66,7 @@ def find_npz_files(root_folder):
 # デバイスを取得
 def _set_train_data(directory, datasets, positional_length, progress: LearningProgress):
     print("Starting load....")
-    mortm_datasets = MORTM_DataSets(progress, positional_length)
+    mortm_datasets = MORTM_SEQDataset(progress, positional_length)
     loss_count = 0
     count = 0
     dataset_length = 0
@@ -96,11 +96,11 @@ def _get_padding_mask(input_ids, progress: LearningProgress):
 
 def collate_fn(batch):
     # バッチ内のテンソルの長さを揃える（パディングする）
-    src_list = [item[0] for item in batch]  # 各タプルのsrcを抽出
-    tgt_list = [item[1] for item in batch]  # 各タプルのtgtを抽出
-    src = pad_sequence(src_list, batch_first=True, padding_value=0)
-    tgt = pad_sequence(tgt_list, batch_first=True, padding_value=0)
-    return (src, tgt)
+    #src_list = [item[0] for item in batch]  # 各タプルのsrcを抽出
+    #tgt_list = [item[1] for item in batch]  # 各タプルのtgtを抽出
+    src = pad_sequence(batch, batch_first=True, padding_value=0)
+    #tgt = pad_sequence(tgt_list, batch_first=True, padding_value=0)
+    return src
 
 
 def update_log(model, writer, global_step):
@@ -136,14 +136,13 @@ def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.Cr
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
-        for src, tgt in val_loader:
-            correct: Tensor = tgt[:, 1:]
-            tgt = tgt[:, :-1]
+        for src in val_loader:
+            correct: Tensor = src[:, 1:]
+            src = src[:, :-1]
 
             padding_mask_in: Tensor = _get_padding_mask(src, progress)
-            padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-            outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in, tgt_padding_mask=padding_mask_tg, tgt_is_causal=True)
+            outputs: Tensor = model(src=src, input_padding_mask=padding_mask_in, src_is_causal=True)
 
             outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
             correct = correct.reshape(-1).long()
@@ -201,18 +200,16 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
             model.train()
             optimizer.zero_grad()
 
-            for src, tgt in train_loader:  # seqにはbatch_size分の楽曲が入っている
+            for src in train_loader:  # seqにはbatch_size分の楽曲が入っている
                 #print(f"learning sequence {count}")
-                correct: Tensor = tgt[:, 1:]
+                correct: Tensor = src[:, 1:]
                 correct = correct.reshape(-1).long()
-                tgt = tgt[:, :-1]
+                src = src[:, :-1]
                 begin_time = time.time()
 
                 padding_mask_in: Tensor = _get_padding_mask(src, progress)
-                padding_mask_tg: Tensor = _get_padding_mask(tgt, progress)
 
-                outputs: Tensor = model(src=src, tgt=tgt, input_padding_mask=padding_mask_in,
-                                        tgt_padding_mask=padding_mask_tg, tgt_is_causal=True)
+                outputs: Tensor = model(src=src, input_padding_mask=padding_mask_in, src_is_causal=True)
 
                 outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
 

@@ -1,5 +1,6 @@
 from typing import Optional, Literal
 
+import numpy
 import torch
 from torch import Tensor
 import torch.nn as nn
@@ -21,7 +22,7 @@ attn_impl: Literal["naive", "absorb"] = "absorb"
 
 class MORTM(nn.Module):
     def __init__(self, vocab_size, progress: LearningProgress, d_layer=15, e_layer=15, num_heads=12, d_model=768,
-                 dim_feedforward=3072, dropout=0.2, decoder_only:bool=False,
+                 dim_feedforward=3072, dropout=0.2,
                  position_length=400):
         super(MORTM, self).__init__()
         self.progress = progress
@@ -31,15 +32,12 @@ class MORTM(nn.Module):
         self.d_model = d_model
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
-        self.decoder_only = decoder_only
-        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length * 4).to(
+        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length * 10).to(
             self.progress.get_device())
-        #Transformerの設定
-        if not decoder_only:
-            self.decoder = MORTMDecoder(d_model=d_model, dim_ff=dim_feedforward,
-                                   num_head=num_heads, dropout=dropout,
-                                   batch_first=True, bias=True,
-                                   layer_norm_eps=1e-5, num_decoder_layer=d_layer, progress=progress)
+        self.decoder = MORTMDecoder(d_model=d_model, dim_ff=dim_feedforward,
+                               num_head=num_heads, dropout=dropout,
+                               batch_first=True, bias=True,
+                               layer_norm_eps=1e-5, num_decoder_layer=d_layer, progress=progress)
 
         self.encoder = MORTMEncoder(d_model=d_model, dim_ff=dim_feedforward, num_layer=e_layer,
                                     num_head=num_heads, dropout=dropout,
@@ -56,71 +54,53 @@ class MORTM(nn.Module):
 
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
                 tgt_padding_mask=None, src_is_causal=False, tgt_is_causal=False):
-        if tgt_mask is None and tgt_is_causal:
-            tgt_mask = _generate_square_subsequent_mask(tgt.size(1)).to(self.progress.get_device())
-
         sec_e: Tensor = self.embedding(src)
         sec_e = sec_e.permute(1, 0, 2)
 
         src_p: Tensor = self.positional(sec_e)
         src_p = src_p.permute(1, 0, 2)
 
-        if tgt is not None:
-            tgt_e = self.embedding(tgt)
-            tgt_e = tgt_e.permute(1, 0, 2)
-            tgt_p = self.positional(tgt_e)
-            tgt_p = tgt_p.permute(1, 0, 2)
-        else:
-            tgt_p = src_p
 
-        if not self.decoder_only:
-            memory = self.encoder(src=src_p, mask=src_mask, src_key_padding_mask=input_padding_mask, is_causal=src_is_causal)
+        out = self.decoder(tgt=src_p, memory=None, tgt_mask=tgt_mask,
+                           memory_key_padding_mask=input_padding_mask,
+                           tgt_key_padding_mask=input_padding_mask, memory_is_causal=src_is_causal, tgt_is_causal=src_is_causal)
 
-            out = self.decoder(tgt=tgt_p, memory=memory, tgt_mask=tgt_mask,
-                               memory_key_padding_mask=input_padding_mask,
-                               tgt_key_padding_mask=tgt_padding_mask, memory_is_causal=src_is_causal, tgt_is_causal=tgt_is_causal)
-        else:
-            out = self.encoder(src=src_p, mask=tgt_mask, src_key_padding_mask=input_padding_mask, is_casual=src_is_causal)
-
-        #out = out.permute(1, 0, 2)
         score: Tensor = self.Wout(out)
         return score.to(self.progress.get_device())
 
-    def top_p_sampling_measure(self, input_seq, p=0.9, max_measure=20, temperature=1.0, context_measure=8):
-        self.eval()
-        if not isinstance(input_seq, torch.Tensor):
-            input_seq = torch.tensor(input_seq, dtype=torch.long, device=self.progress.get_device())
-        seg: Tensor = self.split_tensor_at_value(input_seq, 3, include_split=True)
-        tgt = torch.tensor([2], dtype=torch.long, device=self.progress.get_device())
-        tgt = torch.concatenate((tgt, seg[-1])).to(self.progress.get_device())
-        point = 0 if len(seg[:-1]) - context_measure <= 0 else len(seg[:-1]) - context_measure
+    def top_p_sampling_measure(self, src: Tensor, p=0.9, max_measure=20, temperature=1.0) -> Tuple[Tensor, Tensor]:
+        """
+        トークンを生成するためのメソッドです。
 
-        src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
+        Args:
+            src (Tensor): 入力テンソル
+            p (float): 確率の閾値
+            max_measure (int): 最大生成長
+            temperature (float): 温度パラメータ
 
-        for i in range(point, len(seg[point:-1])):
-            src = torch.concatenate((src, seg[i]))
-        generated = src.clone()
+        Returns:
+            List[Tensor]: 生成されたトークンのリスト
+        """
+        if isinstance(src, numpy.ndarray):
+            src = torch.tensor(src, device=self.progress.get_device())
+        src = src.unsqueeze(0)
+        #src_mask = _generate_square_subsequent_mask(src.size(1)).to(self.progress.get_device())
+        #src_key_padding_mask = torch.zeros(src.size(0), src.size(1), dtype=torch.bool).to(self.progress.get_device())
 
-        for i in range(max_measure):
-            while not (tgt[-1] == 391 or tgt[-1] == 392):
-                logit = self(src=src.unsqueeze(0), tgt=tgt.unsqueeze(0))
-                outputs = logit.view(-1, logit.size(-1)).to(self.progress.get_device())
-                token = self.top_p_sampling(outputs[-1], p=p, temperature=temperature)
-                tgt = torch.concatenate((tgt, torch.tensor([token], dtype=torch.long,
-                                                           device=self.progress.get_device())), dim=0)
+        generated_tokens = []
+        is_running = True
+        while is_running:
+            logits: Tensor = self(src, src_is_causal=True)
+            logits = logits.squeeze(0)
+            sampled_index = self.top_p_sampling(logits[-1], p=p, temperature=temperature)
+            generated_tokens.append(sampled_index)
+            src = torch.cat([src, torch.tensor([[sampled_index]], device=self.progress.get_device())], dim=1)
+            measure_count = (src == 3).sum().item()
+            if sampled_index == 391 or sampled_index == 392 or measure_count > max_measure:
+                is_running = False
 
-            if tgt[-1] == 392:
-                break
-            generated = torch.concatenate((generated, tgt[1: -1]))
-            src = torch.concatenate((src, tgt[1:-1]))
-            tgt = torch.tensor([2], device=self.progress.get_device())
-            seg = self.split_tensor_at_value(src, 3, include_split=True)
-            if len(seg) > context_measure:
-                src = torch.tensor([], dtype=torch.long, device=self.progress.get_device())
-                for i in seg[1:]:
-                    src = torch.concatenate((src, i))
+        return torch.tensor(generated_tokens), src.squeeze(0)
 
-        return generated
 
     def top_p_sampling(self, logits, p=0.9, temperature=1.0) -> int:
 
@@ -344,9 +324,10 @@ class MORTMDecoderLayer(nn.Module):
 
         y = y + self.self_block(self.norm1(y), tgt_mask, tgt_key_padding_mask, tgt_is_causal) #相対位置マルチヘッドアテンションを適用
 
-        y = y + self.cross_block(self.norm2(y), memory, memory_mask,
-                                 memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
-                                 is_causal=memory_is_causal) # マルチヘッドアテンションを適用
+        if memory is not None:
+            y = y + self.cross_block(self.norm2(y), memory, memory_mask,
+                                     memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
+                                     is_causal=memory_is_causal) # マルチヘッドアテンションを適用
 
         y = y + self.ff_block(self.norm3(y)) # フィードフォワード層を適用
 

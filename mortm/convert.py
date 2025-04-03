@@ -175,7 +175,7 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
                 if token is not None:
                     if conv.token_type == "<SME>":
                         clip_count += 1
-                    if clip_count >= 8:
+                    if clip_count >= 12:
                         clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                         aya_node_inst = self.marge_clip(clip, aya_node_inst)
                         clip = np.array([], dtype=int)
