@@ -25,7 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .messager import Messenger, _DefaultMessenger
 from .progress import LearningProgress, _DefaultLearningProgress
 from .datasets import MORTM_DataSets, MORTM_SEQDataset
-from .mortm import MORTM
+from .mortm import MORTM, MORTMArgs
 from .noam import noam_lr
 from .loss import ReinforceCrossEntropy
 from .tokenizer import Tokenizer
@@ -152,25 +152,21 @@ def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.Cr
     model.train()
     return val_loss / len(val_loader)
 
-def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, message: Messenger, vocab_size: int, num_epochs: int, weight: Tensor, progress: LearningProgress,
-                       writer,
-                       e_layer, d_layer, load_model_directory:str = None, train_dataset_split:float = 0.9,
-                       num_heads=8, d_model=512, dim_feedforward=1024, dropout=0.1, is_save_training_progress=False,
-                       position_length=2048, accumulation_steps=4, batch_size=16, num_workers=0, warmup_steps=4000, lr_param: Optional[float]=None):
+
+def _train_self_tuning(args: MORTMArgs, save_directory, mortm_dataset, message: Messenger, num_epochs: int, progress: LearningProgress,
+                       writer, load_model_directory:str = None, train_dataset_split:float = 0.9, is_save_training_progress=False,
+                       batch_size=16, accumulation_steps=4, num_workers=0, warmup_steps=4000, lr_param: Optional[float]=None):
 
     train_size = int(train_dataset_split * len(mortm_dataset))
     val_size = len(mortm_dataset) - train_size
     train_dataset, val_dataset = random_split(mortm_dataset, [train_size, val_size])
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                        num_workers=num_workers, collate_fn=collate_fn
-                        )
+                        num_workers=num_workers, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True,
                             num_workers=num_workers, collate_fn=collate_fn)
 
     print("Creating Model....")
-    model = MORTM(vocab_size=vocab_size, progress=progress, num_heads=num_heads, e_layer=e_layer, d_layer=d_layer,
-                  d_model=d_model, dim_feedforward=dim_feedforward,
-                  dropout=dropout, position_length=position_length).to(progress.get_device())
+    model = MORTM(progress=progress, args=args).to(progress.get_device())
     if load_model_directory is not None:
         model.load_state_dict(torch.load(load_model_directory))
 
@@ -179,7 +175,7 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-1 if lr_param is None else lr_param, betas=(0.9, 0.98))  # オプティマイザを定義
     if lr_param is None:
-        scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=d_model, warmup_steps=warmup_steps))
+        scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=warmup_steps))
     else:
         scheduler = None
 
@@ -230,8 +226,9 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
                 end_time = time.time()
 
                 if mail_bool and message is not None:
-                    _send_prediction_end_time(message, len(train_loader), begin_time, end_time, vocab_size, num_epochs,
-                                              e_layer, num_heads, d_model, dim_feedforward, dropout, position_length)
+                    _send_prediction_end_time(message, len(train_loader), begin_time, end_time, args.vocab_size, num_epochs,
+                                              args.e_layer, args.num_heads, args.d_model, args.dim_feedforward, args.dropout,
+                                              args.position_length)
                     mail_bool = False
 
                 if (count + 1) % message.step_by_message_count == 0:
@@ -278,61 +275,35 @@ def _train_self_tuning(tokenizer: Tokenizer, save_directory, mortm_dataset, mess
 
 
 
-def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_size: int, num_epochs: int, weight_directory,
+def train_mortm(json_directory: str, root_directory, save_directory, version: str, num_epochs: int,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, train_dataset_split = 0.9,
-                e_layer=15, d_layer=15, num_heads=12, d_model=768, is_save_training_progress=False, lr_param=None,
-                dim_feedforward=3072, dropout=0.2, position_length=320, num_workers=0, warmup_steps=4000, src_mask_method: Callable[[Tensor], Tensor]=None,
-                accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(), ):
+                is_save_training_progress=False, lr_param=None,
+                num_workers=0, warmup_steps=4000, accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(), ):
 
+    args = MORTMArgs(json_directory=json_directory)
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
 
     print(f"ToDay is{datetime.date.today()}! start generating MORTEM_Model.{version}_{today_date}")
 
     directory, filename = find_npz_files(root_directory)
-    train_data = _set_train_data(directory, filename, position_length, progress)
+    train_data = _set_train_data(directory, filename, args.position_length, progress)
 
     try:
+        writer = SummaryWriter(save_directory + f"/runs/{version}_{today_date}/")
 
-        with open(weight_directory, 'r') as file:
-            '''
-            freq_dict = json.load(file)
-            # 逆数を取り、頻出度が0の場合は小さい値に設定
-            epsilon = 1e-11  # 非ゼロの小さい値を設定しておく
-            weights = []
-
-            for i in range(len(freq_dict)):
-                freq = freq_dict[str(i)]  # JSONのキーは文字列なのでstrに変換
-                if freq == 0:
-                    weights.append(epsilon)
-                else:
-                    weights.append(1.0 / (math.log(freq + 1.0) + epsilon))  # 対数スケーリングを適用
-            # テンソルに変換
-            weight_tensor = torch.tensor(weights)
-            #weight_tensor = weight_tensor / weight_tensor.sum()
-
-            print(weight_tensor[weight_tensor.argmax(dim=-1)], weight_tensor[weight_tensor.argmin(dim=-1)])
-            '''
-            writer = SummaryWriter(save_directory + f"/runs/{version}_{today_date}/")
-
-            model, loss = _train_self_tuning(tokenizer,save_directory, train_data, message, vocab_size, num_epochs, None, progress=progress,
-                                             writer = writer,
-                                             load_model_directory=load_model_directory,
-                                             d_model=d_model,
-                                             dim_feedforward=dim_feedforward,
-                                             e_layer=e_layer,
-                                             d_layer=d_layer,
-                                             num_heads=num_heads,
-                                             position_length=position_length,
-                                             dropout=dropout,
-                                             accumulation_steps=accumulation_steps,
-                                             batch_size=batch_size,
-                                             num_workers=num_workers,
-                                             warmup_steps=warmup_steps,
-                                             is_save_training_progress=is_save_training_progress,
-                                             lr_param=lr_param,
-                                             train_dataset_split= train_dataset_split
-                                             )  # 20エポック分機械学習を行う。
+        model, loss = _train_self_tuning(args, save_directory, train_data, message, num_epochs,
+                                         progress=progress,
+                                         writer=writer,
+                                         load_model_directory=load_model_directory,
+                                         accumulation_steps=accumulation_steps,
+                                         batch_size=batch_size,
+                                         num_workers=num_workers,
+                                         warmup_steps=warmup_steps,
+                                         is_save_training_progress=is_save_training_progress,
+                                         lr_param=lr_param,
+                                         train_dataset_split= train_dataset_split
+                                         )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",
                                  f"MORTM.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
@@ -346,14 +317,3 @@ def train_mortm(tokenizer, root_directory, save_directory, version: str, vocab_s
                                  "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
         print("オーバーフローしました。")
     pass
-
-
-
-class VerificationLoss:
-
-    def __init__(self, datasets: MORTM_DataSets):
-        self.dataloader = DataLoader(dataset=datasets, collate_fn=collate_fn, shuffle=False)
-
-    def __call__(self, *args, **kwargs):
-        pass
-

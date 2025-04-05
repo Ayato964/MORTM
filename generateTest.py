@@ -1,6 +1,6 @@
 from mortm import constants
 import torch
-from mortm.mortm import MORTM
+from mortm.mortm import MORTM, MORTMArgs
 import pretty_midi as pm
 import mortm.tokenizer as token
 import numpy as np
@@ -31,23 +31,13 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
 
 tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
 tokenizer.rev_mode()
+args = MORTMArgs("configs/512_3.6B.json")
 
-model = MORTM(
-    progress=_DefaultLearningProgress(),
-    vocab_size=393,
-    d_model=512,
-    dim_feedforward=2048,
-    d_layer=12,
-    e_layer=12,
-    num_heads=8,
-    position_length=400
-)
-model.load_state_dict(torch.load("out/model/MORTM.3.0t5-SMALL_0.35.pth")) # モデルをロードする。
+model = MORTM(progress=_DefaultLearningProgress(), args=args)
+model.load_state_dict(torch.load("out/model/MORTM.3.0t5-MEDIUM_0.29.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
-#np_note = np.load("out/np/Sample.mid.npz", allow_pickle=True)['array_1'].tolist()
-#start = np_note['key']
 '''
 既存の楽曲からその続きを生成する場合、以下を実行し、NPZから解凍してください。
 システム的な事情でarray1からメロディが記録されています。
@@ -56,30 +46,11 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/np/Sample_add2.mid.npz")
+np_notes = np.load("out/np/Sample.mid.npz")
 
 start = np_notes[f'array1'][:-1]
 
-'''
-一から、もしくはメロディをプログラマーが設定したい場合、以下を実行します。
-シーケンスは数値の配列です。tokenizerで文字列からトークンに変換してください。
-'''
-#start = [tokenizer.get(constants.START_SEQ_TOKEN)]
-
-print(f"First:{start}") # ロードしたシーケンスを表示
-
-'''
-シーケンスの生成は以下の2つから選べます。
-1. Top P sampling
-    -これは、確率の閾値Pを設定し、それ以上に該当するトークンからサンプリングを行います。複数存在する場合、ランダムでトークンを選びます。
-2. Top K sampling
-    - これは、確率の高い順番からK個のトークンを取得し、サンプリングを行います。複数存在する場合、ランダムでトークンを選びます。
-'''
-
-#gene = generate_note(100, start, model, t=1.05, p=0.95)
-
 gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
-#gene = model.top_p_sampling_measure_decoder(start, p=0.95, max_measure=20, temperature=1.0)
 
 output = all
 for t in output:

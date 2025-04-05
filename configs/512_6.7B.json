@@ -1,0 +1,13 @@
+{
+  "vocab_size": 393,
+  "d_model": 512,
+  "dim_feedforward": 2048,
+  "num_heads": 8,
+  "d_layer": 12,
+  "dropout": 0.2,
+  "position_length": 400,
+  "num_experts": 12,
+  "topk_experts": 2,
+  "num_groups": 4,
+  "topk_groups": 1
+}

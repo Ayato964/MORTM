@@ -56,11 +56,11 @@ def convert_ex(pid, tokenizer, directory, md_file, program, progress):
         con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
         ex_midi = con.expansion_midi()
         con.convert()
-        is_saved, reason = con.save("out/np/datasets5_small/")
+        is_saved, reason = con.save("out/np/datasets5_medium/")
 
         for ex in ex_midi:
             ex.convert()
-            is_saved, reason = ex.save("out/np/datasets5_small/")
+            is_saved, reason = ex.save("out/np/datasets5_medium/")
             print(f"Process#{pid}: データ拡張中...{is_saved}  {reason}")
 
         if is_saved:
@@ -75,8 +75,8 @@ if __name__ == "__main__":
     THREAD_VALUE = 10
     SAX = [65, 66]
 
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    datasets = "./data/other"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    #datasets = "./data/other"
     #datasets = "./out/np/datasets_large"
     directory, md_file = find_midi_files(datasets)
 

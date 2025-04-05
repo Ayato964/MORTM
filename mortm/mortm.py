@@ -1,3 +1,4 @@
+import json
 from typing import Optional, Literal
 
 import numpy
@@ -20,36 +21,55 @@ gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
 
 
+class MORTMArgs:
+    def __init__(self, json_directory: str):
+        with open(json_directory, 'r') as f:
+            data: dict = json.load(f)
+            self.vocab_size = data['vocab_size']
+            self.d_layer = data['d_layer'] if data.get('d_layer') else 12
+            self.e_layer = data['e_layer'] if data.get('e_layer') else 12
+            self.num_heads = data['num_heads']
+            self.d_model = data['d_model']
+            self.dim_feedforward = data['dim_feedforward']
+            self.dropout = data['dropout']
+            self.position_length = data['position_length']
+            self.num_experts = data['num_experts'] if data.get('num_experts') else 12
+            self.topk_experts = data['topk_experts'] if data.get('topk_experts') else 2
+            self.num_groups = data['num_groups'] if data.get('num_groups') else 1
+            self.topk_groups = data['topk_groups'] if data.get('topk_groups') else 1
+            self.route_scale = data['route_scale'] if data.get('route_scale') else 1
+            self.score_type = data['score_type'] if data.get('score_type') else "softmax"
+
+
+
+
 class MORTM(nn.Module):
-    def __init__(self, vocab_size, progress: LearningProgress, d_layer=15, e_layer=15, num_heads=12, d_model=768,
-                 dim_feedforward=3072, dropout=0.2,
-                 position_length=400):
+    def __init__(self, args: MORTMArgs, progress: LearningProgress):
         super(MORTM, self).__init__()
         self.progress = progress
-        self.e_layer = e_layer
-        self.d_layer = d_layer
-        self.num_heads = num_heads
-        self.d_model = d_model
-        self.dim_feedforward = dim_feedforward
-        self.dropout = dropout
-        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, dropout, position_length * 10).to(
+        self.e_layer = args.e_layer
+        self.d_layer = args.d_layer
+        self.num_heads = args.num_heads
+        self.d_model = args.d_model
+        self.dim_feedforward = args.dim_feedforward
+        self.dropout = args.dropout
+        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, args.dropout, args.position_length * 10).to(
             self.progress.get_device())
-        self.decoder = MORTMDecoder(d_model=d_model, dim_ff=dim_feedforward,
-                               num_head=num_heads, dropout=dropout,
+        self.decoder = MORTMDecoder(args,
                                batch_first=True, bias=True,
-                               layer_norm_eps=1e-5, num_decoder_layer=d_layer, progress=progress)
+                               layer_norm_eps=1e-5, progress=progress)
 
-        self.encoder = MORTMEncoder(d_model=d_model, dim_ff=dim_feedforward, num_layer=e_layer,
-                                    num_head=num_heads, dropout=dropout,
+        self.encoder = MORTMEncoder(d_model=args.d_model, dim_ff=args.dim_feedforward, num_layer=args.e_layer,
+                                    num_head=args.num_heads, dropout=args.dropout,
                                     batch_first=True, bias=True,
                                     layer_norm_eps=1e-5,
                                     progress=progress)
 
         print("Use RPR Transformer")
-        print(f"Input Vocab Size:{vocab_size}")
-        self.Wout: nn.Linear = nn.Linear(self.d_model, vocab_size).to(self.progress.get_device())
+        print(f"Input Vocab Size:{args.vocab_size}")
+        self.Wout: nn.Linear = nn.Linear(self.d_model, args.vocab_size).to(self.progress.get_device())
 
-        self.embedding: nn.Embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
+        self.embedding: nn.Embedding = nn.Embedding(args.vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
@@ -255,14 +275,13 @@ class MORTMEncoderLayer(nn.Module):
 
 
 class MORTMDecoder(nn.Module):
-    def __init__(self,d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps,  num_decoder_layer:int, progress):
+    def __init__(self, args: MORTMArgs, batch_first, bias, layer_norm_eps, progress):
         super(MORTMDecoder, self).__init__()
-        self.num_layer = num_decoder_layer
-        self.layers = _get_clones(MORTMDecoderLayer(d_model=d_model, dim_ff=dim_ff,
-                                                    num_head=num_head, dropout=dropout,
+        self.num_layer = args.d_layer
+        self.layers = _get_clones(MORTMDecoderLayer(args,
                                                     batch_first=batch_first, bias=bias,
                                                     layer_norm_eps=layer_norm_eps, progress=progress), self.num_layer)
-        self.norm = LayerNorm(d_model, eps=1e-5, bias=True, dtype=torch.float32)
+        self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
     def forward(self, tgt: Tensor,
         memory: Tensor,
         tgt_mask: Optional[Tensor] = None,
@@ -291,23 +310,24 @@ class MORTMDecoder(nn.Module):
 
 class MORTMDecoderLayer(nn.Module):
 
-    def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps, progress):
+    def __init__(self, args: MORTMArgs, batch_first, bias, layer_norm_eps, progress):
         super(MORTMDecoderLayer, self).__init__()
-        self.n_head = num_head
-        self.d_model = d_model
-        self.cross_attention: FlashCrossAttentionM = FlashCrossAttentionM(d_model, num_head, dropout)
-        self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(d_model, num_head, dropout, progress=progress)
+        self.n_head = args.num_heads
+        self.d_model = args.d_model
+        self.cross_attention: FlashCrossAttentionM = FlashCrossAttentionM(args.d_model, args.num_heads, args.dropout)
+        self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(args.d_model, args.num_heads, args.dropout, progress=progress)
 
         #self.ffn = FFN(d_model, dim_ff, dropout)
-        self.ffn = MoE(d_model, dim_ff, 5, 2, 1, 1, )
+        self.ffn = MoE(args.d_model, args.dim_feedforward,
+                       args.num_experts, args.topk_experts, args.num_groups, args.topk_groups, )
 
-        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
-        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
-        self.norm3 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
+        self.norm1 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
+        self.norm2 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
+        self.norm3 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
 
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(args.dropout)
+        self.dropout2 = nn.Dropout(args.dropout)
+        self.dropout3 = nn.Dropout(args.dropout)
 
     def forward(self,
         tgt: Tensor,

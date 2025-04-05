@@ -23,7 +23,7 @@ class MORTM_SEQDataset(Dataset):
         suc_count = 0
         for i in range(len(music_seq) - 1):
             seq = music_seq[f'array{i + 1}'].tolist()
-            if 90 < len(seq) < self.positional_length:
+            if 90 < len(seq) < self.positional_length and seq.count(4) < 3:
                 self.seq.append(seq)
                 suc_count += 1
         return suc_count
