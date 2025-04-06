@@ -38,6 +38,7 @@ class ShiftTimeContainer:
     def __init__(self, time, tempo):
         self.measure_start_time = time
         self.shift_measure = False
+        self.is_error = False
         self.tempo = tempo
 
     def shift(self):
@@ -241,20 +242,20 @@ class StartRE(MusicToken):
             if note_measure > back_note_measure:
                 shift = int(now_start)
                 if shift < 0:
-                    print("WHATS!?!?!?!?!?")
+                    container.is_error = True
                 #print(shift % 64)
                 return shift % 64
             else:
                 back_start = ct_time_to_beat(back_notes.start, tempo)
                 shift = int(now_start - back_start)
                 if shift < 0:
-                    print("WHATS!?!?!?!?!?")
+                    container.is_error = True
                 return shift
         else:
             shift = int(now_start - ct_time_to_beat(container.measure_start_time, tempo))
             container.shift_measure = False
             if shift < 0:
-                print("WHATS!?!?!?!?!?")
+                container.is_error = True
             return shift % 64
 
 

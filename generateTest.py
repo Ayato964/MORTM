@@ -34,7 +34,7 @@ tokenizer.rev_mode()
 args = MORTMArgs("configs/512_3.6B.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/MORTM.3.0t5-MEDIUM_0.29.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.3.0t5-LARGE_1.0860.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -46,7 +46,7 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/np/Sample.mid.npz")
+np_notes = np.load("out/np/Sample_add2.mid.npz")
 
 start = np_notes[f'array1'][:-1]
 

@@ -186,6 +186,10 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
                     clip = np.append(clip, token_id)
                     if conv.token_type == "<BLANK>":
                         break
+                if shift_time_container.is_error:
+                    self.is_error = True
+                    self.error_reason = "MIDIの変換中にエラーが発生しました。"
+                    break
             back_note = note
             if not shift_time_container.shift_measure:
                 note_count += 1
@@ -194,8 +198,6 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
             aya_node_inst = self.marge_clip(clip, aya_node_inst)
         return aya_node_inst
 
-    def get_next_measure(self) -> float:
-        pass
     def marge_clip(self, clip, aya_node_inst):
         aya_node_inst.append(clip)
 

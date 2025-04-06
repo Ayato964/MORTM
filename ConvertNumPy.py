@@ -29,9 +29,9 @@ def find_seq_files(root_folder):
 def convert(pid, tokenizer, directory, md_file, program, progress):
     local_count = 0
     for i in range(len(md_file)):
-        con = MIDI2PareSeq(tokenizer, directory[i], md_file[i], program)
+        con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
         con.convert()
-        is_saved, reason = con.save("out/np/datasets_large/")
+        is_saved, reason = con.save("out/np/datasets5_large/")
         if is_saved:
             local_count += 1
         print(f"Process#{pid}: Running... {local_count}  {reason}")
@@ -89,7 +89,7 @@ if __name__ == "__main__":
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            p = Process(target=convert_ex, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
+            p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
             processes.append(p)
             p.start()
 
