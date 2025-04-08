@@ -1,13 +1,11 @@
 '''
 Tokenizerで変換したシーケンスを全て保管します。
 '''
-import random
-import time
 
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-from .progress import LearningProgress
+from mortm.models.modules.progress import LearningProgress
 
 
 class MORTM_SEQDataset(Dataset):

@@ -1,7 +1,3 @@
-import torch
-from torch.optim import Adam
-from torch.optim.lr_scheduler import LambdaLR
-
 
 def noam_lr(d_model: int, warmup_steps=4000):
     def lr_lambda(step):

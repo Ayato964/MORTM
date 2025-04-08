@@ -1,17 +1,16 @@
 import math
 
-import torch
 from torch.nn import Embedding
 import torch
 from torch import Tensor
-from pretty_midi import PrettyMIDI, Instrument, Note
+from pretty_midi import PrettyMIDI
 import umap
 import plotly.express as px
 import pandas as pd
 from numpy import ndarray
 import numpy as np
 import matplotlib.pyplot as plt
-from .mortm import MORTM
+from mortm.models.mortm import MORTM
 from .tokenizer import Tokenizer
 from abc import abstractmethod
 

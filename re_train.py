@@ -1,8 +1,8 @@
 
 from mortm.reinforcement import re_train
-from mortm.mortm import MORTM
+from mortm.models.mortm import MORTM
 from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC
-from mortm.progress import LearningProgress, _DefaultLearningProgress
+from mortm.models.modules.progress import LearningProgress, _DefaultLearningProgress
 import torch
 
 tokenizer = Tokenizer(music_token=get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")

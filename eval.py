@@ -1,9 +1,9 @@
 import torch
 
 import mortm.eval as ev
-from mortm.mortm import MORTM
+from mortm.models.mortm import MORTM
 from mortm.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
-from mortm.progress import _DefaultLearningProgress
+from mortm.models.modules.progress import _DefaultLearningProgress
 import numpy as np
 
 tokenizer = Tokenizer(music_token=get_token_converter(TO_MUSIC))

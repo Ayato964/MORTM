@@ -1,7 +1,6 @@
 import torch
-from torch import Tensor
 
-from .mortm import MORTM
+from mortm.models.mortm import MORTM
 
 
 def generate_note(note_max: int, input_seq, model: MORTM, t=1.0, p=0.90):

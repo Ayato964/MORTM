@@ -1,13 +1,11 @@
-from mortm import constants
 import torch
-from mortm.mortm import MORTM, MORTMArgs
-import pretty_midi as pm
+from mortm.models.mortm import MORTM, MORTMArgs
 import mortm.tokenizer as token
 import numpy as np
 
-from mortm.tokenizer import TO_TOKEN, TO_MUSIC
+from mortm.tokenizer import TO_MUSIC
 
-from mortm.progress import _DefaultLearningProgress
+from mortm.models.modules.progress import _DefaultLearningProgress
 from mortm.tokenizer import get_token_converter
 from mortm.de_convert import ct_token_to_midi
 

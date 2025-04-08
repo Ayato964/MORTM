@@ -4,7 +4,6 @@ import math
 
 from .progress import LearningProgress
 
-
 class RelativePositionalEncoding(nn.Module):
 
     def __init__(self, n_head, d_model, progress: LearningProgress, dropout=0.1, max_len=8000):

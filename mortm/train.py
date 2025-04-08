@@ -6,12 +6,9 @@ train_mortmメソッドを呼び出し、引数の型に合ったオブジェク
 '''
 
 import datetime
-import json
-import math
 import os
 import time
-from abc import abstractmethod
-from typing import  Callable, Optional
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -23,12 +20,10 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
 
 from .messager import Messenger, _DefaultMessenger
-from .progress import LearningProgress, _DefaultLearningProgress
-from .datasets import MORTM_DataSets, MORTM_SEQDataset
-from .mortm import MORTM, MORTMArgs
+from mortm.models.modules.progress import LearningProgress, _DefaultLearningProgress
+from .datasets import MORTM_SEQDataset
+from mortm.models.mortm import MORTM, MORTMArgs
 from .noam import noam_lr
-from .loss import ReinforceCrossEntropy
-from .tokenizer import Tokenizer
 from .epoch import EpochObserver
 IS_DEBUG = False
 
@@ -110,21 +105,8 @@ def update_log(model, writer, global_step):
 
         writer.add_scalar(f"Parameter Value/{name}", param.norm(), global_step)
 
-def get_color(criterion: ReinforceCrossEntropy):
-    if criterion.te < 0.1:
-        return "\033[32m"
-    elif criterion.te < 0.25:
-        return "\033[33m"
-    elif criterion.te < 0.5:
-        return "\033[34m"
-    elif criterion.te < 0.75:
-        return "\033[35m"
-    elif criterion.te < 0.95:
-        return "\033[36m"
-    else:
-        return "\033[37m"
 
-def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss, criterion:ReinforceCrossEntropy):
+def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
     per = sequence / batch_size * 100
     block = int(per / 100 * 50)
     #color_bar = get_color(criterion)
@@ -238,7 +220,7 @@ def _train_self_tuning(args: MORTMArgs, save_directory, mortm_dataset, message: 
                                                                        #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr() if lr_param is None else lr_param, verification_loss, criterion)
+                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr() if lr_param is None else lr_param, verification_loss)
 
                 if (count + 1) % int(100000 / batch_size) == 0:
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
