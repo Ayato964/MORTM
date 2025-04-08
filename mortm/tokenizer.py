@@ -4,7 +4,7 @@ from numpy import ndarray
 
 import re
 from . import constants
-from .custom_token import Token, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd, Blank, SequenceEnd, Continue
+from .custom_token import Token, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd, Blank, SequenceEnd, Gen, CLS
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -24,8 +24,9 @@ TO_MUSIC = 1
 def get_token_converter(convert: int) -> List[Token]:
     register: List[Token] = list()
 
+    register.append(CLS(convert))
     register.append(TrackStart(convert))
-    register.append(Continue(convert))
+    register.append(Gen(convert))
 
     register.append(MeasureToken(convert))
     register.append(Blank(convert))

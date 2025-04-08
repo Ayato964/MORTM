@@ -208,13 +208,23 @@ class SequenceEnd(SpecialToken):
         return None
 
 
-class Continue(SpecialToken):
+class Gen(SpecialToken):
 
     def __init__(self, convert_type: int):
-        super().__init__("<CONTINUE>", convert_type)
+        super().__init__("<GEN>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         return None
+
+
+class CLS(SpecialToken):
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int,
+                  container: ShiftTimeContainer) -> int | str | None:
+        pass
+    def __init__(self, convert_type: int):
+        super().__init__("<CLS>", convert_type)
+
+
 
 
 class StartRE(MusicToken):
