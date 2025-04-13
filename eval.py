@@ -2,7 +2,7 @@ import torch
 
 import mortm.eval as ev
 from mortm.models.mortm import MORTM
-from mortm.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
+from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
 from mortm.models.modules.progress import _DefaultLearningProgress
 import numpy as np
 

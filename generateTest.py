@@ -1,12 +1,12 @@
 import torch
 from mortm.models.mortm import MORTM, MORTMArgs
-import mortm.tokenizer as token
+import mortm.train.tokenizer as token
 import numpy as np
 
-from mortm.tokenizer import TO_MUSIC
+from mortm.train.tokenizer import TO_MUSIC
 
 from mortm.models.modules.progress import _DefaultLearningProgress
-from mortm.tokenizer import get_token_converter
+from mortm.train.tokenizer import get_token_converter
 from mortm.de_convert import ct_token_to_midi
 
 

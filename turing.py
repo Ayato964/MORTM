@@ -1,6 +1,5 @@
 from mortm.convert import MIDI2Seq, MidiToAyaNode_TGT
-from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-import numpy
+from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
 import os
 from typing import List
 

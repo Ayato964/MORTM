@@ -1,13 +1,11 @@
 from typing import List, Any
 
-import mido
 import numpy as np
-from numpy import ndarray
 from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
 from abc import abstractmethod, ABC
 from typing import TypeVar, Generic
 from .custom_token import Token, ShiftTimeContainer
-from .tokenizer import Tokenizer
+from mortm.train.tokenizer import Tokenizer
 
 T = TypeVar("T")
 class _AbstractMidiToAyaNode(ABC):

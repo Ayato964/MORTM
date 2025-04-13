@@ -1,8 +1,8 @@
 import os
 import numpy as np
 from multiprocessing import Process, Manager
-from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.convert import MIDI2PareSeq, PareSeqToCatSeq, MIDI2Seq
+from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.convert import PareSeqToCatSeq, MIDI2Seq
 
 def find_midi_files(root_folder):
     midi_files = []

@@ -1,5 +1,5 @@
 from mortm.convert import MIDI2Seq
-from mortm.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
 from mortm.de_convert import ct_token_to_midi
 tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
 

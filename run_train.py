@@ -5,7 +5,7 @@
 import os
 from mortm.train import train_mortm
 
-from mortm.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
+from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
 from mortm.gmail_messanger import GmailMessanger, Messenger
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 

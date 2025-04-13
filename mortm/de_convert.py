@@ -1,9 +1,8 @@
 from torch import Tensor
 from pretty_midi import Instrument, Note, PrettyMIDI
-from typing import List
 
-from .tokenizer import Tokenizer, PITCH_TYPE, START_TYPE, SHIFT_TYPE, VELOCITY_TYPE, DURATION_TYPE
-from .custom_token import Token, ShiftTimeContainer
+from mortm.train.tokenizer import Tokenizer, DURATION_TYPE
+from .custom_token import ShiftTimeContainer
 
 
 

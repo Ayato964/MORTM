@@ -1,7 +1,7 @@
 
 from mortm.reinforcement import re_train
 from mortm.models.mortm import MORTM
-from mortm.tokenizer import Tokenizer, get_token_converter, TO_MUSIC
+from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_MUSIC
 from mortm.models.modules.progress import LearningProgress, _DefaultLearningProgress
 import torch
 

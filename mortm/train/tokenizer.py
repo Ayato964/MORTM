@@ -3,8 +3,8 @@ from typing import List
 from numpy import ndarray
 
 import re
-from . import constants
-from .custom_token import Token, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd, Blank, SequenceEnd, Gen, CLS
+from mortm import constants
+from mortm.custom_token import Token, Pitch, Duration, StartRE, MeasureToken, TrackStart, TrackEnd, Blank, SequenceEnd, Gen, CLS
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'

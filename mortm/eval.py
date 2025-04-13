@@ -11,7 +11,7 @@ from numpy import ndarray
 import numpy as np
 import matplotlib.pyplot as plt
 from mortm.models.mortm import MORTM
-from .tokenizer import Tokenizer
+from mortm.train.tokenizer import Tokenizer
 from abc import abstractmethod
 
 

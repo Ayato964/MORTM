@@ -19,7 +19,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
 
-from .messager import Messenger, _DefaultMessenger
+from mortm.messager import Messenger, _DefaultMessenger
 from mortm.models.modules.progress import LearningProgress, _DefaultLearningProgress
 from .datasets import MORTM_SEQDataset
 from mortm.models.mortm import MORTM, MORTMArgs
