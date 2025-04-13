@@ -507,40 +507,45 @@ class QKVLinear(nn.Module):
         super(QKVLinear, self).__init__()
         self.num_heads = num_heads
         self.drop_out = nn.Dropout(drop_out)
-
-        #self.W_q = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
-        #self.W_k = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
-        #self.W_v = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
-
+        '''
         self.W_dkv = nn.Linear(d_model, d_kv, dtype=torch.bfloat16)
         self.W_dq = nn.Linear(d_model, d_q, dtype=torch.bfloat16)
 
         self.W_uq = nn.Linear(d_q, d_model, dtype=torch.bfloat16)
         self.W_uk = nn.Linear(d_kv, d_model, dtype=torch.bfloat16)
         self.W_uv = nn.Linear(d_kv, d_model, dtype=torch.bfloat16)
+        '''
+        self.qkv_weight = Parameter(torch.empty(3 * d_model, d_model, dtype=torch.bfloat16)).to(dtype=torch.bfloat16)
+        self.qkv_bias = Parameter(torch.empty(3 * d_model, dtype=torch.bfloat16)).to(dtype=torch.bfloat16)
 
         self.W_o = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
+        self.reset_()
 
 
-    def reset(self):
-        if not self.is_cross_attn:
-            xavier_uniform_(self.qkv_weight)
-            constant_(self.qkv_bias, 0)
+    def reset_(self):
+        #if not self.is_cross_attn:
+        xavier_uniform_(self.qkv_weight)
+        constant_(self.qkv_bias, 0)
+        '''
         else:
             xavier_uniform_(self.q_weight)
             xavier_uniform_(self.kv_weight)
-
+        
             constant_(self.q_bias, 0)
             constant_(self.kv_bias, 0)
+        '''
 
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor, memory_padding_mask: Tensor=None, key_padding_mask: Tensor=None):
+        '''
         dkv = self.W_dkv(k)
         dq = self.W_dq(q)
 
         q = self.W_uq(dq)
         k = self.W_uk(dkv)
         v = self.W_uv(dkv)
+        '''
+        q, k, v = linear(q, self.qkv_weight, self.qkv_bias).chunk(3, dim=-1)
 
         if key_padding_mask is not None:
             q_unpad, indices, cu_seqlens, max_s, used_seqlens = unpad_input(q, key_padding_mask)

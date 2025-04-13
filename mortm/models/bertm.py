@@ -30,7 +30,7 @@ class BERTM(nn.Module):
                                      progress=progress)
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.positional = PositionalEncoding(d_model, progress, dropout, max_len=5000)
-        self.Wout = nn.Linear(d_model, vocab_size)
+        self.Wout = nn.Linear(d_model, 2)
 
     def forward(self, src: Tensor, input_padding_mask=None):
         """
@@ -40,12 +40,13 @@ class BERTM(nn.Module):
         src = self.embedding(src)
         src = src.permute(1, 0, 2)
         src = self.positional(src)
+        src = src.permute(1, 0, 2)
 
         # Encoderのforwardメソッドを呼び出す
         out = self.encoder(src=src, src_mask=None,
                            src_key_padding_mask=input_padding_mask,
                            src_is_causal=False)
-
+        out = out[:, 0, :]
         out = self.Wout(out)
 
         return out
