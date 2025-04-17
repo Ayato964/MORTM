@@ -3,6 +3,12 @@ from abc import abstractmethod
 
 
 def ct_time_to_beat(time: float, tempo: int) -> int:
+    '''
+    Convert time to beat.
+    :param time:
+    :param tempo:
+    :return:
+    '''
     b4 = 60 / tempo
     b8 = b4 / 2
     b16 = b8 / 2
@@ -15,6 +21,12 @@ def ct_time_to_beat(time: float, tempo: int) -> int:
 
 
 def ct_beat_to_time(beat: float, tempo: int) -> float:
+    '''
+    Convert beat to time.
+    :param beat:
+    :param tempo:
+    :return:
+    '''
     b4 = 60 / tempo
     b8 = b4 / 2
     b16 = b8 / 2
@@ -24,6 +36,12 @@ def ct_beat_to_time(beat: float, tempo: int) -> float:
 
 
 def calc_time_to_beat(time, beat_time) -> (int, int):
+    '''
+    Convert time to beat.
+    :param time:
+    :param beat_time:
+    :return:
+    '''
     main_beat: int = time // beat_time
     sub_time: int = time % beat_time
     return main_beat, sub_time

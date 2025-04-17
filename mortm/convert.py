@@ -11,6 +11,15 @@ T = TypeVar("T")
 class _AbstractMidiToAyaNode(ABC):
 
     def __init__(self, instance: Generic[T],  tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None,):
+        '''
+        MIDIをトークンのシーケンスに変換するクラスの抽象クラス
+        :param instance: 子クラスのインスタンス
+        :param tokenizer: 変換するトークナイザー
+        :param directory: MIDIのディレクトリパス
+        :param file_name: ディレクトリにあるMIDIのファイル名
+        :param program_list: MIDIの楽器のプログラムリスト
+        :param midi_data: PrettyMIDIのインスタンス(Optinal)
+        '''
         self.program_list = program_list
         self.directory = directory
         self.file_name = file_name
@@ -42,6 +51,11 @@ class _AbstractMidiToAyaNode(ABC):
         self.convert()
 
     def get_midi_change_scale(self, scale_up_key):
+        '''
+        MIDIの音程を変更する。
+        :param scale_up_key: いくつ音程を上げるか
+        :return:
+        '''
         midi = PrettyMIDI()
 
         for ins in self.midi_data.instruments:
@@ -66,6 +80,11 @@ class _AbstractMidiToAyaNode(ABC):
         return midi
 
     def expansion_midi(self) -> List[Any]:
+        '''
+        データ拡張する関数。
+        MIDIデータを全スケール分に拡張する。
+        :return: MIDIのリスト
+        '''
         converts = []
         key = 5
         if not self.is_error:
@@ -80,6 +99,11 @@ class _AbstractMidiToAyaNode(ABC):
         return converts
 
     def get_tempo(self, start: float):
+        '''
+        MIDIのテンポを取得する関数
+        :param start:
+        :return:
+        '''
         tempo = 0
         for i in range(len(self.tempo_change_time)):
             if start >= self.tempo_change_time[i]:
@@ -96,6 +120,9 @@ class _AbstractMidiToAyaNode(ABC):
         pass
 
 class MIDI2Seq(_AbstractMidiToAyaNode):
+    '''
+    MIDIをトークンのシーケンスに変換するクラス
+    '''
 
     def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
         super().__init__(MIDI2Seq, tokenizer, directory, file_name, program_list, midi_data)
@@ -104,24 +131,10 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
     def convert(self):
         """
         以下のステップでMidiが変換される
-        1. テンポ固定
-            120テンポに変換される。
-        2. 指定した楽器があるかを検索する
-            インスタンス化した際に、指定したprogram_listに乗っ取り、該当する楽器があるかを検索する
-        3. ノートを変換する。
-            self.ct_aya_nodeにインストを渡すことで、MORTMに適した形に変換する。
-
-        また、変換したインストゥルメントは以下のような配列構造になる。
-
-        1_music = [
-                    [1 inst's 60s clip],
-                        ...
-                    [1 inst's 60s clip],
-                    [2 inst's 60s clip],
-                        ...
-                    [n inst's 60s clip]
-                    ]
-        :return:なし。
+        1. Instrumentsから楽器を取り出す。
+        2. 楽器の音を1音ずつ取り出し、Tokenizerで変換する。
+        3. clip = [<START>, S, P, D, S, P, D, ...<END>]
+        :return:なし
         """
         if not self.is_error:
             program_count = 0
@@ -138,17 +151,6 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
                 self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
 
     def ct_aya_node(self, inst: Instrument) -> list:
-
-        """
-        Instrumentsから1音ずつ取り出し、Tokenizerで変換する。
-        clip = [<START>, S, P, V, D, H, S, P, V, D, H ...<END>]
-        さらに60秒ごとにスプリットし、以下のような配列構造を作る。
-        aya_node_inst = [clip_1, clip_2 ... clip_n]
-
-        よって、二次元配列のndarrayを返す。
-        :param inst: インストゥルメント
-        :return: 60秒にクリッピングされた旋律の配列(2次元)
-        """
 
         clip = np.array([], dtype=int)
         aya_node_inst = []
