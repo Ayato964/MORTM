@@ -1,6 +1,7 @@
 '''
 Tokenizerで変換したシーケンスを全て保管します。
 '''
+import random
 
 import torch
 from torch.utils.data import Dataset
@@ -29,7 +30,7 @@ class MORTM_SEQDataset(Dataset):
         return torch.tensor(self.seq[item], dtype=torch.long, device=self.progress.get_device())
 
 
-class MORTM_DataSets(Dataset):
+class ClassDataSets(Dataset):
     def __init__(self, progress: LearningProgress, positional_length):
         self.key: list = list()
         self.value: list = list()
@@ -40,17 +41,26 @@ class MORTM_DataSets(Dataset):
         return len(self.key)
 
     def __getitem__(self, item):
-        return (torch.tensor(self.key[item], dtype=torch.long, device=self.progress.get_device()),
+        if self.value[item] == 0:
+            ind = [i for i, v in enumerate(self.key[item]) if v == 3]
+            r = 4 + random.randint(0, 8)
+            if r != 12 and r < len(ind):
+                v = self.key[item][:ind[r]]
+            else:
+                v = self.key[item]
+        else:
+            v = self.key[item]
+        return (torch.tensor(v, dtype=torch.long, device=self.progress.get_device()),
                 torch.tensor(self.value[item], dtype=torch.long, device=self.progress.get_device()))
 
-    def add_data(self, music_seq: np.ndarray):
+    def add_data(self, music_seq: np.ndarray, value):
         suc_count = 0
         for i in range(len(music_seq) - 1):
-            seq = music_seq[f'array_{i + 1}'].tolist()
-            if (90 < len(seq['key']) < self.positional_length) or (4 in seq['key'] and len(seq['key']) < 90):
-                if len(seq['value']) < self.positional_length:
-                    self.key.append(seq['key'].tolist())
-                    self.value.append(seq['value'].tolist())
-                    suc_count += 1
+            seq = music_seq[f'array{i + 1}'].tolist()
+            if 90 < len(seq) < self.positional_length and seq.count(4) < 3:
+                self.key.append(seq)
+                self.value.append(value)
+                suc_count += 1
 
         return suc_count
+

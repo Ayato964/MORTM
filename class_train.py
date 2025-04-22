@@ -3,7 +3,8 @@
 
 """
 import os
-from mortm.train.train import train_mortm
+
+from mortm.train.re_train import train_bertm
 
 from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
 from mortm.gmail_messanger import GmailMessanger, Messenger
@@ -13,14 +14,14 @@ message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi
 
 tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
-model = train_mortm("configs/512_6.7B.json", "out/np/Piano/datasets_small/", "out/model", "3.1t6-SMALL-PIANO",
-                    #load_model_directory="out/model/MORTM.3.1t6-LARGE_1.01.pth",
-                    num_epochs=30,
-                    train_dataset_split=0.99,
+model = train_bertm(human_dir="out/np/Sax/dis/human", ai_dir="out/np/Sax/dis/ai",
+                    args_dir="configs/class_file.json",
+                    save_directory="out/model/class/",version="1.0",
+                    train_split=0.99,
                     message=message,
-                    is_save_training_progress=True,
-                    batch_size=16,
-                    #lr_param=8e-6,
-                    accumulation_steps=1,
-                    warmup_steps=4000)
+                    epoch=100, batch_size=8,
+                    warmup_steps=4000,
+                    accumlation_steps=1,
+                    #lr_param=None,
+                    is_save_training_progress=True)
 

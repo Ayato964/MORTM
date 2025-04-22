@@ -124,9 +124,10 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
     MIDIをトークンのシーケンスに変換するクラス
     '''
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None, split_measure=12):
         super().__init__(MIDI2Seq, tokenizer, directory, file_name, program_list, midi_data)
         self.aya_node = [0]
+        self.split_measure = split_measure
 
     def convert(self):
         """
@@ -175,7 +176,7 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
                 if token is not None:
                     if conv.token_type == "<SME>":
                         clip_count += 1
-                    if clip_count >= 12:
+                    if clip_count >= self.split_measure:
                         clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                         aya_node_inst = self.marge_clip(clip, aya_node_inst)
                         clip = np.array([], dtype=int)

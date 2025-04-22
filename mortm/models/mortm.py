@@ -25,9 +25,7 @@ class MORTM(nn.Module):
                                batch_first=True, bias=True,
                                layer_norm_eps=1e-5, progress=progress)
 
-        self.encoder = MORTMEncoder(d_model=args.d_model, dim_ff=args.dim_feedforward, num_layer=args.e_layer,
-                                    num_head=args.num_heads, dropout=args.dropout,
-                                    batch_first=True, bias=True,
+        self.encoder = MORTMEncoder(args,
                                     layer_norm_eps=1e-5,
                                     progress=progress)
 

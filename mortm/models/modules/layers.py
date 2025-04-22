@@ -30,13 +30,12 @@ class DummyDecoder(nn.Module):
 
 
 class MORTMEncoder(nn.Module):
-    def __init__(self, d_model, dim_ff, num_head, num_layer, dropout, batch_first, bias, layer_norm_eps, progress):
+    def __init__(self, args: MORTMArgs, layer_norm_eps, progress):
         super(MORTMEncoder, self).__init__()
-        self.num_layer = num_layer
-        self.layers = _get_clones(MORTMEncoderLayer(d_model=d_model, dim_ff=dim_ff, num_head=num_head, dropout=dropout, batch_first=batch_first,
-                                                    bias=bias, layer_norm_eps=layer_norm_eps, progress=progress), self.num_layer)
+        self.num_layer = args.e_layer
+        self.layers = _get_clones(MORTMEncoderLayer(args, layer_norm_eps=layer_norm_eps, progress=progress), self.num_layer)
 
-        self.norm = LayerNorm(d_model, eps=1e-5, bias=True, dtype=torch.float32)
+        self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
 
     def forward(self, src, mask, src_key_padding_mask, is_causal):
         memory = src
@@ -53,27 +52,22 @@ class MORTMEncoder(nn.Module):
 
 
 class MORTMEncoderLayer(nn.Module):
-    def __init__(self, d_model, dim_ff, num_head, dropout, batch_first, bias, layer_norm_eps, progress):
+    def __init__(self, args: MORTMArgs, layer_norm_eps, progress):
         super(MORTMEncoderLayer, self).__init__()
 
-        self.d_model = d_model
-        self.dim_ff = dim_ff
-        self.dropout = dropout
+        self.d_model = args.d_model
+        self.dim_ff = args.dim_feedforward
+        self.dropout = args.dropout
 
 
-        self.self_attn =FlashSelfAttentionM(d_model, num_head, dropout, progress=progress)
+        self.self_attn =FlashSelfAttentionM(args.d_model, args.num_heads, args.dropout, progress=progress)
+        self.ffn = MoE(args.d_model, args.dim_feedforward, args.num_experts, args.topk_experts, args.num_groups, args.topk_groups)
 
-        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
-        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
+        self.norm1 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
+        self.norm2 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
 
-
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-
-        self.f_linear = nn.Linear(self.d_model, self.dim_ff)
-        self.f_drop = nn.Dropout(dropout)
-        self.ff_linear = nn.Linear(self.dim_ff, self.d_model)
+        self.dropout1 = nn.Dropout(args.dropout)
+        self.dropout2 = nn.Dropout(args.dropout)
 
     def forward(self, memory, mask, src_key_padding_mask, is_causal):
         y = memory
@@ -92,11 +86,7 @@ class MORTMEncoderLayer(nn.Module):
         return self.dropout1(y)
 
     def ff_block(self, y: Tensor):
-        y = self.f_linear(y)
-        y = F.relu(y)
-        y = self.f_drop(y)
-        y = self.ff_linear(y)
-        return self.dropout2(y)
+        return self.dropout2(self.ffn(y))
 
 
 class MORTMDecoder(nn.Module):
@@ -202,9 +192,6 @@ class MORTMDecoderLayer(nn.Module):
                     ):
         y, _ = self.cross_attention(y, mem, memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
                                     attn_mask=attn_mask, is_causal=is_causal)
-
-        #y, _ = self.cross_attention(y, mem, mem, key_padding_mask=memory_key_padding_mask,
-        #                            is_causal=is_causal)
         return self.dropout2(y)
 
     def ff_block(self, y: Tensor):
