@@ -1,9 +1,9 @@
 {
-  "vocab_size": 400,
+  "vocab_size": 521,
   "d_model": 512,
   "dim_feedforward": 2048,
   "num_heads": 8,
-  "d_layer": 13,
+  "d_layer": 12,
   "dropout": 0.2,
   "position_length": 400,
   "num_experts": 16,

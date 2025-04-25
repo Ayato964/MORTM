@@ -19,8 +19,6 @@ class MORTM(nn.Module):
         self.d_model = args.d_model
         self.dim_feedforward = args.dim_feedforward
         self.dropout = args.dropout
-        self.positional: PositionalEncoding = PositionalEncoding(self.d_model, progress, args.dropout, args.position_length * 10).to(
-            self.progress.get_device())
         self.decoder = MORTMDecoder(args,
                                batch_first=True, bias=True,
                                layer_norm_eps=1e-5, progress=progress)
@@ -38,14 +36,9 @@ class MORTM(nn.Module):
 
     def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
                 tgt_padding_mask=None, src_is_causal=False, tgt_is_causal=False):
-        sec_e: Tensor = self.embedding(src)
-        sec_e = sec_e.permute(1, 0, 2)
+        src_e: Tensor = self.embedding(src)
 
-        src_p: Tensor = self.positional(sec_e)
-        src_p = src_p.permute(1, 0, 2)
-
-
-        out = self.decoder(tgt=src_p, memory=None, tgt_mask=tgt_mask,
+        out = self.decoder(tgt=src_e, memory=None, tgt_mask=tgt_mask,
                            memory_key_padding_mask=input_padding_mask,
                            tgt_key_padding_mask=input_padding_mask, memory_is_causal=src_is_causal, tgt_is_causal=src_is_causal)
 

@@ -91,19 +91,17 @@ def _get_padding_mask(input_ids, progress: LearningProgress):
 
 def collate_fn(batch):
     # バッチ内のテンソルの長さを揃える（パディングする）
-    #src_list = [item[0] for item in batch]  # 各タプルのsrcを抽出
-    #tgt_list = [item[1] for item in batch]  # 各タプルのtgtを抽出
     src = pad_sequence(batch, batch_first=True, padding_value=0)
-    #tgt = pad_sequence(tgt_list, batch_first=True, padding_value=0)
     return src
 
 
 def update_log(model, writer, global_step):
     for name, param in model.named_parameters():
-        writer.add_scalar(f"params_mean/{name}", param.mean(), global_step)
-        writer.add_scalar(f"params_std/{name}", param.std(), global_step)
+        if param.grad is not None:
+            writer.add_scalar(f"params_mean/{name}", param.grad.mean(), global_step)
+            writer.add_scalar(f"params_std/{name}", param.grad.std(), global_step)
 
-        writer.add_scalar(f"Parameter Value/{name}", param.norm(), global_step)
+            writer.add_scalar(f"Parameter Norm/{name}", param.grad.norm(), global_step)
 
 
 def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):

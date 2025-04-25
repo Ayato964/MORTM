@@ -1,7 +1,6 @@
 from pretty_midi import Note, Instrument
 from abc import abstractmethod
 
-
 def ct_time_to_beat(time: float, tempo: int) -> int:
     '''
     Convert time to beat.
@@ -10,12 +9,11 @@ def ct_time_to_beat(time: float, tempo: int) -> int:
     :return:
     '''
     b4 = 60 / tempo
-    b8 = b4 / 2
-    b16 = b8 / 2
-    b32 = b16 / 2
-    b64 = b32 / 2
+    measure = b4 * 4
+    # 96 subdivisions per measure
+    b96 = measure / 96
 
-    beat, sub = calc_time_to_beat(time, b64)
+    beat, sub = calc_time_to_beat(time, b96)
 
     return beat
 
@@ -28,11 +26,11 @@ def ct_beat_to_time(beat: float, tempo: int) -> float:
     :return:
     '''
     b4 = 60 / tempo
-    b8 = b4 / 2
-    b16 = b8 / 2
-    b32 = b16 / 2
-    b64 = b32 / 2
-    return float(beat) * b64
+    measure = b4 * 4
+    # 96 subdivisions per measure
+    b96 = measure / 96
+
+    return float(beat) * b96
 
 
 def calc_time_to_beat(time, beat_time) -> (int, int):
@@ -248,7 +246,7 @@ class CLS(SpecialToken):
 class StartRE(MusicToken):
 
     def _set_tokens(self, tokens: dict):
-        max_length = 64
+        max_length = 96
         tokens_length = len(tokens)
         for i in range(max_length + 1):
             tokens[f's_{i}'] = tokens_length + i
@@ -271,8 +269,7 @@ class StartRE(MusicToken):
                 shift = int(now_start)
                 if shift < 0:
                     container.is_error = True
-                #print(shift % 64)
-                return shift % 64
+                return shift % 96
             else:
                 back_start = ct_time_to_beat(back_notes.start, tempo)
                 shift = int(now_start - back_start)
@@ -284,7 +281,32 @@ class StartRE(MusicToken):
             container.shift_measure = False
             if shift < 0:
                 container.is_error = True
-            return shift % 64
+            return shift % 96
+
+
+class Duration(MusicToken):
+
+    def _set_tokens(self, tokens: dict):
+        # allow up to 3 measures (96 * 3)
+        max_length = 96 * 3
+        tokens_length = len(tokens)
+        for i in range(max_length + 1):
+            tokens[f'd_{i}'] = tokens_length + i
+
+    def de_convert(self, number: int, back_note: Note, note: Note, tempo, container: ShiftTimeContainer):
+        duration = ct_beat_to_time(number, tempo)
+        note.end = note.start + duration
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo, container: ShiftTimeContainer) -> int:
+        start = ct_time_to_beat(note.start, tempo)
+        end = ct_time_to_beat(note.end, tempo)
+        d = int(max(abs(end - start), 1))
+
+        if 96 * 3 < d:
+            d = 96 * 3 - 1
+
+        return d
+
 
 
 class Pitch(MusicToken):
@@ -305,25 +327,3 @@ class Pitch(MusicToken):
         p: int = note.pitch
         return p
 
-
-class Duration(MusicToken):
-
-    def _set_tokens(self, tokens: dict):
-        max_length = 192
-        tokens_length = len(tokens)
-        for i in range(max_length + 1):
-            tokens[f'd_{i}'] = tokens_length + i
-
-    def de_convert(self, number: int, back_note: Note, note: Note, tempo, container: ShiftTimeContainer):
-        duration = ct_beat_to_time(number, tempo)
-        note.end = note.start + duration
-
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo, container: ShiftTimeContainer) -> int:
-        start = ct_time_to_beat(note.start, tempo)
-        end = ct_time_to_beat(note.end, tempo)
-        d = int(max(abs(end - start), 1))
-
-        if 192 < d:
-            d = 191
-
-        return d

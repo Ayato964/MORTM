@@ -13,13 +13,13 @@ message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi
 
 tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
-model = train_mortm("configs/512_6.7B.json", "out/np/Piano/datasets_small/", "out/model", "3.1t6-SMALL-PIANO",
+model = train_mortm("configs/512_6.7B.json", "out/np/Sax/datasets6_large/", "out/model", "3.2t6-LARGE-SAX",
                     #load_model_directory="out/model/MORTM.3.1t6-LARGE_1.01.pth",
                     num_epochs=30,
                     train_dataset_split=0.99,
                     message=message,
                     is_save_training_progress=True,
-                    batch_size=16,
+                    batch_size=12,
                     #lr_param=8e-6,
                     accumulation_steps=1,
                     warmup_steps=4000)

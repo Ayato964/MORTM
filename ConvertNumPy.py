@@ -31,9 +31,9 @@ def convert(pid, tokenizer, directory, md_file, program, progress):
     for i in range(len(md_file)):
         con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
         con.convert()
-        is_saved, reason = con.save("out/np/datasets5_large/")
-        if is_saved:
-            local_count += 1
+        is_saved, reason = con.save("out/np/Sax/datasets6_large/")
+        #if is_saved:
+        #    local_count += 1
         print(f"Process#{pid}: Running... {local_count}  {reason}")
     progress[pid] = local_count
 
@@ -46,17 +46,17 @@ def convert_ex(pid, tokenizer, directory, md_file, program, progress):
         con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
         ex_midi = con.expansion_midi()
         con.convert()
-        is_saved, reason = con.save("out/np/Sax/dis/")
+        is_saved, reason = con.save("out/np/Sax/datasets6_small/")
 
         for ex in ex_midi:
             ex.convert()
-            is_saved, reason = ex.save("out/np/Sax/dis/")
+            is_saved, reason = ex.save("out/np/Sax/datasets6_small/")
             print(f"Process#{pid}: データ拡張中...{is_saved}  {reason}")
 
         if is_saved:
             local_count += 1
-        if local_count >= 30:
-            break
+        #if local_count >= 30:
+        #    break
         print(f"Process#{pid}: Running... {local_count}  {reason}")
     progress[pid] = local_count
 
@@ -79,7 +79,7 @@ if __name__ == "__main__":
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            p = Process(target=convert_ex, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
+            p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
             processes.append(p)
             p.start()
 
