@@ -66,8 +66,8 @@ if __name__ == "__main__":
     PIANO = [i + 1 for i in range(5)]
     SAX = [65, 66]
 
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    #datasets = "./data/other"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    datasets = "./data/other"
     directory, md_file = find_midi_files(datasets)
 
     directory = np.array_split(directory, THREAD_VALUE)
