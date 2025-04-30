@@ -2,7 +2,7 @@ import os
 import numpy as np
 from multiprocessing import Process, Manager
 from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.convert import MIDI2Seq
+from mortm.convert import MIDI2Seq, PackSeq
 
 def find_midi_files(root_folder):
     midi_files = []
@@ -15,15 +15,6 @@ def find_midi_files(root_folder):
     return direc, midi_files
 
 
-def find_seq_files(root_folder):
-    midi_files = []
-    direc = []
-    for defpath, surnames, filenames in os.walk(root_folder):
-        for file in filenames:
-            if file.lower().endswith(('.npz')):
-                midi_files.append(file)
-                direc.append(defpath)
-    return direc, midi_files
 
 
 def convert(pid, tokenizer, directory, md_file, program, progress):
@@ -31,7 +22,7 @@ def convert(pid, tokenizer, directory, md_file, program, progress):
     for i in range(len(md_file)):
         con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
         con.convert()
-        is_saved, reason = con.save("out/np/Sax/datasets6_large/")
+        is_saved, reason = con.save("out/np/Piano/datasets_large/")
         #if is_saved:
         #    local_count += 1
         print(f"Process#{pid}: Running... {local_count}  {reason}")
@@ -46,11 +37,11 @@ def convert_ex(pid, tokenizer, directory, md_file, program, progress):
         con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
         ex_midi = con.expansion_midi()
         con.convert()
-        is_saved, reason = con.save("out/np/Sax/datasets6_small/")
+        is_saved, reason = con.save("out/np/Piano/datasets_small/")
 
         for ex in ex_midi:
             ex.convert()
-            is_saved, reason = ex.save("out/np/Sax/datasets6_small/")
+            is_saved, reason = ex.save("out/np/Piano/datasets_small/")
             print(f"Process#{pid}: データ拡張中...{is_saved}  {reason}")
 
         if is_saved:
@@ -60,14 +51,13 @@ def convert_ex(pid, tokenizer, directory, md_file, program, progress):
         print(f"Process#{pid}: Running... {local_count}  {reason}")
     progress[pid] = local_count
 
-
 if __name__ == "__main__":
     THREAD_VALUE = 10
     PIANO = [i + 1 for i in range(5)]
     SAX = [65, 66]
 
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    datasets = "./data/other"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    #datasets = "./data/other"
     directory, md_file = find_midi_files(datasets)
 
     directory = np.array_split(directory, THREAD_VALUE)
@@ -79,7 +69,7 @@ if __name__ == "__main__":
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), SAX, progress))
+            p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(), md_file[t].tolist(), PIANO, progress))
             processes.append(p)
             p.start()
 

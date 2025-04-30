@@ -215,3 +215,30 @@ class MIDI2Seq(_AbstractMidiToAyaNode):
                 return False, "オブジェクトが何らかの理由で見つかりませんでした。"
         else:
             return False, self.error_reason
+
+
+class PackSeq:
+    def __init__(self, directory, file_list):
+        self.directory = directory
+        self.file_list: list = file_list
+        self.seq = [0]
+
+
+    def convert(self):
+        count = 0
+        for file in self.file_list:
+            seq = np.load(f"{self.directory}/{file}")
+            for i in range(len(seq) - 1):
+                s = seq[f'array{i + 1}']
+                self.seq.append(s)
+            count += 1
+            print(f"\r 一つのパックに纏めています。。。。{count}/{len(self.file_list)}", end="")
+
+    def save(self, dire, filename):
+        array_dict = {f'array{i}': arr for i, arr in enumerate(self.seq)}
+        if len(array_dict) > 1:
+            np.savez(dire + "/ "+ filename, **array_dict)
+            return True, "処理が正常に終了しました。"
+        else:
+            return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+        pass

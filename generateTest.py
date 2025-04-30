@@ -29,7 +29,7 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
 
 tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
 tokenizer.rev_mode()
-args = MORTMArgs("configs/512_6.7B.json")
+args = MORTMArgs("configs/A.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
 model.load_state_dict(torch.load("out/model/MORTM.3.2t6-LARGE-SAX_1.11.pth")) # モデルをロードする。

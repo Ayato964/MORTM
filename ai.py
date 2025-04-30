@@ -17,7 +17,7 @@ progress = _DefaultLearningProgress()
 tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
 tokenizer.rev_mode()
 
-args = MORTMArgs("configs/512_3.6B.json")
+args = MORTMArgs("configs/B.json")
 model = MORTM(progress=progress, args=args)
 model.load_state_dict(torch.load("out/model/MORTM.3.1t6-LARGE_1.012.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
