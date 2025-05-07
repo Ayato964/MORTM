@@ -103,6 +103,7 @@ def train_epoch(epoch, batch, args: MORTMArgs, train_dataset, val_dataset, messa
             optimizer.zero_grad()
             for src, tgt in train_loader:
                 begin_time = time.time()
+
                 tgt: Tensor = tgt.to(progress.get_device())
                 src = src.to(progress.get_device())
     #            src = torch.cat([torch.full((src.size(0), 1), 399, dtype=src.dtype, device=src.device), src], dim=1)

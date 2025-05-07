@@ -61,7 +61,12 @@ class MORTMEncoderLayer(nn.Module):
 
 
         self.self_attn =FlashSelfAttentionM(args.d_model, args.num_heads, args.dropout, progress=progress)
-        self.ffn = MoE(args.d_model, args.dim_feedforward, args.num_experts, args.topk_experts, args.num_groups, args.topk_groups)
+        if args.use_moe_encoder:
+            self.ffn = MoE(args.d_model, args.dim_feedforward, args.num_experts, args.topk_experts, args.num_groups, args.topk_groups)
+        else:
+            self.ffn = self.mlp
+            self.ff_linear = nn.Linear(args.d_model, args.dim_feedforward)
+            self.ff_linear2 = nn.Linear(args.dim_feedforward, args.d_model)
 
         self.norm1 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
         self.norm2 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
@@ -77,6 +82,11 @@ class MORTMEncoderLayer(nn.Module):
         y = y + self.ff_block(self.norm2(y))
 
         return y
+
+    def mlp(self, x:  Tensor):
+        x = self.ff_linear(x)
+        x = F.gelu(x)
+        return self.ff_linear2(x)
 
     def self_block(self, y, mask, src_key_padding_mask, is_causal):
 

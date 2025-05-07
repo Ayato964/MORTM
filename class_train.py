@@ -19,9 +19,9 @@ model = train_bertm(human_dir="out/np/Sax/dis/human", ai_dir="out/np/Sax/dis/ai"
                     save_directory="out/model/class/",version="1.0",
                     train_split=0.99,
                     message=message,
-                    epoch=100, batch_size=8,
+                    epoch=100, batch_size=4,
                     warmup_steps=4000,
-                    accumlation_steps=1,
+                    accumlation_steps=2,
                     #lr_param=None,
                     is_save_training_progress=True)
 

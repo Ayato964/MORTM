@@ -8,8 +8,6 @@ from mortm.train.tokenizer import TO_MUSIC
 from mortm.models.modules.progress import _DefaultLearningProgress
 from mortm.train.tokenizer import get_token_converter
 from mortm.de_convert import ct_token_to_midi
-
-
 '''
 MORTMのバージョンは常に新しくなる為、モデルのバージョンとvocab_list.jsonを確認してください。
 うまくメロディが生成できない場合や、エラーが発生する場合、以下の項目を確認してください。
@@ -44,11 +42,11 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/Sample.mid.npz")
+np_notes = np.load("out/Sample4.mid.npz")
 
-start = np_notes[f'array1'][:-1]
+start = np_notes[f'array1'][:-190]
 
-gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
+gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=0.7)
 
 output = all
 for t in output:

@@ -21,13 +21,13 @@ bertm = BERTM(
     progress=_DefaultLearningProgress()
 )
 
-bertm.load_state_dict(torch.load("out/model/class/BERTM.train.22.0.0148.pth")) # モデルをロードする。
+bertm.load_state_dict(torch.load("out/model/class/BERTM.1.0_None.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 bertm.to(device)
 bertm.eval()
 
-src = np.load("out/np/Sax/dis/val/7fe217c3817af19eccd2ba74905e6bbb.mid_scale_2.npz")
-src = torch.Tensor(src['array3']).to(device, dtype=torch.long).unsqueeze(0)
+src = np.load("out/Sample5.mid.npz")
+src = torch.Tensor(src['array1']).to(device, dtype=torch.long).unsqueeze(0)
 sm = Softmax()
 out = sm(bertm(src))
 
