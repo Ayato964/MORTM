@@ -1,0 +1,16 @@
+{
+  "d_layer": 16,
+  "num_heads": 8,
+  "d_model": 512,
+  "d_spect": 80,
+  "patch_size": 6,
+  "dim_feedforward": 2048,
+  "dropout": 0.2,
+  "num_experts": 12,
+  "topk_experts": 2,
+  "num_groups": 1,
+  "topk_groups": 1,
+  "route_scale": 1,
+  "score_type": "softmax",
+  "use_moe_decoder": true
+}

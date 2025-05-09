@@ -12,7 +12,7 @@ from .modules.progress import LearningProgress
 
 class V_MORTM(nn.Module):
     def __init__(self, args: V_MORTMArgs, progress:LearningProgress):
-        super(V_MORTM).__init__()
+        super(V_MORTM, self).__init__()
 
         self.vision = Vision(args.d_spect, args.patch_size, args.dropout)
 
@@ -23,12 +23,11 @@ class V_MORTM(nn.Module):
 
         self.Wout = nn.Linear(args.d_spect, args.d_spect)
 
-    def forward(self, spect: Tensor) -> Tensor:
-        emb = rearrange(spect, 'b d s -> b s d')
-        v_spect = self.vision(emb)
+    def forward(self, src: Tensor) -> Tensor:
+        v_spect = self.vision(src)
         x = self.conv_d_model(v_spect)
-        x = self.decoder(x, tgt_is_causal=True)
+        x = self.decoder(x, memory=None, tgt_is_causal=True)
         x = self.conv_d_spect(x)
         x = self.unvision(x)
         x = self.Wout(F.gelu(x))
-        return rearrange(x, 'b s d -> b d s')
+        return x

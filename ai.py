@@ -11,7 +11,7 @@ from mortm.models.modules.progress import _DefaultLearningProgress
 from mortm.train.tokenizer import get_token_converter
 from mortm.de_convert import ct_token_to_midi
 from mortm.train.datasets import MORTM_SEQDataset
-from mortm.train.train import _set_train_data, find_npz_files
+from mortm.train.train import _set_train_data, find_files
 
 progress = _DefaultLearningProgress()
 tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
@@ -24,7 +24,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバ�
 model.to(device)
 
 
-directory, file_name = find_npz_files("out/np/Sax/dis/human/")
+directory, file_name = find_files("out/np/Sax/dis/human/")
 datasets = _set_train_data(directory, file_name, args.position_length, progress)
 loader = DataLoader(datasets, batch_size=1, shuffle=True)
 count = 0

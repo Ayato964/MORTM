@@ -6,9 +6,16 @@ train_mortmメソッドを呼び出し、引数の型に合ったオブジェク
 '''
 
 import datetime
+import json
 import os
 import time
-from typing import Optional
+from abc import abstractmethod
+from typing import Optional, Callable, Any
+
+import torchaudio
+from einops import rearrange
+import soundfile as sf
+
 
 import torch
 from torch import Tensor
@@ -18,14 +25,185 @@ import numpy as np
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data.dataset import Dataset
 
 from mortm.messager import Messenger, _DefaultMessenger
 from mortm.models.modules.progress import LearningProgress, _DefaultLearningProgress
-from .datasets import MORTM_SEQDataset
+from .datasets import MORTM_SEQDataset, ClassDataSets, PreLoadingDatasets, TensorDataset
 from mortm.models.mortm import MORTM, MORTMArgs
+from mortm.models.bertm import BERTM
+from mortm.models.v_mortm import V_MORTM, V_MORTMArgs
 from .noam import noam_lr
 from .epoch import EpochObserver
 IS_DEBUG = False
+
+
+class TrainArgs:
+    def __init__(self, json_directory: str):
+        with open(json_directory, 'r') as f:
+            data: dict = json.load(f)
+            self.batch_size = data['batch_size'] if data.get('batch_size') else 16
+            self.is_save_training_progress = data['is_save_training_progress'] if data.get('is_save_training_progress') else False
+            self.train_dataset_split:float = data['train_dataset_split'] if data.get('train_dataset_split') else 0.9
+            self.accumulation_steps= data['accumulation_steps'] if data.get('accumulation_steps') else 4
+            self.warmup_steps= data['warmup_steps'] if data.get('warmup_steps') else 4000
+            self.lr_param: Optional[float]= data['lr_param'] if data.get('lr_param') else None
+            self.num_epochs = data['num_epochs'] if data.get('num_epochs') else 20
+
+
+class AbstractTrainSet:
+    model: nn.Module
+    def __init__(self, criterion: nn.Module, optimizer: torch.optim.Optimizer, scheduler: Optional[torch.optim.lr_scheduler.LambdaLR]):
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+
+    @abstractmethod
+    def epoch_fc(self, model, pack, progress):
+        raise NotImplementedError("epoch_fc is not implemented.")
+
+    def pre_processing(self, pack, progress):
+        raise NotImplementedError("pre_processing is not implemented.")
+
+
+class MORTMTrainSet(AbstractTrainSet):
+    def __init__(self, args: MORTMArgs, progress: LearningProgress, load_directory=None):
+
+        self.model = MORTM(progress=progress, args=args).to(progress.get_device())
+        if load_directory is not None:
+            self.model.load_state_dict(torch.load(load_directory))
+
+        adam = torch.optim.Adam(self.model.parameters(), lr=1e-1, betas=(0.9, 0.98))
+
+        super().__init__(criterion=nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device()),
+                        optimizer=adam,
+                        scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
+
+    def epoch_fc(self, model, pack, progress):
+        src = pack
+        target: Tensor = src[:, 1:]
+        target = target.reshape(-1).long()
+
+        src = src[:, :-1]
+        padding_mask_in: Tensor = _get_padding_mask(src, progress)
+        input: Tensor = model(src=src, input_padding_mask=padding_mask_in, src_is_causal=True)
+        input = input.view(-1, input.size(-1)).to(progress.get_device())
+        return input.to(dtype=torch.float32), target
+
+
+class BERTMTrainSet(AbstractTrainSet):
+    def __init__(self, args: MORTMArgs, progress: LearningProgress, load_directory=None):
+        self.model = BERTM(progress=progress, args=args).to(progress.get_device())
+        if load_directory is not None:
+            self.model.load_state_dict(torch.load(load_directory))
+
+        adam = torch.optim.Adam(self.model.parameters(), lr=1e-1, betas=(0.9, 0.98))
+
+        super().__init__(criterion=nn.CrossEntropyLoss().to(progress.get_device()),
+                         optimizer=adam,
+                         scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
+
+
+    def epoch_fc(self, model, pack, progress):
+        src, tgt = pack
+        target: Tensor = tgt.to(progress.get_device())
+        src = src.to(progress.get_device())
+        src_pad = _get_padding_mask(src, progress)
+
+        out = model(src, input_padding_mask=src_pad)
+        inputs = out.view(-1, out.size(-1)).to(progress.get_device())
+        return inputs.to(dtype=torch.float32), target
+
+
+class V_MORTMTrainSet(AbstractTrainSet):
+    def __init__(self, args: V_MORTMArgs, progress: LearningProgress, load_directory=None, split_time=10,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        n_mels: int = 80,
+                 ):
+        self.split_time = split_time
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+
+        self.model = V_MORTM(progress=progress, args=args).to(progress.get_device())
+        if load_directory is not None:
+            self.model.load_state_dict(torch.load(load_directory))
+
+        adam = torch.optim.Adam(self.model.parameters(), lr=1e-1, betas=(0.9, 0.98))
+
+        super().__init__(criterion=nn.MSELoss().to(progress.get_device()),
+                         optimizer=adam,
+                         scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
+
+    def pre_processing(self, pack, progress):
+        wav_set = pack
+        comp = []
+        for ws in wav_set:
+            wav_np, sr = sf.read(ws, always_2d=True)
+            wav_np = wav_np.T.astype("float32")       # shape: (ch, time)
+            waveform = torch.from_numpy(wav_np)
+
+            # 3) モノラル化
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)  # → [1, time]
+
+            # 4) 分割長サンプル数の決定（必ず split_time 秒ごと）
+            if self.split_time:
+                seg_len = int(self.split_time * sr)
+                total = waveform.shape[1]
+                num_segments = (total + seg_len - 1) // seg_len  # ceil
+            else:
+                seg_len = waveform.shape[1]
+                num_segments = 1
+
+            # 5) メル変換器を一度だけ生成
+            mel_tf = torchaudio.transforms.MelSpectrogram(
+                sample_rate=sr,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                n_mels=self.n_mels,
+            )
+
+            # 6) 各セグメントを切り出し、最後は無音でパディング
+            for i in range(num_segments):
+                start = i * seg_len
+                end = start + seg_len
+                if end <= waveform.shape[1]:
+                    seg = waveform[:, start:end]
+                else:
+                    # 残り部分 + 無音パディング
+                    rest = waveform[:, start:]
+                    pad_len = end - waveform.shape[1]
+                    pad = torch.zeros((waveform.shape[0], pad_len), dtype=waveform.dtype)
+                    seg = torch.cat([rest, pad], dim=1)
+
+                # mel: [1, n_mels, T]
+                mel = mel_tf(seg)
+                # squeeze → [n_mels, T]
+                mel = mel.squeeze(0)
+                # log1p
+                logmel = torch.log1p(mel)
+                comp.append(logmel)
+
+        # 7) バッチ化
+        datasets = TensorDataset(progress)
+        datasets.add_data(comp)
+        return datasets
+
+
+    def epoch_fc(self, model, pack, progress):
+        src: Tensor = pack
+
+        src = rearrange(src, 'b d s -> b s d')
+
+        target: Tensor = src[:, 1:, :]
+        src = src[:, :-1, :]
+
+        input: Tensor = model(src=src)
+        input = rearrange(input, 'b s d -> b d s')
+        target = rearrange(target, 'b s d -> b d s')
+        return input.to(dtype=torch.float32), target
 
 
 def _send_prediction_end_time(message, loader_len, begin_time, end_time,
@@ -47,31 +225,38 @@ def _send_prediction_end_time(message, loader_len, begin_time, end_time,
                          )
 
 
-def find_npz_files(root_folder):
+def _get_padding_mask(input_ids, progress: LearningProgress):
+    # input_ids が Tensor であることを仮定
+    pad_id = (input_ids != 0).to(torch.float)
+    padding_mask = pad_id.to(progress.get_device())
+    return padding_mask
+
+
+def find_files(root_folder, extension: str):
     midi_files = []
     direc = []
     for defpath, surnames, filenames in os.walk(root_folder):
         for file in filenames:
-            if file.lower().endswith('.npz'):
+            if file.lower().endswith(extension):
                 midi_files.append(file)
                 direc.append(defpath)
     return direc, midi_files
 
 
 # デバイスを取得
-def _set_train_data(directory, datasets, positional_length, progress: LearningProgress):
+def _set_train_data(directory, datasets, mortm_datasets, *args):
     print("Starting load....")
-    mortm_datasets = MORTM_SEQDataset(progress, positional_length)
     loss_count = 0
     count = 0
     dataset_length = 0
-    loss_data = 4
+    loss_data = 0
+    print(len(datasets))
     for i in range(len(datasets)):
         count += 1
-
         np_load_data = np.load(f"{directory[i]}/{datasets[i]}", allow_pickle=True)
+
         if len(np_load_data) > loss_data:
-            dataset_length += mortm_datasets.add_data(np_load_data)
+            dataset_length += mortm_datasets.add_data(np_load_data, *args)
             print(f"\r {count}/{len(datasets)} | Dataset Length:{dataset_length} | Load[{directory[i]}/{datasets[i]}]", end="")
         else:
             loss_count += 1
@@ -81,12 +266,12 @@ def _set_train_data(directory, datasets, positional_length, progress: LearningPr
 
     return mortm_datasets
 
-
-def _get_padding_mask(input_ids, progress: LearningProgress):
-    # input_ids が Tensor であることを仮定
-    pad_id = (input_ids != 0).to(torch.float)
-    padding_mask = pad_id.to(progress.get_device())
-    return padding_mask
+def _set_train_data_audio(directory, datasets, mortm_datasets, *args):
+    print("Starting load....")
+    datasets_length = 0
+    mortm_datasets.add_data(directory, datasets)
+    print("load Successful!!")
+    return mortm_datasets
 
 
 def collate_fn(batch):
@@ -112,60 +297,83 @@ def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
     bar = f" {color_bar}{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
     print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
 
-def get_verification_loss(model: MORTM, val_loader: DataLoader, criterion: nn.CrossEntropyLoss, progress: LearningProgress):
+
+def progress_bar_with_minibatch(epoch, sum_epoch, seq_count, all_pac, mini_seq_count, mini_seq_pac, loss, lr, verif_loss):
+    big_per = seq_count / all_pac * 100
+    block = int(big_per / 100 * 50)
+    color_bar = "\033[32m"
+    big_bar = f" {color_bar}{'#' * block}\033[31m{'-' * (50 - block)}\033[0m"
+
+    mini_per = mini_seq_count / mini_seq_pac * 100
+    mini_block = int(mini_per / 100 * 20)
+    mini_bar = f"{color_bar}{'#' * mini_block}\033[31m{'-' * (20 - mini_block)} \033[0m"
+
+    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} Package [{big_bar}] {big_per:.2f}%  Mini Package [{mini_bar}]  {mini_per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
+
+
+def get_data_loader(t_args: TrainArgs, mortm_dataset, shuffle=True, collate_fn=None):
+    train_size = int(t_args.train_dataset_split * len(mortm_dataset))
+    val_size = len(mortm_dataset) - train_size
+    train_dataset, val_dataset = random_split(mortm_dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=t_args.batch_size, shuffle=shuffle,
+                              num_workers=0, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=t_args.batch_size, shuffle=shuffle,
+                            num_workers=0, collate_fn=collate_fn)
+    return train_loader, val_loader
+
+
+
+def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: nn.Module, progress: LearningProgress,
+                          epoch_fc: Callable[[Any, tuple | Tensor, LearningProgress], tuple]):
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
-        for src in val_loader:
-            correct: Tensor = src[:, 1:]
-            src = src[:, :-1]
+        for pack in val_loader:
 
-            padding_mask_in: Tensor = _get_padding_mask(src, progress)
-
-            outputs: Tensor = model(src=src, input_padding_mask=padding_mask_in, src_is_causal=True)
-
-            outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
-            correct = correct.reshape(-1).long()
-
-            loss = criterion(outputs, correct)  # 損失を計算
+            r_pack = epoch_fc(model, pack, progress)
+            loss = criterion(*r_pack)  # 損失を計算
             val_loss += loss.item()
     model.train()
     return val_loss / len(val_loader)
 
-
-def _train_self_tuning(args: MORTMArgs, save_directory, mortm_dataset, message: Messenger, num_epochs: int, progress: LearningProgress,
-                       writer, load_model_directory:str = None, train_dataset_split:float = 0.9, is_save_training_progress=False,
-                       batch_size=16, accumulation_steps=4, num_workers=0, warmup_steps=4000, lr_param: Optional[float]=None):
-
-    train_size = int(train_dataset_split * len(mortm_dataset))
-    val_size = len(mortm_dataset) - train_size
-    train_dataset, val_dataset = random_split(mortm_dataset, [train_size, val_size])
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                        num_workers=num_workers, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True,
-                            num_workers=num_workers, collate_fn=collate_fn)
-
-    print("Creating Model....")
-    model = MORTM(progress=progress, args=args).to(progress.get_device())
-    if load_model_directory is not None:
-        model.load_state_dict(torch.load(load_model_directory))
-
-    #criterion = ReinforceCrossEntropy(tokenizer=tokenizer, ignore_index=0, k=1, warmup=10, weight=weight.to(progress.get_device()))
-    criterion = nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device())
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-1 if lr_param is None else lr_param, betas=(0.9, 0.98))  # オプティマイザを定義
-    if lr_param is None:
-        scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=warmup_steps))
-    else:
-        scheduler = None
+def get_dataloading_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: nn.Module, progress: LearningProgress,
+                                      trainer, train_args: TrainArgs,
+                                      epoch_fc: Callable[[Any, tuple | Tensor, LearningProgress], tuple]):
+    model.eval()
+    val_loss = 0.0
+    all_count = 0
+    with torch.no_grad():
+        for pack in val_loader:
+            pre_processing: Dataset = trainer.pre_processing(pack, progress)
+            loader = DataLoader(pre_processing, batch_size=train_args.batch_size, shuffle=True)
+            for pack2 in loader:
+                begin_time = time.time()
+                r_pack = trainer.epoch_fc(model, pack2, progress)
+                loss = criterion(*r_pack)  # 損失を計算
+                val_loss += loss.item()
+                all_count += 1
+    model.train()
+    return val_loss / all_count
 
 
+def _train_self_tuning(args, train_args: TrainArgs, save_directory, trainer:AbstractTrainSet,
+                       train_loader: DataLoader, val_loader: DataLoader,
+                       message: Messenger, progress: LearningProgress,
+                       writer,):
+
+
+    print("Creating Trainer...")
+    model = trainer.model
+    criterion = trainer.criterion
+    optimizer = trainer.optimizer
+    scheduler = trainer.scheduler
     print("Start training...")
 
     loss_val = None
     mail_bool = True
     all_count = 1
-    for epoch in range(num_epochs):
+    for epoch in range(train_args.num_epochs):
         #criterion.step()
         try:
             print(f"epoch {epoch + 1} start....")
@@ -176,29 +384,21 @@ def _train_self_tuning(args: MORTMArgs, save_directory, mortm_dataset, message: 
             model.train()
             optimizer.zero_grad()
 
-            for src in train_loader:  # seqにはbatch_size分の楽曲が入っている
-                #print(f"learning sequence {count}")
-                correct: Tensor = src[:, 1:]
-                correct = correct.reshape(-1).long()
-                src = src[:, :-1]
+            for pack in train_loader:  # seqにはbatch_size分の楽曲が入っている
                 begin_time = time.time()
 
-                padding_mask_in: Tensor = _get_padding_mask(src, progress)
+                r_pack = trainer.epoch_fc(model, pack, progress)
 
-                outputs: Tensor = model(src=src, input_padding_mask=padding_mask_in, src_is_causal=True)
-
-                outputs = outputs.view(-1, outputs.size(-1)).to(progress.get_device())
-
-                loss = criterion(outputs.to(dtype=torch.float32), correct)  # 損失を計算
+                loss = criterion(*r_pack)  # 損失を計算
                 epoch_loss.add(loss.item())
 
-                loss = loss / accumulation_steps
+                loss = loss / train_args.accumulation_steps
                 loss.backward()  # 逆伝播
 
 
-                if count % accumulation_steps == 0:  #実質バッチサイズは64である
-                    progress.step_optimizer(optimizer, model, accumulation_steps)
-                    if lr_param is None:
+                if count % train_args.accumulation_steps == 0:  #実質バッチサイズは64である
+                    progress.step_optimizer(optimizer, model, train_args.accumulation_steps)
+                    if train_args.lr_param is None:
                         scheduler.step()
                     torch.cuda.empty_cache()
 
@@ -206,28 +406,28 @@ def _train_self_tuning(args: MORTMArgs, save_directory, mortm_dataset, message: 
                 end_time = time.time()
 
                 if mail_bool and message is not None:
-                    _send_prediction_end_time(message, len(train_loader), begin_time, end_time, args.vocab_size, num_epochs,
+                    _send_prediction_end_time(message, len(train_loader), begin_time, end_time, args.vocab_size, train_args.num_epochs,
                                               args.e_layer, args.num_heads, args.d_model, args.dim_feedforward, args.dropout,
                                               args.position_length)
                     mail_bool = False
 
                 if (count + 1) % message.step_by_message_count == 0:
-                    message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{num_epochs}の"
+                    message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{train_args.num_epochs}の"
                                                                        f"learning sequence {count}結果は、\n {epoch_loss.get():.4f}でした。\n"
                                                                        f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
                                                                        #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-                progress_bar(epoch, num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr() if lr_param is None else lr_param, verification_loss)
+                progress_bar(epoch, train_args.num_epochs, count, len(train_loader), epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss)
 
-                if (count + 1) % int(100000 / batch_size) == 0:
+                if (count + 1) % int(100000 / train_args.batch_size) == 0:
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
                     print("途中経過を保存しました。")
 
-                if (count + 1) % int(10000 / batch_size) == 0:
+                if (count + 1) % int(10000 / train_args.batch_size) == 0:
                     print("検証損失を求めています")
                     torch.cuda.empty_cache()
-                    verification_loss = get_verification_loss(model, val_loader, criterion, progress)
+                    verification_loss = get_verification_loss(model, val_loader, criterion, progress, epoch_fc=trainer.epoch_fc)
                     writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss.get(),
                                                                   "Verification": verification_loss}, all_count)
                     update_log(model, writer, all_count)
@@ -235,17 +435,17 @@ def _train_self_tuning(args: MORTMArgs, save_directory, mortm_dataset, message: 
                 all_count += 1
 
             message.send_message("機械学習の途中経過について",
-                                     f"Epoch {epoch + 1}/{num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
+                                     f"Epoch {epoch + 1}/{train_args.num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
                                      f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
                                      #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
             loss_val = verification_loss
             writer.add_scalar('EpochLoss', epoch_loss.get(), epoch)  # 損失値を記録
 
-            if is_save_training_progress:
-                torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}.pth") #エポック終了時に途中経過を保存
+            if train_args.is_save_training_progress:
+                torch.save(model.state_dict(), f"{save_directory}/{args.name}.train.{epoch}.{verification_loss:.4f}.pth") #エポック終了時に途中経過を保存
                 print("途中経過を保存しました。")
         except torch.cuda.OutOfMemoryError or RuntimeError:
-            torch.save(model.state_dict(), f"{save_directory}/MORTM.error_end.{epoch}.pth")
+            torch.save(model.state_dict(), f"{save_directory}/{args.name}.error_end.{epoch}.pth")
             message.send_message("オーバーフローしました・。", f"{epoch}エポック中にオーバーフローが発生しました。\n"
                                                               f"次のエポックに移行します。\n")
                                                               #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
@@ -253,47 +453,188 @@ def _train_self_tuning(args: MORTMArgs, save_directory, mortm_dataset, message: 
 
     return model, loss_val
 
+def _train_dataloading_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTrainSet,
+                              train_loader: DataLoader, val_loader: DataLoader,
+                              message: Messenger, progress: LearningProgress,
+                              writer,):
+    print("Creating Trainer...")
+    model = trainer.model
+    criterion = trainer.criterion
+    optimizer = trainer.optimizer
+    scheduler = trainer.scheduler
+    print("Start training...")
+
+    mail_bool = True
+    all_count = 1
+    verification_loss = 0.0
+    for epoch in range(train_args.num_epochs):
+        #criterion.step()
+        try:
+            print(f"epoch {epoch + 1} start....")
+            count = 1
+            epoch_loss = EpochObserver(1000)
+            verification_loss = 0.0
+
+            model.train()
+            optimizer.zero_grad()
+
+            for pack in train_loader:
+                pre_processing: Dataset = trainer.pre_processing(pack, progress)
+                loader = DataLoader(pre_processing, batch_size=train_args.batch_size, shuffle=True)
+                mini_c = 0
+                for pack2 in loader:
+                    begin_time = time.time()
+                    r_pack = trainer.epoch_fc(model, pack2, progress)
+                    loss = criterion(*r_pack)  # 損失を計算
+                    epoch_loss.add(loss.item())
+
+                    loss = loss / train_args.accumulation_steps
+                    loss.backward()  # 逆伝播
+
+                    if count % train_args.accumulation_steps == 0:  #実質バッチサイズは64である
+                        progress.step_optimizer(optimizer, model, train_args.accumulation_steps)
+
+                    if train_args.lr_param is None:
+                        scheduler.step()
+                    torch.cuda.empty_cache()
+                    mini_c += 1
+                    end_time = time.time()
+
+                    if mail_bool and message is not None:
+                        _send_prediction_end_time(message, len(train_loader), begin_time, end_time, args.vocab_size, train_args.num_epochs,
+                                                  args.e_layer, args.num_heads, args.d_model, args.dim_feedforward, args.dropout,
+                                                  args.position_length)
+                        mail_bool = False
+
+                    if (count + 1) % message.step_by_message_count == 0:
+                        message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{train_args.num_epochs}の"
+                                                                           f"learning sequence {count}結果は、\n {epoch_loss.get():.4f}でした。\n"
+                                                                           f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
+                        #f"損失関数スケジューラーは{criterion.cs}です。")
+                    writer.flush()
+
+                    progress_bar_with_minibatch(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss)
+
+                count += 1
+
+                if (count + 1) % int(100000 / train_args.batch_size) == 0:
+                    torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
+                    print("途中経過を保存しました。")
+
+                if (count + 1) % int(1000 / train_args.batch_size) == 0:
+                    print("検証損失を求めています")
+                    torch.cuda.empty_cache()
+                    verification_loss = get_dataloading_verification_loss(model, val_loader, criterion, progress,trainer, train_args, epoch_fc=trainer.epoch_fc)
+                    writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss.get(),
+                                                                   "Verification": verification_loss}, all_count)
+                    update_log(model, writer, all_count)
+
+                all_count += 1
 
 
-def train_mortm(json_directory: str, root_directory, save_directory, version: str, num_epochs: int,
-                message: Messenger = _DefaultMessenger(), load_model_directory: str=None, train_dataset_split = 0.9,
-                is_save_training_progress=False, lr_param=None,
-                num_workers=0, warmup_steps=4000, accumulation_steps=32, batch_size=1, progress: LearningProgress = _DefaultLearningProgress(), ):
+        except  torch.cuda.OutOfMemoryError:
+            message.send_message("エラーが発生し、処理を中断しました",
+                                 "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
+        print("オーバーフローしました。")
+    return model, verification_loss
 
-    args = MORTMArgs(json_directory=json_directory)
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-    today_date = datetime.date.today().strftime('%Y%m%d')
 
-    print(f"ToDay is{datetime.date.today()}! start generating MORTEM_Model.{version}_{today_date}")
 
-    directory, filename = find_npz_files(root_directory)
-    train_data = _set_train_data(directory, filename, args.position_length, progress)
 
+def _train(args, t_args, save_directory, trainer, version, today_date,
+           message, train_loader, val_loader,
+           progress, turing_fc=_train_self_tuning):
     try:
         writer = SummaryWriter(save_directory + f"/runs/{version}_{today_date}/")
 
-        model, loss = _train_self_tuning(args, save_directory, train_data, message, num_epochs,
+        model, loss = turing_fc(args, t_args, save_directory, trainer,
+                                         message=message,
+                                         train_loader=train_loader, val_loader=val_loader,
                                          progress=progress,
                                          writer=writer,
-                                         load_model_directory=load_model_directory,
-                                         accumulation_steps=accumulation_steps,
-                                         batch_size=batch_size,
-                                         num_workers=num_workers,
-                                         warmup_steps=warmup_steps,
-                                         is_save_training_progress=is_save_training_progress,
-                                         lr_param=lr_param,
-                                         train_dataset_split= train_dataset_split
+
                                          )  # 20エポック分機械学習を行う。
 
         message.send_message("機械学習終了のお知らせ",
-                                 f"MORTM.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
+                             f"{args.name}.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
 
-        torch.save(model.state_dict(), f"{save_directory}/MORTM.{version}_{loss}.pth")  # できたモデルをセーブする
+        torch.save(model.state_dict(), f"{save_directory}/{args.name}.{version}_{loss}.pth")  # できたモデルをセーブする
 
         return model
 
     except torch.cuda.OutOfMemoryError:
         message.send_message("エラーが発生し、処理を中断しました",
-                                 "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
+                             "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
         print("オーバーフローしました。")
-    pass
+
+
+def train_mortm(model_config: str, train_config: str, root_directory, save_directory, version: str,
+                message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
+                progress: LearningProgress = _DefaultLearningProgress(), ):
+    args = MORTMArgs(json_directory=model_config)
+    t_args = TrainArgs(json_directory=train_config)
+    trainer = MORTMTrainSet(args, progress, load_directory=load_model_directory)
+
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    today_date = datetime.date.today().strftime('%Y%m%d')
+
+    print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
+
+    directory, filename = find_files(root_directory, '.npz')
+    mortm_dataset = _set_train_data(directory, filename, MORTM_SEQDataset(progress, args.position_length))
+    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True, collate_fn=collate_fn)
+
+    _train(args, t_args, save_directory, trainer,message=message, version=version, today_date=today_date,
+           train_loader=train_loader, val_loader=val_loader,
+           progress=progress)
+
+def train_bertm(model_config: str, train_config: str, human_dir, ai_dir, save_directory, version: str,
+                message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
+                progress: LearningProgress = _DefaultLearningProgress()):
+    def collate_fn(batch):
+
+        src_list = [item[0] for item in batch]  # 各タプルのsrcを抽出
+        tgt_list = [item[1] for item in batch]  # 各タプルのtgtを抽出
+
+        tgt_list = torch.tensor(tgt_list)
+        src = pad_sequence(src_list, batch_first=True, padding_value=0)
+        return src, tgt_list
+
+    args = MORTMArgs(json_directory=model_config)
+    t_args = TrainArgs(json_directory=train_config)
+    trainer = BERTMTrainSet(args, progress, load_directory=load_model_directory)
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    today_date = datetime.date.today().strftime('%Y%m%d')
+
+    print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
+
+    directory, filename = find_files(human_dir, '.npz')
+    mortm_dataset = _set_train_data(directory, filename, ClassDataSets(progress, args.position_length), 0)
+
+    directory, filename = find_files(ai_dir, '.npz')
+    mortm_dataset = _set_train_data(directory, filename, mortm_dataset, 1)
+    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True, collate_fn=collate_fn)
+
+    _train(args, t_args, save_directory, trainer,message=message, version=version, today_date=today_date,
+           train_loader=train_loader, val_loader=val_loader,
+           progress=progress)
+
+
+def train_v_mortm(model_config: str, train_config: str, root_directory, save_directory, version: str,
+                  message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
+                  progress: LearningProgress = _DefaultLearningProgress()):
+
+    args = V_MORTMArgs(json_directory=model_config)
+    t_args = TrainArgs(json_directory=train_config)
+    trainer = V_MORTMTrainSet(args, progress, load_directory=load_model_directory)
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    today_date = datetime.date.today().strftime('%Y%m%d')
+    print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
+
+    directory, filename = find_files(root_directory, '.wav')
+    mortm_dataset = _set_train_data_audio(directory, filename, PreLoadingDatasets(progress))
+    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
+
+    _train(args, t_args, save_directory, trainer,message=message, version=version, today_date=today_date,
+           train_loader=train_loader, val_loader=val_loader,
+           progress=progress, turing_fc=_train_dataloading_turing)

@@ -2,6 +2,7 @@
 Tokenizerで変換したシーケンスを全て保管します。
 '''
 import random
+from typing import List, Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -18,7 +19,7 @@ class MORTM_SEQDataset(Dataset):
     def __len__(self):
         return len(self.seq)
 
-    def add_data(self, music_seq: np.ndarray):
+    def add_data(self, music_seq: np.ndarray, *args):
         suc_count = 0
         for i in range(len(music_seq) - 1):
             seq = music_seq[f'array{i + 1}'].tolist()
@@ -64,3 +65,34 @@ class ClassDataSets(Dataset):
 
         return suc_count
 
+
+class PreLoadingDatasets(Dataset):
+    def __init__(self, progress: LearningProgress):
+        self.progress = progress
+        self.src_list: List[str] = list()
+
+    def __len__(self):
+        return len(self.src_list)
+
+    def __getitem__(self, item: int) :
+        return self.src_list[item]
+
+
+    def add_data(self, directory: List[str], filename: List[str]):
+        for i in range(len(directory)):
+            self.src_list.append(directory[i] + filename[i])
+
+
+class TensorDataset(Dataset):
+    def __init__(self, progress: LearningProgress):
+        self.seq: list = list()
+        self.progress = progress
+
+    def __len__(self):
+        return len(self.seq)
+
+    def __getitem__(self, item):
+        return self.seq[item].to(self.progress.get_device())
+
+    def add_data(self, patch_list: list, *args):
+        self.seq = patch_list

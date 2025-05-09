@@ -7,12 +7,13 @@ from typing import List, Optional
 from einops import rearrange
 from torch.nn.modules.transformer import _get_clones
 
+
 class Vision(nn.Module):
-    def __init__(self, d_spect, patch_size, dropout):
-        super().__init__()
+    def __init__(self, d_spect, patch_size, dropout:float):
+        super(Vision, self).__init__()
         self.d_spect = d_spect
         self.patch_size = patch_size
-        self.dropout = nn.Dropout(dropout)
+        self.dt = nn.Dropout(dropout)
         self.linear = nn.Linear(d_spect * patch_size, d_spect * patch_size)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -21,12 +22,12 @@ class Vision(nn.Module):
         x = rearrange(x, 'b (s p) d -> b s p d', s=S // self.patch_size, p=self.patch_size)
         x = rearrange(x, 'b s p d -> b s (p d)')
         x = self.linear(x)
-        x = self.dropout(x)
+        x = self.dt(x)
         return x
 
 class UnVision(nn.Module):
     def __init__(self, d_spect, patch_size, dropout):
-        super().__init__()
+        super(UnVision, self).__init__()
         self.d_spect = d_spect
         self.patch_size = patch_size
         self.linear = nn.Linear(d_spect * patch_size, d_spect * patch_size)

@@ -1,4 +1,7 @@
 import numpy as np
+import torch
+from torch import Tensor
+from mortm.models.modules.progress import LearningProgress
 
 
 class EpochObserver:
@@ -14,3 +17,4 @@ class EpochObserver:
 
     def get(self):
         return self.loss.sum() / len(self.loss)
+
