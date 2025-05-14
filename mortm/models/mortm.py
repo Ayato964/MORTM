@@ -19,18 +19,13 @@ class MORTM(nn.Module):
         self.d_model = args.d_model
         self.dim_feedforward = args.dim_feedforward
         self.dropout = args.dropout
+
         self.decoder = MORTMDecoder(args,
                                batch_first=True, bias=True,
                                layer_norm_eps=1e-5, progress=progress)
 
-        self.encoder = MORTMEncoder(args,
-                                    layer_norm_eps=1e-5,
-                                    progress=progress)
-
-        print("Use RPR Transformer")
         print(f"Input Vocab Size:{args.vocab_size}")
         self.Wout: nn.Linear = nn.Linear(self.d_model, args.vocab_size).to(self.progress.get_device())
-
         self.embedding: nn.Embedding = nn.Embedding(args.vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 

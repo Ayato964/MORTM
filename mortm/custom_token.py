@@ -1,5 +1,44 @@
 from pretty_midi import Note, Instrument
 from abc import abstractmethod
+from .train.utils.chord_midi import ChordMidi
+
+roots = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+bases = ['/C', '/C#', '/D', '/D#', '/E', '/F', '/F#', '/G', '/G#', '/A', '/A#', '/B', "None"]
+qualities = [
+    'None', 'm', '7', 'maj7', 'm7', 'dim', 'aug',
+    'sus2', 'sus4', '6', 'm6', '9', 'maj9', 'm9', '11', '13', 'add9'
+]
+
+def parse_chord(chord: str):
+    """
+    コード文字列を root, quality, base に分解する。
+    例: "Em/G" -> ("E", "m", "/G")
+    """
+    # 1) ベース音の抽出（"/" 以下を base とする）
+    if '/' in chord:
+        core, bass_note = chord.split('/', 1)
+        base = '/' + bass_note
+    else:
+        core = chord
+        base = 'None'  # ベースなしの場合は空文字
+
+    # 2) ルートの抽出（シャープ付きを優先）
+    #    roots を長さ順にソートして先にマッチさせる
+    sorted_roots = sorted(roots, key=lambda x: -len(x))
+    for r in sorted_roots:
+        if core.startswith(r):
+            root = r
+            quality = core[len(r):] or 'None'
+            break
+    else:
+        raise ValueError(f"Unknown root in chord '{chord}'")
+
+    # 3) クオリティがリスト外なら 'None' にフォールバック
+    if quality not in qualities:
+        quality = 'None'
+
+    return root, quality, base
+
 
 def ct_time_to_beat(time: float, tempo: int) -> int:
     '''
@@ -72,7 +111,7 @@ class Token:
         self.end = 0
 
     @abstractmethod
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+    def get_token(self, *args, **kwargs) -> int | str | None:
         pass
 
     @abstractmethod
@@ -93,8 +132,7 @@ class Token:
         pass
 
     @abstractmethod
-    def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
-                 tempo=120, container: ShiftTimeContainer = None, *args, **kwargs):
+    def __call__(self,  *args, **kwargs):
         pass
 
 
@@ -153,6 +191,26 @@ class MusicToken(Token):
     def is_my_token(self, seq):
         pass
 
+
+class ChordToken(Token):
+
+    def __call__(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer, token=None, *args, **kwargs):
+        if self.convert_type == 0:
+            token_c = self.get_token(note=note, chords=chords, container=container)
+            if token_c is not None:
+                return f"{self.token_type}_{token_c}"
+            else:
+                return None
+        else:
+            t_s = token.split("_")
+            return t_s[1]
+
+    def __init__(self, token_type: str, convert_type: int):
+        super().__init__(token_type, convert_type)
+
+    @abstractmethod
+    def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> int | str | None:
+        pass
 
 class MeasureToken(SpecialToken):
     def __init__(self, convert_type: int):
@@ -241,7 +299,34 @@ class CLS(SpecialToken):
         super().__init__("<CLS>", convert_type)
 
 
+class QueryMelody(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<QUERY_M>", convert_type)
 
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+class QueryMelodyEnd(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("</QUERY_M>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+
+class QueryChord(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<QUERY_C>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+class QueryChordEnd(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("</QUERY_C>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
 
 class StartRE(MusicToken):
 
@@ -327,3 +412,62 @@ class Pitch(MusicToken):
         p: int = note.pitch
         return p
 
+
+#--- ChordRoot トークン ------------------------------------------------
+class ChordRoot(ChordToken):
+    def __init__(self, convert_type: int):
+        super().__init__('CR', convert_type)
+
+    def _set_tokens(self, tokens: dict):
+        base = len(tokens)
+        for i, r in enumerate(roots):
+            tokens[f'CR_{r}'] = base + i
+
+    def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> str:
+        # NOTE: note.chord_root 属性を事前にセットしておく前提
+        c = chords.get_chord(note.start)
+        if c is not None:
+            root, _, _ = parse_chord(c.chord)
+            return root
+        else:
+            return None
+
+
+#--- ChordQuality トークン ----------------------------------------------
+class ChordQuality(ChordToken):
+    def __init__(self, convert_type: int):
+        super().__init__('CQ', convert_type)
+
+    def _set_tokens(self, tokens: dict):
+        base = len(tokens)
+        for i, q in enumerate(qualities):
+            tokens[f'CQ_{q}'] = base + i
+
+    def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> str:
+        # NOTE: note.chord_root 属性を事前にセットしておく前提
+        c = chords.get_chord(note.start)
+        if c is not None:
+            _, qualities, _ = parse_chord(c.chord)
+            return qualities
+        else:
+            return None
+
+
+#--- ChordBass トークン ------------------------------------------------
+class ChordBass(ChordToken):
+    def __init__(self, convert_type: int):
+        super().__init__('CB', convert_type)
+
+    def _set_tokens(self, tokens: dict):
+        base = len(tokens)
+        for i, r in enumerate(bases, start=1):
+            tokens[f'CB_{r}'] = base + i
+
+    def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> str:
+        # NOTE: note.chord_root 属性を事前にセットしておく前提
+        c = chords.get_chord(note.start, is_final_search=True)
+        if c is not None:
+            _, _, base = parse_chord(c.chord)
+            return base
+        else:
+            return None

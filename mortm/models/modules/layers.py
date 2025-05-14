@@ -61,7 +61,7 @@ class MORTMEncoderLayer(nn.Module):
 
 
         self.self_attn =FlashSelfAttentionM(args.d_model, args.num_heads, args.dropout, progress=progress)
-        if args.use_moe_encoder:
+        if args.use_moe_encoder == True:
             self.ffn = MoE(args.d_model, args.dim_feedforward, args.num_experts, args.topk_experts, args.num_groups, args.topk_groups)
         else:
             self.ffn = self.mlp

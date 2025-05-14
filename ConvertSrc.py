@@ -1,8 +1,11 @@
+import json
 import os
+from typing import List
+
 import numpy as np
 from multiprocessing import Process, Manager
 from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.convert import MIDI2Seq, PackSeq, MidiExpantion
+from mortm.convert import MIDI2Seq, PackSeq, MidiExpantion, Midi2SeqWithChord
 
 def find_midi_files(root_folder):
     midi_files = []
@@ -15,9 +18,36 @@ def find_midi_files(root_folder):
     return direc, midi_files
 
 
+def find_midi_files_with_json(root_folder):
+    midi_files = []
+    direct = []
+    with open(f'{root_folder}/json/train.json', 'r') as f:
+        data = [json.loads(line) for line in f if line.strip()]
+        for i in range(len(data)):
+            location = data[i]["location"]
+            file_name = location.split("/")[-1]
+            d = "/".join(location.split("/")[:-1])
+
+            midi_files.append(file_name)
+            direct.append(f"{root_folder}/{d}")
+
+    return direct, midi_files, data
+
 
 
 def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
+    '''
+    MIDIデータを受け取り、シーケンス生成を行う。
+    :param pid:
+    :param tokenizer:
+    :param directory:
+    :param md_file:
+    :param program:
+    :param progress:
+    :param save_path:
+    :return:
+    '''
+
     local_count = 0
     for i in range(len(md_file)):
         con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
@@ -51,6 +81,17 @@ def expansion(pid, tokenizer, directory, md_file, program, progress, save_path):
 
 
 def convert_ex(pid, tokenizer, directory, md_file, program, progress, save_path):
+    '''
+    MIDIデータを受け取り、全てのキーに変換を行いながらシーケンス生成を行う。
+    :param pid:
+    :param tokenizer:
+    :param directory:
+    :param md_file:
+    :param program:
+    :param progress:
+    :param save_path:
+    :return:
+    '''
     local_count = 0
     for i in range(len(md_file)):
         con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
@@ -70,17 +111,54 @@ def convert_ex(pid, tokenizer, directory, md_file, program, progress, save_path)
         print(f"Process#{pid}: Running... {local_count}  {reason}")
     progress[pid] = local_count
 
+
+def convert_with_chord(pid, tokenizer, directory: List[str], md_file: List[str], system_file: List[dict], program, progress, save_path):
+    '''
+    MIDIデータと楽曲情報を含むJSONを受け取り、コード進行を考慮したシーケンス生成を行う。
+    :param pid:
+    :param tokenizer:
+    :param directory: 楽曲のディレクトリが格納されている。
+    :param md_file:　楽曲名が格納されている。
+    :param system_file: 楽曲情報が格納されている
+    :param program:
+    :param progress:
+    :param save_path:
+    :return:
+    '''
+    local_count = 0
+
+    for i in range(len(md_file)):
+
+        con = Midi2SeqWithChord(tokenizer, directory[i], md_file[i], all_chords=system_file[i]["all_chords"],
+                                all_chord_timestamps=system_file[i]["all_chords_timestamps"],  program_list=program)
+        con.convert()
+        is_saved, reason = con.save(save_path)
+        if is_saved:
+            local_count += 1
+            if local_count >= 10:
+                break
+
+        print(f"Process#{pid}: Running... {local_count}  {reason}")
+    progress[pid] = local_count
+
 if __name__ == "__main__":
     THREAD_VALUE = 10
     PIANO = [i + 1 for i in range(5)]
     SAX = [65, 66]
 
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    datasets = "./data/other"
-    directory, md_file = find_midi_files(datasets)
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    #datasets = "./data/other"
+    #directory, md_file = find_midi_files(datasets)
+
+    print("データ整理中・・・・")
+    directory, md_file, system_file = find_midi_files_with_json(datasets)
+
+    print("完了！！")
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
+    system_file = np.array_split(system_file, THREAD_VALUE)
 
     tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
 
@@ -88,8 +166,13 @@ if __name__ == "__main__":
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            p = Process(target=expansion, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), PIANO, progress, "out/midi/datasets_small"))
+            """
+            p = Process(target=convert_with_chord, args=(t, tokenizer, directory[t].tolist(),
+                                              md_file[t].tolist(), SAX, progress, "out/np/Sax/test"))
+            """
+            p = Process(target=convert_with_chord, args=(t, tokenizer, directory[t].tolist(),
+                                                         md_file[t].tolist(), system_file[t], SAX, progress, "out/np/Sax/test"))
+
             processes.append(p)
             p.start()
 

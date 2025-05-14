@@ -30,7 +30,7 @@ tokenizer.rev_mode()
 args = MORTMArgs("configs/models/mortm/A.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/MORTM.3.2t6-LARGE-SAX_1.11.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.3.2t6-LARGE-SAX-1.11.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -42,11 +42,11 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/Sample4.mid.npz")
+np_notes = np.load("out/Sample2.mid.npz")
 
-start = np_notes[f'array1'][:-190]
+start = np_notes[f'array1'][:90]
 
-gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=0.7)
+gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
 
 output = all
 for t in output:

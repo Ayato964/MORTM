@@ -1,9 +1,10 @@
 {
   "vocab_size": 521,
-  "d_model": 768,
-  "dim_feedforward": 3072,
+  "d_model": 256,
+  "dim_feedforward": 1024,
   "num_heads": 4,
-  "e_layer": 9,
+  "e_layer": 6,
   "dropout": 0.2,
-  "position_length": 400
+  "position_length": 400,
+  "use_moe_encoder": false
 }

@@ -507,14 +507,7 @@ class QKVLinear(nn.Module):
         super(QKVLinear, self).__init__()
         self.num_heads = num_heads
         self.drop_out = nn.Dropout(drop_out)
-        '''
-        self.W_dkv = nn.Linear(d_model, d_kv, dtype=torch.bfloat16)
-        self.W_dq = nn.Linear(d_model, d_q, dtype=torch.bfloat16)
 
-        self.W_uq = nn.Linear(d_q, d_model, dtype=torch.bfloat16)
-        self.W_uk = nn.Linear(d_kv, d_model, dtype=torch.bfloat16)
-        self.W_uv = nn.Linear(d_kv, d_model, dtype=torch.bfloat16)
-        '''
         self.qkv_weight = Parameter(torch.empty(3 * d_model, d_model, dtype=torch.bfloat16)).to(dtype=torch.bfloat16)
         self.qkv_bias = Parameter(torch.empty(3 * d_model, dtype=torch.bfloat16)).to(dtype=torch.bfloat16)
 

@@ -56,37 +56,62 @@ class MeanPoolingWithMask(nn.Module):
 
         return pooled_output
 
+class MaxPoolingWithMask(nn.Module):
+    def forward(self, last_hidden_state: Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        if attention_mask is None:
+            return torch.max(last_hidden_state, dim=1)[0] # [0]は値のみ取得
+        else:
+            # マスクされていない部分を非常に小さい値で埋めてからmaxを取る
+            # これにより、パディング部分は実質的に無視される
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size())
+            masked_hidden_state = last_hidden_state.masked_fill(~input_mask_expanded.bool(), -float('inf'))
+            pooled_output = torch.max(masked_hidden_state, dim=1)[0]
+            return pooled_output
+
 
 class BERTM(nn.Module):
 
     def __init__(self, args: MORTMArgs, progress):
         super(BERTM, self).__init__()
+        self.args = args # argsを保存しておくと便利
         self.encoder = MORTMEncoder(args=args,
-                                     layer_norm_eps=1e-5,
-                                     progress=progress)
+                                    layer_norm_eps=1e-5,
+                                    progress=progress)
         self.embedding = nn.Embedding(args.vocab_size, args.d_model)
 
         self.pooling = MeanPoolingWithMask()
+        self.max_pooling = MaxPoolingWithMask() # 上記のクラス定義が必要
 
-        self.norm = nn.LayerNorm(args.d_model, eps=1e-5)
-        self.linear = nn.Linear(args.d_model, args.d_model)
+        self.norm = nn.LayerNorm(args.d_model * 2, eps=1e-5)
+        # オプション2: 各プーリング結果に個別にLayerNormを適用し、その後結合する場合
+        self.norm_mean = nn.LayerNorm(args.d_model, eps=1e-5)
+        self.norm_max = nn.LayerNorm(args.d_model, eps=1e-5)
 
-        self.Wout = nn.Linear(args.d_model, 2)
+        self.linear = nn.Linear(args.d_model * 2, args.d_model)
+
+        self.Wout = nn.Linear(args.d_model, 1) # linear層の出力次元に合わせる
 
     def forward(self, src: Tensor, input_padding_mask=None):
-        """
-        src: 入力テンソル (バッチサイズ, シーケンス長, 特徴量次元)
-        input_padding_mask: パディングマスク (バッチサイズ, シーケンス長)
-        """
         src = self.embedding(src)
-        # Encoderのforwardメソッドを呼び出す
-        out = self.encoder(src=src, mask=None,
-                           src_key_padding_mask=input_padding_mask,
-                           is_causal=False)
-        out = self.pooling(out, input_padding_mask)
-        out = self.norm(out)
-        out = self.linear(out)
+        out_encoder = self.encoder(src=src, mask=None,
+                                   src_key_padding_mask=input_padding_mask,
+                                   is_causal=False)
+
+        pooled_mean = self.pooling(out_encoder, input_padding_mask)     # [B, D]
+        pooled_max = self.max_pooling(out_encoder, input_padding_mask) # [B, D]
+
+        # オプション2: 各プーリング結果にLayerNormを適用してから結合する場合の例
+        pooled_mean_norm = self.norm_mean(pooled_mean)
+        pooled_max_norm = self.norm_max(pooled_max)
+        combined_pool = torch.cat((pooled_mean_norm, pooled_max_norm), dim=1) # [B, 2*D]
+        out = combined_pool # この場合、上のself.norm(combined_pool)は不要
+
+        # ---- ここではオプション1 (結合後にnorm) を採用したと仮定 ----
+        #combined_pool = torch.cat((pooled_mean, pooled_max), dim=1)   # [B, 2*D]
+        #out = self.norm(combined_pool) # self.normの入力次元が args.d_model * 2 であること
+        #out = F.dropout(out, p=self.args.dropout, training=self.training)
+
+        out = self.linear(out) # self.linearの入力次元が args.d_model * 2 であること
         out = F.gelu(out)
         out = self.Wout(out)
-
         return out

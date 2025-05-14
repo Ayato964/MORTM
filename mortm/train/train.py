@@ -97,9 +97,9 @@ class BERTMTrainSet(AbstractTrainSet):
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
 
-        adam = torch.optim.Adam(self.model.parameters(), lr=1e-1, betas=(0.9, 0.98))
+        adam = torch.optim.Adam(self.model.parameters(), lr=5e-3, betas=(0.9, 0.98))
 
-        super().__init__(criterion=nn.CrossEntropyLoss().to(progress.get_device()),
+        super().__init__(criterion=nn.BCEWithLogitsLoss().to(progress.get_device()),
                          optimizer=adam,
                          scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
 
@@ -112,7 +112,7 @@ class BERTMTrainSet(AbstractTrainSet):
 
         out = model(src, input_padding_mask=src_pad)
         inputs = out.view(-1, out.size(-1)).to(progress.get_device())
-        return inputs.to(dtype=torch.float32), target
+        return inputs.squeeze(-1).to(dtype=torch.float32), target.to(dtype=torch.float32)
 
 
 class V_MORTMTrainSet(AbstractTrainSet):
@@ -385,6 +385,14 @@ def _train_self_tuning(args, train_args: TrainArgs, save_directory, trainer:Abst
             optimizer.zero_grad()
 
             for pack in train_loader:  # seqにはbatch_size分の楽曲が入っている
+
+                count += 1
+                if count % train_args.accumulation_steps == 0:  #実質バッチサイズは64である
+                    progress.step_optimizer(optimizer, model, train_args.accumulation_steps)
+                    if train_args.lr_param is None:
+                        scheduler.step()
+                    torch.cuda.empty_cache()
+
                 begin_time = time.time()
 
                 r_pack = trainer.epoch_fc(model, pack, progress)
@@ -395,14 +403,6 @@ def _train_self_tuning(args, train_args: TrainArgs, save_directory, trainer:Abst
                 loss = loss / train_args.accumulation_steps
                 loss.backward()  # 逆伝播
 
-
-                if count % train_args.accumulation_steps == 0:  #実質バッチサイズは64である
-                    progress.step_optimizer(optimizer, model, train_args.accumulation_steps)
-                    if train_args.lr_param is None:
-                        scheduler.step()
-                    torch.cuda.empty_cache()
-
-                count += 1
                 end_time = time.time()
 
                 if mail_bool and message is not None:
@@ -482,7 +482,16 @@ def _train_dataloading_turing(args, train_args: TrainArgs, save_directory, train
                 pre_processing: Dataset = trainer.pre_processing(pack, progress)
                 loader = DataLoader(pre_processing, batch_size=train_args.batch_size, shuffle=True)
                 mini_c = 0
+                count += 1
                 for pack2 in loader:
+                    mini_c += 1
+                    all_count += 1
+                    if mini_c % train_args.accumulation_steps == 0:  #実質バッチサイズは64である
+                        progress.step_optimizer(optimizer, model, train_args.accumulation_steps)
+                        if train_args.lr_param is None:
+                            scheduler.step()
+                        torch.cuda.empty_cache()
+
                     begin_time = time.time()
                     r_pack = trainer.epoch_fc(model, pack2, progress)
                     loss = criterion(*r_pack)  # 損失を計算
@@ -491,14 +500,8 @@ def _train_dataloading_turing(args, train_args: TrainArgs, save_directory, train
                     loss = loss / train_args.accumulation_steps
                     loss.backward()  # 逆伝播
 
-                    if count % train_args.accumulation_steps == 0:  #実質バッチサイズは64である
-                        progress.step_optimizer(optimizer, model, train_args.accumulation_steps)
-
-                    if train_args.lr_param is None:
-                        scheduler.step()
-                    torch.cuda.empty_cache()
-                    mini_c += 1
                     end_time = time.time()
+                    progress_bar_with_minibatch(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss)
 
                     if mail_bool and message is not None:
                         _send_prediction_end_time(message, len(train_loader), begin_time, end_time, args.vocab_size, train_args.num_epochs,
@@ -506,22 +509,19 @@ def _train_dataloading_turing(args, train_args: TrainArgs, save_directory, train
                                                   args.position_length)
                         mail_bool = False
 
-                    if (count + 1) % message.step_by_message_count == 0:
-                        message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{train_args.num_epochs}の"
-                                                                           f"learning sequence {count}結果は、\n {epoch_loss.get():.4f}でした。\n"
-                                                                           f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
-                        #f"損失関数スケジューラーは{criterion.cs}です。")
-                    writer.flush()
+                if (count + 1) % message.step_by_message_count == 0:
+                    message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{train_args.num_epochs}の"
+                                                                       f"learning sequence {count}結果は、\n {epoch_loss.get():.4f}でした。\n"
+                                                                       f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
+                    #f"損失関数スケジューラーは{criterion.cs}です。")
+                writer.flush()
 
-                    progress_bar_with_minibatch(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss)
 
-                count += 1
-
-                if (count + 1) % int(100000 / train_args.batch_size) == 0:
+                if (count + 1) % int(10000 / train_args.batch_size) == 0:
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
                     print("途中経過を保存しました。")
 
-                if (count + 1) % int(1000 / train_args.batch_size) == 0:
+                if (count + 1) % int(500 / train_args.batch_size) == 0:
                     print("検証損失を求めています")
                     torch.cuda.empty_cache()
                     verification_loss = get_dataloading_verification_loss(model, val_loader, criterion, progress,trainer, train_args, epoch_fc=trainer.epoch_fc)
@@ -529,7 +529,16 @@ def _train_dataloading_turing(args, train_args: TrainArgs, save_directory, train
                                                                    "Verification": verification_loss}, all_count)
                     update_log(model, writer, all_count)
 
-                all_count += 1
+            message.send_message("機械学習の途中経過について",
+                                 f"Epoch {epoch + 1}/{train_args.num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
+                                 f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
+                #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
+            loss_val = verification_loss
+            writer.add_scalar('EpochLoss', epoch_loss.get(), epoch)  # 損失値を記録
+
+            if train_args.is_save_training_progress:
+                torch.save(model.state_dict(), f"{save_directory}/{args.name}.train.{epoch}.{verification_loss:.4f}.pth") #エポック終了時に途中経過を保存
+                print("途中経過を保存しました。")
 
 
         except  torch.cuda.OutOfMemoryError:

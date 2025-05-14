@@ -2,7 +2,7 @@ from torch import Tensor
 from pretty_midi import Instrument, Note, PrettyMIDI
 
 from mortm.train.tokenizer import Tokenizer, DURATION_TYPE
-from .custom_token import ShiftTimeContainer
+from .custom_token import ShiftTimeContainer, ChordToken
 
 
 
@@ -23,11 +23,12 @@ def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, prog
             container.shift()
 
         for con in token_converter_list:
-            token_type = con(token=token, back_notes=back_note, note=note, container=container, tempo=tempo)
-            if token_type == DURATION_TYPE:
-                inst.notes.append(note)
-                back_note = note
-                note = Note(pitch=0, velocity=100, start=0, end=0)
+            if not isinstance(con, ChordToken):
+                token_type = con(token=token, back_notes=back_note, note=note, container=container, tempo=tempo)
+                if token_type == DURATION_TYPE:
+                    inst.notes.append(note)
+                    back_note = note
+                    note = Note(pitch=0, velocity=100, start=0, end=0)
     midi.instruments.append(inst)
     print(inst.notes)
     midi.write(save_directory)

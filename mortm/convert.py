@@ -10,8 +10,9 @@ from typing import TypeVar, Generic
 from midi2audio import FluidSynth
 import soundfile as sf
 
-from .custom_token import Token, ShiftTimeContainer
+from .custom_token import Token, ShiftTimeContainer, MusicToken, ChordToken
 from mortm.train.tokenizer import Tokenizer
+from .train.utils.chord_midi import ChordMidi
 
 T = TypeVar("T")
 
@@ -222,7 +223,103 @@ class MIDI2Seq(_AbstractMidiConverter):
             for conv in self.token_converter:
                 conv: Token = conv
 
-                token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo, container=shift_time_container)
+                if not isinstance(conv, ChordToken):
+                    token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo, container=shift_time_container)
+
+                    if token is not None:
+                        if conv.token_type == "<SME>":
+                            clip_count += 1
+                        if clip_count >= self.split_measure:
+                            clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
+                            aya_node_inst = self.marge_clip(clip, aya_node_inst)
+                            clip = np.array([], dtype=int)
+                            back_note = None
+                            clip_count = 0
+
+                        token_id = self.tokenizer.get(token)
+                        clip = np.append(clip, token_id)
+                        if conv.token_type == "<BLANK>":
+                            break
+                    if shift_time_container.is_error:
+                        self.is_error = True
+                        self.error_reason = "MIDIの変換中にエラーが発生しました。"
+                        break
+            back_note = note
+            if not shift_time_container.shift_measure:
+                note_count += 1
+
+        if len(clip) > 4:
+            aya_node_inst = self.marge_clip(clip, aya_node_inst)
+        return aya_node_inst
+
+    def marge_clip(self, clip, aya_node_inst):
+        aya_node_inst.append(clip)
+
+        return aya_node_inst
+
+    def save(self, save_directory: str) -> [bool, str]:
+        if not self.is_error:
+
+            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
+            if len(array_dict) > 1:
+                np.savez(save_directory + "/" + self.file_name, **array_dict)
+                return True, "処理が正常に終了しました。"
+            else:
+                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+        else:
+            return False, self.error_reason
+
+
+class Midi2SeqWithChord(_AbstractMidiConverter):
+
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name, all_chords: List[str], all_chord_timestamps: List[float], program_list, split_measure=12):
+        super().__init__(Midi2SeqWithChord, tokenizer, directory, file_name, program_list)
+        self.aya_node = [0]
+        self.split_measure = split_measure
+        self.chords = ChordMidi(all_chords, all_chord_timestamps)
+
+
+    def convert(self, *args, **kwargs):
+        if not self.is_error:
+            program_count = 0
+
+            for inst in self.midi_data.instruments:
+                inst: Instrument = inst
+                if not inst.is_drum and inst.program in self.program_list:
+                    aya_node_inst = self.ct_aya_node(inst)
+                    self.aya_node = self.aya_node + aya_node_inst
+                    program_count += 1
+
+            if program_count == 0:
+                self.is_error = True
+                self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
+
+
+    def ct_aya_node(self, inst: Instrument) -> list:
+
+        clip = np.array([], dtype=int)
+        aya_node_inst = []
+        back_note = None
+
+        clip_count = 0
+
+        sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
+        shift_time_container = ShiftTimeContainer(0, 0)
+        note_count = 0
+        while note_count < len(sorted_notes):
+            note: Note = sorted_notes[note_count]
+
+            tempo = self.get_tempo(note.start)
+            shift_time_container.tempo = tempo
+
+            for conv in self.token_converter:
+                conv: Token = conv
+
+                if isinstance(conv, ChordToken):
+                    conv: ChordToken
+                    token = conv(note=note, chords=self.chords, container=shift_time_container)
+                else:
+                    token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo, container=shift_time_container)
 
                 if token is not None:
                     if conv.token_type == "<SME>":
@@ -248,6 +345,8 @@ class MIDI2Seq(_AbstractMidiConverter):
 
         if len(clip) > 4:
             aya_node_inst = self.marge_clip(clip, aya_node_inst)
+
+        self.chords.reset()
         return aya_node_inst
 
     def marge_clip(self, clip, aya_node_inst):
@@ -266,6 +365,8 @@ class MIDI2Seq(_AbstractMidiConverter):
                 return False, "オブジェクトが何らかの理由で見つかりませんでした。"
         else:
             return False, self.error_reason
+
+
 
 class MidiExpantion(_AbstractMidiConverter):
 

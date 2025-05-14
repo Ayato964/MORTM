@@ -16,6 +16,5 @@ tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_
 
 model = train_bertm(human_dir="out/np/Sax/dis/human", ai_dir="out/np/Sax/dis/ai",
                     model_config="configs/models/bertm/class_file.json",
-                    save_directory="out/model/class/", version="1.0",
-                    train_config="configs/train/pre_training.json",
-                    message=message, )
+                    save_directory="out/model/class/", version="1.1Ex2",
+                    train_config="configs/train/pre_training.json", )
