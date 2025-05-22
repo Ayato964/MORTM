@@ -5,8 +5,8 @@ from numpy import ndarray
 import re
 from mortm import constants
 from mortm.custom_token import (Token, Pitch, Duration, StartRE, QueryMelody, QueryMelodyEnd, QueryChord, QueryChordEnd,
-                                MeasureToken, TrackStart, TrackEnd,
-                                Blank, SequenceEnd, Gen, CLS, ChordBass, ChordQuality, ChordRoot)
+                                MeasureToken, TrackStart, TrackEnd,CGen,
+                                Blank, SequenceEnd, MGen, CLS, ChordBass, ChordQuality, ChordRoot)
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -28,7 +28,7 @@ def bertm_converter(convert: int) -> List[Token]:
 
     register.append(CLS(convert))
     register.append(TrackStart(convert))
-    register.append(Gen(convert))
+    register.append(MGen(convert))
 
     register.append(MeasureToken(convert))
     register.append(Blank(convert))
@@ -47,7 +47,13 @@ def get_token_converter(convert: int) -> List[Token]:
     register: List[Token] = list()
 
     register.append(TrackStart(convert))
-    register.append(Gen(convert))
+    register.append(QueryMelody(convert))
+    register.append(QueryMelodyEnd(convert))
+    register.append(QueryChord(convert))
+    register.append(QueryChordEnd(convert))
+
+    register.append(MGen(convert))
+    register.append(CGen(convert))
 
     register.append(MeasureToken(convert))
     register.append(Blank(convert))
@@ -62,10 +68,6 @@ def get_token_converter(convert: int) -> List[Token]:
 
     register.append(SequenceEnd(convert))
     register.append(TrackEnd(convert))
-    register.append(QueryMelody(convert))
-    register.append(QueryMelodyEnd(convert))
-    register.append(QueryChord(convert))
-    register.append(QueryChordEnd(convert))
 
     return register
 

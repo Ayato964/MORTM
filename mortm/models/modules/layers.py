@@ -143,8 +143,12 @@ class MORTMDecoderLayer(nn.Module):
         self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(args.d_model, args.num_heads, args.dropout, progress=progress)
 
         #self.ffn = FFN(d_model, dim_ff, dropout)
-        self.ffn = MoE(args.d_model, args.dim_feedforward,
-                       args.num_experts, args.topk_experts, args.num_groups, args.topk_groups, )
+        if args.use_moe_decoder == True:
+            self.ffn = MoE(args.d_model, args.dim_feedforward,
+                           args.num_experts, args.topk_experts, args.num_groups, args.topk_groups, )
+        else:
+            self.ffn = FFN(args.d_model, args.dim_feedforward, args.dropout)
+
 
         self.norm1 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
         self.norm2 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)

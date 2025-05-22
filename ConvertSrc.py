@@ -135,8 +135,8 @@ def convert_with_chord(pid, tokenizer, directory: List[str], md_file: List[str],
         is_saved, reason = con.save(save_path)
         if is_saved:
             local_count += 1
-            if local_count >= 10:
-                break
+            #if local_count >= 10:
+            #    break
 
         print(f"Process#{pid}: Running... {local_count}  {reason}")
     progress[pid] = local_count
@@ -146,19 +146,20 @@ if __name__ == "__main__":
     PIANO = [i + 1 for i in range(5)]
     SAX = [65, 66]
 
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "./data/other"
-    #directory, md_file = find_midi_files(datasets)
+    directory, md_file = find_midi_files(datasets)
 
+    """
     print("データ整理中・・・・")
     directory, md_file, system_file = find_midi_files_with_json(datasets)
-
     print("完了！！")
+    """
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
-    system_file = np.array_split(system_file, THREAD_VALUE)
+    #system_file = np.array_split(system_file, THREAD_VALUE)
 
     tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
 
@@ -166,12 +167,15 @@ if __name__ == "__main__":
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            """
-            p = Process(target=convert_with_chord, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), SAX, progress, "out/np/Sax/test"))
+            #"""
+            p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
+                                              md_file[t].tolist(), SAX, progress, "out/np/Sax/datasets7_large"))
+            #"""
+
             """
             p = Process(target=convert_with_chord, args=(t, tokenizer, directory[t].tolist(),
                                                          md_file[t].tolist(), system_file[t], SAX, progress, "out/np/Sax/test"))
+            """
 
             processes.append(p)
             p.start()

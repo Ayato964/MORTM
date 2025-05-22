@@ -206,6 +206,7 @@ class MIDI2Seq(_AbstractMidiConverter):
     def ct_aya_node(self, inst: Instrument) -> list:
 
         clip = np.array([], dtype=int)
+        clip = np.append(clip, self.tokenizer.get("<MGEN>"))
         aya_node_inst = []
         back_note = None
 
@@ -233,6 +234,7 @@ class MIDI2Seq(_AbstractMidiConverter):
                             clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                             aya_node_inst = self.marge_clip(clip, aya_node_inst)
                             clip = np.array([], dtype=int)
+                            clip = np.append(clip, self.tokenizer.get("<MGEN>"))
                             back_note = None
                             clip_count = 0
 
@@ -298,6 +300,7 @@ class Midi2SeqWithChord(_AbstractMidiConverter):
     def ct_aya_node(self, inst: Instrument) -> list:
 
         clip = np.array([], dtype=int)
+        clip = np.append(clip, self.tokenizer.get("<CGEN>"))
         aya_node_inst = []
         back_note = None
 
@@ -328,6 +331,7 @@ class Midi2SeqWithChord(_AbstractMidiConverter):
                         clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                         aya_node_inst = self.marge_clip(clip, aya_node_inst)
                         clip = np.array([], dtype=int)
+                        clip = np.append(clip, self.tokenizer.get("<CGEN>"))
                         back_note = None
                         clip_count = 0
 

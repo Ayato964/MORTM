@@ -282,13 +282,21 @@ class SequenceEnd(SpecialToken):
         return None
 
 
-class Gen(SpecialToken):
+class MGen(SpecialToken):
 
     def __init__(self, convert_type: int):
-        super().__init__("<GEN>", convert_type)
+        super().__init__("<MGEN>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         return None
+
+
+class CGen(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<CGEN>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
 
 
 class CLS(SpecialToken):

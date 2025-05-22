@@ -67,8 +67,8 @@ class MORTM(nn.Module):
             sampled_index = self.top_p_sampling(logits[-1], p=p, temperature=temperature)
             generated_tokens.append(sampled_index)
             src = torch.cat([src, torch.tensor([[sampled_index]], device=self.progress.get_device())], dim=1)
-            measure_count = (src == 3).sum().item()
-            if sampled_index == 519 or sampled_index == 520 or measure_count > max_measure:
+            measure_count = (src == 8).sum().item()
+            if sampled_index == 566 or sampled_index == 567 or measure_count > max_measure:
                 is_running = False
 
         return torch.tensor(generated_tokens), src.squeeze(0)

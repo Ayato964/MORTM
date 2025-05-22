@@ -1,5 +1,5 @@
 {
-  "batch_size": 12,
+  "batch_size": 32,
   "accumulation_steps":1,
   "warmup_steps": 4000,
   "num_epochs": 30,

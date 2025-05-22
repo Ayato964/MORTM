@@ -17,9 +17,9 @@ def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, prog
     container = ShiftTimeContainer(0, tempo)
     for token_id in seq:
         token = tokenizer.rev_get(token_id.item())
-        if token_id == 392:
+        if token_id == tokenizer.get("<TE>") or token_id == tokenizer.get("<ESEQ>"):
             break
-        if token_id == 3:
+        if token_id == tokenizer.get("<SME>"):
             container.shift()
 
         for con in token_converter_list:

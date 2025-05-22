@@ -30,7 +30,7 @@ tokenizer.rev_mode()
 args = MORTMArgs("configs/models/mortm/A.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/MORTM.3.2t6-LARGE-SAX-1.11.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.4.0-SAX-LARGE-P1_1.06.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -42,9 +42,11 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/Sample2.mid.npz")
+np_notes = np.load("out/Sample5.mid.npz")
+start = np_notes[f'array1'][:50]
 
-start = np_notes[f'array1'][:90]
+#start = np.array([tokenizer.get("<MGEN>")])
+
 
 gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
 
@@ -54,4 +56,4 @@ for t in output:
     print(f"{t}  {tokenizer.rev_get(t.tolist())}")
 
 
-midi = ct_token_to_midi(tokenizer, output, "out/generate_test.midi", program=65, tempo=120) #生成したトークンをMIDIに変換する。
+midi = ct_token_to_midi(tokenizer, output, "out/generate_test.midi", program=65, tempo=135) #生成したトークンをMIDIに変換する。
