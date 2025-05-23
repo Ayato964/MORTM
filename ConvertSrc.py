@@ -53,8 +53,10 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
         con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
         con.convert()
         is_saved, reason = con.save(save_path)
-        #if is_saved:
-        #    local_count += 1
+        if is_saved:
+            local_count += 1
+            if local_count >= 50:
+                break
         print(f"Process#{pid}: Running... {local_count}  {reason}")
     progress[pid] = local_count
 
@@ -146,8 +148,8 @@ if __name__ == "__main__":
     PIANO = [i + 1 for i in range(5)]
     SAX = [65, 66]
 
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "./data/other"
     directory, md_file = find_midi_files(datasets)
 
@@ -169,7 +171,7 @@ if __name__ == "__main__":
         for t in range(THREAD_VALUE):
             #"""
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), SAX, progress, "out/np/Sax/datasets7_large"))
+                                              md_file[t].tolist(), SAX, progress, "out/np/Sax/eval"))
             #"""
 
             """

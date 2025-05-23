@@ -27,6 +27,7 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
 
 tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
 tokenizer.rev_mode()
+#args = MORTMArgs("configs/models/mortm/not_moe/A.json")
 args = MORTMArgs("configs/models/mortm/A.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
@@ -42,8 +43,8 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/Sample5.mid.npz")
-start = np_notes[f'array1'][:50]
+np_notes = np.load("out/Sample4.mid.npz")
+start = np_notes[f'array1'][:70]
 
 #start = np.array([tokenizer.get("<MGEN>")])
 
@@ -56,4 +57,4 @@ for t in output:
     print(f"{t}  {tokenizer.rev_get(t.tolist())}")
 
 
-midi = ct_token_to_midi(tokenizer, output, "out/generate_test.midi", program=65, tempo=135) #生成したトークンをMIDIに変換する。
+midi = ct_token_to_midi(tokenizer, output, "out/goodsample/論文/MoE4_3.midi", program=65, tempo=135) #生成したトークンをMIDIに変換する。
