@@ -43,9 +43,10 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/Sample4.mid.npz")
-start = np_notes[f'array1'][:70]
+np_notes = np.load("out/Sample.mid.npz")
+start = np_notes[f'array1'][:120]
 
+print(start)
 #start = np.array([tokenizer.get("<MGEN>")])
 
 
@@ -57,4 +58,4 @@ for t in output:
     print(f"{t}  {tokenizer.rev_get(t.tolist())}")
 
 
-midi = ct_token_to_midi(tokenizer, output, "out/goodsample/論文/MoE4_3.midi", program=65, tempo=135) #生成したトークンをMIDIに変換する。
+midi = ct_token_to_midi(tokenizer, output, "out/goodsample/論文/non4_1.midi", program=65, tempo=120) #生成したトークンをMIDIに変換する。

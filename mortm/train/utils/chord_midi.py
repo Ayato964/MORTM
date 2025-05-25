@@ -6,7 +6,15 @@ class Chord:
         self.time_stamp = time_stamp
         self.is_called = False
 
+
 class ChordMidi:
+
+    def __len__(self):
+        return len(self.chords)
+
+    def __getitem__(self, item):
+        return self.chords[item]
+
     def __init__(self, chords: List[str], time_stamps: List[float]):
         self.chords: List[Chord] = list()
         for chord, time_stamp in zip(chords, time_stamps):

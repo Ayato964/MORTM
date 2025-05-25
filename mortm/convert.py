@@ -12,7 +12,7 @@ import soundfile as sf
 
 from .custom_token import Token, ShiftTimeContainer, MusicToken, ChordToken
 from mortm.train.tokenizer import Tokenizer
-from .train.utils.chord_midi import ChordMidi
+from .train.utils.chord_midi import ChordMidi, Chord
 
 T = TypeVar("T")
 
@@ -369,6 +369,32 @@ class Midi2SeqWithChord(_AbstractMidiConverter):
                 return False, "オブジェクトが何らかの理由で見つかりませんでした。"
         else:
             return False, self.error_reason
+
+
+class MetaData2Chord(_AbstractConverter):
+    def save(self, save_directory: str) -> [bool, str]:
+        pass
+
+    def convert(self, *args, **kwargs):
+        token_converter: List[Token] = self.tokenizer.music_token_list
+        shift_time_container = ShiftTimeContainer(0, 0)
+        back_chord = None
+        for c in self.chords:
+            c: Chord = c
+            for conv in token_converter:
+                if isinstance(conv, ChordToken):
+                    token = conv(note=Note(pitch=0, start=c.time_stamp, end=c.time_stamp, velocity=100),
+                                 chords=self.chords, container=shift_time_container)
+
+    def __init__(self, tokenizer: Tokenizer, all_chords: List[str], all_chord_timestamps: List[float], program_list,
+                directory: str, file_name: str | List[str], split_measure=12):
+        super().__init__(MetaData2Chord, directory, file_name)
+        self.aya_node = [0]
+        self.tokenizer = tokenizer
+        self.split_measure = split_measure
+        self.chords = ChordMidi(all_chords, all_chord_timestamps)
+
+
 
 
 

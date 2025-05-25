@@ -479,3 +479,17 @@ class ChordBass(ChordToken):
             return base
         else:
             return None
+
+
+class ChordShiftRE(ChordToken):
+    def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):
+        pass
+
+    def _set_tokens(self, tokens: dict):
+        pass
+
+    def __init__(self, token_type: str, convert_type: int):
+        super().__init__(token_type, convert_type)
