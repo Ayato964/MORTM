@@ -11,10 +11,11 @@ from mortm.models.modules.progress import LearningProgress
 
 
 class MORTM_SEQDataset(Dataset):
-    def __init__(self, progress: LearningProgress, positional_length):
+    def __init__(self, progress: LearningProgress, positional_length, min_length):
         self.seq: list = list()
         self.progress = progress
         self.positional_length = positional_length
+        self.min_length = min_length
 
     def __len__(self):
         return len(self.seq)
@@ -23,7 +24,7 @@ class MORTM_SEQDataset(Dataset):
         suc_count = 0
         for i in range(len(music_seq) - 1):
             seq = music_seq[f'array{i + 1}'].tolist()
-            if 90 < len(seq) < self.positional_length and seq.count(4) < 3:
+            if self.min_length < len(seq) < self.positional_length and seq.count(4) < 3:
                 self.seq.append(seq)
                 suc_count += 1
         return suc_count

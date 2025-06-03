@@ -14,6 +14,7 @@ class MORTMArgs:
             self.dim_feedforward = data['dim_feedforward']
             self.dropout = data['dropout']
             self.position_length = data['position_length'] if data.get('position_length') else 512
+            self.min_length = data['min_length'] if data.get("min_length") else 90
             self.num_experts = data['num_experts'] if data.get('num_experts') else 12
             self.topk_experts = data['topk_experts'] if data.get('topk_experts') else 2
             self.num_groups = data['num_groups'] if data.get('num_groups') else 1

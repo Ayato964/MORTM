@@ -28,10 +28,10 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
 tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
 tokenizer.rev_mode()
 #args = MORTMArgs("configs/models/mortm/not_moe/A.json")
-args = MORTMArgs("configs/models/mortm/A.json")
+args = MORTMArgs("configs/models/mortm/B.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/MORTM.4.0-SAX-LARGE-P1_1.06.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM.train.25.1.0730_8332.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -43,19 +43,20 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/Sample.mid.npz")
-start = np_notes[f'array1'][:120]
+np_notes = np.load("out/np/Sax/eval/000af4e01daeeaf70d077f238b4944e1.mid.npz")
+start = np_notes[f'array1']
 
 print(start)
 #start = np.array([tokenizer.get("<MGEN>")])
 
 
-gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
+#gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
 
-output = all
+#output = all
+output = torch.tensor(start)
 for t in output:
     t: torch.Tensor = t
     print(f"{t}  {tokenizer.rev_get(t.tolist())}")
 
 
-midi = ct_token_to_midi(tokenizer, output, "out/goodsample/論文/non4_1.midi", program=65, tempo=120) #生成したトークンをMIDIに変換する。
+midi = ct_token_to_midi(tokenizer, output, "out/generate.midi", program=65, tempo=120) #生成したトークンをMIDIに変換する。

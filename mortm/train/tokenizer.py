@@ -5,7 +5,7 @@ from numpy import ndarray
 import re
 from mortm import constants
 from mortm.custom_token import (Token, Pitch, Duration, StartRE, QueryMelody, QueryMelodyEnd, QueryChord, QueryChordEnd,
-                                MeasureToken, TrackStart, TrackEnd,CGen,
+                                MeasureToken, TrackStart, TrackEnd,CGen, ChordShiftRE, Key,
                                 Blank, SequenceEnd, MGen, CLS, ChordBass, ChordQuality, ChordRoot)
 
 '''旋律トークン'''
@@ -58,6 +58,7 @@ def get_token_converter(convert: int) -> List[Token]:
     register.append(MeasureToken(convert))
     register.append(Blank(convert))
     register.append(StartRE(START_TYPE, convert))
+    register.append(ChordShiftRE(START_TYPE, convert))
 
     register.append(ChordRoot(convert))
     register.append(ChordQuality(convert))
@@ -68,6 +69,8 @@ def get_token_converter(convert: int) -> List[Token]:
 
     register.append(SequenceEnd(convert))
     register.append(TrackEnd(convert))
+
+    register.append(Key(convert))
 
     return register
 
@@ -107,8 +110,6 @@ class Tokenizer:
                 length = self.get_length(sp[0])
 
                 self.tokens[token] = length
-            if not self.is_converter:
-                self.token_max[self.tokens[token]] += 1
             return self.tokens[token]
 
     def get_length(self, token_type: str):

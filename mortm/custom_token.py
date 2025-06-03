@@ -2,12 +2,15 @@ from pretty_midi import Note, Instrument
 from abc import abstractmethod
 from .train.utils.chord_midi import ChordMidi
 
-roots = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-bases = ['/C', '/C#', '/D', '/D#', '/E', '/F', '/F#', '/G', '/G#', '/A', '/A#', '/B', "None"]
+roots = ['C', 'C#', 'D', 'D#', 'E', 'E#', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B', 'Cb','Db','Eb','Fb','Gb','Ab','Bb']
+bases = ['/C', '/C#', '/D', '/D#', '/E', '/E#', '/F', '/F#', '/G', '/G#', '/A', '/A#', '/B', "/B#", "/Db","/Eb", "/Fb", "/Gb","/Ab","/Bb","/Cb", "None"]
 qualities = [
-    'None', 'm', '7', 'maj7', 'm7', 'dim', 'aug',
+    'None', 'm', '7', 'maj7', 'm7', 'dim', 'aug', "m7b5", "b5",
     'sus2', 'sus4', '6', 'm6', '9', 'maj9', 'm9', '11', '13', 'add9'
 ]
+
+key = ['CM','DM','EM','FM','GM','AM','BM','C#M','D#M','F#M','G#M','AM', 'DbM','EbM','GbM','AbM','BbM',
+       'Cm','Dm','Em','Fm','Gm','Am','Bm','C#m','D#m','F#m','G#m','Am', 'Dbm','Ebm','Gbm','Abm','Bbm']
 
 def parse_chord(chord: str):
     """
@@ -95,6 +98,7 @@ class ShiftTimeContainer:
         self.shift_measure = False
         self.is_error = False
         self.tempo = tempo
+        self.is_code_mode = False
 
     def shift(self):
         self.measure_start_time += (60 / self.tempo) * 4
@@ -164,7 +168,8 @@ class MusicToken(Token):
     def __call__(self, inst: Instrument = None, back_notes: Note = None, note: Note = None, token: str = None,
                  tempo=120, container: ShiftTimeContainer = None,*args, **kwargs, ):
         if self.convert_type == 0:
-            return f"{self.token_type}_{self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo, container=container)}"
+            k = self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo, container=container)
+            return f"{self.token_type}_{k}" if k else None
         else:
             if token is None:
                 return None
@@ -218,6 +223,7 @@ class MeasureToken(SpecialToken):
         super().__init__("<SME>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int or None or str:
+
         measure1 = 60 / tempo * 4
         if back_notes is not None and not container.shift_measure:
             note_measure = note.start // measure1
@@ -336,6 +342,25 @@ class QueryChordEnd(SpecialToken):
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
 
+
+class Key(MusicToken):
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int,
+                  container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):
+        pass
+
+    def _set_tokens(self, tokens: dict):
+        base = len(tokens)
+        for i, k in enumerate(key):
+            tokens[f'k_{k}'] = base + i
+
+    def __init__(self, convert_type: int):
+        super().__init__("k", convert_type)
+
+
+
 class StartRE(MusicToken):
 
     def _set_tokens(self, tokens: dict):
@@ -433,8 +458,8 @@ class ChordRoot(ChordToken):
 
     def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> str:
         # NOTE: note.chord_root 属性を事前にセットしておく前提
-        c = chords.get_chord(note.start)
-        if c is not None:
+        c, _ = chords.get_chord(note.start)
+        if not c.is_called:
             root, _, _ = parse_chord(c.chord)
             return root
         else:
@@ -453,8 +478,8 @@ class ChordQuality(ChordToken):
 
     def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> str:
         # NOTE: note.chord_root 属性を事前にセットしておく前提
-        c = chords.get_chord(note.start)
-        if c is not None:
+        c, _ = chords.get_chord(note.start)
+        if not c.is_called:
             _, qualities, _ = parse_chord(c.chord)
             return qualities
         else:
@@ -468,14 +493,15 @@ class ChordBass(ChordToken):
 
     def _set_tokens(self, tokens: dict):
         base = len(tokens)
-        for i, r in enumerate(bases, start=1):
+        for i, r in enumerate(bases):
             tokens[f'CB_{r}'] = base + i
 
     def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> str:
         # NOTE: note.chord_root 属性を事前にセットしておく前提
-        c = chords.get_chord(note.start, is_final_search=True)
-        if c is not None:
+        c,_ = chords.get_chord(note.start)
+        if not c.is_called:
             _, _, base = parse_chord(c.chord)
+            c.is_called = True
             return base
         else:
             return None
@@ -483,7 +509,27 @@ class ChordBass(ChordToken):
 
 class ChordShiftRE(ChordToken):
     def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> int | str | None:
-        pass
+        if container.is_code_mode:
+            now_c, i = chords.get_chord(note.start)
+            now_tick = ct_time_to_beat(now_c.time_stamp, container.tempo)
+            if container.shift_measure:
+                container.shift_measure = False
+                shift = int(now_tick - ct_time_to_beat(container.measure_start_time, container.tempo))
+                if shift < 0:
+                    container.is_error = True
+                return shift % 96
+
+            if i == 0:
+                #print(now_tick)
+                return 0
+            back_c = chords[i - 1]
+            back_tick = ct_time_to_beat(back_c.time_stamp, container.tempo)
+            shift = int(now_tick - back_tick)
+            if shift < 0:
+                container.is_error = True
+            return shift % 96
+        return None
+
 
     def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):
         pass

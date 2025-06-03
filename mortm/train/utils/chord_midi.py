@@ -25,21 +25,23 @@ class ChordMidi:
     def get_chord(self, time: float, is_final_search=False):
         for i in range(len(self.chords) - 1):
             if self.chords[i].time_stamp <= time < self.chords[i + 1].time_stamp:
-                if self.chords[i].is_called:
-                    return None
-                else:
-                    self.chords[i].is_called = is_final_search
-                    return self.chords[i]
+                return self.chords[i], i
 
         if self.chords[-1].time_stamp <= time:
-            if self.chords[-1].is_called:
-                return None
-            else:
-                self.chords[-1].is_called = is_final_search
-                return self.chords[-1]
+            return self.chords[-1], len(self.chords) - 1
+
+        return None
+
+    def get_chord_by_index(self, index: int):
+        if 0 <= index < len(self.chords):
+            return self.chords[index]
         return None
 
     def reset(self):
         for chord in self.chords:
             chord.is_called = False
+
+    def sort(self, time: int):
+        for c in self.chords:
+            c.time_stamp -= time
 

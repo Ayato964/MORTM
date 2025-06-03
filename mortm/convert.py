@@ -10,7 +10,7 @@ from typing import TypeVar, Generic
 from midi2audio import FluidSynth
 import soundfile as sf
 
-from .custom_token import Token, ShiftTimeContainer, MusicToken, ChordToken
+from .custom_token import Token, ShiftTimeContainer, MusicToken, ChordToken, MeasureToken, Blank
 from mortm.train.tokenizer import Tokenizer
 from .train.utils.chord_midi import ChordMidi, Chord
 
@@ -373,27 +373,89 @@ class Midi2SeqWithChord(_AbstractMidiConverter):
 
 class MetaData2Chord(_AbstractConverter):
     def save(self, save_directory: str) -> [bool, str]:
-        pass
+        if not self.is_error:
+
+            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
+            if len(array_dict) > 1:
+                np.savez(save_directory + "/" + self.file_name, **array_dict)
+                return True, "処理が正常に終了しました。"
+            else:
+                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+        else:
+            return False, self.error_reason
 
     def convert(self, *args, **kwargs):
         token_converter: List[Token] = self.tokenizer.music_token_list
-        shift_time_container = ShiftTimeContainer(0, 0)
-        back_chord = None
-        for c in self.chords:
-            c: Chord = c
+        shift_time_container = ShiftTimeContainer(0, self.tempo)
+        shift_time_container.is_code_mode = True
+        back_chord: Optional[Chord] = None
+        aya_node_split = []
+        clip = np.array([], dtype=int)
+        clip = np.append(clip, self.tokenizer.get("<CGEN>"))
+        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
+        clip_count = 0
+
+        self.chords.sort(self.chords[0].time_stamp)
+        chord_count = 0
+        while chord_count < len(self.chords):
+            c: Chord = self.chords[chord_count]
             for conv in token_converter:
+                token = None
                 if isinstance(conv, ChordToken):
                     token = conv(note=Note(pitch=0, start=c.time_stamp, end=c.time_stamp, velocity=100),
                                  chords=self.chords, container=shift_time_container)
+                if isinstance(conv, MeasureToken):
+                    token = conv(note=Note(pitch=0, start=c.time_stamp, end=c.time_stamp, velocity=100),
+                                 back_notes=Note(pitch=0, start=back_chord.time_stamp, end=back_chord.time_stamp, velocity=100) if back_chord else None,
+                                 container=shift_time_container, tempo=shift_time_container.tempo)
+                    clip_count += 1
+                if isinstance(conv, Blank):
+                    token = conv(note=Note(pitch=0, start=c.time_stamp, end=c.time_stamp, velocity=100),
+                                 back_notes=Note(pitch=0, start=back_chord.time_stamp, end=back_chord.time_stamp, velocity=100) if back_chord else None,
+                                 container=shift_time_container, tempo=shift_time_container.tempo)
 
-    def __init__(self, tokenizer: Tokenizer, all_chords: List[str], all_chord_timestamps: List[float], program_list,
+                if token is not None:
+                    if clip_count >= self.split_measure:
+                        clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
+                        aya_node_split.append(clip)
+
+                        clip = np.array([], dtype=int)
+                        clip = np.append(clip, self.tokenizer.get("<CGEN>"))
+                        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
+                        back_chord = None
+                        clip_count = 0
+                    token_id = self.tokenizer.get(token)
+                    clip = np.append(clip, token_id)
+
+                    if conv.token_type == "<BLANK>":
+                        break
+
+            back_chord = c
+            if not shift_time_container.shift_measure:
+                chord_count += 1
+
+        self.aya_node = self.aya_node + aya_node_split
+
+
+
+
+    def __init__(self, tokenizer: Tokenizer, key: str, all_chords: List[str], all_chord_timestamps: List[float], tempo,
                 directory: str, file_name: str | List[str], split_measure=12):
         super().__init__(MetaData2Chord, directory, file_name)
-        self.aya_node = [0]
+        self.aya_node = [-1]
+        self.tempo = tempo
         self.tokenizer = tokenizer
         self.split_measure = split_measure
         self.chords = ChordMidi(all_chords, all_chord_timestamps)
 
+        if "major" in key:
+            self.key = f"{key.split(" major")[0]}M"
+        elif "minor" in key:
+            self.key = f"{key.split(" minor")[0]}m"
+        else:
+            self.key = None
+
+        print(self.key)
 
 
 
