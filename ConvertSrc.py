@@ -209,7 +209,7 @@ if __name__ == "__main__":
         for t in range(THREAD_VALUE):
             #"""
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), SAX, progress, "out/np/Sax/datasets7_large"))
+                                              md_file[t].tolist(), SAX, progress, "out/np/Sax/pre-train/Phase1/mel_large"))
             #"""
 
             """

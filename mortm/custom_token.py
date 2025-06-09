@@ -169,7 +169,7 @@ class MusicToken(Token):
                  tempo=120, container: ShiftTimeContainer = None,*args, **kwargs, ):
         if self.convert_type == 0:
             k = self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo, container=container)
-            return f"{self.token_type}_{k}" if k else None
+            return f"{self.token_type}_{k}" if k is not None else None
         else:
             if token is None:
                 return None

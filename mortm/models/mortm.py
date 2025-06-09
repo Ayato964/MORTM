@@ -3,11 +3,12 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 from typing import Tuple, List
+from einops import rearrange
 
-from .modules.PositionalEncoding import PositionalEncoding
 from .modules.progress import LearningProgress
 from .modules.config import MORTMArgs
-from .modules.layers import MORTMDecoder, MORTMEncoder
+from .modules.layers import MORTMDecoder
+from flash_attn.bert_padding import pad_input, unpad_input
 
 class MORTM(nn.Module):
     def __init__(self, args: MORTMArgs, progress: LearningProgress):
@@ -20,22 +21,26 @@ class MORTM(nn.Module):
         self.dim_feedforward = args.dim_feedforward
         self.dropout = args.dropout
 
-        self.decoder = MORTMDecoder(args,
-                               batch_first=True, bias=True,
-                               layer_norm_eps=1e-5, progress=progress)
+        self.decoder = MORTMDecoder(args, bias=True, layer_norm_eps=1e-5, progress=progress)
 
         print(f"Input Vocab Size:{args.vocab_size}")
         self.Wout: nn.Linear = nn.Linear(self.d_model, args.vocab_size).to(self.progress.get_device())
         self.embedding: nn.Embedding = nn.Embedding(args.vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
-    def forward(self, src, tgt=None, src_mask=None, tgt_mask=None, input_padding_mask=None,
-                tgt_padding_mask=None, src_is_causal=False, tgt_is_causal=False):
-        src_e: Tensor = self.embedding(src)
+    def forward(self, x, padding_mask=None, is_causal=False):
+        x: Tensor = self.embedding(x)
+        batch, tgt_len, embed_dim = x.size()
 
-        out = self.decoder(tgt=src_e, memory=None, tgt_mask=tgt_mask,
-                           memory_key_padding_mask=input_padding_mask,
-                           tgt_key_padding_mask=input_padding_mask, memory_is_causal=src_is_causal, tgt_is_causal=src_is_causal)
+        if padding_mask is not None:
+            x, indices, cu_seqlens, max_s, used_seqlens = unpad_input(x, padding_mask)
+        else:
+            indices = cu_seqlens = max_s = used_seqlens = None
+
+        out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s)
+
+        if padding_mask is not None:
+            out = pad_input(out, indices, batch, tgt_len)
 
         score: Tensor = self.Wout(out)
         return score.to(self.progress.get_device())

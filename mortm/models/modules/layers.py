@@ -11,7 +11,7 @@ from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttent
 from typing import Tuple, List
 import numpy as np
 
-from .attention import FlashSelfAttentionM, FlashCrossAttentionM, MultiHeadAttentionRPR, linear
+from .attention import FlashSelfAttentionM, FlashCrossAttentionM, linear
 from .config import MORTMArgs
 
 
@@ -100,34 +100,23 @@ class MORTMEncoderLayer(nn.Module):
 
 
 class MORTMDecoder(nn.Module):
-    def __init__(self, args: MORTMArgs, batch_first, bias, layer_norm_eps, progress):
+    def __init__(self, args: MORTMArgs, bias, layer_norm_eps, progress):
         super(MORTMDecoder, self).__init__()
         self.num_layer = args.d_layer
         self.layers = _get_clones(MORTMDecoderLayer(args,
-                                                    batch_first=batch_first, bias=bias,
+                                                    bias=bias,
                                                     layer_norm_eps=layer_norm_eps, progress=progress), self.num_layer)
         self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
-    def forward(self, tgt: Tensor,
-                memory: Tensor,
-                tgt_mask: Optional[Tensor] = None,
-                memory_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                tgt_is_causal: Optional[bool] = None,
-                memory_is_causal: bool = False, **kwargs) -> Tensor:
+
+    def forward(self, tgt: Tensor, tgt_is_causal: Optional[bool] = None, cu_seqlens=None, max_seqlen=None) -> Tensor:
 
         output = tgt
         for mod in self.layers:
             mod: MORTMDecoderLayer
             output = mod(
                 output,
-                memory,
-                tgt_mask=tgt_mask,
-                memory_mask=memory_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
                 tgt_is_causal=tgt_is_causal,
-                memory_is_causal=memory_is_causal,
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
             )
 
         return self.norm(output)
@@ -135,14 +124,12 @@ class MORTMDecoder(nn.Module):
 
 class MORTMDecoderLayer(nn.Module):
 
-    def __init__(self, args: MORTMArgs, batch_first, bias, layer_norm_eps, progress):
+    def __init__(self, args: MORTMArgs, bias, layer_norm_eps, progress):
         super(MORTMDecoderLayer, self).__init__()
         self.n_head = args.num_heads
         self.d_model = args.d_model
-        self.cross_attention: FlashCrossAttentionM = FlashCrossAttentionM(args.d_model, args.num_heads, args.dropout)
         self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(args.d_model, args.num_heads, args.dropout, progress=progress)
 
-        #self.ffn = FFN(d_model, dim_ff, dropout)
         if args.use_moe_decoder == True:
             self.ffn = MoE(args.d_model, args.dim_feedforward,
                            args.num_experts, args.topk_experts, args.num_groups, args.topk_groups, )
@@ -158,55 +145,20 @@ class MORTMDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(args.dropout)
         self.dropout3 = nn.Dropout(args.dropout)
 
-    def forward(self,
-                tgt: Tensor,
-                memory: Tensor,
-                tgt_mask: Optional[Tensor] = None,
-                memory_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                tgt_is_causal: bool = False,
-                memory_is_causal: bool = False,
-                )-> Tensor:
+    def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None)-> Tensor:
 
         y = tgt
 
-        y = y + self.self_block(self.norm1(y), tgt_mask, tgt_key_padding_mask, tgt_is_causal) #相対位置マルチヘッドアテンションを適用
-
-        if memory is not None:
-            y = y + self.cross_block(self.norm2(y), memory, memory_mask,
-                                     memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
-                                     is_causal=memory_is_causal) # マルチヘッドアテンションを適用
+        y = y + self.self_block(self.norm1(y), tgt_is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
         y = y + self.ff_block(self.norm3(y)) # フィードフォワード層を適用
 
         return y
 
-    def self_block(self,
-                   y: Tensor,
-                   attn_mask: Optional[Tensor],
-                   tgt_key_padding_mask: Optional[Tensor],
-                   is_causal: bool = False,
-                   ):
-
-        #print(y.shape)
-        y, _ = self.self_attention(y, key_padding_mask=tgt_key_padding_mask,
-                                   need_weights=True, attn_mask=attn_mask, is_causal=is_causal)
-        #print(y.shape)
+    def self_block(self, y: Tensor, is_causal: bool = False, cu_seqlens=None, max_seqlen=None):
+        y, _ = self.self_attention(y, is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
         return self.dropout1(y)
-
-    def cross_block(self,
-                    y: Tensor,
-                    mem: Tensor,
-                    attn_mask: Optional[Tensor],
-                    memory_key_padding_mask: Optional[Tensor],
-                    tgt_key_padding_mask: Optional[Tensor],
-                    is_causal: bool = False,
-                    ):
-        y, _ = self.cross_attention(y, mem, memory_key_padding_mask=memory_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask,
-                                    attn_mask=attn_mask, is_causal=is_causal)
-        return self.dropout2(y)
 
     def ff_block(self, y: Tensor):
         return self.dropout3(self.ffn(y))
@@ -334,8 +286,6 @@ class MoE(nn.Module):
         Returns:
             torch.Tensor: Output tensor after expert routing and computation.
         """
-        shape = x.size()
-        x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
         y = torch.zeros_like(x)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
@@ -348,4 +298,4 @@ class MoE(nn.Module):
         z = self.shared_experts(x)
         if world_size > 1:
             dist.all_reduce(y)
-        return (y + z).view(shape)
+        return (y + z)

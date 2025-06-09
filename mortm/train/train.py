@@ -49,7 +49,7 @@ class MORTMTrainSet(AbstractTrainSet):
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
 
-        adam = torch.optim.Adam(self.model.parameters(), lr=1e-1)
+        adam = torch.optim.Adam(self.model.parameters(), lr=5e-1)
 
         super().__init__(criterion=nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device()),
                         optimizer=adam,
@@ -72,7 +72,7 @@ class MORTMTrainSet(AbstractTrainSet):
 
         src = src[:, :-1]
         padding_mask_in: Tensor = _get_padding_mask(src, progress)
-        input: Tensor = model(src=src, input_padding_mask=padding_mask_in, src_is_causal=True)
+        input: Tensor = model(x=src, padding_mask=padding_mask_in, is_causal=True)
         input = input.view(-1, input.size(-1)).to(progress.get_device())
         return input.to(device=progress.get_device(), dtype=torch.float32), target
 
@@ -219,13 +219,21 @@ def _get_padding_mask(input_ids, progress: LearningProgress):
 
 
 def find_files(root_folder, extension: str):
-    midi_files = []
+    """
+    root_folder 以下を再帰的に探索し、
+    拡張子が extension のファイルの
+    ・ディレクトリ（末尾にパス区切り文字付き）
+    ・ファイル名
+    を別々のリストで返す
+    """
     direc = []
-    for defpath, surnames, filenames in os.walk(root_folder):
-        for file in filenames:
-            if file.lower().endswith(extension):
-                midi_files.append(file)
-                direc.append(defpath)
+    midi_files = []
+    for dirpath, _, filenames in os.walk(root_folder):
+        for fname in filenames:
+            if fname.lower().endswith(extension):
+                # ディレクトリには末尾に os.sep を付与しておく
+                direc.append(dirpath + os.sep)
+                midi_files.append(fname)
     return direc, midi_files
 
 
@@ -468,6 +476,7 @@ def train_mortm(model_config: str, train_config: str, root_directory, save_direc
     print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
 
     directory, filename = find_files(root_directory, '.npz')
+    print("データセットの規模：", len(filename))
     mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
     train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
 

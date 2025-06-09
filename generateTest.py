@@ -28,10 +28,10 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
 tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
 tokenizer.rev_mode()
 #args = MORTMArgs("configs/models/mortm/not_moe/A.json")
-args = MORTMArgs("configs/models/mortm/B.json")
+args = MORTMArgs("configs/models/mortm/A.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/MORTM.train.25.1.0730_8332.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/MORTM4.0P1_1.3425.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -43,7 +43,7 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
-np_notes = np.load("out/np/Sax/eval/000af4e01daeeaf70d077f238b4944e1.mid.npz")
+np_notes = np.load("out/np/Sax/chord/00fc908a1e20f476dc4b6502b6add516.mid.npz")
 start = np_notes[f'array1']
 
 print(start)
