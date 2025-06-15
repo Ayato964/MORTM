@@ -30,13 +30,14 @@ class MORTM(nn.Module):
 
     def forward(self, x, padding_mask=None, is_causal=False):
         x: Tensor = self.embedding(x)
-        batch, tgt_len, embed_dim = x.size()
 
         if padding_mask is not None:
+            batch, tgt_len, embed_dim = x.size()
             x, indices, cu_seqlens, max_s, used_seqlens = unpad_input(x, padding_mask)
         else:
+            tgt_len, embed_dim = x.size()
+            batch = None
             indices = cu_seqlens = max_s = used_seqlens = None
-
         out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s)
 
         if padding_mask is not None:
@@ -60,18 +61,20 @@ class MORTM(nn.Module):
         """
         if isinstance(src, numpy.ndarray):
             src = torch.tensor(src, device=self.progress.get_device())
-        src = src.unsqueeze(0)
+        #src = src.unsqueeze(0)
         #src_mask = _generate_square_subsequent_mask(src.size(1)).to(self.progress.get_device())
         #src_key_padding_mask = torch.zeros(src.size(0), src.size(1), dtype=torch.bool).to(self.progress.get_device())
 
         generated_tokens = []
         is_running = True
         while is_running:
-            logits: Tensor = self(src, src_is_causal=True)
-            logits = logits.squeeze(0)
+            logits: Tensor = self(src, is_causal=True)
+            #logits = logits.squeeze(0)
             sampled_index = self.top_p_sampling(logits[-1], p=p, temperature=temperature)
             generated_tokens.append(sampled_index)
-            src = torch.cat([src, torch.tensor([[sampled_index]], device=self.progress.get_device())], dim=1)
+            print(sampled_index)
+
+            src = torch.cat([src, torch.tensor([sampled_index], device=self.progress.get_device())], dim=0)
             measure_count = (src == 8).sum().item()
             if sampled_index == 585 or sampled_index == 586 or measure_count > max_measure:
                 is_running = False

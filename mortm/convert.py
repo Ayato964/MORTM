@@ -274,9 +274,10 @@ class MIDI2Seq(_AbstractMidiConverter):
 
 class Midi2SeqWithChord(_AbstractMidiConverter):
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name, all_chords: List[str], all_chord_timestamps: List[float], program_list, split_measure=12):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name, key: str, all_chords: List[str], all_chord_timestamps: List[float], program_list, split_measure=12):
         super().__init__(Midi2SeqWithChord, tokenizer, directory, file_name, program_list)
         self.aya_node = [0]
+        self.key = key
         self.split_measure = split_measure
         self.chords = ChordMidi(all_chords, all_chord_timestamps)
 
@@ -300,7 +301,8 @@ class Midi2SeqWithChord(_AbstractMidiConverter):
     def ct_aya_node(self, inst: Instrument) -> list:
 
         clip = np.array([], dtype=int)
-        clip = np.append(clip, self.tokenizer.get("<CGEN>"))
+        clip = np.append(clip, self.tokenizer.get("<MGEN>"))
+        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
         aya_node_inst = []
         back_note = None
 
@@ -331,7 +333,8 @@ class Midi2SeqWithChord(_AbstractMidiConverter):
                         clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                         aya_node_inst = self.marge_clip(clip, aya_node_inst)
                         clip = np.array([], dtype=int)
-                        clip = np.append(clip, self.tokenizer.get("<CGEN>"))
+                        clip = np.append(clip, self.tokenizer.get("<MGEN>"))
+                        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
                         back_note = None
                         clip_count = 0
 
@@ -456,6 +459,53 @@ class MetaData2Chord(_AbstractConverter):
             self.key = None
 
         print(self.key)
+
+
+class MIDI2TaskSeq(_AbstractMidiConverter):
+    def __init__(self, tokenizer: Tokenizer, system: dict, directory: str, file_name: str, program_list):
+        super().__init__(MIDI2TaskSeq, tokenizer, directory, file_name, program_list)
+        self.aya_node = [0]
+        self.system = system
+
+    def save(self, save_directory: str) -> [bool, str]:
+        if not self.is_error:
+
+            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
+            if len(array_dict) > 1:
+                np.savez(save_directory + "/" + self.file_name, **array_dict)
+                return True, "処理が正常に終了しました。"
+            else:
+                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+        else:
+            return False, self.error_reason
+
+    def convert(self, *args, **kwargs):
+        if not self.is_error:
+            program_count = 0
+
+            for inst in self.midi_data.instruments:
+                inst: Instrument = inst
+                if not inst.is_drum and inst.program in self.program_list:
+                    aya_node_inst = self.ct_inst2seq(inst)
+                    self.aya_node = self.aya_node + aya_node_inst
+                    program_count += 1
+
+            if program_count == 0:
+                self.is_error = True
+                self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
+
+    def ct_inst2seq(self, inst: Instrument) -> list:
+        clip = np.array([], dtype=int)
+        clip = np.append(clip, self.tokenizer.get("<MGEN>"))
+        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
+        aya_node_inst = []
+        back_note = None
+        clip_count = 0
+        sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
+        shift_time_container = ShiftTimeContainer(0, 0)
+
+
+
 
 
 

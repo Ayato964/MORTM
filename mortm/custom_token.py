@@ -1,3 +1,4 @@
+import pylab as p
 from pretty_midi import Note, Instrument
 from abc import abstractmethod
 from .train.utils.chord_midi import ChordMidi
@@ -458,12 +459,15 @@ class ChordRoot(ChordToken):
 
     def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> str:
         # NOTE: note.chord_root 属性を事前にセットしておく前提
-        c, _ = chords.get_chord(note.start)
-        if not c.is_called:
-            root, _, _ = parse_chord(c.chord)
-            return root
-        else:
-            return None
+        p = chords.get_chord(note.start)
+        if p is not None:
+            c, _ = p
+            if not c.is_called:
+                root, _, _ = parse_chord(c.chord)
+                return root
+            else:
+                return None
+        return None
 
 
 #--- ChordQuality トークン ----------------------------------------------
@@ -478,12 +482,16 @@ class ChordQuality(ChordToken):
 
     def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> str:
         # NOTE: note.chord_root 属性を事前にセットしておく前提
-        c, _ = chords.get_chord(note.start)
-        if not c.is_called:
-            _, qualities, _ = parse_chord(c.chord)
-            return qualities
-        else:
-            return None
+
+        p = chords.get_chord(note.start)
+        if p is not None:
+            c, _ = p
+            if not c.is_called:
+                _, qualities, _ = parse_chord(c.chord)
+                return qualities
+            else:
+                return None
+        return None
 
 
 #--- ChordBass トークン ------------------------------------------------
@@ -498,13 +506,17 @@ class ChordBass(ChordToken):
 
     def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> str:
         # NOTE: note.chord_root 属性を事前にセットしておく前提
-        c,_ = chords.get_chord(note.start)
-        if not c.is_called:
-            _, _, base = parse_chord(c.chord)
-            c.is_called = True
-            return base
-        else:
-            return None
+
+        p = chords.get_chord(note.start)
+        if p is not None:
+            c, _ = p
+            if not c.is_called:
+                _, _, base = parse_chord(c.chord)
+                c.is_called = True
+                return base
+            else:
+                return None
+        return None
 
 
 class ChordShiftRE(ChordToken):

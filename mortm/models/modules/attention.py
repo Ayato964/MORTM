@@ -121,7 +121,7 @@ class FlashSelfAttentionM(nn.Module):
     def forward(self, x, is_causal=False, cu_seqlens=None, max_seqlen=None):
 
         x = x.to(dtype=torch.bfloat16)
-        qkv = self.qkv_block(q=x)
+        qkv: Tensor = self.qkv_block(q=x)
 
 
         if cu_seqlens is not None:
@@ -129,8 +129,10 @@ class FlashSelfAttentionM(nn.Module):
                                                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                                                    alibi_slopes=self.alibi_slopes) # OK
         else:
-            out = flash_attn_qkvpacked_func(qkv, causal=is_causal, dropout_p=0,
+            qkv = qkv.unsqueeze(0)
+            out: Tensor = flash_attn_qkvpacked_func(qkv, causal=is_causal, dropout_p=0,
                                             alibi_slopes=self.alibi_slopes)
+            out = out.squeeze(0)
 
         out = rearrange(out, "total h d -> total (h d)")
         out = self.qkv_block.comp(out)

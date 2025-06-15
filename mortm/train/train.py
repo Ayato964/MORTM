@@ -49,7 +49,7 @@ class MORTMTrainSet(AbstractTrainSet):
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
 
-        adam = torch.optim.Adam(self.model.parameters(), lr=5e-1)
+        adam = torch.optim.Adam(self.model.parameters(), lr=2e-1)
 
         super().__init__(criterion=nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device()),
                         optimizer=adam,
@@ -363,6 +363,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
             optimizer.zero_grad()
 
             for pack in train_loader:
+                begin_time = time.time()
                 pre_processing: Dataset = trainer.pre_processing(pack, progress)
                 loader = DataLoader(pre_processing, batch_size=train_args.batch_size, shuffle=True, collate_fn=coll_fn)
                 mini_c = 0
@@ -376,7 +377,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                             scheduler.step()
                         torch.cuda.empty_cache()
 
-                    begin_time = time.time()
+
 
                     r_pack = trainer.epoch_fc(model, pack2, progress)
 
@@ -386,14 +387,14 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                     loss = loss / train_args.accumulation_steps
                     loss.backward()  # 逆伝播
 
-                    end_time = time.time()
                     progress_bar_with_minibatch(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss)
 
-                    if mail_bool and message is not None:
-                        _send_prediction_end_time(message, len(train_loader), begin_time, end_time, args.vocab_size, train_args.num_epochs,
-                                                  args.e_layer, args.num_heads, args.d_model, args.dim_feedforward, args.dropout,
-                                                  args.position_length)
-                        mail_bool = False
+                end_time = time.time()
+                if mail_bool and message is not None:
+                    _send_prediction_end_time(message, len(train_loader), begin_time, end_time, args.vocab_size, train_args.num_epochs,
+                                              args.e_layer, args.num_heads, args.d_model, args.dim_feedforward, args.dropout,
+                                              args.position_length)
+                    mail_bool = False
 
                 if (count + 1) % message.step_by_message_count == 0:
                     message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{train_args.num_epochs}の"
@@ -407,7 +408,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                     torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
                     print("途中経過を保存しました。")
 
-                if (count + 1) % int(500 / train_args.batch_size) == 0:
+                if (count + 1) % int(100 / train_args.batch_size) == 0:
                     print("検証損失を求めています")
                     torch.cuda.empty_cache()
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn)

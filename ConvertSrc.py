@@ -139,17 +139,26 @@ def convert_with_chord(pid, tokenizer, directory: List[str], md_file: List[str],
     local_count = 0
 
     for i in range(len(md_file)):
+        if (system_file[i]["key"] and system_file[i]["all_chords"] and not ("N" in system_file[i]["all_chords"])
+                and system_file[i]["all_chords_timestamps"] and system_file[i]["tempo"]):
 
-        con = Midi2SeqWithChord(tokenizer, directory[i], md_file[i], all_chords=system_file[i]["all_chords"],
-                                all_chord_timestamps=system_file[i]["all_chords_timestamps"],  program_list=program)
-        con.convert()
-        is_saved, reason = con.save(save_path)
-        if is_saved:
-            local_count += 1
-            #if local_count >= 10:
-            #    break
+            con = Midi2SeqWithChord(tokenizer, directory[i], md_file[i],key=system_file[i]["key"], all_chords=system_file[i]["all_chords"],
+                                    all_chord_timestamps=system_file[i]["all_chords_timestamps"],  program_list=program)
+            con.convert()
+            is_saved, reason = con.save(save_path)
+            for a in con.aya_node[1:]:
+                a:np.ndarray
+                if np.sum(a == 0) != 0:
+                    print(f"Error!!  : {system_file[i]["location"]}")
+                    is_error = True
+                    break
+            if is_saved:
+                local_count += 1
+                #if local_count >= 10:
+                #    break
 
-        print(f"Process#{pid}: Running... {local_count}  {reason}")
+            print(f"Process#{pid}: Running... {local_count}  {reason}")
+
     progress[pid] = local_count
 
 def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress, save_directory):
@@ -167,7 +176,7 @@ def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress
             for a in con.aya_node[1:]:
                 a:np.ndarray
                 if np.sum(a == 0) != 0:
-                    print(f"Error!!  : {system_file[i]["location"]}")
+                    print(f"\033[31m 警告, 今すぐ処理を中断してください！！！  : {system_file[i]["location"]} ")
                     is_error = True
                     break
 
@@ -184,38 +193,38 @@ if __name__ == "__main__":
     PIANO = [i + 1 for i in range(5)]
     SAX = [65, 66]
 
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "./data/other"
-    #"""
-    directory, md_file = find_midi_files(datasets)
-    #"""
     """
+    directory, md_file = find_midi_files(datasets)
+    """
+    #"""
     print("データ整理中・・・・")
     directory, md_file, system_file = find_midi_files_with_json(datasets)
     print("完了！！")
-    """
+    #"""
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
-    """
+    #"""
     system_file = np.array_split(system_file, THREAD_VALUE)
-    """
+    #"""
     tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
 
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            #"""
+            """
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
                                               md_file[t].tolist(), SAX, progress, "out/np/Sax/pre-train/Phase1/mel_large"))
-            #"""
+            """
 
-            """
-            p = Process(target=convert_chord, args=(t, tokenizer, directory[t].tolist(),
-                                                         md_file[t].tolist(), system_file[t], SAX, progress, "out/np/Sax/chord"))
-            """
+            #"""
+            p = Process(target=convert_with_chord, args=(t, tokenizer, directory[t].tolist(),
+                                                         md_file[t].tolist(), system_file[t], SAX, progress, "out/np/Sax/pre-train/Phase2/with_chord"))
+            #"""
 
             processes.append(p)
             p.start()
