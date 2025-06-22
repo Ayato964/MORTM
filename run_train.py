@@ -14,8 +14,7 @@ message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi
 tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
 model = train_mortm("configs/models/mortm/A.json", "configs/train/pre_training.json",
-                    "out/np/Sax/pre-train/Phase2", "out/model",
-                    "4.0-SAX-Phase2",
-                    load_model_directory="out/model/MORTM.4.0EP1_1.2515.pth",
+                    "out/np/Sax/pre-train/Phase1", "out/model/mortm/",
+                    "4.0-SAX-Phase1",
                     message=message)
 

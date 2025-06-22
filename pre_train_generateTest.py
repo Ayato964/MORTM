@@ -31,7 +31,7 @@ tokenizer.rev_mode()
 args = MORTMArgs("configs/models/mortm/A.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/MORTM.4.0EP1_1.2515.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/mortm/MORTM.4.0-SAX-Phase1.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -43,10 +43,13 @@ model.to(device)
 !実行する際はconvert.pyモジュールを使用し、MIDIをトークンのシーケンスに変換してください。!
 '''
 
+""""------ 旋律の自己回帰生成を行う場合------"""
 np_notes = np.load("out/Sample4.mid.npz")
-start = np_notes[f'array1'][:180]
+start = np_notes[f'array1'][:-1]
 print(start)
+"""-------------------------------------"""
 
+"""------- コードの自己回帰生成を行う場合-----"""
 #start = np.load("out/np/Sax/pre-train/Phase2/with_chord/a5360659764a37938776844025fadc61.mid.npz")["array4"] # 既存のメロディをロードする。
 #print(f"Length: {len(start)}")
 
@@ -54,6 +57,7 @@ print(start)
 #                  tokenizer.get("s_0"), tokenizer.get("CR_Ab"), tokenizer.get("CQ_m7"), tokenizer.get("CB_None"),tokenizer.get("<SME>"),
 #                  tokenizer.get("s_0"), tokenizer.get("CR_G"), tokenizer.get("CQ_7"), tokenizer.get("CB_None"),])
 
+"""--------------------------------------"""
 
 gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
 

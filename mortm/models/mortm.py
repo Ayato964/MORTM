@@ -4,6 +4,7 @@ from torch import Tensor
 import torch.nn as nn
 from typing import Tuple, List
 from einops import rearrange
+import loralib.layers as lora
 
 from .modules.progress import LearningProgress
 from .modules.config import MORTMArgs
@@ -20,12 +21,17 @@ class MORTM(nn.Module):
         self.d_model = args.d_model
         self.dim_feedforward = args.dim_feedforward
         self.dropout = args.dropout
+        self.use_lora = args.use_lora
 
         self.decoder = MORTMDecoder(args, bias=True, layer_norm_eps=1e-5, progress=progress)
 
         print(f"Input Vocab Size:{args.vocab_size}")
-        self.Wout: nn.Linear = nn.Linear(self.d_model, args.vocab_size).to(self.progress.get_device())
         self.embedding: nn.Embedding = nn.Embedding(args.vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
+        if not self.use_lora:
+            self.Wout: nn.Linear = nn.Linear(self.d_model, args.vocab_size).to(self.progress.get_device())
+        else:
+            self.Wout: lora.Linear = lora.Linear(self.d_model, args.vocab_size, r=args.lora_r, lora_alpha=args.lora_alpha)
+
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
     def forward(self, x, padding_mask=None, is_causal=False):

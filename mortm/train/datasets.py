@@ -11,11 +11,12 @@ from mortm.models.modules.progress import LearningProgress
 
 
 class MORTM_SEQDataset(Dataset):
-    def __init__(self, progress: LearningProgress, positional_length, min_length):
+    def __init__(self, progress: LearningProgress, positional_length, min_length, is_random_delete_key = False):
         self.seq: list = list()
         self.progress = progress
         self.positional_length = positional_length
         self.min_length = min_length
+        self.is_random_delete_key = is_random_delete_key
 
     def __len__(self):
         return len(self.seq)
@@ -29,7 +30,14 @@ class MORTM_SEQDataset(Dataset):
                 suc_count += 1
         return suc_count
     def __getitem__(self, item):
-        return torch.tensor(self.seq[item], dtype=torch.long, device=self.progress.get_device())
+        if self.is_random_delete_key:
+            i = random.random()
+        else:
+            i = 1
+        if i < 0.5:
+            return torch.tensor(self.seq[item][1:], dtype=torch.long, device=self.progress.get_device())
+        else:
+            return torch.tensor(self.seq[item], dtype=torch.long, device=self.progress.get_device())
 
 
 class ClassDataSets(Dataset):

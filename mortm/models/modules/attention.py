@@ -1,14 +1,9 @@
 from typing import Optional
 
-from torch.nn import functional as F
 from torch.nn.parameter import Parameter
-from torch.nn import Module
-from torch.nn.modules.transformer import _get_clones
-from torch.nn.modules.linear import Linear
-from torch.nn.modules.dropout import Dropout
-from torch.nn.modules.normalization import LayerNorm
 from torch.nn.init import *
 from typing import Optional, Tuple
+import loralib.layers as lora
 
 from torch.nn.functional import linear, softmax, dropout
 
@@ -17,6 +12,7 @@ import torch.nn as nn
 import math
 from einops import rearrange
 
+from .config import MORTMArgs
 try:
     from flash_attn.bert_padding import pad_input, unpad_input
     from flash_attn.flash_attn_interface import (flash_attn_varlen_qkvpacked_func,
@@ -59,43 +55,22 @@ def get_alibi_slopes(n_heads):
 
 
 class QKVLinear(nn.Module):
-    def __init__(self, d_model, num_heads, drop_out):
+    def __init__(self, args: MORTMArgs):
         super(QKVLinear, self).__init__()
-        self.num_heads = num_heads
-        self.drop_out = nn.Dropout(drop_out)
+        self.num_heads = args.num_heads
+        self.drop_out = nn.Dropout(args.dropout)
 
-        self.qkv_weight = Parameter(torch.empty(3 * d_model, d_model, dtype=torch.bfloat16)).to(dtype=torch.bfloat16)
-        self.qkv_bias = Parameter(torch.empty(3 * d_model, dtype=torch.bfloat16)).to(dtype=torch.bfloat16)
-
-        self.W_o = nn.Linear(d_model, d_model, dtype=torch.bfloat16)
-        self.reset_()
-
-
-    def reset_(self):
-        #if not self.is_cross_attn:
-        xavier_uniform_(self.qkv_weight)
-        constant_(self.qkv_bias, 0)
-        '''
+        if not  args.use_lora:
+            self.qkv_weight = nn.Linear(args.d_model, 3 * args.d_model, bias=True, dtype=torch.bfloat16)
+            self.W_o = nn.Linear(args.d_model, args.d_model, dtype=torch.bfloat16)
         else:
-            xavier_uniform_(self.q_weight)
-            xavier_uniform_(self.kv_weight)
-        
-            constant_(self.q_bias, 0)
-            constant_(self.kv_bias, 0)
-        '''
+            self.qkv_weight = lora.Linear(args.d_model, 3 * args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=True, dtype=torch.bfloat16)
+            self.W_o = lora.Linear(args.d_model, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=True, dtype=torch.bfloat16)
 
 
     def forward(self, q: Tensor, k: Tensor=None, v: Tensor=None, ):
-        '''
-        dkv = self.W_dkv(k)
-        dq = self.W_dq(q)
-
-        q = self.W_uq(dq)
-        k = self.W_uk(dkv)
-        v = self.W_uv(dkv)
-        '''
         total, D = q.size()
-        qkv = linear(q, self.qkv_weight, self.qkv_bias).view(total, 3, self.num_heads, D // self.num_heads)
+        qkv = self.qkv_weight(q).view(total, 3, self.num_heads, D // self.num_heads)
 
         return qkv
 
@@ -106,17 +81,17 @@ class QKVLinear(nn.Module):
 
 
 class FlashSelfAttentionM(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.2, progress=None):
+    def __init__(self, args: MORTMArgs, progress=None):
         super(FlashSelfAttentionM, self).__init__()
         self.batch_first = True
         self._qkv_same_embed_dim = True
         self.in_proj_bias = None
 
-        self.embed_dim = embed_dim
-        self.qkv_block = QKVLinear(embed_dim,  num_heads, dropout)
-        self.drop = dropout
+        self.embed_dim = args.d_model
+        self.qkv_block = QKVLinear(args)
+        self.drop = args.dropout
 
-        self.alibi_slopes = torch.tensor(get_alibi_slopes(num_heads), dtype=torch.float32, device=progress.get_device())
+        self.alibi_slopes = torch.tensor(get_alibi_slopes(args.num_heads), dtype=torch.float32, device=progress.get_device())
 
     def forward(self, x, is_causal=False, cu_seqlens=None, max_seqlen=None):
 

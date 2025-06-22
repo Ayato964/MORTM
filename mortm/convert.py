@@ -1,4 +1,5 @@
 import os
+import random
 from typing import List, Any, Optional, Tuple
 
 import numpy as np
@@ -436,7 +437,8 @@ class MetaData2Chord(_AbstractConverter):
             back_chord = c
             if not shift_time_container.shift_measure:
                 chord_count += 1
-
+        if len(clip) > 10:
+            aya_node_split.append(clip)
         self.aya_node = self.aya_node + aya_node_split
 
 
@@ -462,10 +464,12 @@ class MetaData2Chord(_AbstractConverter):
 
 
 class MIDI2TaskSeq(_AbstractMidiConverter):
-    def __init__(self, tokenizer: Tokenizer, system: dict, directory: str, file_name: str, program_list):
+    def __init__(self, tokenizer: Tokenizer, system: dict, directory: str, file_name: str, program_list, split_measure=8, out_measure=4):
         super().__init__(MIDI2TaskSeq, tokenizer, directory, file_name, program_list)
         self.aya_node = [0]
         self.system = system
+        self.out_measure = out_measure
+        self.prompt_max_measure = split_measure
 
     def save(self, save_directory: str) -> [bool, str]:
         if not self.is_error:
@@ -487,23 +491,168 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
                 inst: Instrument = inst
                 if not inst.is_drum and inst.program in self.program_list:
                     aya_node_inst = self.ct_inst2seq(inst)
+                    if aya_node_inst is None:
+                        break
                     self.aya_node = self.aya_node + aya_node_inst
                     program_count += 1
+                    break
 
             if program_count == 0:
                 self.is_error = True
                 self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
 
     def ct_inst2seq(self, inst: Instrument) -> list:
-        clip = np.array([], dtype=int)
-        clip = np.append(clip, self.tokenizer.get("<MGEN>"))
-        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
         aya_node_inst = []
-        back_note = None
-        clip_count = 0
-        sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
-        shift_time_container = ShiftTimeContainer(0, 0)
+        melody_clip = MIDI2Seq(tokenizer=self.tokenizer, directory=self.directory, file_name=self.file_name, program_list=self.program_list, midi_data=self.midi_data, split_measure=999)
+        melody_clip.convert()
+        melody_with_chord_clip = Midi2SeqWithChord(self.tokenizer, self.directory, self.file_name,
+                                                   key=self.system["key"], all_chords=self.system["all_chords"],
+                                                   all_chord_timestamps= self.system["all_chords_timestamps"],program_list=self.program_list, split_measure=999)
+        melody_with_chord_clip.convert()
+        chord_clip = MetaData2Chord(self.tokenizer,
+                                    key=self.system["key"], all_chords=self.system["all_chords"],
+                                    all_chord_timestamps= self.system["all_chords_timestamps"], tempo= self.system["tempo"],
+                                    directory=self.directory, file_name=self.file_name, split_measure=999)
+        chord_clip.convert()
 
+        if melody_clip.is_error and melody_with_chord_clip.is_error and chord_clip.is_error:
+            self.is_error = True
+            self.error_reason = "MIDIの変換中にエラーが発生しました。"
+            return None
+        melody_all: np.ndarray = melody_clip.aya_node[1][1:]
+        melody_all_ind = np.where(melody_all == self.tokenizer.get("<SME>"))[0]
+
+        if len(chord_clip.aya_node) == 1:
+            self.is_error = True
+            self.error_reason = "コード進行の情報がありませんでした。"
+            print(chord_clip.aya_node)
+            return None
+        chord_all = chord_clip.aya_node[1][1:]
+        chord_all_ind = np.where(chord_all == self.tokenizer.get("<SME>"))[0]
+
+        melody_with_chord_all = melody_with_chord_clip.aya_node[1][1:]
+        melody_with_chord_all_ind = np.where(melody_with_chord_all == self.tokenizer.get("<SME>"))[0]
+        back_ind = 0
+
+        print(len(melody_all_ind), len(chord_all_ind), len(melody_with_chord_all_ind))
+        is_running = back_ind + self.prompt_max_measure + self.out_measure < len(melody_all_ind)
+
+        while is_running:
+            prompt_measure = random.randint(back_ind + 1, back_ind + self.prompt_max_measure)
+            melody_task = self.get_melody_task(chord_clip.key, melody_all, prompt_measure, melody_all_ind, back_ind)
+            melody_task_with_chord = self.get_melody_task_with_chord(chord_clip.key, melody_with_chord_all, prompt_measure, melody_with_chord_all_ind, back_ind)
+            chord_task = self.get_chord_task(chord_clip.key, melody_all, chord_all, prompt_measure, melody_all_ind, back_ind)
+            melody_task_add_chord = self.get_melody_task_add_chord(chord_clip.key, melody_with_chord_all, chord_all, prompt_measure, melody_with_chord_all_ind, back_ind)
+
+            self.marge(aya_node_inst, melody_task, melody_task_with_chord, chord_task, melody_task_add_chord)
+
+            back_ind = prompt_measure + self.out_measure
+            is_running = back_ind + self.prompt_max_measure + self.out_measure < len(melody_all_ind)
+        return aya_node_inst
+
+    def marge(self, aya_node_inst, melody_task, melody_task_with_chord, chord_task, melody_task_add_chord):
+        if len(np.where(melody_task == self.tokenizer.get("<BLANK>"))[0]) < 4:
+            aya_node_inst.append(melody_task)
+            aya_node_inst.append(melody_task_with_chord)
+        if len(np.where(chord_task == self.tokenizer.get("<BLANK>"))[0]) < 4:
+            aya_node_inst.append(chord_task)
+            aya_node_inst.append(melody_task_add_chord)
+
+    def get_melody_task_add_chord(self, key, melody_all_with_chord, chord_all, prompt_measure, ind, back_ind) -> np.ndarray:
+        """
+        コード進行制約付き旋律生成タスクを取得する関数
+        :param key:
+        :param melody_all_with_chord:
+        :param chord_all:
+        :param prompt_measure:
+        :param ind:
+        :param back_ind:
+        :return:
+        """
+        melody_prompt: np.ndarray = melody_all_with_chord[ind[back_ind]:ind[prompt_measure]]
+        chord_prompt: np.ndarray  = chord_all[ind[prompt_measure]:ind[prompt_measure + self.out_measure]]
+        melody_tgt: np.ndarray    = melody_all_with_chord[ind[prompt_measure]:ind[prompt_measure + self.out_measure]]
+
+        melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
+        melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
+
+        melody_task = np.concatenate((melody_task, melody_prompt))
+        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
+        melody_task = np.append(melody_task, self.tokenizer.get("<QUERY_C>"))
+        melody_task = np.concatenate((melody_task, chord_prompt))
+        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_C>"))
+        melody_task = np.append(melody_task, self.tokenizer.get("<MGEN>"))
+        melody_task = np.concatenate((melody_task, melody_tgt))
+        melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
+        return melody_task
+
+
+
+    def get_chord_task(self, key,  melody_all, chord_all, prompt_measure, ind, back_ind) -> np.ndarray:
+        """
+        メロディからコード進行を予測するタスクを取得する関数
+        :param melody_all: メロディの全体の配列
+        :param chord_all: コード進行の全体の配列
+        :param prompt_measure: プロンプトの小節数
+        :return: メロディのタスクの配列
+        """
+        melody_prompt: np.ndarray = melody_all[ind[back_ind]:ind[prompt_measure]]
+        chord_tgt: np.ndarray    = chord_all[ind[back_ind]:ind[prompt_measure]]
+
+        melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
+        melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
+
+        melody_task = np.concatenate((melody_task, melody_prompt))
+        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
+        melody_task = np.append(melody_task, self.tokenizer.get("<CGEN>"))
+        melody_task = np.concatenate((melody_task, chord_tgt))
+        melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
+
+        return melody_task
+
+    def get_melody_task(self, key,  melody_all, prompt_measure, ind, back_ind) -> np.ndarray:
+        """
+        単純メロディ生成タスクを取得する関数
+        :param melody_all: メロディの全体の配列
+        :param prompt_measure: プロンプトの小節数
+        :return: メロディのタスクの配列
+        """
+        melody_prompt: np.ndarray = melody_all[ind[back_ind]:ind[prompt_measure]]
+        melody_tgt: np.ndarray    = melody_all[ind[prompt_measure]:ind[prompt_measure + self.out_measure]]
+
+        melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
+        melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
+
+        melody_task = np.concatenate((melody_task, melody_prompt))
+        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
+        melody_task = np.append(melody_task, self.tokenizer.get("<MGEN>"))
+        melody_task = np.concatenate((melody_task, melody_tgt))
+        melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
+
+        return melody_task
+
+    def get_melody_task_with_chord(self, key, melody_all_with_chord, prompt_measure, ind, back_ind) -> np.ndarray:
+        """
+        コード進行付きメロディ生成タスクを取得する関数
+        :param key:
+        :param melody_all_with_chord:
+        :param prompt_measure:
+        :param ind:
+        :param back_ind:
+        :return:
+        """
+        melody_prompt: np.ndarray = melody_all_with_chord[ind[back_ind]:ind[prompt_measure]]
+        melody_tgt: np.ndarray    = melody_all_with_chord[ind[prompt_measure]:ind[prompt_measure + self.out_measure]]
+
+        melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
+        melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
+
+        melody_task = np.concatenate((melody_task, melody_prompt))
+        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
+        melody_task = np.append(melody_task, self.tokenizer.get("<MGEN>"))
+        melody_task = np.concatenate((melody_task, melody_tgt))
+        melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
+        return melody_task
 
 
 

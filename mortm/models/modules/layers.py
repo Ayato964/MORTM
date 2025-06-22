@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttention, TransformerEncoder, TransformerEncoderLayer, _generate_square_subsequent_mask
+import loralib.layers as lora
 from typing import Tuple, List
 import numpy as np
 
@@ -128,11 +129,10 @@ class MORTMDecoderLayer(nn.Module):
         super(MORTMDecoderLayer, self).__init__()
         self.n_head = args.num_heads
         self.d_model = args.d_model
-        self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(args.d_model, args.num_heads, args.dropout, progress=progress)
+        self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(args, progress=progress)
 
         if args.use_moe_decoder == True:
-            self.ffn = MoE(args.d_model, args.dim_feedforward,
-                           args.num_experts, args.topk_experts, args.num_groups, args.topk_groups, )
+            self.ffn = MoE(args)
         else:
             self.ffn = FFN(args.d_model, args.dim_feedforward, args.dropout)
 
@@ -182,11 +182,16 @@ class FFN(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, dim: int, inter_dim: int):
+    def __init__(self, args: MORTMArgs):
         super().__init__()
-        self.w1 = nn.Linear(dim, inter_dim)
-        self.w2 = nn.Linear(inter_dim, dim)
-        self.w3 = nn.Linear(dim, inter_dim)
+        if not args.use_lora:
+            self.w1 = nn.Linear(args.d_model, args.dim_feedforward)
+            self.w2 = nn.Linear(args.dim_feedforward, args.d_model)
+            self.w3 = nn.Linear(args.d_model, args.dim_feedforward)
+        else:
+            self.w1 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha)
+            self.w2 = lora.Linear(args.dim_feedforward, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha)
+            self.w3 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -242,39 +247,35 @@ class Gate(nn.Module):
 
 class Expert(nn.Module):
 
-    def __init__(self, dim: int, inter_dim: int):
+    def __init__(self, args: MORTMArgs):
         super().__init__()
-        self.w1 = nn.Linear(dim, inter_dim)
-        self.w2 = nn.Linear(inter_dim, dim)
-        self.w3 = nn.Linear(dim, inter_dim)
+        if not args.use_lora:
+            self.w1 = nn.Linear(args.d_model, args.dim_feedforward)
+            self.w2 = nn.Linear(args.dim_feedforward, args.d_model)
+            self.w3 = nn.Linear(args.d_model, args.dim_feedforward)
+        else:
+            self.w1 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha)
+            self.w2 = lora.Linear(args.dim_feedforward, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha)
+            self.w3 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class MoE(nn.Module):
-    def __init__(self, d_model, dim_ff, num_experts, topk_experts, num_group, topk_groups, route_scale=1):
-        """
-        :param d_model: 埋め込み次元数
-        :param dim_ff: FFNの次元数
-        :param num_experts: 専門家の数
-        :param topk_experts: 選択される専門家の数(top_k)
-        :param num_group: 専門家のグループの数
-        :param topk_groups: 選択される専門家のグループの数(top_k)
-        :param route_scale: スケーリングの値
-        """
+    def __init__(self, args: MORTMArgs, route_scale=1):
         super().__init__()
-        self.dim = d_model
-        self.n_routed_experts = num_experts
+        self.dim = args.d_model
+        self.n_routed_experts = args.num_experts
         self.n_local_experts = self.n_routed_experts // world_size
-        self.n_activated_experts = topk_experts
+        self.n_activated_experts = args.topk_experts
         self.experts_start_idx = 0
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = Gate(d_model, num_experts, topk_experts, num_group, topk_groups, route_scale=route_scale)
+        self.gate = Gate(args.d_model, args.num_experts, args.topk_experts, args.num_groups, args.topk_groups, route_scale=route_scale)
 
-        self.experts = nn.ModuleList([Expert(d_model, dim_ff) if self.experts_start_idx <= i < self.experts_end_idx else None
+        self.experts = nn.ModuleList([Expert(args) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])
-        self.shared_experts = MLP(d_model, dim_ff)
+        self.shared_experts = MLP(args)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

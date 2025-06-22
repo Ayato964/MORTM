@@ -24,6 +24,10 @@ class MORTMArgs:
             self.use_moe_encoder = False if data.get('use_moe_encoder') is None else data['use_moe_encoder'],
             self.use_moe_decoder = True if data.get('use_moe_decoder') is None else data['use_moe_decoder']
 
+            self.use_lora = False if data.get('use_lora') is None else data['use_lora']
+            self.lora_r = data['lora_r'] if data.get('lora_r') else 8
+            self.lora_alpha = data['lora_alpha'] if data.get('lora_alpha') else 16
+
 
 class V_MORTMArgs(MORTMArgs):
     def __init__(self, json_directory: str):

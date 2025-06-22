@@ -4,9 +4,7 @@ from numpy import ndarray
 
 import re
 from mortm import constants
-from mortm.custom_token import (Token, Pitch, Duration, StartRE, QueryMelody, QueryMelodyEnd, QueryChord, QueryChordEnd,
-                                MeasureToken, TrackStart, TrackEnd,CGen, ChordShiftRE, Key,
-                                Blank, SequenceEnd, MGen, CLS, ChordBass, ChordQuality, ChordRoot)
+from mortm.custom_token import *
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'
@@ -71,6 +69,11 @@ def get_token_converter(convert: int) -> List[Token]:
     register.append(TrackEnd(convert))
 
     register.append(Key(convert))
+    register.append(QueryCross(convert))
+    register.append(QueryCrossEnd(convert))
+    register.append(Motif(convert))
+    register.append(MotifEnd(convert))
+    register.append(GenMotif(convert))
 
     return register
 

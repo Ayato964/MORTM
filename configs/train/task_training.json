@@ -1,9 +1,9 @@
 {
   "big_batch_size": 512,
-  "batch_size":16,
-  "accumulation_steps":3,
+  "batch_size":32,
+  "accumulation_steps":1,
   "warmup_steps": 4000,
-  "num_epochs": 40,
+  "num_epochs": 20,
   "is_save_training_progress": true,
   "train_dataset_split": 0.99
 }

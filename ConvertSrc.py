@@ -5,7 +5,7 @@ from typing import List
 import numpy as np
 from multiprocessing import Process, Manager
 from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.convert import MIDI2Seq, PackSeq, MidiExpantion, Midi2SeqWithChord, MetaData2Chord
+from mortm.convert import *
 
 def find_midi_files(root_folder):
     midi_files = []
@@ -145,6 +145,7 @@ def convert_with_chord(pid, tokenizer, directory: List[str], md_file: List[str],
             con = Midi2SeqWithChord(tokenizer, directory[i], md_file[i],key=system_file[i]["key"], all_chords=system_file[i]["all_chords"],
                                     all_chord_timestamps=system_file[i]["all_chords_timestamps"],  program_list=program)
             con.convert()
+            print("SSS?")
             is_saved, reason = con.save(save_path)
             for a in con.aya_node[1:]:
                 a:np.ndarray
@@ -172,11 +173,36 @@ def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress
                                  all_chord_timestamps=system_file[i]["all_chords_timestamps"], tempo=system_file[i]["tempo"],
                                  directory=directory[i], file_name=md_file[i])
             con.convert()
+            print("は？")
 
             for a in con.aya_node[1:]:
                 a:np.ndarray
                 if np.sum(a == 0) != 0:
-                    print(f"\033[31m 警告, 今すぐ処理を中断してください！！！  : {system_file[i]["location"]} ")
+                    print(f"\033[31m 警告, 今すぐ処理を中断してください！！！  : {system_file[i]["location"]}  {np.where(a == 0)}")
+                    is_error = True
+                    break
+            if not is_error:
+                is_saved, reason = con.save(save_directory)
+                if is_saved:
+                    local_count += 1
+
+                print(f"Process#{pid}: Running... {local_count}  Reason: {reason}")
+
+def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progress, save_directory):
+    local_count = 0
+    for i in range(len(md_file)):
+        if (system_file[i]["key"] and len(system_file[i]["all_chords"]) > 10 and not ("N" in system_file[i]["all_chords"])
+                and len(system_file[i]["all_chords_timestamps"]) != 0 and system_file[i]["tempo"]):
+            #print(system_file[i]["location"], system_file[i]["all_chords"], system_file[i]["all_chords_timestamps"])
+            is_error = False
+            con = MIDI2TaskSeq(tokenizer, system=system_file[i],
+                                 directory=directory[i], file_name=md_file[i], program_list=SAX)
+            con.convert()
+
+            for a in con.aya_node[1:]:
+                a:np.ndarray
+                if np.sum(a == 0) != 0:
+                    print(f"\033[31m 警告, 今すぐ処理を中断してください！！！  : {system_file[i]["location"]}  {np.where(a == 0)} ")
                     is_error = True
                     break
 
@@ -184,7 +210,6 @@ def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress
                 is_saved, reason = con.save(save_directory)
                 if is_saved:
                     local_count += 1
-
                 print(f"Process#{pid}: Running... {local_count}  Reason: {reason}")
 
 
@@ -222,8 +247,8 @@ if __name__ == "__main__":
             """
 
             #"""
-            p = Process(target=convert_with_chord, args=(t, tokenizer, directory[t].tolist(),
-                                                         md_file[t].tolist(), system_file[t], SAX, progress, "out/np/Sax/pre-train/Phase2/with_chord"))
+            p = Process(target=convert_task_seq, args=(t, tokenizer, directory[t].tolist(),
+                                                         md_file[t].tolist(), system_file[t], SAX, progress, "out/np/Sax/task_train"))
             #"""
 
             processes.append(p)

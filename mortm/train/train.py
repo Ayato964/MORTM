@@ -41,7 +41,6 @@ from solo.adamw import AdamWQ
 
 IS_DEBUG = False
 
-
 class MORTMTrainSet(AbstractTrainSet):
     def __init__(self, args: MORTMArgs, progress: LearningProgress, load_directory=None):
         self.args = args
@@ -49,7 +48,7 @@ class MORTMTrainSet(AbstractTrainSet):
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
 
-        adam = torch.optim.Adam(self.model.parameters(), lr=2e-1)
+        adam = torch.optim.Adam(self.model.parameters(), lr=5e-1)
 
         super().__init__(criterion=nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device()),
                         optimizer=adam,
@@ -534,4 +533,19 @@ def train_v_mortm(model_config: str, train_config: str, root_directory, save_dir
 
     _train(args, t_args, save_directory, trainer, message=message, version=version, today_date=today_date,
            train_loader=train_loader, val_loader=val_loader,
+           progress=progress)
+
+def train_custom(trainer, train_config, root_directory, save_directory, version: str, extention: str = '.npz', coll_fn=None,
+                 message: Messenger = _DefaultMessenger(), progress: LearningProgress = _DefaultLearningProgress()):
+    t_args = TrainArgs(json_directory=train_config)
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    today_date = datetime.date.today().strftime('%Y%m%d')
+    print(f"ToDay is{datetime.date.today()}! start learning. {trainer.args.name}.Ver.{version}_{today_date}")
+
+    directory, filename = find_files(root_directory, extention)
+    mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
+    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
+
+    _train(trainer.args, t_args, save_directory, trainer, message=message, version=version, today_date=today_date,
+           train_loader=train_loader, val_loader=val_loader, coll_fn=coll_fn,
            progress=progress)
