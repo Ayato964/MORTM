@@ -42,6 +42,7 @@ class TTMORTM(AbstractTrainSet):
                          scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=self.args.d_model, warmup_steps=4000)),
                          criterion=MaskedCrossEntropyLoss(ignore_index=0))
 
+
     def epoch_fc(self, model, pack, progress):
         src = pack
         target: Tensor = src[:, 1:].to(progress.get_device())
@@ -98,7 +99,7 @@ if __name__ == "__main__":
     MODEL_CONFIG =  "configs/models/mortm/A.json"
     TRAIN_CONFIG = "configs/train/task_training.json"
     LOOT_DIRECTORY = "out/np/Sax/task_train/"
-    LOAD_MODEL_DIRECTORY = "out/model/mortm/MORTM.4.0-SAX-Phase1.pth"
+    LOAD_MODEL_DIRECTORY = "out/model/mortm/MORTM.4.0EX5-SAX-Phase1_1.4054.pth"
     SAVE_DIRECTORY = "out/model/mortm"
     VERSION = "4.0-SAX-Phase2"
 

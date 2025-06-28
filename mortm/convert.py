@@ -177,10 +177,11 @@ class MIDI2Seq(_AbstractMidiConverter):
     MIDIをトークンのシーケンスに変換するクラス
     '''
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None, split_measure=12):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None, split_measure=12, is_include_special_token = True):
         super().__init__(MIDI2Seq, tokenizer, directory, file_name, program_list, midi_data)
         self.aya_node = [0]
         self.split_measure = split_measure
+        self.is_include_special_token = is_include_special_token
 
     def convert(self):
         """
@@ -207,7 +208,8 @@ class MIDI2Seq(_AbstractMidiConverter):
     def ct_aya_node(self, inst: Instrument) -> list:
 
         clip = np.array([], dtype=int)
-        clip = np.append(clip, self.tokenizer.get("<MGEN>"))
+        if self.is_include_special_token:
+            clip = np.append(clip, self.tokenizer.get("<MGEN>"))
         aya_node_inst = []
         back_note = None
 
@@ -235,7 +237,8 @@ class MIDI2Seq(_AbstractMidiConverter):
                             clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                             aya_node_inst = self.marge_clip(clip, aya_node_inst)
                             clip = np.array([], dtype=int)
-                            clip = np.append(clip, self.tokenizer.get("<MGEN>"))
+                            if self.is_include_special_token:
+                                clip = np.append(clip, self.tokenizer.get("<MGEN>"))
                             back_note = None
                             clip_count = 0
 
@@ -275,12 +278,14 @@ class MIDI2Seq(_AbstractMidiConverter):
 
 class Midi2SeqWithChord(_AbstractMidiConverter):
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name, key: str, all_chords: List[str], all_chord_timestamps: List[float], program_list, split_measure=12):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name, key: str, all_chords: List[str], all_chord_timestamps: List[float],
+                 program_list, split_measure=12, is_include_special_token=True):
         super().__init__(Midi2SeqWithChord, tokenizer, directory, file_name, program_list)
         self.aya_node = [0]
         self.key = key
         self.split_measure = split_measure
         self.chords = ChordMidi(all_chords, all_chord_timestamps)
+        self.is_include_special_token = is_include_special_token
 
 
     def convert(self, *args, **kwargs):
@@ -302,8 +307,9 @@ class Midi2SeqWithChord(_AbstractMidiConverter):
     def ct_aya_node(self, inst: Instrument) -> list:
 
         clip = np.array([], dtype=int)
-        clip = np.append(clip, self.tokenizer.get("<MGEN>"))
-        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
+        if self.is_include_special_token:
+            clip = np.append(clip, self.tokenizer.get("<MGEN>"))
+            clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
         aya_node_inst = []
         back_note = None
 
@@ -334,8 +340,9 @@ class Midi2SeqWithChord(_AbstractMidiConverter):
                         clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                         aya_node_inst = self.marge_clip(clip, aya_node_inst)
                         clip = np.array([], dtype=int)
-                        clip = np.append(clip, self.tokenizer.get("<MGEN>"))
-                        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
+                        if self.is_include_special_token:
+                            clip = np.append(clip, self.tokenizer.get("<MGEN>"))
+                            clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
                         back_note = None
                         clip_count = 0
 
@@ -395,8 +402,9 @@ class MetaData2Chord(_AbstractConverter):
         back_chord: Optional[Chord] = None
         aya_node_split = []
         clip = np.array([], dtype=int)
-        clip = np.append(clip, self.tokenizer.get("<CGEN>"))
-        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
+        if self.is_include_special_token:
+            clip = np.append(clip, self.tokenizer.get("<CGEN>"))
+            clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
         clip_count = 0
 
         self.chords.sort(self.chords[0].time_stamp)
@@ -422,10 +430,10 @@ class MetaData2Chord(_AbstractConverter):
                     if clip_count >= self.split_measure:
                         clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                         aya_node_split.append(clip)
-
                         clip = np.array([], dtype=int)
-                        clip = np.append(clip, self.tokenizer.get("<CGEN>"))
-                        clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
+                        if self.is_include_special_token:
+                            clip = np.append(clip, self.tokenizer.get("<CGEN>"))
+                            clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
                         back_chord = None
                         clip_count = 0
                     token_id = self.tokenizer.get(token)
@@ -445,9 +453,10 @@ class MetaData2Chord(_AbstractConverter):
 
 
     def __init__(self, tokenizer: Tokenizer, key: str, all_chords: List[str], all_chord_timestamps: List[float], tempo,
-                directory: str, file_name: str | List[str], split_measure=12):
+                directory: str, file_name: str | List[str], split_measure=12, is_include_special_token=True):
         super().__init__(MetaData2Chord, directory, file_name)
         self.aya_node = [-1]
+        self.is_include_special_token = is_include_special_token
         self.tempo = tempo
         self.tokenizer = tokenizer
         self.split_measure = split_measure
@@ -503,13 +512,14 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
 
     def ct_inst2seq(self, inst: Instrument) -> list:
         aya_node_inst = []
-        melody_clip = MIDI2Seq(tokenizer=self.tokenizer, directory=self.directory, file_name=self.file_name, program_list=self.program_list, midi_data=self.midi_data, split_measure=999)
+        melody_clip = MIDI2Seq(tokenizer=self.tokenizer, directory=self.directory, file_name=self.file_name,is_include_special_token=False,
+                               program_list=self.program_list, midi_data=self.midi_data, split_measure=999)
         melody_clip.convert()
-        melody_with_chord_clip = Midi2SeqWithChord(self.tokenizer, self.directory, self.file_name,
+        melody_with_chord_clip = Midi2SeqWithChord(self.tokenizer, self.directory, self.file_name, is_include_special_token=False,
                                                    key=self.system["key"], all_chords=self.system["all_chords"],
                                                    all_chord_timestamps= self.system["all_chords_timestamps"],program_list=self.program_list, split_measure=999)
         melody_with_chord_clip.convert()
-        chord_clip = MetaData2Chord(self.tokenizer,
+        chord_clip = MetaData2Chord(self.tokenizer,is_include_special_token=False,
                                     key=self.system["key"], all_chords=self.system["all_chords"],
                                     all_chord_timestamps= self.system["all_chords_timestamps"], tempo= self.system["tempo"],
                                     directory=self.directory, file_name=self.file_name, split_measure=999)
@@ -582,6 +592,8 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
         melody_task = np.concatenate((melody_task, chord_prompt))
         melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_C>"))
         melody_task = np.append(melody_task, self.tokenizer.get("<MGEN>"))
+        melody_task = np.append(melody_task, self.tokenizer.get(f"k_{key}"))
+
         melody_task = np.concatenate((melody_task, melody_tgt))
         melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
         return melody_task
@@ -605,6 +617,7 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
         melody_task = np.concatenate((melody_task, melody_prompt))
         melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
         melody_task = np.append(melody_task, self.tokenizer.get("<CGEN>"))
+        melody_task = np.append(melody_task, self.tokenizer.get(f"k_{key}"))
         melody_task = np.concatenate((melody_task, chord_tgt))
         melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
 
@@ -626,6 +639,7 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
         melody_task = np.concatenate((melody_task, melody_prompt))
         melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
         melody_task = np.append(melody_task, self.tokenizer.get("<MGEN>"))
+        melody_task = np.append(melody_task, self.tokenizer.get(f"k_{key}"))
         melody_task = np.concatenate((melody_task, melody_tgt))
         melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
 
@@ -650,6 +664,7 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
         melody_task = np.concatenate((melody_task, melody_prompt))
         melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
         melody_task = np.append(melody_task, self.tokenizer.get("<MGEN>"))
+        melody_task = np.append(melody_task, self.tokenizer.get(f"k_{key}"))
         melody_task = np.concatenate((melody_task, melody_tgt))
         melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
         return melody_task

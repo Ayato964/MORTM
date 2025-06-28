@@ -49,6 +49,7 @@ class MORTMTrainSet(AbstractTrainSet):
             self.model.load_state_dict(torch.load(load_directory))
 
         adam = torch.optim.Adam(self.model.parameters(), lr=5e-1)
+        #self.model = torch.compile(self.model)
 
         super().__init__(criterion=nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device()),
                         optimizer=adam,
@@ -73,7 +74,7 @@ class MORTMTrainSet(AbstractTrainSet):
         padding_mask_in: Tensor = _get_padding_mask(src, progress)
         input: Tensor = model(x=src, padding_mask=padding_mask_in, is_causal=True)
         input = input.view(-1, input.size(-1)).to(progress.get_device())
-        return input.to(device=progress.get_device(), dtype=torch.float32), target
+        return input.to(device=progress.get_device()), target
 
 
 class BERTMTrainSet(AbstractTrainSet):
@@ -328,8 +329,9 @@ def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: n
             pre_processing: Dataset = trainer.pre_processing(pack, progress)
             loader = DataLoader(pre_processing, batch_size=train_args.batch_size, shuffle=True, collate_fn=coll_fn)
             for pack2 in loader:
-                r_pack = trainer.epoch_fc(model, pack2, progress)
-                loss = criterion(*r_pack)  # 損失を計算
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    r_pack = trainer.epoch_fc(model, pack2, progress)
+                    loss = criterion(*r_pack)  # 損失を計算
                 val_loss += loss.item()
                 all_count += 1
     model.train()
@@ -345,7 +347,8 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
     criterion = trainer.criterion
     optimizer = trainer.optimizer
     scheduler = trainer.scheduler
-    print("Start training...")
+    print(f"Start training...")
+    print(f"検証損失計算回数:{len(train_loader) // 20}")
 
     mail_bool = True
     all_count = 1
@@ -370,17 +373,17 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                 for pack2 in loader:
                     mini_c += 1
                     all_count += 1
+
                     if mini_c % train_args.accumulation_steps == 0:  #実質バッチサイズは64である
                         progress.step_optimizer(optimizer, model, train_args.accumulation_steps)
                         if train_args.lr_param is None:
                             scheduler.step()
                         torch.cuda.empty_cache()
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        r_pack = trainer.epoch_fc(model, pack2, progress)
 
+                        loss = criterion(*r_pack)  # 損失を計算
 
-
-                    r_pack = trainer.epoch_fc(model, pack2, progress)
-
-                    loss = criterion(*r_pack)  # 損失を計算
                     epoch_loss.add(loss.item())
 
                     loss = loss / train_args.accumulation_steps
@@ -402,12 +405,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                     #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-
-                if (count + 1) % int(10000 / train_args.batch_size) == 0:
-                    torch.save(model.state_dict(), f"{save_directory}/MORTM.train.{epoch}.{verification_loss:.4f}_{count}.pth")
-                    print("途中経過を保存しました。")
-
-                if (count + 1) % int(100 / train_args.batch_size) == 0:
+                if (count + 1) % int(len(train_loader) // 20) == 0:
                     print("検証損失を求めています")
                     torch.cuda.empty_cache()
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn)

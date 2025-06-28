@@ -14,12 +14,15 @@ from einops import rearrange
 
 from .config import MORTMArgs
 try:
+    from flash_attn.layers.rotary import RotaryEmbedding, apply_rotary_emb
+    IS_NOT_FLASH = False
+except ImportError as i:
+    IS_NOT_FLASH = True
+    print(f"モジュールをインストールできませんでした。（WindowsではFlashを利用できません）\n {i.name}")
+
+try:
     from flash_attn.bert_padding import pad_input, unpad_input
-    from flash_attn.flash_attn_interface import (flash_attn_varlen_qkvpacked_func,
-                                                 flash_attn_qkvpacked_func,
-                                                 flash_attn_varlen_kvpacked_func,
-                                                 flash_attn_kvpacked_func)
-    from flash_attn.modules.mha import FlashSelfAttention, FlashCrossAttention
+    from flash_attn.flash_attn_interface import *
 except ImportError as i:
     print(f"モジュールをインストールできませんでした。\n {i.name}")
 
@@ -77,7 +80,7 @@ class QKVLinear(nn.Module):
     def comp(self, o: Tensor):
         out: Tensor = self.W_o(o)
 
-        return out.to(dtype=torch.float32)
+        return out
 
 
 class FlashSelfAttentionM(nn.Module):
@@ -91,23 +94,54 @@ class FlashSelfAttentionM(nn.Module):
         self.qkv_block = QKVLinear(args)
         self.drop = args.dropout
 
-        self.alibi_slopes = torch.tensor(get_alibi_slopes(args.num_heads), dtype=torch.float32, device=progress.get_device())
+        if IS_NOT_FLASH:
+            print("FlashAttention2のALiBiを使用します。")
+            self.alibi_slopes = torch.tensor(get_alibi_slopes(args.num_heads), dtype=torch.float32, device=progress.get_device())
+        else:
+            print("FlashAttention2のRoPEを使用します。")
+            head_dim = args.d_model // args.num_heads
+            device = progress.get_device() if progress else None
+            self.rotary_emb = RotaryEmbedding(dim=head_dim, base=10000.0, interleaved=False, device=device)
+
+
 
     def forward(self, x, is_causal=False, cu_seqlens=None, max_seqlen=None):
 
-        x = x.to(dtype=torch.bfloat16)
+        #x = x.to(dtype=torch.bfloat16)
         qkv: Tensor = self.qkv_block(q=x)
 
-
         if cu_seqlens is not None:
-            out = flash_attn_varlen_qkvpacked_func(qkv, dropout_p=self.drop, causal=is_causal,
-                                                   cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                                                   alibi_slopes=self.alibi_slopes) # OK
+            if IS_NOT_FLASH:
+                out = flash_attn_varlen_qkvpacked_func(qkv, dropout_p=self.drop, causal=is_causal,
+                                                       cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                                                       alibi_slopes=self.alibi_slopes) # OK
+            else:
+                q, k = qkv[:, 0], qkv[:, 1]
+
+                # cos/sinキャッシュを更新
+                # 可変長の場合、最大のシーケンス長をmax_seqlenとして渡す必要があります
+                assert max_seqlen is not None, "max_seqlen must be provided for variable length sequences"
+                self.rotary_emb._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)
+
+                # apply_rotary_embを直接呼び出して、QとKにそれぞれRoPEを適用
+                q = apply_rotary_emb(q, self.rotary_emb._cos_cached, self.rotary_emb._sin_cached, interleaved=False, cu_seqlens=cu_seqlens)
+                k = apply_rotary_emb(k, self.rotary_emb._cos_cached, self.rotary_emb._sin_cached, interleaved=False, cu_seqlens=cu_seqlens)
+
+                # 更新されたq, kをqkvテンソルに戻す (vは変更しない)
+                qkv = torch.stack([q, k, qkv[:, 2]], dim=1)
+                out = flash_attn_varlen_qkvpacked_func(qkv, dropout_p=self.drop, causal=is_causal,
+                                                       cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,) # OK
         else:
-            qkv = qkv.unsqueeze(0)
-            out: Tensor = flash_attn_qkvpacked_func(qkv, causal=is_causal, dropout_p=0,
-                                            alibi_slopes=self.alibi_slopes)
-            out = out.squeeze(0)
+            if IS_NOT_FLASH:
+                qkv = qkv.unsqueeze(0)
+                out: Tensor = flash_attn_qkvpacked_func(qkv, causal=is_causal, dropout_p=0, alibi_slopes=self.alibi_slopes)
+                out = out.squeeze(0)
+            else:
+                qkv = qkv.unsqueeze(0)
+                self.rotary_emb(qkv, max_seqlen=qkv.shape[1])
+                out: Tensor = flash_attn_qkvpacked_func(qkv, causal=is_causal, dropout_p=0)
+                flash_attn_qkvpacked_func()
+                out = out.squeeze(0)
 
         out = rearrange(out, "total h d -> total (h d)")
         out = self.qkv_block.comp(out)

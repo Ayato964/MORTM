@@ -4,10 +4,10 @@ with open('README.md', 'r', encoding='utf-8-sig') as f:
     long_description = f.read()
 setup(
     name='MORTM',
-    version='4.0b6',
+    version='4.0b51',
     author='Nagoshi Takaaki',
     author_email='nagoshi@kthrlab.jp',
-    description='音楽の旋律生成を実現したシステム',
+    description='旋律生成、コード推定、マルチタスクな音楽生成を行うライブラリ',
     long_description=long_description,
     long_description_content_type='text/markdown',
     url='https://github.com/Ayato964',

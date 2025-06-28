@@ -101,13 +101,11 @@ class MORTMEncoderLayer(nn.Module):
 
 
 class MORTMDecoder(nn.Module):
-    def __init__(self, args: MORTMArgs, bias, layer_norm_eps, progress):
+    def __init__(self, args: MORTMArgs, progress):
         super(MORTMDecoder, self).__init__()
         self.num_layer = args.d_layer
-        self.layers = _get_clones(MORTMDecoderLayer(args,
-                                                    bias=bias,
-                                                    layer_norm_eps=layer_norm_eps, progress=progress), self.num_layer)
-        self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
+        self.layers = _get_clones(MORTMDecoderLayer(args, progress=progress), self.num_layer)
+        self.norm = DynamicTanh(args.d_model)
 
     def forward(self, tgt: Tensor, tgt_is_causal: Optional[bool] = None, cu_seqlens=None, max_seqlen=None) -> Tensor:
 
@@ -125,7 +123,7 @@ class MORTMDecoder(nn.Module):
 
 class MORTMDecoderLayer(nn.Module):
 
-    def __init__(self, args: MORTMArgs, bias, layer_norm_eps, progress):
+    def __init__(self, args: MORTMArgs, progress):
         super(MORTMDecoderLayer, self).__init__()
         self.n_head = args.num_heads
         self.d_model = args.d_model
@@ -137,9 +135,9 @@ class MORTMDecoderLayer(nn.Module):
             self.ffn = FFN(args.d_model, args.dim_feedforward, args.dropout)
 
 
-        self.norm1 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
-        self.norm2 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
-        self.norm3 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=bias, dtype=torch.float32)
+        self.norm1 = DynamicTanh(args.d_model)
+        self.norm2 = DynamicTanh(args.d_model)
+        self.norm3 = DynamicTanh(args.d_model)
 
         self.dropout1 = nn.Dropout(args.dropout)
         self.dropout2 = nn.Dropout(args.dropout)
@@ -161,6 +159,7 @@ class MORTMDecoderLayer(nn.Module):
         return self.dropout1(y)
 
     def ff_block(self, y: Tensor):
+
         return self.dropout3(self.ffn(y))
 
 
@@ -220,29 +219,30 @@ class Gate(nn.Module):
         self.bias = nn.Parameter(torch.empty(num_experts)) if self.dim == 7168 else None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        scores = linear(x, self.weight)
-        if self.score_func == "softmax":
-            scores = scores.softmax(dim=-1, dtype=torch.float32)
-        else:
-            scores = scores.sigmoid()
-        original_scores = scores
-        if self.bias is not None:
-            scores = scores + self.bias
-        if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
-            if self.bias is None:
-                group_scores = scores.amax(dim=-1)
+        with torch.autocast(device_type=x.device.type):
+            scores = linear(x, self.weight)
+            if self.score_func == "softmax":
+                scores = scores.softmax(dim=-1)
             else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-            mask = scores.new_ones(x.size(0), self.n_groups, dtype=torch.bool).scatter_(1, indices, False)
-            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
-        if self.score_func == "sigmoid":
-            weights /= weights.sum(dim=-1, keepdim=True)
-        weights *= self.route_scale
-        return weights.type_as(x), indices
+                scores = scores.sigmoid()
+            original_scores = scores
+            if self.bias is not None:
+                scores = scores + self.bias
+            if self.n_groups > 1:
+                scores = scores.view(x.size(0), self.n_groups, -1)
+                if self.bias is None:
+                    group_scores = scores.amax(dim=-1)
+                else:
+                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+                mask = scores.new_ones(x.size(0), self.n_groups, dtype=torch.bool).scatter_(1, indices, False)
+                scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+            if self.score_func == "sigmoid":
+                weights /= weights.sum(dim=-1, keepdim=True)
+            weights *= self.route_scale
+        return weights.type_as(x).to(dtype=x.dtype), indices
 
 
 class Expert(nn.Module):
@@ -300,3 +300,20 @@ class MoE(nn.Module):
         if world_size > 1:
             dist.all_reduce(y)
         return (y + z)
+
+
+class DynamicTanh(nn.Module):
+    def __init__(self, normalized_shape, alpha_init_value=0.5):
+        super().__init__()
+        self.normalized_shape = normalized_shape
+        self.alpha_init_value = alpha_init_value
+
+        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+
+    def forward(self, x):
+        dtype = x.dtype
+        x = torch.tanh(self.alpha * x)
+        x = x * self.weight + self.bias
+        return x.to(dtype=dtype)

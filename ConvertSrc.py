@@ -195,7 +195,7 @@ def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progr
                 and len(system_file[i]["all_chords_timestamps"]) != 0 and system_file[i]["tempo"]):
             #print(system_file[i]["location"], system_file[i]["all_chords"], system_file[i]["all_chords_timestamps"])
             is_error = False
-            con = MIDI2TaskSeq(tokenizer, system=system_file[i],
+            con = MIDI2TaskSeq(tokenizer, system=system_file[i], split_measure=8, out_measure=12,
                                  directory=directory[i], file_name=md_file[i], program_list=SAX)
             con.convert()
 

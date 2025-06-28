@@ -23,7 +23,7 @@ class MORTM(nn.Module):
         self.dropout = args.dropout
         self.use_lora = args.use_lora
 
-        self.decoder = MORTMDecoder(args, bias=True, layer_norm_eps=1e-5, progress=progress)
+        self.decoder = MORTMDecoder(args, progress=progress)
 
         print(f"Input Vocab Size:{args.vocab_size}")
         self.embedding: nn.Embedding = nn.Embedding(args.vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
@@ -35,8 +35,7 @@ class MORTM(nn.Module):
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
     def forward(self, x, padding_mask=None, is_causal=False):
-        x: Tensor = self.embedding(x)
-
+        x: Tensor = self.embedding(x).to(dtype=torch.bfloat16)
         if padding_mask is not None:
             batch, tgt_len, embed_dim = x.size()
             x, indices, cu_seqlens, max_s, used_seqlens = unpad_input(x, padding_mask)
@@ -45,12 +44,12 @@ class MORTM(nn.Module):
             batch = None
             indices = cu_seqlens = max_s = used_seqlens = None
         out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s)
-
         if padding_mask is not None:
             out = pad_input(out, indices, batch, tgt_len)
 
-        score: Tensor = self.Wout(out)
-        return score.to(self.progress.get_device())
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
+            score: Tensor = self.Wout(out)
+        return score
 
     def top_p_sampling_measure(self, src: Tensor, p=0.9, max_measure=20, temperature=1.0) -> Tuple[Tensor, Tensor]:
         """
@@ -65,6 +64,7 @@ class MORTM(nn.Module):
         Returns:
             List[Tensor]: 生成されたトークンのリスト
         """
+        self.eval()
         if isinstance(src, numpy.ndarray):
             src = torch.tensor(src, device=self.progress.get_device())
         #src = src.unsqueeze(0)
@@ -73,17 +73,18 @@ class MORTM(nn.Module):
 
         generated_tokens = []
         is_running = True
-        while is_running:
-            logits: Tensor = self(src, is_causal=True)
-            #logits = logits.squeeze(0)
-            sampled_index = self.top_p_sampling(logits[-1], p=p, temperature=temperature)
-            generated_tokens.append(sampled_index)
-            print(sampled_index)
+        with torch.no_grad():
+            while is_running:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16) :
+                    logits: Tensor = self(src, is_causal=True)
+                sampled_index = self.top_p_sampling(logits[-1], p=p, temperature=temperature)
+                generated_tokens.append(sampled_index)
+                print(sampled_index)
 
-            src = torch.cat([src, torch.tensor([sampled_index], device=self.progress.get_device())], dim=0)
-            measure_count = (src == 8).sum().item()
-            if sampled_index == 585 or sampled_index == 586 or measure_count > max_measure:
-                is_running = False
+                src = torch.cat([src, torch.tensor([sampled_index], device=self.progress.get_device())], dim=0)
+                measure_count = (src == 8).sum().item()
+                if sampled_index == 585 or sampled_index == 586 or measure_count > max_measure:
+                    is_running = False
 
         return torch.tensor(generated_tokens), src.squeeze(0)
 

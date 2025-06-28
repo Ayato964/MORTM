@@ -1,4 +1,5 @@
 import torch
+from torch import compile
 from mortm.models.mortm import MORTM, MORTMArgs
 import mortm.train.tokenizer as token
 import numpy as np
@@ -25,15 +26,16 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
     モデルによって異なるので、再度確認してください。
 '''
 
-tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
+tokenizer =token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
 tokenizer.rev_mode()
 #args = MORTMArgs("configs/models/mortm/not_moe/A.json")
 args = MORTMArgs("configs/models/mortm/A.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/mortm/MORTM.4.0-SAX-Phase1.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/mortm/MORTM.4.0EX5-SAX-Phase1_1.4054.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
+model = compile(model)
 
 '''
 既存の楽曲からその続きを生成する場合、以下を実行し、NPZから解凍してください。
@@ -44,8 +46,8 @@ model.to(device)
 '''
 
 """"------ 旋律の自己回帰生成を行う場合------"""
-np_notes = np.load("out/Sample4.mid.npz")
-start = np_notes[f'array1'][:-1]
+np_notes = np.load("out/Sample.mid.npz")
+start = np_notes[f'array1'][:120]
 print(start)
 """-------------------------------------"""
 
