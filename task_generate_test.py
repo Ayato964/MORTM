@@ -15,7 +15,7 @@ tokenizer.rev_mode()
 args = MORTMArgs("configs/models/mortm/A.json")
 args.use_lora = True
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/mortm/MORTM.4.0-SAX-Phase2_0.28078685654327273.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/mortm/MORTM.4.0-SAX-Phase2_0.28.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 
@@ -28,15 +28,15 @@ model.to(device)
 
 
 """--------旋律自己回帰生成----------"""
-#np_notes = np.load("out/Sample4.mid.npz")
-#midi_prompt = np_notes[f'array1'][2:98]
+np_notes = np.load("out/Sample4.mid.npz")
+midi_prompt = np_notes[f'array1'][2:129]
 
-#start = np.array([tokenizer.get(f"k_Cm"), tokenizer.get("<QUERY_M>")] + midi_prompt.tolist() + [tokenizer.get("</QUERY_M>"), tokenizer.get("<MGEN>")])
+start = np.array([tokenizer.get(f"k_Cm"), tokenizer.get("<QUERY_M>")] + midi_prompt.tolist() + [tokenizer.get("</QUERY_M>"), tokenizer.get("<MGEN>")])
 """----------------------------"""
 
 
 """--------コード進行付き旋律自己回帰生成----------"""
-#"""
+"""
 np_notes = np.load("out/Sample4.mid.npz")
 midi_prompt = np_notes[f'array1'][2:98]
 chord_prompt = np.array([tokenizer.get("<SME>"),
@@ -58,9 +58,9 @@ chord_prompt = np.array([tokenizer.get("<SME>"),
                          ])
 start = np.array([tokenizer.get(f"k_Cm"), tokenizer.get("<QUERY_M>")] + midi_prompt.tolist() + [tokenizer.get("</QUERY_M>"), tokenizer.get("<QUERY_C>")] +
                  chord_prompt.tolist() + [tokenizer.get("</QUERY_C>"), tokenizer.get("<MGEN>")])
-#"""
+"""
 """----------------------------"""
-gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
+gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.2)
 
 output = all
 #output = torch.tensor(start)
