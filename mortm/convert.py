@@ -463,9 +463,9 @@ class MetaData2Chord(_AbstractConverter):
         self.chords = ChordMidi(all_chords, all_chord_timestamps)
 
         if "major" in key:
-            self.key = f"{key.split(" major")[0]}M"
+            self.key = f"{key.split(' major')[0]}M"
         elif "minor" in key:
-            self.key = f"{key.split(" minor")[0]}m"
+            self.key = f"{key.split(' minor')[0]}m"
         else:
             self.key = None
 
