@@ -28,10 +28,6 @@ except ImportError as i:
 
 # FlashAttention2 の関数（flash_attn_func）をインポート
 # （ライブラリがダウンロード済みであると仮定）
-try:
-    from flash_attn import flash_attn_func
-except ImportError:
-    raise ImportError("FlashAttention2 のライブラリが必要です。インストールしてください。")
 
 
 
@@ -140,7 +136,6 @@ class FlashSelfAttentionM(nn.Module):
                 qkv = qkv.unsqueeze(0)
                 self.rotary_emb(qkv, max_seqlen=qkv.shape[1])
                 out: Tensor = flash_attn_qkvpacked_func(qkv, causal=is_causal, dropout_p=0)
-                flash_attn_qkvpacked_func()
                 out = out.squeeze(0)
 
         out = rearrange(out, "total h d -> total (h d)")

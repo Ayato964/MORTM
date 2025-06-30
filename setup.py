@@ -4,7 +4,7 @@ with open('README.md', 'r', encoding='utf-8-sig') as f:
     long_description = f.read()
 setup(
     name='MORTM',
-    version='4.0b51',
+    version='4.0',
     author='Nagoshi Takaaki',
     author_email='nagoshi@kthrlab.jp',
     description='旋律生成、コード推定、マルチタスクな音楽生成を行うライブラリ',
