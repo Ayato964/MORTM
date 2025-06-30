@@ -23,6 +23,7 @@ except ImportError as i:
 try:
     from flash_attn.bert_padding import pad_input, unpad_input
     from flash_attn.flash_attn_interface import *
+    from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func, flash_attn_qkvpacked_func
 except ImportError as i:
     print(f"モジュールをインストールできませんでした。\n {i.name}")
 
