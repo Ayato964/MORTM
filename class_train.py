@@ -14,7 +14,7 @@ message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi
 
 tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
-model = train_bertm(human_dir="out/np/Sax/dis/human", ai_dir="out/np/Sax/dis/ai",
+model = train_bertm(human_dir="out/np/Piano/rl/human", ai_dir="out/np/Piano/rl/ai/",
                     model_config="configs/models/bertm/class_file.json",
-                    save_directory="out/model/class/", version="1.1Ex2",
-                    train_config="configs/train/pre_training.json", )
+                    save_directory="out/model/class/", version="4.0",
+                    train_config="configs/train/bertm_training.json", )

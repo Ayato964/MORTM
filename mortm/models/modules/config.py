@@ -23,6 +23,7 @@ class MORTMArgs:
             self.score_type = data['score_type'] if data.get('score_type') else "softmax"
             self.use_moe_encoder = False if data.get('use_moe_encoder') is None else data['use_moe_encoder'],
             self.use_moe_decoder = True if data.get('use_moe_decoder') is None else data['use_moe_decoder']
+            self.is_not_flash = data.get("is_not_flash")
 
             self.use_lora = False if data.get('use_lora') is None else data['use_lora']
             self.lora_r = data['lora_r'] if data.get('lora_r') else 8

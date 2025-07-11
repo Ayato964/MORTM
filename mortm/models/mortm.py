@@ -14,6 +14,7 @@ from flash_attn.bert_padding import pad_input, unpad_input
 class MORTM(nn.Module):
     def __init__(self, args: MORTMArgs, progress: LearningProgress):
         super(MORTM, self).__init__()
+        self.args = args
         self.progress = progress
         self.e_layer = args.e_layer
         self.d_layer = args.d_layer
@@ -34,7 +35,7 @@ class MORTM(nn.Module):
 
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
-    def forward(self, x, padding_mask=None, is_causal=False):
+    def forward(self, x, padding_mask=None, is_causal=False, is_save_cache=False):
         x: Tensor = self.embedding(x).to(dtype=torch.bfloat16)
         if padding_mask is not None:
             batch, tgt_len, embed_dim = x.size()
@@ -43,7 +44,8 @@ class MORTM(nn.Module):
             tgt_len, embed_dim = x.size()
             batch = None
             indices = cu_seqlens = max_s = used_seqlens = None
-        out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s)
+        out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s,
+                           batch_size=batch, indices=indices, is_save_cache=is_save_cache)
         if padding_mask is not None:
             out = pad_input(out, indices, batch, tgt_len)
 
@@ -51,69 +53,118 @@ class MORTM(nn.Module):
             score: Tensor = self.Wout(out)
         return score
 
-    def top_p_sampling_measure(self, src: Tensor, p=0.9, max_measure=20, temperature=1.0) -> Tuple[Tensor, Tensor]:
+    @torch.inference_mode()
+    def top_sampling_measure_kv_cache(self, src: Tensor, p=0.9, max_measure=20, temperature=1.0, print_log=True) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        トークンを生成するためのメソッドです。
-
-        Args:
-            src (Tensor): 入力テンソル
-            p (float): 確率の閾値
-            max_measure (int): 最大生成長
-            temperature (float): 温度パラメータ
-
-        Returns:
-            List[Tensor]: 生成されたトークンのリスト
+        KVキャッシュを利用してトークンを生成するためのメソッドです。
+        複数バッチに対応しています。
         """
         self.eval()
-        if isinstance(src, numpy.ndarray):
-            src = torch.tensor(src, device=self.progress.get_device())
-        #src = src.unsqueeze(0)
-        #src_mask = _generate_square_subsequent_mask(src.size(1)).to(self.progress.get_device())
-        #src_key_padding_mask = torch.zeros(src.size(0), src.size(1), dtype=torch.bool).to(self.progress.get_device())
-
-        generated_tokens = []
         is_running = True
-        with torch.no_grad():
-            while is_running:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16) :
-                    logits: Tensor = self(src, is_causal=True)
-                sampled_index = self.top_p_sampling(logits[-1], p=p, temperature=temperature)
-                generated_tokens.append(sampled_index)
-                print(sampled_index)
+        end_count = 0
+        device = self.progress.get_device()
 
-                src = torch.cat([src, torch.tensor([sampled_index], device=self.progress.get_device())], dim=0)
-                measure_count = (src == 8).sum().item()
-                if sampled_index == 585 or sampled_index == 586 or measure_count > max_measure:
-                    is_running = False
+        if isinstance(src, numpy.ndarray):
+            src = torch.tensor(src, device=device)
+        if src.dim() == 1:
+            src = src.unsqueeze(0)
 
-        return torch.tensor(generated_tokens), src.squeeze(0)
+        batch_size = src.shape[0]
+        prompt_len = src.shape[1]
 
+        # --- 1. プロンプト処理 (Pre-fill) ---
+        if print_log: print("--- Pre-fill Phase ---")
+        prompt_padding_mask = (src != self.embedding.padding_idx)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = self.forward(src, padding_mask=prompt_padding_mask, is_causal=True, is_save_cache=True)
 
-    def top_p_sampling(self, logits, p=0.9, temperature=1.0) -> int:
+        last_token_logits = logits[:, -1, :]
+        # next_tokens は (batch_size,) の形状を持つテンソル
+        next_tokens = self.top_p_sampling(last_token_logits, p=p, temperature=temperature)
 
+        # 全トークンを保持するテンソル
+        all_tokens = torch.cat([src, next_tokens.unsqueeze(1)], dim=1)
+
+        # --- 2. トークン生成 (Decoding) ---
+        i = 0
+        if print_log: print("\n--- Decoding Phase ---")
+        while is_running:
+            # 入力は直前に生成されたトークン (B, 1)
+            input_tokens = next_tokens
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = self.forward(input_tokens, padding_mask=None, is_causal=True, is_save_cache=False)
+
+            # next_tokens は (batch_size,) の形状を持つテンソル
+            next_tokens = self.top_p_sampling(logits.squeeze(1), p=p, temperature=temperature)
+
+            # 生成されたトークンを連結
+            all_tokens = torch.cat([all_tokens, next_tokens.unsqueeze(1)], dim=1)
+
+            if print_log: print(f"\r Step {i+1}: Generated tokens {next_tokens.tolist()}", end="")
+
+            if self.is_end_point(all_tokens) or i >= self.args.position_length:
+                is_running = False
+
+            i += 1
+
+        # --- 3. 返り値の準備 ---
+        generated_only_tokens = all_tokens[:, prompt_len:]
+
+        return all_tokens, generated_only_tokens
+
+    def is_end_point(self, x: torch.Tensor) -> bool:
+        """
+        x: Tensor of shape [n, 14]
+        戻り値: 全ての行に少なくとも1つ 5 があれば True、そうでなければ False
+        """
+
+        mask = (x == 585) | (x == 586)
+        per_row_has5 = mask.any(dim=1)
+        # 3) 全行が True かを判定する
+        all_rows_ok = per_row_has5.all()
+
+        # 4) Python の bool 型で返す
+        return bool(all_rows_ok)
+
+    def top_p_sampling(self, logits: Tensor, p=0.9, temperature=1.0) -> Tensor:
+        """
+        複数バッチに対応したTop-pサンプリング。
+
+        Args:
+            logits (Tensor): (batch_size, vocab_size) の形状を持つロジット
+
+        Returns:
+            Tensor: (batch_size,) の形状を持つサンプリングされたトークンID
+        """
         logits = logits / temperature
-        # logitsをソフトマックスで確率分布に変換
         probs = self.softmax(logits)
-        # 確率の降順に並べ替え、そのインデックスを取得
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
 
-        # 累積確率を計算
+        # 各バッチに対してソートを実行
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-        # 累積確率がpを超えるインデックスを取得
-        cutoff_index = torch.where(cumulative_probs > p)[0][0]
+        # pを超える確率を持つトークンをマスクするための準備
+        sorted_probs_to_remove = cumulative_probs > p
+        # ただし、pを超えた最初のトークンは含める
+        sorted_probs_to_remove[..., 1:] = sorted_probs_to_remove[..., :-1].clone()
+        sorted_probs_to_remove[..., 0] = 0
 
-        # 上位pに入らないトークンの確率を0にする
-        sorted_probs[cutoff_index + 1:] = 0
+        # マスクを適用し、確率を0にする
+        probs_to_keep = sorted_probs.masked_fill(sorted_probs_to_remove, 0)
 
         # 確率を再正規化
-        sorted_probs /= torch.sum(sorted_probs)
+        renormalized_probs = probs_to_keep / probs_to_keep.sum(dim=-1, keepdim=True)
 
-        # トークンをサンプリング
-        sampled_index = torch.multinomial(sorted_probs, 1)
+        # サンプリングを実行
+        sampled_next_indices = torch.multinomial(renormalized_probs, num_samples=1)
 
-        # インデックスを元の順序に戻す
-        return sorted_indices[sampled_index].item()
+        # 元のトークンIDに戻す
+        sampled_original_indices = torch.gather(sorted_indices, dim=-1, index=sampled_next_indices)
+
+        # (batch_size, 1) -> (batch_size,) の形状にして返す
+        return sampled_original_indices.squeeze(-1)
+
 
     def split_tensor_at_value(self, tensor: Tensor, split_value, include_split=True):
         """

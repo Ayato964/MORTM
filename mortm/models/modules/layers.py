@@ -21,6 +21,29 @@ rank = 0
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
 
+class Pool(nn.Module):
+    """Attention Poolingによるシーケンス集約モジュール"""
+    def __init__(self, args: MORTMArgs):
+        super().__init__()
+        self.attention_scorer = nn.Linear(args.d_model, 1)
+
+    def forward(self, x: Tensor, cu_seqlens: Tensor) -> Tensor:
+        attention_scores = self.attention_scorer(x)
+
+        batch_size = len(cu_seqlens) - 1
+        output_vectors = []
+        for i in range(batch_size):
+            start_idx, end_idx = cu_seqlens[i], cu_seqlens[i+1]
+            if start_idx == end_idx: continue
+
+            seq_x = x[start_idx:end_idx]
+            seq_scores = attention_scores[start_idx:end_idx]
+            attention_weights = torch.softmax(seq_scores, dim=0)
+            context_vector = torch.sum(seq_x * attention_weights, dim=0)
+            output_vectors.append(context_vector)
+
+        return torch.stack(output_vectors) # shape: [B, d_model]
+
 
 class DummyDecoder(nn.Module):
     def __init__(self):
@@ -107,7 +130,8 @@ class MORTMDecoder(nn.Module):
         self.layers = _get_clones(MORTMDecoderLayer(args, progress=progress), self.num_layer)
         self.norm = DynamicTanh(args.d_model)
 
-    def forward(self, tgt: Tensor, tgt_is_causal: Optional[bool] = None, cu_seqlens=None, max_seqlen=None) -> Tensor:
+    def forward(self, tgt: Tensor, tgt_is_causal: Optional[bool] = None,
+                cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False) -> Tensor:
 
         output = tgt
         for mod in self.layers:
@@ -115,7 +139,8 @@ class MORTMDecoder(nn.Module):
             output = mod(
                 output,
                 tgt_is_causal=tgt_is_causal,
-                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                batch_size=batch_size, indices=indices, is_save_cache=is_save_cache
             )
 
         return self.norm(output)
@@ -143,18 +168,19 @@ class MORTMDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(args.dropout)
         self.dropout3 = nn.Dropout(args.dropout)
 
-    def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None)-> Tensor:
+    def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False)-> Tensor:
 
         y = tgt
 
-        y = y + self.self_block(self.norm1(y), tgt_is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        y = y + self.self_block(self.norm1(y), tgt_is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, batch_size=batch_size, indices=indices, is_save_cache=is_save_cache) # 自己注意機構を適用
 
         y = y + self.ff_block(self.norm3(y)) # フィードフォワード層を適用
 
         return y
 
-    def self_block(self, y: Tensor, is_causal: bool = False, cu_seqlens=None, max_seqlen=None):
-        y, _ = self.self_attention(y, is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    def self_block(self, y: Tensor, is_causal: bool, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False):
+        y = self.self_attention(y, is_causal=is_causal, cu_seqlens=cu_seqlens,
+                                max_seqlen=max_seqlen, batch_size=batch_size, indices=indices, is_save_cache=is_save_cache)
 
         return self.dropout1(y)
 

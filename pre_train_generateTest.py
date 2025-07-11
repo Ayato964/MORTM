@@ -17,13 +17,7 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
     -ハイパーパラメータが正しいか確認してください。モデルのバージョンによって、パラメータが異なる可能性があります。
     -CPUを使っているか、GPUを使っているかを確認してください。
     もし、CPUを使っている場合、 torch.load("model/ *** ", map_location="cpu")を設定してください。
-    
-2. 生成する時にエラーが発生する
-    - 配列構造が不正である可能性があります。サンプリングに入力する配列は1次元配列になるはずです。
-    
-3. 意味不明なメロディが生成される。
-    - 生成できたが、メロディとして成り立っていない場合、vocab_list.jsonが古い場合があります。
-    モデルによって異なるので、再度確認してください。
+
 '''
 
 tokenizer =token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
@@ -32,7 +26,7 @@ tokenizer.rev_mode()
 args = MORTMArgs("configs/models/mortm/A.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/mortm/MORTM.4.0EX5-SAX-Phase1_1.4054.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/mortm/MORTM.4.0-PIANO_0.9285.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 model = compile(model)
@@ -46,8 +40,8 @@ model = compile(model)
 '''
 
 """"------ 旋律の自己回帰生成を行う場合------"""
-np_notes = np.load("out/Sample.mid.npz")
-start = np_notes[f'array1'][:120]
+np_notes = np.load("out/np/Piano/rl/ai/\\4210_1.npz")
+start = np_notes[f'array1'][:-1]
 print(start)
 """-------------------------------------"""
 
@@ -61,13 +55,14 @@ print(start)
 
 """--------------------------------------"""
 
-gene, all = model.top_p_sampling_measure(start, p=0.95, max_measure=20, temperature=1.0)
+all, gene = model.top_sampling_measure_kv_cache(start, p=0.95, max_measure=20, temperature=0.7)
 
 output = all
 #output = torch.tensor(start)
-for t in output:
-    t: torch.Tensor = t
-    print(f"{t}  {tokenizer.rev_get(t.tolist())}")
-
-
-midi = ct_token_to_midi(tokenizer, output, "out/generate.midi", program=65, tempo=120) #生成したトークンをMIDIに変換する。
+count = 0
+for out in output:
+    for t in out:
+        t: torch.Tensor = t
+        print(f"{t}  {tokenizer.rev_get(t.tolist())}")
+    midi = ct_token_to_midi(tokenizer, out, f"out/generate_{count}.midi", program=0, tempo=120) #生成したトークンをMIDIに変換する。
+    count += 1

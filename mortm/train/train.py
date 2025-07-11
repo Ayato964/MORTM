@@ -78,17 +78,30 @@ class MORTMTrainSet(AbstractTrainSet):
 
 
 class BERTMTrainSet(AbstractTrainSet):
+
     def __init__(self, args: MORTMArgs, progress: LearningProgress, load_directory=None):
         self.model = BERTM(progress=progress, args=args).to(progress.get_device())
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
 
-        adam = torch.optim.Adam(self.model.parameters(), lr=5e-3, betas=(0.9, 0.98))
+        adam = torch.optim.Adam(self.model.parameters(), lr=5e-1, betas=(0.9, 0.98))
 
         super().__init__(criterion=nn.BCEWithLogitsLoss().to(progress.get_device()),
                          optimizer=adam,
                          scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
 
+
+    def pre_processing(self, pack, progress):
+        dt: DataLoader = pack
+        mini_dataset = ClassDataSets(progress, self.model.args.position_length)
+        for d in dt:
+            d: str
+            np_load_data = np.load(d, allow_pickle=True)
+            if "/ai" in d:
+                mini_dataset.add_data(np_load_data, 1)
+            elif "/human" in d:
+                mini_dataset.add_data(np_load_data, 0)
+        return mini_dataset
 
     def epoch_fc(self, model, pack, progress):
         src, tgt = pack
@@ -96,7 +109,7 @@ class BERTMTrainSet(AbstractTrainSet):
         src = src.to(progress.get_device())
         src_pad = _get_padding_mask(src, progress)
 
-        out = model(src, input_padding_mask=src_pad)
+        out = model(src, padding_mask=src_pad)
         inputs = out.view(-1, out.size(-1)).to(progress.get_device())
         return inputs.squeeze(-1).to(dtype=torch.float32), target.to(dtype=torch.float32)
 
@@ -273,6 +286,27 @@ def collate_fn(batch):
     src = pad_sequence(batch, batch_first=True, padding_value=0)
     return src
 
+def collate_fn_with_tgt(batch):
+    # バッチ内のテンソルの長さを揃える（パディングする）
+    tgt_list = [item[1] for item in batch]
+    src = pad_sequence([item[0] for item in batch], batch_first=True, padding_value=0)
+    tgt = torch.tensor(tgt_list, device=src.device)
+    return src, tgt
+
+def save_val_path_json(val_loader: DataLoader, save_directory, version):
+    """
+    検証データのパスをJSONファイルに保存する。
+    :param val_loader: DataLoaderオブジェクト
+    :param save_directory: 保存先ディレクトリ
+    :param version: バージョン名
+    """
+    val_paths = []
+    for v in val_loader:
+        val_paths.append(v)
+    with open(f"{save_directory}/val_paths_{version}.json", 'w') as f:
+        json.dump(val_paths, f, indent=4)
+    print(f"Validation paths saved to {save_directory}/val_paths_{version}.json")
+
 
 def update_log(model, writer, global_step):
     for name, param in model.named_parameters():
@@ -437,6 +471,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
 def _train(args, t_args, save_directory, trainer, version, today_date,
            message, train_loader, val_loader,
            progress, coll_fn=None):
+    save_val_path_json(val_loader, save_directory, version)
     try:
         writer = SummaryWriter(save_directory + f"/runs/{version}_{today_date}/")
 
@@ -459,6 +494,7 @@ def _train(args, t_args, save_directory, trainer, version, today_date,
         message.send_message("エラーが発生し、処理を中断しました",
                              "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
         print("オーバーフローしました。")
+
 
 
 def train_mortm(model_config: str, train_config: str, root_directory, save_directory, version: str,
@@ -503,14 +539,14 @@ def train_bertm(model_config: str, train_config: str, human_dir, ai_dir, save_di
     print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
 
     directory, filename = find_files(human_dir, '.npz')
-    mortm_dataset = _set_train_data(directory, filename, ClassDataSets(progress, args.position_length), 0)
+    mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress), )
 
     directory, filename = find_files(ai_dir, '.npz')
-    mortm_dataset = _set_train_data(directory, filename, mortm_dataset, 1)
-    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True, collate_fn=collate_fn)
+    mortm_dataset = _set_train_data_preloading(directory, filename, mortm_dataset, )
+    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
 
     _train(args, t_args, save_directory, trainer,message=message, version=version, today_date=today_date,
-           train_loader=train_loader, val_loader=val_loader,
+           train_loader=train_loader, val_loader=val_loader, coll_fn=collate_fn_with_tgt,
            progress=progress)
 
 

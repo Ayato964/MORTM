@@ -57,8 +57,8 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
             is_saved, reason = con.save(save_path)
             if is_saved:
                 local_count += 1
-                #if local_count >= 50:
-                #    break
+                if local_count >= 300:
+                    break
 
             for a in con.aya_node[1:]:
                 a:np.ndarray
@@ -215,11 +215,12 @@ def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progr
 
 if __name__ == "__main__":
     THREAD_VALUE = 10
-    PIANO = [i + 1 for i in range(5)]
+    PIANO = [i for i in range(6)]
     SAX = [65, 66]
 
     datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
     #"""
     directory, md_file = find_midi_files(datasets)
@@ -243,7 +244,7 @@ if __name__ == "__main__":
         for t in range(THREAD_VALUE):
             #"""
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), PIANO, progress, "out/np/Piano/pre_train/large"))
+                                              md_file[t].tolist(), PIANO, progress, "out/np/Piano/rl/human/"))
             #"""
 
             """
