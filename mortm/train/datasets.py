@@ -1,6 +1,7 @@
 '''
 Tokenizerで変換したシーケンスを全て保管します。
 '''
+import os.path
 import random
 from typing import List, Optional
 
@@ -51,8 +52,9 @@ class ClassDataSets(Dataset):
         return len(self.key)
 
     def __getitem__(self, item):
+        #print(self.value[item], max(self.key[item]))
         if self.value[item] == 0:
-            ind = [i for i, v in enumerate(self.key[item]) if v == 3]
+            ind = [i for i, v in enumerate(self.key[item]) if v == 8]
             r = 4 + random.randint(0, 8)
             if r != 12 and r < len(ind):
                 v = self.key[item][:ind[r]]
@@ -89,7 +91,8 @@ class PreLoadingDatasets(Dataset):
 
     def add_data(self, directory: List[str], filename: List[str]):
         for i in range(len(directory)):
-            self.src_list.append(directory[i] + filename[i])
+            self.src_list.append(os.path.join(directory[i], filename[i]))
+
 
 
 class TensorDataset(Dataset):

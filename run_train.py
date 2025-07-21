@@ -15,6 +15,6 @@ tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_
 
 model = train_mortm("configs/models/mortm/A.json", "configs/train/pre_training.json",
                     "out/np/Piano/pre_train/", "out/model/mortm/",
-                    "4.0-PIANO-Phase1",
+                    "FF",
                     message=message)
 

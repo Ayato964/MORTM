@@ -171,7 +171,6 @@ class MORTMDecoderLayer(nn.Module):
     def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False)-> Tensor:
 
         y = tgt
-
         y = y + self.self_block(self.norm1(y), tgt_is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, batch_size=batch_size, indices=indices, is_save_cache=is_save_cache) # 自己注意機構を適用
 
         y = y + self.ff_block(self.norm3(y)) # フィードフォワード層を適用

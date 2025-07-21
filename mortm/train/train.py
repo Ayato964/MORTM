@@ -99,7 +99,7 @@ class BERTMTrainSet(AbstractTrainSet):
             np_load_data = np.load(d, allow_pickle=True)
             if "/ai" in d:
                 mini_dataset.add_data(np_load_data, 1)
-            elif "/human" in d:
+            elif "/human" in d or "/pre_train" in d:
                 mini_dataset.add_data(np_load_data, 0)
         return mini_dataset
 
@@ -108,7 +108,7 @@ class BERTMTrainSet(AbstractTrainSet):
         target: Tensor = tgt.to(progress.get_device())
         src = src.to(progress.get_device())
         src_pad = _get_padding_mask(src, progress)
-
+        #print(src.max(), target)
         out = model(src, padding_mask=src_pad)
         inputs = out.view(-1, out.size(-1)).to(progress.get_device())
         return inputs.squeeze(-1).to(dtype=torch.float32), target.to(dtype=torch.float32)
@@ -280,6 +280,16 @@ def _set_train_data_preloading(directory, datasets, mortm_datasets, *args):
     print("load Successful!!")
     return mortm_datasets
 
+def find_files_with_json(path:str, min=0):
+    with open(path, "r") as f:
+        json_data = json.load(f)
+    data = np.array([])
+    json_data = json_data[min:]
+    for l in json_data:
+        data = np.concatenate([data, l])
+    directory = [os.path.dirname(d) for d in data]
+    file_name = [os.path.basename(d) for d in data]
+    return directory, file_name
 
 def collate_fn(batch):
     # バッチ内のテンソルの長さを揃える（パディングする）
@@ -301,11 +311,13 @@ def save_val_path_json(val_loader: DataLoader, save_directory, version):
     :param version: バージョン名
     """
     val_paths = []
+    counter = 0
     for v in val_loader:
         val_paths.append(v)
+        counter += len(v)
     with open(f"{save_directory}/val_paths_{version}.json", 'w') as f:
         json.dump(val_paths, f, indent=4)
-    print(f"Validation paths saved to {save_directory}/val_paths_{version}.json")
+    print(f"Validation paths saved to {save_directory}/val_paths_{version}.json   All Count = {counter}")
 
 
 def update_log(model, writer, global_step):
@@ -349,6 +361,7 @@ def get_data_loader(t_args: TrainArgs, mortm_dataset, shuffle=True, collate_fn=N
 
     val_loader = DataLoader(val_dataset, batch_size=t_args.big_batch_size, shuffle=shuffle,
                             num_workers=0, collate_fn=collate_fn)
+    print(f"All Size:{len(mortm_dataset)} Train Size:{len(train_dataset)} Val Size:{len(val_dataset)}")
     return train_loader, val_loader
 
 
@@ -439,7 +452,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                     #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-                if (count + 1) % int(len(train_loader) // 20) == 0:
+                if (count + 1) % int(len(train_loader) // 5) == 0:
                     print("検証損失を求めています")
                     torch.cuda.empty_cache()
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn)
@@ -462,7 +475,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
         except  torch.cuda.OutOfMemoryError:
             message.send_message("エラーが発生し、処理を中断しました",
                                  "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
-        print("オーバーフローしました。")
+            print("オーバーフローしました。")
     return model, verification_loss
 
 
@@ -537,8 +550,17 @@ def train_bertm(model_config: str, train_config: str, human_dir, ai_dir, save_di
     today_date = datetime.date.today().strftime('%Y%m%d')
 
     print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
+    if isinstance(human_dir, str):
+        directory, filename = find_files(human_dir, '.npz')
+    elif isinstance(human_dir, tuple):
+        directory, filename = find_files_with_json(human_dir[1])
 
-    directory, filename = find_files(human_dir, '.npz')
+        directory2, filename2 = find_files(human_dir[0], '.npz')
+        for d, f in zip(directory2, filename2):
+            directory.append(d)
+            filename.append(f)
+    else:
+        directory, filename = human_dir
     mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress), )
 
     directory, filename = find_files(ai_dir, '.npz')

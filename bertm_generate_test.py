@@ -14,7 +14,7 @@ tokenizer.rev_mode()
 #args = MORTMArgs("configs/models/mortm/not_moe/A.json")
 args = MORTMArgs("configs/models/bertm/class_file.json")
 model = BERTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/class/BERTM4.0-PIANO_.0.0377.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/class/MORTM.4.0.1_0.07270082146024857.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 

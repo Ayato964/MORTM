@@ -69,7 +69,7 @@ class BERTM(nn.Module):
 
         out = self.decoder(tgt=x, tgt_is_causal=False, cu_seqlens=cu_seqlens, max_seqlen=max_s)
 
-        out = self.attn_pool(out, cu_seqlens)
+        out = self.attn_pool(out, cu_seqlens if cu_seqlens is not None else torch.tensor([0, len(x)], dtype=torch.int32, device=x.device))  # バッチサイズをcu_seqlensに設定
 
         out = self.hidden(out)
         hid = F.relu(out)

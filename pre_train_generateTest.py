@@ -26,7 +26,7 @@ tokenizer.rev_mode()
 args = MORTMArgs("configs/models/mortm/A.json")
 
 model = MORTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/mortm/MORTM.4.0-PIANO_0.9285.pth")) # モデルをロードする。
+model.load_state_dict(torch.load("out/model/mortm/MORTM.4.0.1-PIANO_0.98.pth")) # モデルをロードする。
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # デバイスを設定
 model.to(device)
 model = compile(model)
@@ -40,7 +40,7 @@ model = compile(model)
 '''
 
 """"------ 旋律の自己回帰生成を行う場合------"""
-np_notes = np.load("out/np/Piano/rl/ai/\\4210_1.npz")
+np_notes = np.load("out/np/Piano/rl/ai/pre/70_0.npz")
 start = np_notes[f'array1'][:-1]
 print(start)
 """-------------------------------------"""

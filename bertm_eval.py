@@ -17,14 +17,14 @@ tokenizer: Tokenizer = Tokenizer(music_token=get_token_converter(TO_MUSIC))
 tokenizer.rev_mode()
 args = MORTMArgs("configs/models/bertm/class_file.json")
 model = BERTM(progress=_DefaultLearningProgress(), args=args)
-model.load_state_dict(torch.load("out/model/class/BERTM4.0-PIANO_.0.0377.pth"))
+model.load_state_dict(torch.load("out/model/class/MORTM.4.0.1_0.07270082146024857.pth"))
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 # ----------------------------------------------------------------
 
 # 2. 評価対象のnpzファイルのパスリストを定義
 # NOTE: このリストを実際のファイルパスに置き換えてください
-with open("out/model/class/val_paths_4.0.json", "r") as f:
+with open("out/model/class/val_paths_4.0.1.json", "r") as f:
     import json
     npz_file_paths = json.load(f)[0]
 

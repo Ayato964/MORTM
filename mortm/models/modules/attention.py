@@ -81,6 +81,7 @@ class QKVLinear(nn.Module):
 
 
     def forward(self, q: Tensor, k: Tensor=None, v: Tensor=None, ):
+
         total, D = q.size()
         qkv = self.qkv_weight(q).view(total, 3, self.num_heads, D // self.num_heads)
 
@@ -117,7 +118,7 @@ class FlashSelfAttentionM(nn.Module):
 
     def _init_kv_cache(self, batch_size, device, dtype):
         """最初の呼び出し時に、バッチサイズに合わせてキャッシュを初期化する"""
-        max_seq_len = self.args.position_length # 設定ファイルなどから最大長を取得
+        max_seq_len = self.args.position_length + 100 # 設定ファイルなどから最大長を取得
         head_dim = self.args.d_model // self.args.num_heads
         shape = (batch_size, max_seq_len, self.args.num_heads, head_dim)
 
@@ -172,44 +173,51 @@ class FlashSelfAttentionM(nn.Module):
 
         # --- フェーズ2: 1トークンずつの推論 ---
         else:
-            # このパスでは、xは (batch_size, d_model) の形状を想定
-            qkv: Tensor = self.qkv_block(q=x)
-            # (batch_size, 3, num_heads, head_dim) -> (3, batch_size, num_heads, head_dim)
-            qkv = qkv.permute(1, 0, 2, 3)
-            q, k, v = qkv[0], qkv[1], qkv[2]
+            if is_save_cache:
+                # このパスでは、xは (batch_size, d_model) の形状を想定
+                qkv: Tensor = self.qkv_block(q=x)
+                # (batch_size, 3, num_heads, head_dim) -> (3, batch_size, num_heads, head_dim)
+                qkv = qkv.permute(1, 0, 2, 3)
+                q, k, v = qkv[0], qkv[1], qkv[2]
 
-            # (batch_size, num_heads, head_dim) -> (batch_size, 1, num_heads, head_dim)
-            # flash_attn_with_kvcache の入力形状に合わせる
-            q, k, v = q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
+                # (batch_size, num_heads, head_dim) -> (batch_size, 1, num_heads, head_dim)
+                # flash_attn_with_kvcache の入力形状に合わせる
+                q, k, v = q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
 
-            # RoPE / ALiBi の引数を準備
-            rotary_kwargs = {}
-            if not IS_NOT_LINUX:
-                self.rotary_emb._update_cos_sin_cache(self.args.position_length, device=x.device, dtype=x.dtype)
-                rotary_kwargs = {
-                    "rotary_cos": self.rotary_emb.cos_cached,
-                    "rotary_sin": self.rotary_emb.sin_cached,
-                    "rotary_interleaved": False
-                }
+                # RoPE / ALiBi の引数を準備
+                rotary_kwargs = {}
+                if not IS_NOT_LINUX:
+                    self.rotary_emb._update_cos_sin_cache(self.args.position_length, device=x.device, dtype=x.dtype)
+                    rotary_kwargs = {
+                        "rotary_cos": self.rotary_emb.cos_cached,
+                        "rotary_sin": self.rotary_emb.sin_cached,
+                        "rotary_interleaved": False
+                    }
 
-            # flash_attn_with_kvcache を呼び出すだけで、計算とキャッシュ更新が完了
-            out = flash_attn_with_kvcache(
-                q,
-                k_cache=self.kv_cache[0],
-                v_cache=self.kv_cache[1],
-                k=k,
-                v=v,
-                cache_seqlens=self.cache_seqlens,
-                alibi_slopes=self.alibi_slopes if IS_NOT_LINUX else None,
-                causal=True,
-                **rotary_kwargs
-            )
+                # flash_attn_with_kvcache を呼び出すだけで、計算とキャッシュ更新が完了
+                out = flash_attn_with_kvcache(
+                    q,
+                    k_cache=self.kv_cache[0],
+                    v_cache=self.kv_cache[1],
+                    k=k,
+                    v=v,
+                    cache_seqlens=self.cache_seqlens,
+                    alibi_slopes=self.alibi_slopes if IS_NOT_LINUX else None,
+                    causal=True,
+                    **rotary_kwargs
+                )
 
-            # キャッシュの有効長をインクリメント
-            self.cache_seqlens += 1
+                # キャッシュの有効長をインクリメント
+                self.cache_seqlens += 1
 
-            # (batch_size, 1, h, d_model) -> (batch_size, h, d_model)
-            out = out.squeeze(1)
+                # (batch_size, 1, h, d_model) -> (batch_size, h, d_model)
+                out = out.squeeze(1)
+            else:
+                qkv = self.qkv_block(q=x)
+                qkv = qkv.unsqueeze(0)
+                out = flash_attn_qkvpacked_func(qkv=qkv, dropout_p=self.drop, causal=is_causal)
+                out = rearrange(out, "b s h d -> (b s) (h d)")
+                return self.qkv_block.comp(out)
 
         # 最終的な出力層
         out = rearrange(out, "total h d -> total (h d)")

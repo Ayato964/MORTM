@@ -1,4 +1,5 @@
 import numpy
+import numpy as np
 import torch
 from torch import Tensor
 import torch.nn as nn
@@ -54,7 +55,7 @@ class MORTM(nn.Module):
         return score
 
     @torch.inference_mode()
-    def top_sampling_measure_kv_cache(self, src: Tensor, p=0.9, max_measure=20, temperature=1.0, print_log=True) -> Tuple[torch.Tensor, torch.Tensor]:
+    def top_sampling_measure_kv_cache(self, src: Tensor, p=0.9, max_measure=20, temperature=1.0, print_log=True):
         """
         KVキャッシュを利用してトークンを生成するためのメソッドです。
         複数バッチに対応しています。
@@ -69,8 +70,6 @@ class MORTM(nn.Module):
         if src.dim() == 1:
             src = src.unsqueeze(0)
 
-        batch_size = src.shape[0]
-        prompt_len = src.shape[1]
 
         # --- 1. プロンプト処理 (Pre-fill) ---
         if print_log: print("--- Pre-fill Phase ---")
@@ -86,31 +85,63 @@ class MORTM(nn.Module):
         all_tokens = torch.cat([src, next_tokens.unsqueeze(1)], dim=1)
 
         # --- 2. トークン生成 (Decoding) ---
-        i = 0
+        i = len(all_tokens)
         if print_log: print("\n--- Decoding Phase ---")
         while is_running:
             # 入力は直前に生成されたトークン (B, 1)
             input_tokens = next_tokens
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = self.forward(input_tokens, padding_mask=None, is_causal=True, is_save_cache=False)
+                logits = self.forward(input_tokens, padding_mask=None, is_causal=True, is_save_cache=True)
 
             # next_tokens は (batch_size,) の形状を持つテンソル
             next_tokens = self.top_p_sampling(logits.squeeze(1), p=p, temperature=temperature)
 
+            #print(next_tokens.max(), all_tokens.max())
             # 生成されたトークンを連結
             all_tokens = torch.cat([all_tokens, next_tokens.unsqueeze(1)], dim=1)
 
             if print_log: print(f"\r Step {i+1}: Generated tokens {next_tokens.tolist()}", end="")
 
-            if self.is_end_point(all_tokens) or i >= self.args.position_length:
+            if self.is_end_point(all_tokens) or i > self.args.position_length:
                 is_running = False
 
             i += 1
 
-        # --- 3. 返り値の準備 ---
-        generated_only_tokens = all_tokens[:, prompt_len:]
+        np_all_tokens = []
+        np_generated_only_tokens = []
+        print(all_tokens.max())
+        for seq in all_tokens:
+            seq: Tensor
+            np_seq = np.array([], dtype=int)
+            pad = (seq == 0).nonzero(as_tuple=True)[0]
+            eseq = (seq == 585).nonzero(as_tuple=True)[0]
+            if len(eseq) == 0:
+                eseq = len(seq)-1
+            elif len(eseq) != 1:
+                eseq = eseq[0].item()
+            else:
+                eseq = eseq.item()
 
-        return all_tokens, generated_only_tokens
+            if len(pad) != 0:
+                start = pad[0]
+                end = pad[-1]
+                np_seq = np.append(np_seq, seq[:start].cpu().numpy())
+                if eseq == len(seq):
+                    np_seq = np.append(np_seq, seq[end+1:].cpu().numpy())
+                else:
+                    np_seq = np.append(np_seq, seq[end+1:eseq+1].cpu().numpy())
+            else:
+                if eseq == len(seq):
+                    np_seq = np.append(np_seq, seq.cpu().numpy())
+                else:
+                    np_seq = np.append(np_seq,seq[:eseq+1].cpu().numpy())
+            np_all_tokens.append(np_seq)
+            if np_seq.max() > self.args.vocab_size:
+                raise ValueError(
+                    f"生成されたトークンIDが語彙サイズ({self.args.vocab_size})を超えています: {np_seq.max()}"
+                )
+
+        return np_all_tokens, None
 
     def is_end_point(self, x: torch.Tensor) -> bool:
         """
@@ -128,42 +159,37 @@ class MORTM(nn.Module):
 
     def top_p_sampling(self, logits: Tensor, p=0.9, temperature=1.0) -> Tensor:
         """
-        複数バッチに対応したTop-pサンプリング。
-
-        Args:
-            logits (Tensor): (batch_size, vocab_size) の形状を持つロジット
-
-        Returns:
-            Tensor: (batch_size,) の形状を持つサンプリングされたトークンID
+        複数バッチに対応したTop-pサンプリング。（修正版）
         """
         logits = logits / temperature
         probs = self.softmax(logits)
 
-        # 各バッチに対してソートを実行
         sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-        # pを超える確率を持つトークンをマスクするための準備
         sorted_probs_to_remove = cumulative_probs > p
-        # ただし、pを超えた最初のトークンは含める
         sorted_probs_to_remove[..., 1:] = sorted_probs_to_remove[..., :-1].clone()
         sorted_probs_to_remove[..., 0] = 0
 
-        # マスクを適用し、確率を0にする
         probs_to_keep = sorted_probs.masked_fill(sorted_probs_to_remove, 0)
 
-        # 確率を再正規化
-        renormalized_probs = probs_to_keep / probs_to_keep.sum(dim=-1, keepdim=True)
+        # ゼロ除算を避けるため、分母に微小な値を加える
+        probs_sum = probs_to_keep.sum(dim=-1, keepdim=True)
+        renormalized_probs = probs_to_keep / (probs_sum + 1e-9) #
 
-        # サンプリングを実行
         sampled_next_indices = torch.multinomial(renormalized_probs, num_samples=1)
-
-        # 元のトークンIDに戻す
         sampled_original_indices = torch.gather(sorted_indices, dim=-1, index=sampled_next_indices)
 
-        # (batch_size, 1) -> (batch_size,) の形状にして返す
-        return sampled_original_indices.squeeze(-1)
+        r = sampled_original_indices.squeeze(-1)
+
+        # vocab_sizeを直接取得してチェックする
+        vocab_size = logits.shape[-1]
+        if r.max().item() > vocab_size:
+            raise ValueError(
+                f"サンプリングされたトークンIDが語彙サイズ({vocab_size})以上です: {r.max().item()}"
+            )
+
+        return r
 
 
     def split_tensor_at_value(self, tensor: Tensor, split_value, include_split=True):
