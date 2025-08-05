@@ -12,7 +12,7 @@ from mortm.train.train import _get_padding_mask
 from torch import nn, Tensor
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-
+from mortm.train.config import TrainArgs
 from mortm.train.config import AbstractTrainSet
 from mortm.models.mortm import MORTM, MORTMArgs
 from mortm.train.datasets import MORTM_SEQDataset
@@ -107,10 +107,11 @@ if __name__ == "__main__":
     progress = _DefaultLearningProgress()
     tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
     trainer = TTMORTM(args_config=MODEL_CONFIG, load_model_directory=LOAD_MODEL_DIRECTORY, tokenizer=tokenizer, progress=progress)
+    t_args = TrainArgs(TRAIN_CONFIG)
 
     train_custom(
         trainer=trainer,
-        train_config=TRAIN_CONFIG,
+        t_args=t_args,
         root_directory=LOOT_DIRECTORY,
         save_directory=SAVE_DIRECTORY,
         version=VERSION,

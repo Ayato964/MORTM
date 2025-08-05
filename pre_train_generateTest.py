@@ -40,8 +40,8 @@ model = compile(model)
 '''
 
 """"------ 旋律の自己回帰生成を行う場合------"""
-np_notes = np.load("out/np/Piano/rl/ai/pre/70_0.npz")
-start = np_notes[f'array1'][:-1]
+np_notes = np.load("out/Sample4.mid.npz")
+start = np_notes[f'array1'][:128]
 print(start)
 """-------------------------------------"""
 
@@ -55,7 +55,7 @@ print(start)
 
 """--------------------------------------"""
 
-all, gene = model.top_sampling_measure_kv_cache(start, p=0.95, max_measure=20, temperature=0.7)
+all, gene = model.top_sampling_measure_kv_cache(start, p=0.95, max_measure=20, temperature=1.0)
 
 output = all
 #output = torch.tensor(start)

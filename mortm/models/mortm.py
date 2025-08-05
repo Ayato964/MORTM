@@ -2,6 +2,7 @@ import numpy
 import numpy as np
 import torch
 from torch import Tensor
+from torch.distributions import Categorical
 import torch.nn as nn
 from typing import Tuple, List
 from einops import rearrange
@@ -238,4 +239,44 @@ class MORTM(nn.Module):
             segments.append(segment)
 
         return segments
+
+    def get_log_probs(self, sequence_tensors: torch.Tensor, padding_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        与えられたシーケンスの対数確率を計算する。
+
+        Args:
+            sequence_tensors (torch.Tensor): 形状 (batch, seq_len) のトークンIDテンソル。
+            padding_mask (torch.Tensor): 対応するアテンションマスク。
+
+        Returns:
+            torch.Tensor: 各トークン位置の対数確率のテンソル。
+        """
+        # 1. 入力とターゲットを作成（1つずらす）
+        input_ids = sequence_tensors[:, :-1]
+        target_ids = sequence_tensors[:, 1:]
+
+        # マスクも同様にずらす
+        if padding_mask is not None:
+            input_mask = padding_mask[:, :-1]
+        else:
+            input_mask = None
+
+        # 2. モデルに`input_ids`を通して、各ステップのlogitsを取得
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = self.forward(input_ids, padding_mask=input_mask, is_causal=True)
+
+        reshaped_logits = logits.view(-1, self.args.vocab_size)
+        reshaped_targets = target_ids.reshape(-1).long()
+        # Categorical分布を使って一括で計算
+        dist = Categorical(logits=reshaped_logits)
+        log_probs = dist.log_prob(reshaped_targets)
+
+        # 元の形状 (batch, seq_len-1) に戻す
+        log_probs = log_probs.view(logits.size(0), logits.size(1))
+
+        # パディング部分のlog_probを0にする
+        if padding_mask is not None:
+            log_probs = log_probs * padding_mask[:, 1:]
+
+        return log_probs
 

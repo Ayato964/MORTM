@@ -6,10 +6,11 @@ import random
 from typing import List, Optional
 
 import torch
+from torch import Tensor
 from torch.utils.data import Dataset
 import numpy as np
 from mortm.models.modules.progress import LearningProgress
-
+from einops import rearrange
 
 class MORTM_SEQDataset(Dataset):
     def __init__(self, progress: LearningProgress, positional_length, min_length, is_random_delete_key = False):
@@ -108,3 +109,33 @@ class TensorDataset(Dataset):
 
     def add_data(self, patch_list: list, *args):
         self.seq = patch_list
+
+
+class PPODataset(Dataset):
+    def __init__(self,
+                 sequences: Tensor,
+                 log_probs: Tensor,
+                 values: Tensor,
+                 advantages: Tensor,
+                 returns: Tensor):
+
+        # 各テンソルをそのままインスタンス変数として保持する
+        self.sequences = sequences
+        self.log_probs = log_probs
+        self.values = values
+        self.advantages = advantages
+        self.returns = returns
+
+    def __len__(self):
+        # バッチサイズを返す
+        return self.sequences.size(0)
+
+    def __getitem__(self, index: int):
+        # 指定されたインデックスのデータを、各テンソルから取り出してタプルで返す
+        return (
+            self.sequences[index],
+            self.log_probs[index],
+            self.values[index],
+            self.advantages[index],
+            self.returns[index]
+        )

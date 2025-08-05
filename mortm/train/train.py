@@ -378,7 +378,7 @@ def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: n
             for pack2 in loader:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     r_pack = trainer.epoch_fc(model, pack2, progress)
-                    loss = criterion(*r_pack)  # 損失を計算
+                    loss = trainer.get_eval_loss(*r_pack)  # 損失を計算
                 val_loss += loss.item()
                 all_count += 1
     model.train()
@@ -390,6 +390,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                 message: Messenger, progress: LearningProgress,
                 writer,  coll_fn=None):
     print("Creating Trainer...")
+
     model = trainer.model
     criterion = trainer.criterion
     optimizer = trainer.optimizer
@@ -421,20 +422,14 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                     mini_c += 1
                     all_count += 1
 
-                    if mini_c % train_args.accumulation_steps == 0:  #実質バッチサイズは64である
-                        progress.step_optimizer(optimizer, model, train_args.accumulation_steps)
-                        if train_args.lr_param is None:
-                            scheduler.step()
-                        torch.cuda.empty_cache()
+                    is_step_optimizer = mini_c % train_args.accumulation_steps == 0
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         r_pack = trainer.epoch_fc(model, pack2, progress)
 
-                        loss = criterion(*r_pack)  # 損失を計算
+                    loss = trainer.backward(train_args.accumulation_steps, is_step_optimizer, progress, train_args.lr_param, *r_pack)
 
                     epoch_loss.add(loss.item())
 
-                    loss = loss / train_args.accumulation_steps
-                    loss.backward()  # 逆伝播
 
                     progress_bar_with_minibatch(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss)
 
@@ -479,8 +474,6 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
     return model, verification_loss
 
 
-
-
 def _train(args, t_args, save_directory, trainer, version, today_date,
            message, train_loader, val_loader,
            progress, coll_fn=None):
@@ -522,7 +515,20 @@ def train_mortm(model_config: str, train_config: str, root_directory, save_direc
 
     print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
 
-    directory, filename = find_files(root_directory, '.npz')
+    if isinstance(root_directory, str):
+        if root_directory.endswith(".json"):
+            directory, filename = find_files_with_json(root_directory)
+        else:
+            directory, filename = find_files(root_directory, '.npz')
+    elif isinstance(root_directory, tuple):
+        directory, filename = find_files_with_json(root_directory[1])
+
+        directory2, filename2 = find_files(root_directory[0], '.npz')
+        for d, f in zip(directory2, filename2):
+            directory.append(d)
+            filename.append(f)
+    else:
+        directory, filename = root_directory
     print("データセットの規模：", len(filename))
     mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
     train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
@@ -551,7 +557,10 @@ def train_bertm(model_config: str, train_config: str, human_dir, ai_dir, save_di
 
     print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
     if isinstance(human_dir, str):
-        directory, filename = find_files(human_dir, '.npz')
+        if human_dir.endswith(".json"):
+            directory, filename = find_files_with_json(human_dir)
+        else:
+            directory, filename = find_files(human_dir, '.npz')
     elif isinstance(human_dir, tuple):
         directory, filename = find_files_with_json(human_dir[1])
 
@@ -591,14 +600,26 @@ def train_v_mortm(model_config: str, train_config: str, root_directory, save_dir
            train_loader=train_loader, val_loader=val_loader,
            progress=progress)
 
-def train_custom(trainer, train_config, root_directory, save_directory, version: str, extention: str = '.npz', coll_fn=None,
+def train_custom(trainer, t_args, root_directory, save_directory, version: str, extention: str = '.npz', coll_fn=None,
                  message: Messenger = _DefaultMessenger(), progress: LearningProgress = _DefaultLearningProgress()):
-    t_args = TrainArgs(json_directory=train_config)
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
     print(f"ToDay is{datetime.date.today()}! start learning. {trainer.args.name}.Ver.{version}_{today_date}")
 
-    directory, filename = find_files(root_directory, extention)
+    if isinstance(root_directory, str):
+        if root_directory.endswith(".json"):
+            directory, filename = find_files_with_json(root_directory)
+        else:
+            directory, filename = find_files(root_directory, extention)
+    elif isinstance(root_directory, tuple):
+        directory, filename = find_files_with_json(root_directory[1])
+
+        directory2, filename2 = find_files(root_directory[0], extention)
+        for d, f in zip(directory2, filename2):
+            directory.append(d)
+            filename.append(f)
+    else:
+        directory, filename = root_directory
     mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
     train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
 

@@ -3,7 +3,7 @@ from abc import abstractmethod
 from typing import Optional
 
 import torch
-from torch import nn
+from torch import nn, Tensor
 
 
 class TrainArgs:
@@ -22,6 +22,7 @@ class TrainArgs:
 
 class AbstractTrainSet:
     model: nn.Module
+
     def __init__(self, criterion: nn.Module, optimizer: torch.optim.Optimizer, scheduler: Optional[torch.optim.lr_scheduler.LambdaLR]):
         self.criterion = criterion
         self.optimizer = optimizer
@@ -34,3 +35,21 @@ class AbstractTrainSet:
     @abstractmethod
     def pre_processing(self, pack, progress):
         raise NotImplementedError("pre_processing is not implemented.")
+
+    def backward(self, accumulation_steps, is_step, progress, lr_param, *args):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss: Tensor = self.criterion(*args)
+        return_loss = loss.clone()
+        loss = loss / accumulation_steps
+        loss.backward()  # 逆伝播
+
+        if is_step:
+            progress.step_optimizer(self.optimizer, self.model, accumulation_steps)
+            if lr_param is None:
+                self.scheduler.step()
+            torch.cuda.empty_cache()
+
+        return return_loss
+
+    def get_eval_loss(self, *eval):
+        return self.criterion(*eval)
