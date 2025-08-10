@@ -12,7 +12,7 @@ from midi2audio import FluidSynth
 import soundfile as sf
 
 from .custom_token import Token, ShiftTimeContainer, MusicToken, ChordToken, MeasureToken, Blank
-from mortm.train.tokenizer import Tokenizer
+from mortm.train.tokenizer import Tokenizer, TO_MUSIC, TO_TOKEN
 from .train.utils.chord_midi import ChordMidi, Chord
 
 T = TypeVar("T")
@@ -282,7 +282,12 @@ class Midi2SeqWithChord(_AbstractMidiConverter):
                  program_list, split_measure=12, is_include_special_token=True):
         super().__init__(Midi2SeqWithChord, tokenizer, directory, file_name, program_list)
         self.aya_node = [0]
-        self.key = key
+        if "major" in key:
+            self.key = f"{key.split(' major')[0]}M"
+        elif "minor" in key:
+            self.key = f"{key.split(' minor')[0]}m"
+        else:
+            self.key = None
         self.split_measure = split_measure
         self.chords = ChordMidi(all_chords, all_chord_timestamps)
         self.is_include_special_token = is_include_special_token
@@ -519,17 +524,14 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
                                                    key=self.system["key"], all_chords=self.system["all_chords"],
                                                    all_chord_timestamps= self.system["all_chords_timestamps"],program_list=self.program_list, split_measure=999)
         melody_with_chord_clip.convert()
-        chord_clip = MetaData2Chord(self.tokenizer,is_include_special_token=False,
-                                    key=self.system["key"], all_chords=self.system["all_chords"],
-                                    all_chord_timestamps= self.system["all_chords_timestamps"], tempo= self.system["tempo"],
-                                    directory=self.directory, file_name=self.file_name, split_measure=999)
+        chord_clip = SeqWithChord2Chord(self.tokenizer,melody_with_chord_clip.aya_node)
         chord_clip.convert()
 
         if melody_clip.is_error and melody_with_chord_clip.is_error and chord_clip.is_error:
             self.is_error = True
             self.error_reason = "MIDIの変換中にエラーが発生しました。"
             return None
-        melody_all: np.ndarray = melody_clip.aya_node[1][1:]
+        melody_all: np.ndarray = melody_clip.aya_node[1]
         melody_all_ind = np.where(melody_all == self.tokenizer.get("<SME>"))[0]
 
         if len(chord_clip.aya_node) == 1:
@@ -537,22 +539,26 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
             self.error_reason = "コード進行の情報がありませんでした。"
             print(chord_clip.aya_node)
             return None
-        chord_all = chord_clip.aya_node[1][1:]
+        chord_all = chord_clip.aya_node[1]
         chord_all_ind = np.where(chord_all == self.tokenizer.get("<SME>"))[0]
 
-        melody_with_chord_all = melody_with_chord_clip.aya_node[1][1:]
+        melody_with_chord_all = melody_with_chord_clip.aya_node[1]
         melody_with_chord_all_ind = np.where(melody_with_chord_all == self.tokenizer.get("<SME>"))[0]
         back_ind = 0
 
         print(len(melody_all_ind), len(chord_all_ind), len(melody_with_chord_all_ind))
         is_running = back_ind + self.prompt_max_measure + self.out_measure < len(melody_all_ind)
+        self.tokenizer.mode(to=TO_TOKEN)
 
         while is_running:
             prompt_measure = random.randint(back_ind + 1, back_ind + self.prompt_max_measure)
-            melody_task = self.get_melody_task(chord_clip.key, melody_all, prompt_measure, melody_all_ind, back_ind)
-            melody_task_with_chord = self.get_melody_task_with_chord(chord_clip.key, melody_with_chord_all, prompt_measure, melody_with_chord_all_ind, back_ind)
-            chord_task = self.get_chord_task(chord_clip.key, melody_all, chord_all, prompt_measure, melody_all_ind, back_ind)
-            melody_task_add_chord = self.get_melody_task_add_chord(chord_clip.key, melody_with_chord_all, chord_all, prompt_measure, melody_with_chord_all_ind, back_ind)
+            #print(f"Test Seq MIDI2Seq: {melody_all[melody_all_ind[back_ind]: melody_all_ind[prompt_measure]]}")
+            #print(f"Test Seq With Chord: {melody_with_chord_all[melody_with_chord_all_ind[back_ind]: melody_with_chord_all_ind[prompt_measure]]}")
+            #print(f"Test Chord: {chord_all[chord_all_ind[back_ind]: chord_all_ind[prompt_measure]]}")
+            melody_task = self.get_melody_task(melody_with_chord_clip.key, melody_all, prompt_measure, melody_all_ind, back_ind)
+            melody_task_with_chord = self.get_melody_task_with_chord(melody_with_chord_clip.key, melody_with_chord_all, prompt_measure, melody_with_chord_all_ind, back_ind)
+            chord_task = self.get_chord_task(melody_with_chord_clip.key, melody_all, chord_all, prompt_measure, melody_all_ind, chord_all_ind, back_ind)
+            melody_task_add_chord = self.get_melody_task_add_chord(melody_with_chord_clip.key, melody_with_chord_all, chord_all, prompt_measure, melody_with_chord_all_ind, chord_all_ind, back_ind)
 
             self.marge(aya_node_inst, melody_task, melody_task_with_chord, chord_task, melody_task_add_chord)
 
@@ -568,21 +574,20 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
             aya_node_inst.append(chord_task)
             aya_node_inst.append(melody_task_add_chord)
 
-    def get_melody_task_add_chord(self, key, melody_all_with_chord, chord_all, prompt_measure, ind, back_ind) -> np.ndarray:
+    def get_melody_task_add_chord(self, key, melody_all_with_chord, chord_all, prompt_measure, melody_with_chord_ind, chord_ind, back_ind) -> np.ndarray:
         """
         コード進行制約付き旋律生成タスクを取得する関数
         :param key:
         :param melody_all_with_chord:
         :param chord_all:
         :param prompt_measure:
-        :param ind:
+        :param melody_with_chord_ind:
         :param back_ind:
         :return:
         """
-        melody_prompt: np.ndarray = melody_all_with_chord[ind[back_ind]:ind[prompt_measure]]
-        chord_prompt: np.ndarray  = chord_all[ind[prompt_measure]:ind[prompt_measure + self.out_measure]]
-        melody_tgt: np.ndarray    = melody_all_with_chord[ind[prompt_measure]:ind[prompt_measure + self.out_measure]]
-
+        melody_prompt: np.ndarray = melody_all_with_chord[melody_with_chord_ind[back_ind]:melody_with_chord_ind[prompt_measure]]
+        chord_prompt: np.ndarray  = chord_all[chord_ind[prompt_measure]:chord_ind[prompt_measure + self.out_measure]]
+        melody_tgt: np.ndarray    = melody_all_with_chord[melody_with_chord_ind[prompt_measure]:melody_with_chord_ind[prompt_measure + self.out_measure]]
         melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
         melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
 
@@ -600,7 +605,7 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
 
 
 
-    def get_chord_task(self, key,  melody_all, chord_all, prompt_measure, ind, back_ind) -> np.ndarray:
+    def get_chord_task(self, key, melody_all, chord_all, prompt_measure, melody_ind, chord_ind, back_ind) -> np.ndarray:
         """
         メロディからコード進行を予測するタスクを取得する関数
         :param melody_all: メロディの全体の配列
@@ -608,8 +613,8 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
         :param prompt_measure: プロンプトの小節数
         :return: メロディのタスクの配列
         """
-        melody_prompt: np.ndarray = melody_all[ind[back_ind]:ind[prompt_measure]]
-        chord_tgt: np.ndarray    = chord_all[ind[back_ind]:ind[prompt_measure]]
+        melody_prompt: np.ndarray = melody_all[melody_ind[back_ind]:melody_ind[prompt_measure]]
+        chord_tgt: np.ndarray    = chord_all[chord_ind[back_ind]:chord_ind[prompt_measure]]
 
         melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
         melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
@@ -671,6 +676,72 @@ class MIDI2TaskSeq(_AbstractMidiConverter):
 
 
 
+class SeqWithChord2Chord(_AbstractConverter):
+    def save(self, save_directory: str) -> [bool, str]:
+        pass
+
+    def convert(self, *args, **kwargs):
+        shift_time = self.tokenizer.get_length_tuple("s")
+        chord_root = self.tokenizer.get_length_tuple("CR")
+        chord_quarter = self.tokenizer.get_length_tuple("CQ")
+        chord_base = self.tokenizer.get_length_tuple("CB")
+        blank = self.tokenizer.get("<BLANK>")
+        sme = self.tokenizer.get("<SME>")
+        for s in self.base:
+            if not self.is_error:
+                in_shift = (s >= shift_time[0]) & (s <= shift_time[1])
+                in_chord = (s >= chord_root[0]) & (s <= chord_root[1])
+                in_quarter = (s >= chord_quarter[0]) & (s <= chord_quarter[1])
+                in_base = (s >= chord_base[0]) & (s <= chord_base[1])
+                bs = (s == blank) | (s == sme)
+                mask = (in_shift | in_chord | in_quarter | in_base | bs)
+                filter_seq = s[mask]
+                tokens = []
+                self.tokenizer.mode(to=TO_MUSIC)
+                for id in filter_seq:
+                    tokens.append(self.tokenizer.rev_get(id))
+                self.aya_node = self.aya_node + [self._ct_seq(tokens)]
+
+    def _ct_seq(self, s):
+        self.tokenizer.mode(to=TO_TOKEN)
+        aya_node_list = []
+        cash = 0
+        blank_trigger = False
+        for token in s:
+            token: str
+            if "s_" in token:
+                cash += int(token.split("_")[1])
+            if "CR_" in token:
+                if cash >= 96:
+                    print(f"Warning: {cash} is too long. It will be cut off.")
+                    cash = 95
+                new_s = self.tokenizer.get(f"s_{cash}")
+                aya_node_list.append(new_s)
+                aya_node_list.append(self.tokenizer.get(token))
+                cash = 0
+            if "CB_" in token or "CQ_" in token or "<BLANK>" == token:
+                aya_node_list.append(self.tokenizer.get(token))
+                blank_trigger = False
+            if token == "<SME>":
+                cash = 0
+                if blank_trigger:
+                    aya_node_list.append(self.tokenizer.get("<BLANK>"))
+                    aya_node_list.append(self.tokenizer.get("<SME>"))
+                else:
+                    aya_node_list.append(self.tokenizer.get("<SME>"))
+                blank_trigger = True
+        if blank_trigger:
+            aya_node_list.append(self.tokenizer.get("<BLANK>"))
+        aya_node_list.append(self.tokenizer.get("<ESEQ>"))
+        return np.array(aya_node_list, dtype=int)
+
+    def __init__(self, tokenizer: Tokenizer, aya_node, ):
+        super().__init__(SeqWithChord2Chord, None, None)
+        self.base = aya_node[1:] if len(aya_node) > 1 else []
+        self.is_error = len(self.base) == 0
+        self.tokenizer = tokenizer
+        self.tokenizer.mode()
+        self.aya_node = [0]
 
 
 

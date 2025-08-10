@@ -1,5 +1,5 @@
 import json
-from typing import List
+from typing import List, Tuple
 from numpy import ndarray
 
 import re
@@ -89,9 +89,8 @@ class Tokenizer:
                 t.set_tokens(self.tokens)
 
             self.token_max: dict = self._init_mx_dict(len(self.tokens))
-            self.is_converter = False
+            self.rev_tokens = None
         else:
-            self.is_converter = True
             self.music_token_list = music_token
             with open(load_data, 'r') as file:
                 self.tokens: dict = json.load(file)
@@ -123,6 +122,12 @@ class Tokenizer:
                 return p
         pass
 
+    def get_length_tuple(self, token_type: str) -> Tuple[int, int]:
+        for t in self.music_token_list:
+            if t.token_type == token_type:
+                return t.get_token_length_tuple()
+        pass
+
     def save(self, save_directory):
         json_string = json.dumps(self.tokens)
         with open(save_directory + "/vocab_list.json", 'w') as file:
@@ -132,14 +137,13 @@ class Tokenizer:
         with open(save_directory + "/vocab_max.json", 'w') as file:
             file.write(json_s)
 
-    pass
-
-    def rev_mode(self):
-        self.is_converter = True
+    def mode(self, to=TO_MUSIC):
         for li in self.music_token_list:
-            li.convert_type = TO_MUSIC
-        self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
-        print(self.rev_tokens)
+            li.convert_type = to
+
+        if to == TO_MUSIC and self.rev_tokens is None:
+            self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
+        #print(self.rev_tokens)
         pass
 
     def begin_token(self, token_type):

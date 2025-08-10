@@ -21,7 +21,7 @@ MORTMのバージョンは常に新しくなる為、モデルのバージョン
 '''
 
 tokenizer =token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
-tokenizer.rev_mode()
+tokenizer.mode()
 #args = MORTMArgs("configs/models/mortm/not_moe/A.json")
 args = MORTMArgs("configs/models/mortm/A.json")
 

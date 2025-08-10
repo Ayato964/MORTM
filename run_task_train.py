@@ -101,7 +101,7 @@ if __name__ == "__main__":
     LOOT_DIRECTORY = "out/np/Sax/task_train/"
     LOAD_MODEL_DIRECTORY = "out/model/mortm/MORTM.4.0EX5-SAX-Phase1_1.4054.pth"
     SAVE_DIRECTORY = "out/model/mortm"
-    VERSION = "4.0-SAX-Phase2"
+    VERSION = "4.1-SAX-Phase2"
 
     message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
     progress = _DefaultLearningProgress()

@@ -115,6 +115,9 @@ class Token:
         self.start = 0
         self.end = 0
 
+    def get_token_length_tuple(self):
+        return self.start, self.end
+
     @abstractmethod
     def get_token(self, *args, **kwargs) -> int | str | None:
         pass

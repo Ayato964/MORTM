@@ -167,17 +167,6 @@ class RLDF(AbstractTrainSet):
                 # ミニバッチのデータを取得
                 mb_sequences, mb_old_log_probs, mb_values, mb_advantages, mb_returns = mini_batch
 
-                """
-                self.actor_critic.eval() # 評価モードで勾配計算をオフに
-                with torch.no_grad():
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        recalculated_log_probs, _ = self.actor_critic.evaluate_actions(mb_sequences, (mb_sequences != 0))
-
-                # 2つのlog_probsの差を計算
-                alignment_error = (recalculated_log_probs - mb_old_log_probs).abs().sum()
-                print(f"\n[ALIGNMENT TEST] Sum of absolute difference: {alignment_error.item():.8f}\n")
-                self.actor_critic.train() # 必ず訓練モードに戻す
-                """
                 mb_padding = (mb_sequences != 0)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     new_log_probs, new_values = self.actor_critic.evaluate_actions(mb_sequences, mb_padding)

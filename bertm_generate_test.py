@@ -10,7 +10,7 @@ from mortm.de_convert import ct_token_to_midi
 
 
 tokenizer:Tokenizer  = Tokenizer(music_token=get_token_converter(TO_MUSIC))
-tokenizer.rev_mode()
+tokenizer.mode()
 #args = MORTMArgs("configs/models/mortm/not_moe/A.json")
 args = MORTMArgs("configs/models/bertm/class_file.json")
 model = BERTM(progress=_DefaultLearningProgress(), args=args)

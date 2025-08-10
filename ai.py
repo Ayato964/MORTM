@@ -21,7 +21,7 @@ from mortm.train.train import _set_train_data, find_files, collate_fn
 # --- 初期設定 (変更なし) ---
 progress = _DefaultLearningProgress()
 tokenizer = token.Tokenizer(music_token=get_token_converter(TO_MUSIC))
-tokenizer.rev_mode()
+tokenizer.mode()
 
 args = MORTMArgs("configs/models/mortm/A.json")
 model = MORTM(progress=progress, args=args)

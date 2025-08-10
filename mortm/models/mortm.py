@@ -56,7 +56,7 @@ class MORTM(nn.Module):
         return score
 
     @torch.inference_mode()
-    def top_sampling_measure_kv_cache(self, src: Tensor, p=0.9, max_measure=20, temperature=1.0, print_log=True):
+    def top_sampling_measure_kv_cache(self, src: Tensor | numpy.ndarray, p=0.9, max_measure=20, temperature=1.0, print_log=True):
         """
         KVキャッシュを利用してトークンを生成するためのメソッドです。
         複数バッチに対応しています。

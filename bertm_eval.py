@@ -14,7 +14,7 @@ from sklearn.metrics import classification_report, roc_auc_score
 # 1. モデルとトークナイザーの準備（ユーザー提供のコードと同様）
 # ----------------------------------------------------------------
 tokenizer: Tokenizer = Tokenizer(music_token=get_token_converter(TO_MUSIC))
-tokenizer.rev_mode()
+tokenizer.mode()
 args = MORTMArgs("configs/models/bertm/class_file.json")
 model = BERTM(progress=_DefaultLearningProgress(), args=args)
 model.load_state_dict(torch.load("out/model/class/MORTM.4.0.1_0.07270082146024857.pth"))
