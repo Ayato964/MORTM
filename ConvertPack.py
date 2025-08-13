@@ -1,6 +1,6 @@
 import os
 
-from mortm.convert import PackSeq
+from mortm.utils.convert import PackSeq
 
 
 def find_seq_files(root_folder):

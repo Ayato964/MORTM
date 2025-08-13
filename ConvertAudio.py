@@ -4,8 +4,8 @@ import numpy as np
 from multiprocessing import Process, Manager
 
 from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.convert import Audio2MelSpectrogramALL
-from midi2audio import FluidSynth
+from mortm.utils.convert import Audio2MelSpectrogramALL
+
 
 def find_midi_files(root_folder):
     midi_files = []

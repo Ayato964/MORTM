@@ -14,6 +14,16 @@ from .modules.layers import MORTMDecoder
 from flash_attn.bert_padding import pad_input, unpad_input
 
 class MORTM(nn.Module):
+    """
+    Main class for the MORTM model.
+
+    Attributes:
+        args (MORTMArgs): Model configuration arguments.
+        progress (LearningProgress): Progress tracker.
+        embedding (nn.Embedding): Embedding layer.
+        Wout (nn.Linear or lora.Linear): Output layer.
+        softmax (nn.Softmax): Softmax layer.
+    """
     def __init__(self, args: MORTMArgs, progress: LearningProgress):
         super(MORTM, self).__init__()
         self.args = args
@@ -38,6 +48,18 @@ class MORTM(nn.Module):
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 
     def forward(self, x, padding_mask=None, is_causal=False, is_save_cache=False):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (Tensor): Input tensor.
+            padding_mask (Tensor, optional): Padding mask tensor.
+            is_causal (bool, optional): Whether to use causal masking.
+            is_save_cache (bool, optional): Whether to save KV cache.
+
+        Returns:
+            Tensor: Output logits.
+        """
         x: Tensor = self.embedding(x).to(dtype=torch.bfloat16)
         if padding_mask is not None:
             batch, tgt_len, embed_dim = x.size()
@@ -56,10 +78,18 @@ class MORTM(nn.Module):
         return score
 
     @torch.inference_mode()
-    def top_sampling_measure_kv_cache(self, src: Tensor | numpy.ndarray, p=0.9, max_measure=20, temperature=1.0, print_log=True):
+    def top_sampling_measure_kv_cache(self, src: Tensor | numpy.ndarray, p=0.9, temperature=1.0, print_log=True):
         """
-        KVキャッシュを利用してトークンを生成するためのメソッドです。
-        複数バッチに対応しています。
+        Generates tokens using top-p sampling with KV cache.
+
+        Args:
+            src (Tensor | numpy.ndarray): Input sequence.
+            p (float, optional): Top-p sampling threshold.
+            temperature (float, optional): Sampling temperature.
+            print_log (bool, optional): Whether to print logs.
+
+        Returns:
+            Tuple[List[numpy.ndarray], Tuple[List[numpy.ndarray], List[numpy.ndarray]]]: Generated tokens and split sequences.
         """
         self.eval()
         is_running = True
@@ -84,7 +114,7 @@ class MORTM(nn.Module):
 
         # 全トークンを保持するテンソル
         all_tokens = torch.cat([src, next_tokens.unsqueeze(1)], dim=1)
-
+        
         # --- 2. トークン生成 (Decoding) ---
         i = len(all_tokens)
         if print_log: print("\n--- Decoding Phase ---")
@@ -100,7 +130,7 @@ class MORTM(nn.Module):
             #print(next_tokens.max(), all_tokens.max())
             # 生成されたトークンを連結
             all_tokens = torch.cat([all_tokens, next_tokens.unsqueeze(1)], dim=1)
-
+        
             if print_log: print(f"\r Step {i+1}: Generated tokens {next_tokens.tolist()}", end="")
 
             if self.is_end_point(all_tokens) or i > self.args.position_length:
@@ -109,7 +139,8 @@ class MORTM(nn.Module):
             i += 1
 
         np_all_tokens = []
-        np_generated_only_tokens = []
+        prompt = []
+        generated = []
         print(all_tokens.max())
         for seq in all_tokens:
             seq: Tensor
@@ -126,15 +157,20 @@ class MORTM(nn.Module):
             if len(pad) != 0:
                 start = pad[0]
                 end = pad[-1]
+                prompt.append(seq[:start].cpu().numpy())
                 np_seq = np.append(np_seq, seq[:start].cpu().numpy())
                 if eseq == len(seq):
+                    generated.append(seq[end+1:].cpu().numpy())
                     np_seq = np.append(np_seq, seq[end+1:].cpu().numpy())
                 else:
+                    generated.append(seq[end+1:eseq+1].cpu().numpy())
                     np_seq = np.append(np_seq, seq[end+1:eseq+1].cpu().numpy())
             else:
                 if eseq == len(seq):
+                    generated.append(seq.cpu().numpy())
                     np_seq = np.append(np_seq, seq.cpu().numpy())
                 else:
+                    generated.append(seq[:eseq+1].cpu().numpy())
                     np_seq = np.append(np_seq,seq[:eseq+1].cpu().numpy())
             np_all_tokens.append(np_seq)
             if np_seq.max() > self.args.vocab_size:
@@ -142,14 +178,18 @@ class MORTM(nn.Module):
                     f"生成されたトークンIDが語彙サイズ({self.args.vocab_size})を超えています: {np_seq.max()}"
                 )
 
-        return np_all_tokens, None
+        return np_all_tokens, (prompt, generated)
 
     def is_end_point(self, x: torch.Tensor) -> bool:
         """
-        x: Tensor of shape [n, 14]
-        戻り値: 全ての行に少なくとも1つ 5 があれば True、そうでなければ False
-        """
+        Check if all rows in the tensor contain at least one of the end tokens.
 
+        Args:
+            x (torch.Tensor): Tensor of shape [n, 14].
+
+        Returns:
+            bool: True if all rows contain at least one end token, False otherwise.
+        """
         mask = (x == 585) | (x == 586)
         per_row_has5 = mask.any(dim=1)
         # 3) 全行が True かを判定する
@@ -160,7 +200,15 @@ class MORTM(nn.Module):
 
     def top_p_sampling(self, logits: Tensor, p=0.9, temperature=1.0) -> Tensor:
         """
-        複数バッチに対応したTop-pサンプリング。（修正版）
+        Perform top-p sampling for multiple batches.
+
+        Args:
+            logits (Tensor): Logits tensor.
+            p (float, optional): Top-p sampling threshold.
+            temperature (float, optional): Sampling temperature.
+
+        Returns:
+            Tensor: Sampled token indices.
         """
         logits = logits / temperature
         probs = self.softmax(logits)
@@ -195,15 +243,15 @@ class MORTM(nn.Module):
 
     def split_tensor_at_value(self, tensor: Tensor, split_value, include_split=True):
         """
-        指定した値を基準にテンソルを分割します。
+        Split a 1D tensor at specified value.
 
         Args:
-            tensor (torch.Tensor): 1次元のテンソルを想定しています。
-            split_value (int or float): 分割の基準となる値。
-            include_split (bool, optional): 分割値を各セグメントに含めるかどうか。デフォルトは True。
+            tensor (torch.Tensor): 1D tensor to split.
+            split_value (int or float): Value to split at.
+            include_split (bool, optional): Whether to include the split value in segments.
 
         Returns:
-            List[torch.Tensor]: 分割されたテンソルのリスト。
+            List[torch.Tensor]: List of split tensor segments.
         """
         if tensor.dim() != 1:
             raise ValueError("この関数は1次元のテンソルに対してのみ動作します。")
@@ -242,14 +290,14 @@ class MORTM(nn.Module):
 
     def get_log_probs(self, sequence_tensors: torch.Tensor, padding_mask: torch.Tensor = None) -> torch.Tensor:
         """
-        与えられたシーケンスの対数確率を計算する。
+        Calculate log probabilities for a given sequence.
 
         Args:
-            sequence_tensors (torch.Tensor): 形状 (batch, seq_len) のトークンIDテンソル。
-            padding_mask (torch.Tensor): 対応するアテンションマスク。
+            sequence_tensors (torch.Tensor): Token ID tensor of shape (batch, seq_len).
+            padding_mask (torch.Tensor): Corresponding attention mask.
 
         Returns:
-            torch.Tensor: 各トークン位置の対数確率のテンソル。
+            torch.Tensor: Log probabilities tensor for each token position.
         """
         # 1. 入力とターゲットを作成（1つずらす）
         input_ids = sequence_tensors[:, :-1]
@@ -279,4 +327,3 @@ class MORTM(nn.Module):
             log_probs = log_probs * padding_mask[:, 1:]
 
         return log_probs
-

@@ -1,10 +1,8 @@
 import json
 from typing import List, Tuple
-from numpy import ndarray
 
-import re
 from mortm import constants
-from mortm.custom_token import *
+from mortm.train.custom_token import *
 
 '''旋律トークン'''
 PITCH_TYPE = 'p'

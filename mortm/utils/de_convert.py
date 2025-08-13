@@ -2,12 +2,25 @@ from torch import Tensor
 from pretty_midi import Instrument, Note, PrettyMIDI
 
 from mortm.train.tokenizer import Tokenizer, DURATION_TYPE
-from .custom_token import ShiftTimeContainer, ChordToken
+from mortm.train.custom_token import ShiftTimeContainer, ChordToken
 
 
 
 
 def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, program=1, tempo=120):
+    """
+    Converts a sequence of tokens into a MIDI file.
+
+    Args:
+        tokenizer (Tokenizer): Tokenizer instance.
+        seq (Tensor): Sequence of tokens.
+        save_directory (str): Path to save the MIDI file.
+        program (int): MIDI program number (default: 1).
+        tempo (int): Tempo of the MIDI file (default: 120).
+
+    Returns:
+        PrettyMIDI: Generated MIDI object.
+    """
     seq = seq[1:]
     midi = PrettyMIDI()
     inst: Instrument = Instrument(program=program)

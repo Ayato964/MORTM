@@ -1,15 +1,13 @@
-from typing import Optional
-
 import numpy as np
 import torch
 
-from mortm.gmail_messanger import GmailMessanger
-from mortm.messager import Messenger
+from mortm.utils.gmail_messanger import GmailMessanger
+from mortm.utils.messager import Messenger
 from mortm.models.modules.progress import _DefaultLearningProgress
 import loralib as lora
 from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
 from mortm.train.train import _get_padding_mask
-from torch import nn, Tensor
+from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from mortm.train.config import TrainArgs
@@ -22,6 +20,14 @@ from mortm.train.utils.loss import MaskedCrossEntropyLoss
 
 
 class TTMORTM(AbstractTrainSet):
+    """
+    Training class for the MORTM model with LoRA fine-tuning.
+
+    Attributes:
+        args (MORTMArgs): Model configuration arguments.
+        tokenizer (Tokenizer): Tokenizer instance.
+        model (MORTM): MORTM model instance.
+    """
     def __init__(self, args_config: str, load_model_directory, tokenizer: Tokenizer, progress):
         self.args = MORTMArgs(args_config)
         self.args.use_lora = True
@@ -44,6 +50,17 @@ class TTMORTM(AbstractTrainSet):
 
 
     def epoch_fc(self, model, pack, progress):
+        """
+        Defines the forward computation for a single epoch.
+
+        Args:
+            model (MORTM): The model instance.
+            pack (Tensor): Input data batch.
+            progress (_DefaultLearningProgress): Progress tracker.
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor]: Model output, target, and mask tensors.
+        """
         src = pack
         target: Tensor = src[:, 1:].to(progress.get_device())
         mask = self.loss_mask(target)
@@ -59,6 +76,16 @@ class TTMORTM(AbstractTrainSet):
 
 
     def pre_processing(self, pack, progress):
+        """
+        Pre-processes the dataset for training.
+
+        Args:
+            pack (DataLoader): Data loader instance.
+            progress (_DefaultLearningProgress): Progress tracker.
+
+        Returns:
+            MORTM_SEQDataset: Pre-processed dataset.
+        """
         dt: DataLoader = pack
         mini_dataset = MORTM_SEQDataset(progress, self.args.position_length, self.args.min_length)
         for d in dt:
@@ -119,3 +146,4 @@ if __name__ == "__main__":
         progress=progress,
         coll_fn=collate_fn
     )
+

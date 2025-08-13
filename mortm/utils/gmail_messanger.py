@@ -1,7 +1,7 @@
 import os
 import base64
 
-from mortm.messager import Messenger
+from mortm.utils.messager import Messenger
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow

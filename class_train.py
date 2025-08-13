@@ -7,7 +7,7 @@ import os
 from mortm.train.train import train_bertm
 
 from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
-from mortm.gmail_messanger import GmailMessanger, Messenger
+from mortm.utils.gmail_messanger import GmailMessanger, Messenger
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)

@@ -1,7 +1,7 @@
 import pylab as p
 from pretty_midi import Note, Instrument
 from abc import abstractmethod
-from .train.utils.chord_midi import ChordMidi
+from mortm.train.utils.chord_midi import ChordMidi
 
 roots = ['C', 'C#', 'D', 'D#', 'E', 'E#', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B', 'Cb','Db','Eb','Fb','Gb','Ab','Bb']
 bases = ['/C', '/C#', '/D', '/D#', '/E', '/E#', '/F', '/F#', '/G', '/G#', '/A', '/A#', '/B', "/B#", "/Db","/Eb", "/Fb", "/Gb","/Ab","/Bb","/Cb", "None"]

@@ -1,8 +1,6 @@
 import numpy as np
 
-from mortm.convert import MIDI2Seq, Midi2SeqWithChord
 from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.de_convert import ct_token_to_midi
 
 TEST_MIDI = "out/np/Sax/"
 

@@ -1,13 +1,11 @@
 import torch
 from mortm.models.bertm import BERTM, MORTMArgs
-from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
+from mortm.train.tokenizer import Tokenizer, get_token_converter
 import numpy as np
 import torch.nn.functional as F
 from mortm.train.tokenizer import TO_MUSIC
 
 from mortm.models.modules.progress import _DefaultLearningProgress
-from mortm.de_convert import ct_token_to_midi
-
 
 tokenizer:Tokenizer  = Tokenizer(music_token=get_token_converter(TO_MUSIC))
 tokenizer.mode()

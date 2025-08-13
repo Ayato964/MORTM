@@ -11,14 +11,27 @@ from typing import TypeVar, Generic
 from midi2audio import FluidSynth
 import soundfile as sf
 
-from .custom_token import Token, ShiftTimeContainer, MusicToken, ChordToken, MeasureToken, Blank
+from mortm.train.custom_token import Token, ShiftTimeContainer, ChordToken, MeasureToken, Blank
 from mortm.train.tokenizer import Tokenizer, TO_MUSIC, TO_TOKEN
-from .train.utils.chord_midi import ChordMidi, Chord
+from mortm.train.utils.chord_midi import ChordMidi, Chord
 
 T = TypeVar("T")
 
 
 def conv_spectro(waveform, sample_rate, n_fft, hop_length, n_mels):
+    """
+    Converts a waveform into a mel spectrogram.
+
+    Args:
+        waveform (Tensor): Input waveform tensor of shape [1, time].
+        sample_rate (int): Sampling rate of the waveform.
+        n_fft (int): Number of FFT components.
+        hop_length (int): Hop length for the STFT.
+        n_mels (int): Number of mel bands.
+
+    Returns:
+        Tensor: Log-scaled mel spectrogram of shape [n_mels, T].
+    """
     mel_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=sample_rate,
         n_fft=n_fft,
@@ -32,6 +45,16 @@ def conv_spectro(waveform, sample_rate, n_fft, hop_length, n_mels):
 
 
 class _AbstractConverter(ABC):
+    """
+    Abstract base class for converters.
+
+    Attributes:
+        instance (Generic[T]): Instance of the child class.
+        directory (str): Directory path for input files.
+        file_name (str | List[str]): Name(s) of the file(s).
+        is_error (bool): Indicates if an error occurred.
+        error_reason (str): Reason for the error.
+    """
     def __init__(self, instance: Generic[T], directory: str, file_name: str | List[str]):
         self.instance = instance
         self.directory = directory
@@ -44,15 +67,30 @@ class _AbstractConverter(ABC):
 
     @abstractmethod
     def save(self, save_directory: str) -> [bool, str]:
+        """
+        Abstract method to save the converted data.
+
+        Args:
+            save_directory (str): Directory to save the output.
+
+        Returns:
+            Tuple[bool, str]: Success status and message.
+        """
         pass
 
     @abstractmethod
     def convert(self, *args, **kwargs):
+        """
+        Abstract method to perform the conversion.
+
+        Args:
+            *args: Variable length argument list.
+            **kwargs: Arbitrary keyword arguments.
+        """
         pass
 
 
 class _AbstractMidiConverter(_AbstractConverter):
-
     def __init__(self, instance: Generic[T], tokenizer: Tokenizer, directory: str, file_name: str, program_list,
                  midi_data=None):
         '''
@@ -927,3 +965,4 @@ class PareAudio2PareMelSpectrogram(_AbstractAudioConverter):
             return True, f"保存に成功しました: {save_path}"
         except Exception as e:
             return False, f"保存に失敗しました: {str(e)}"
+

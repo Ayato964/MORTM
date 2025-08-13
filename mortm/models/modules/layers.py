@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.modules.transformer import _get_clones, LayerNorm, MultiheadAttention, TransformerEncoder, TransformerEncoderLayer, _generate_square_subsequent_mask
+from einops import rearrange
 import loralib.layers as lora
 from typing import Tuple, List
 import numpy as np
@@ -187,6 +188,80 @@ class MORTMDecoderLayer(nn.Module):
 
         return self.dropout3(self.ffn(y))
 
+
+class SelectiveAttentionDecoder(nn.Module):
+    def __init__(self, args: MORTMArgs):
+        super().__init__()
+        self.layers = _get_clones(SelectiveAttentionDecoderLayer(args), args.d_layer)
+        self.norm = DynamicTanh(args.d_model)
+
+    def forward(self, x: Tensor):
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
+
+
+class SelectiveAttentionDecoderLayer(nn.Module):
+    def __init__(self, args: MORTMArgs):
+        super().__init__()
+        self.expand = 2
+        self.d_inner = int(args.d_model * self.expand)
+
+        self.in_proj = nn.Module(args.d_model, args.d_model * 2)
+        self.conv1d = nn.Conv1d(args.d_model, args.d_model, kernel_size=4)
+
+        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(self.d_state, self.d_inner, bias=True)
+
+        A = rearrange(torch.arange(1, self.d_state + 1), "n -> 1 n")
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        self.out_block = MoE(args)
+
+        self.dropout = nn.Dropout(args.dropout)
+        self.norm = DynamicTanh(args.d_model)
+
+    def forward(self, x: Tensor):
+        ss_out = self.ssm_block(self.norm(x))
+
+        y = x + self.dropout(self.out_block(ss_out))
+
+        return y
+
+    def ssm_block(self, x: Tensor):
+        x_and_res: Tensor = self.in_proj(x)
+        x, res = x_and_res.split(split_size=[self.d_inner, self.d_inner], dim=-1)
+        x = rearrange(x, "b l d -> b d l")
+        x_conv = self.conv1d(x)[:, :, :x.shape[-1]]
+        x_conv = rearrange(x_conv, "b d l -> b l d")
+
+        x = F.silu(x_conv)
+        y = self.ssm(x)
+
+        res = F.silu(res)
+        gated_output = y * res
+
+        return gated_output
+
+    def ssm(self, x):
+        # A, D は学習可能なパラメータ
+        A = -torch.exp(self.A_log.float())
+        D = self.D.float()
+
+        # Δ, B, C は入力xに応じて動的に決まる
+        x_doubled = self.x_proj(x)
+        delta, B = x_doubled.split(split_size=[self.d_state, self.d_state], dim=-1)
+        C = B # 簡略化のためBとCを共有
+
+        delta = F.softplus(self.dt_proj(delta))
+
+        # ★★★ ここでCUDAカーネルを呼び出す ★★★
+        #y = selective_scan_fn(
+        #    x, delta, A, B, C, D=D, delta_softplus=True
+        #)
+
+        return delta
 
 class FFN(nn.Module):
 

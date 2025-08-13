@@ -1,13 +1,20 @@
 import json
-import os
 from typing import List
 
-import numpy as np
 from multiprocessing import Process, Manager
-from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.convert import *
+from mortm.train.tokenizer import Tokenizer, get_token_converter
+from mortm.utils.convert import *
 
 def find_midi_files(root_folder):
+    """
+    Finds all MIDI files in the specified root folder.
+
+    Args:
+        root_folder (str): Path to the root folder.
+
+    Returns:
+        Tuple[List[str], List[str]]: A tuple containing a list of directories and a list of MIDI file names.
+    """
     midi_files = []
     direc = []
     for defpath, surnames, filenames in os.walk(root_folder):
@@ -19,6 +26,15 @@ def find_midi_files(root_folder):
 
 
 def find_midi_files_with_json(root_folder):
+    """
+    Finds all MIDI files and their corresponding JSON data in the specified root folder.
+
+    Args:
+        root_folder (str): Path to the root folder.
+
+    Returns:
+        Tuple[List[str], List[str], List[dict]]: A tuple containing a list of directories, a list of MIDI file names, and a list of JSON data.
+    """
     midi_files = []
     direct = []
     with open(f'{root_folder}/json/train.json', 'r') as f:
@@ -36,18 +52,21 @@ def find_midi_files_with_json(root_folder):
 
 
 def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
-    '''
-    MIDIデータを受け取り、シーケンス生成を行う。
-    :param pid:
-    :param tokenizer:
-    :param directory:
-    :param md_file:
-    :param program:
-    :param progress:
-    :param save_path:
-    :return:
-    '''
+    """
+    Converts MIDI files to sequences using the specified tokenizer.
 
+    Args:
+        pid (int): Process ID.
+        tokenizer (Tokenizer): Tokenizer instance for conversion.
+        directory (List[str]): List of directories containing MIDI files.
+        md_file (List[str]): List of MIDI file names.
+        program (List[int]): List of MIDI program numbers.
+        progress (Manager.dict): Shared dictionary to track progress.
+        save_path (str): Directory to save the converted sequences.
+
+    Returns:
+        None
+    """
     local_count = 0
     is_error = False
     for i in range(len(md_file)):
@@ -71,6 +90,21 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
 
 
 def expansion(pid, tokenizer, directory, md_file, program, progress, save_path):
+    """
+    Expands and converts MIDI files to sequences using the specified tokenizer.
+
+    Args:
+        pid (int): Process ID.
+        tokenizer (Tokenizer): Tokenizer instance for conversion.
+        directory (List[str]): List of directories containing MIDI files.
+        md_file (List[str]): List of MIDI file names.
+        program (List[int]): List of MIDI program numbers.
+        progress (Manager.dict): Shared dictionary to track progress.
+        save_path (str): Directory to save the converted sequences.
+
+    Returns:
+        None
+    """
     local_count = 0
     for i in range(len(md_file)):
         con = MidiExpantion(tokenizer, directory[i], md_file[i], program)
@@ -92,17 +126,21 @@ def expansion(pid, tokenizer, directory, md_file, program, progress, save_path):
 
 
 def convert_ex(pid, tokenizer, directory, md_file, program, progress, save_path):
-    '''
-    MIDIデータを受け取り、全てのキーに変換を行いながらシーケンス生成を行う。
-    :param pid:
-    :param tokenizer:
-    :param directory:
-    :param md_file:
-    :param program:
-    :param progress:
-    :param save_path:
-    :return:
-    '''
+    """
+    Converts MIDI files to sequences in all keys using the specified tokenizer.
+
+    Args:
+        pid (int): Process ID.
+        tokenizer (Tokenizer): Tokenizer instance for conversion.
+        directory (List[str]): List of directories containing MIDI files.
+        md_file (List[str]): List of MIDI file names.
+        program (List[int]): List of MIDI program numbers.
+        progress (Manager.dict): Shared dictionary to track progress.
+        save_path (str): Directory to save the converted sequences.
+
+    Returns:
+        None
+    """
     local_count = 0
     for i in range(len(md_file)):
         con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
@@ -124,18 +162,22 @@ def convert_ex(pid, tokenizer, directory, md_file, program, progress, save_path)
 
 
 def convert_with_chord(pid, tokenizer, directory: List[str], md_file: List[str], system_file: List[dict], program, progress, save_path):
-    '''
-    MIDIデータと楽曲情報を含むJSONを受け取り、コード進行を考慮したシーケンス生成を行う。
-    :param pid:
-    :param tokenizer:
-    :param directory: 楽曲のディレクトリが格納されている。
-    :param md_file:　楽曲名が格納されている。
-    :param system_file: 楽曲情報が格納されている
-    :param program:
-    :param progress:
-    :param save_path:
-    :return:
-    '''
+    """
+    Converts MIDI files to sequences considering chord progressions using the specified tokenizer.
+
+    Args:
+        pid (int): Process ID.
+        tokenizer (Tokenizer): Tokenizer instance for conversion.
+        directory (List[str]): List of directories containing MIDI files.
+        md_file (List[str]): List of MIDI file names.
+        system_file (List[dict]): List of JSON data containing song information.
+        program (List[int]): List of MIDI program numbers.
+        progress (Manager.dict): Shared dictionary to track progress.
+        save_path (str): Directory to save the converted sequences.
+
+    Returns:
+        None
+    """
     local_count = 0
 
     for i in range(len(md_file)):
@@ -163,6 +205,22 @@ def convert_with_chord(pid, tokenizer, directory: List[str], md_file: List[str],
     progress[pid] = local_count
 
 def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress, save_directory):
+    """
+    Converts MIDI files to chord sequences using the specified tokenizer.
+
+    Args:
+        pid (int): Process ID.
+        tokenizer (Tokenizer): Tokenizer instance for conversion.
+        directory (List[str]): List of directories containing MIDI files.
+        md_file (List[str]): List of MIDI file names.
+        system_file (List[dict]): List of JSON data containing song information.
+        SAX (List[int]): List of MIDI program numbers for saxophone.
+        progress (Manager.dict): Shared dictionary to track progress.
+        save_directory (str): Directory to save the converted sequences.
+
+    Returns:
+        None
+    """
     local_count = 0
 
     for i in range(len(md_file)):
@@ -188,6 +246,22 @@ def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress
                 print(f"Process#{pid}: Running... {local_count}  Reason: {reason}")
 
 def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progress, save_directory):
+    """
+    Converts MIDI files to task sequences using the specified tokenizer.
+
+    Args:
+        pid (int): Process ID.
+        tokenizer (Tokenizer): Tokenizer instance for conversion.
+        directory (List[str]): List of directories containing MIDI files.
+        md_file (List[str]): List of MIDI file names.
+        system_file (List[dict]): List of JSON data containing song information.
+        SAX (List[int]): List of MIDI program numbers for saxophone.
+        progress (Manager.dict): Shared dictionary to track progress.
+        save_directory (str): Directory to save the converted sequences.
+
+    Returns:
+        None
+    """
     local_count = 0
     for i in range(len(md_file)):
         if (system_file[i]["key"] and len(system_file[i]["all_chords"]) > 10 and not ("N" in system_file[i]["all_chords"])
@@ -264,3 +338,4 @@ if __name__ == "__main__":
     tokenizer.save("out/vocab/")
     print(len(tokenizer.tokens))
     print(tokenizer.token_max)
+

@@ -8,7 +8,7 @@ from mortm.train.tokenizer import TO_MUSIC
 
 from mortm.models.modules.progress import _DefaultLearningProgress
 from mortm.train.tokenizer import get_token_converter
-from mortm.de_convert import ct_token_to_midi
+from mortm.utils.de_convert import ct_token_to_midi
 '''
 MORTMのバージョンは常に新しくなる為、モデルのバージョンとvocab_list.jsonを確認してください。
 うまくメロディが生成できない場合や、エラーが発生する場合、以下の項目を確認してください。

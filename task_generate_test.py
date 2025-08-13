@@ -1,12 +1,12 @@
 import torch
 from mortm.models.mortm import MORTM, MORTMArgs
-from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
+from mortm.train.tokenizer import Tokenizer, get_token_converter
 import numpy as np
 
 from mortm.train.tokenizer import TO_MUSIC
 
 from mortm.models.modules.progress import _DefaultLearningProgress
-from mortm.de_convert import ct_token_to_midi
+from mortm.utils.de_convert import ct_token_to_midi
 
 
 tokenizer:Tokenizer  = Tokenizer(music_token=get_token_converter(TO_MUSIC))
@@ -28,15 +28,15 @@ model.to(device)
 
 
 """--------旋律自己回帰生成----------"""
-#np_notes = np.load("out/Sample4.mid.npz")
-#midi_prompt = np_notes[f'array1'][2:129]
+np_notes = np.load("out/Sample4.mid.npz")
+midi_prompt = np_notes[f'array1'][2:129]
 
-#start = np.array([tokenizer.get(f"k_Cm"), tokenizer.get("<QUERY_M>")] + midi_prompt.tolist() + [tokenizer.get("</QUERY_M>"), tokenizer.get("<MGEN>")])
+start = np.array([tokenizer.get(f"k_Cm"), tokenizer.get("<QUERY_M>")] + midi_prompt.tolist() + [tokenizer.get("</QUERY_M>"), tokenizer.get("<MGEN>")])
 """----------------------------"""
 
 
 """--------コード進行付き旋律自己回帰生成----------"""
-
+"""
 np_notes = np.load("out/Sample4.mid.npz")
 midi_prompt = np_notes[f'array1'][2:98]
 chord_prompt = np.array([tokenizer.get("<SME>"),
@@ -58,9 +58,9 @@ chord_prompt = np.array([tokenizer.get("<SME>"),
                          ])
 start = np.array([tokenizer.get(f"k_Cm"), tokenizer.get("<QUERY_M>")] + midi_prompt.tolist() + [tokenizer.get("</QUERY_M>"), tokenizer.get("<QUERY_C>")] +
                  chord_prompt.tolist() + [tokenizer.get("</QUERY_C>"), tokenizer.get("<MGEN>")])
-
+"""
 """----------------------------"""
-all, gene = model.top_sampling_measure_kv_cache(start, p=0.95, max_measure=20, temperature=1.0)
+all, gene = model.top_sampling_measure_kv_cache(start, p=0.95,  temperature=1.0)
 
 output = all[0]
 #output = torch.tensor(start)
@@ -69,5 +69,8 @@ for t in output:
     print(f"{t}  {tokenizer.rev_get(t.tolist())}")
 
 
+
+
 midi = ct_token_to_midi(tokenizer, output, "out/generate.midi", program=65, tempo=120) #生成したトークンをMIDIに変換する。
+
 

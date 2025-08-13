@@ -1,6 +1,6 @@
 import json
 
-from mortm.convert import MetaData2Chord
+from mortm.utils.convert import MetaData2Chord
 from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
 
 EX = 821

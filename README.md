@@ -72,7 +72,7 @@ Convert MIDI to tokenized `.npz`:
 
 ```python
 from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
-from mortm.convert import MIDI2Seq
+from mortm.utils.convert import MIDI2Seq
 
 tokenizer = Tokenizer(music_token=get_token_converter(TO_TOKEN))
 converter = MIDI2Seq(tokenizer, "midi_dir", "your_midi.mid", program_list=[0], split_measure=12)
@@ -92,7 +92,7 @@ import torch
 import numpy as np
 from mortm.models.mortm import MORTM, MORTMArgs
 from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_MUSIC
-from mortm.de_convert import ct_token_to_midi
+from mortm.utils.de_convert import ct_token_to_midi
 from mortm.models.modules.progress import _DefaultLearningProgress
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

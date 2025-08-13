@@ -5,7 +5,7 @@ from mortm.train.rl.reinforcement import *
 from mortm.train.train import train_custom, collate_fn
 
 from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
-from mortm.gmail_messanger import GmailMessanger, Messenger
+from mortm.utils.gmail_messanger import GmailMessanger, Messenger
 
 ROOT_DIRECTORY = "out/model/class/val_paths_4.0.1.json"
 TRAIN_CONFIG = "configs/train/rl_training.json"

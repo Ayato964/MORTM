@@ -14,9 +14,8 @@ import numpy as np
 from mortm.train.tokenizer import TO_MUSIC
 from mortm.models.modules.progress import _DefaultLearningProgress
 from mortm.train.tokenizer import get_token_converter
-from mortm.de_convert import ct_token_to_midi
 from mortm.train.datasets import MORTM_SEQDataset
-from mortm.train.train import _set_train_data, find_files, collate_fn
+from mortm.train.train import _set_train_data, collate_fn
 
 # --- 初期設定 (変更なし) ---
 progress = _DefaultLearningProgress()
