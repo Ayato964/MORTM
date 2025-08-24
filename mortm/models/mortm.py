@@ -166,11 +166,12 @@ class MORTM(nn.Module):
                     generated.append(seq[end+1:eseq+1].cpu().numpy())
                     np_seq = np.append(np_seq, seq[end+1:eseq+1].cpu().numpy())
             else:
+                gen_id = ((seq == 6) | (seq == 7)).nonzero(as_tuple=True)[0]
                 if eseq == len(seq):
-                    generated.append(seq.cpu().numpy())
+                    generated.append(seq[gen_id+1:].cpu().numpy())
                     np_seq = np.append(np_seq, seq.cpu().numpy())
                 else:
-                    generated.append(seq[:eseq+1].cpu().numpy())
+                    generated.append(seq[gen_id:eseq+1].cpu().numpy())
                     np_seq = np.append(np_seq,seq[:eseq+1].cpu().numpy())
             np_all_tokens.append(np_seq)
             if np_seq.max() > self.args.vocab_size:
