@@ -1,7 +1,7 @@
 import json
 
 from mortm.utils.convert import MetaData2Chord
-from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_TOKEN
 
 EX = 821
 def find_midi_files_with_json(root_folder):
@@ -21,7 +21,7 @@ def find_midi_files_with_json(root_folder):
 
 datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
 directory, md_file, system_file = find_midi_files_with_json(datasets)
-tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
+tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 
 print(system_file[EX]["location"])
 conv = MetaData2Chord(tokenizer, system_file[EX]["key"], system_file[EX]["all_chords"], system_file[EX]["all_chords_timestamps"],

@@ -3,7 +3,7 @@ import os
 import numpy as np
 from multiprocessing import Process, Manager
 
-from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_TOKEN
 from mortm.utils.convert import Audio2MelSpectrogramALL
 
 
@@ -41,7 +41,7 @@ if __name__ == "__main__":
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
 
-    tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書

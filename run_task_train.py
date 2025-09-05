@@ -5,7 +5,7 @@ from mortm.utils.gmail_messanger import GmailMessanger
 from mortm.utils.messager import Messenger
 from mortm.models.modules.progress import _DefaultLearningProgress
 import loralib as lora
-from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_TOKEN
 from mortm.train.train import _get_padding_mask
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
@@ -132,7 +132,7 @@ if __name__ == "__main__":
 
     message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
     progress = _DefaultLearningProgress()
-    tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
     trainer = TTMORTM(args_config=MODEL_CONFIG, load_model_directory=LOAD_MODEL_DIRECTORY, tokenizer=tokenizer, progress=progress)
     t_args = TrainArgs(TRAIN_CONFIG)
 

@@ -4,7 +4,7 @@ from mortm.models.modules.progress import _DefaultLearningProgress
 from mortm.train.rl.reinforcement import *
 from mortm.train.train import train_custom, collate_fn
 
-from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
+from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter_pro
 from mortm.utils.gmail_messanger import GmailMessanger, Messenger
 
 ROOT_DIRECTORY = "out/model/class/val_paths_4.0.1.json"
@@ -23,7 +23,7 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
 progress = _DefaultLearningProgress()
 
-tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
+tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 t_args = RLTrainerArgs(json_directory=TRAIN_CONFIG)
 m_args = MORTMArgs(json_directory=MODEL_CONFIG)
 b_args = MORTMArgs(json_directory=REWARD_CONFIG)

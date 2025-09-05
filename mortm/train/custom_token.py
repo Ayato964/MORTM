@@ -242,17 +242,6 @@ class MeasureToken(SpecialToken):
             return self.token_type
 
 
-class TrackStart(SpecialToken):
-    def __init__(self, convert_type: int):
-        super().__init__("<TS>", convert_type)
-
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
-        if inst.notes[0] == note:
-            return self.token_type
-        else:
-            return None
-
-
 class TrackEnd(SpecialToken):
 
     def __init__(self, convert_type: int):
@@ -317,17 +306,17 @@ class CLS(SpecialToken):
         super().__init__("<CLS>", convert_type)
 
 
-class QueryCross(SpecialToken):
+class ConstMelody(SpecialToken):
     def __init__(self, convert_type: int):
-        super().__init__("<QUERY_CROSS>", convert_type)
+        super().__init__("<CONST_M>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
 
 
-class QueryCrossEnd(SpecialToken):
+class ConstChord(SpecialToken):
     def __init__(self, convert_type: int):
-        super().__init__("</QUERY_CROSS>", convert_type)
+        super().__init__("<CONST_C>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
@@ -341,14 +330,6 @@ class Motif(SpecialToken):
         pass
 
 
-class MotifEnd(SpecialToken):
-    def __init__(self, convert_type: int):
-        super().__init__("</Motif>", convert_type)
-
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
-        pass
-
-
 class GenMotif(SpecialToken):
     def __init__(self, convert_type: int):
         super().__init__("<MotifGen>", convert_type)
@@ -356,32 +337,33 @@ class GenMotif(SpecialToken):
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
 
-class QueryMelody(SpecialToken):
+
+class EOS(SpecialToken):
     def __init__(self, convert_type: int):
-        super().__init__("<QUERY_M>", convert_type)
+        super().__init__("<EOS>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
 
 
-class QueryMelodyEnd(SpecialToken):
+class TagEnd(SpecialToken):
     def __init__(self, convert_type: int):
-        super().__init__("</QUERY_M>", convert_type)
+        super().__init__("<TAG_END>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
 
 
-class QueryChord(SpecialToken):
+class PastMelody(SpecialToken):
     def __init__(self, convert_type: int):
-        super().__init__("<QUERY_C>", convert_type)
+        super().__init__("<PAST_M>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass
 
-class QueryChordEnd(SpecialToken):
+class FutureMelody(SpecialToken):
     def __init__(self, convert_type: int):
-        super().__init__("</QUERY_C>", convert_type)
+        super().__init__("<FUTURE_M>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         pass

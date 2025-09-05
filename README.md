@@ -78,18 +78,18 @@ This requires OAuth2 setup (`client_secret.json`).
 Convert MIDI files into tokenized `.npz` format:
 
 ```python
-from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_TOKEN
 from mortm.convert import MIDI2Seq
 
 # Initialize tokenizer
-tokenizer = Tokenizer(music_token=get_token_converter(TO_TOKEN)) #
+tokenizer = Tokenizer(music_token=get_token_converter_pro(TO_TOKEN))  #
 # Convert MIDI to sequence
-converter = MIDI2Seq(tokenizer, "midi_dir", "your_midi.mid", program_list=, split_measure=12) #
-converter.convert() #
+converter = MIDI2Seq(tokenizer, "midi_dir", "your_midi.mid", program_list=, split_measure=12)  #
+converter.convert()  #
 # Save converted data
-converter.save("output_npz_dir") #
+converter.save("output_npz_dir")  #
 # Save tokenizer vocabulary
-tokenizer.save("vocab_output_dir") #
+tokenizer.save("vocab_output_dir")  #
 ```
 
 #### Inference
@@ -100,21 +100,21 @@ tokenizer.save("vocab_output_dir") #
 import torch
 import numpy as np
 from mortm.models.mortm import MORTM, MORTMArgs
-from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_MUSIC
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_MUSIC
 from mortm.de_convert import ct_token_to_midi
 from mortm.models.modules.progress import _DefaultLearningProgress
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu') #
-tokenizer = Tokenizer(music_token=get_token_converter(TO_MUSIC), load_data="vocab_list.json") #
-args = MORTMArgs("configs/models/mortm/A.json") #
-model = MORTM(progress=_DefaultLearningProgress(), args=args) #
-model.load_state_dict(torch.load("trained_mortm.pth", map_location=DEVICE)) #
-model.to(DEVICE).eval() #
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  #
+tokenizer = Tokenizer(music_token=get_token_converter_pro(TO_MUSIC), load_data="vocab_list.json")  #
+args = MORTMArgs("configs/models/mortm/A.json")  #
+model = MORTM(progress=_DefaultLearningProgress(), args=args)  #
+model.load_state_dict(torch.load("trained_mortm.pth", map_location=DEVICE))  #
+model.to(DEVICE).eval()  #
 
-seed_ids = torch.tensor([tokenizer.get("<MGEN>"), tokenizer.get("<TS>")], device=DEVICE) #
-with torch.no_grad(): #
-    _, full_seq = model.top_p_sampling_measure_kv_cache(seed_ids, p=0.95, max_measure=8, temperature=0.7) #
-ct_token_to_midi(tokenizer, full_seq, "generated_melody.mid", program=0, tempo=120) #
+seed_ids = torch.tensor([tokenizer.get("<MGEN>"), tokenizer.get("<TS>")], device=DEVICE)  #
+with torch.no_grad():  #
+    _, full_seq = model.top_p_sampling_measure_kv_cache(seed_ids, p=0.95, max_measure=8, temperature=0.7)  #
+ct_token_to_midi(tokenizer, full_seq, "generated_melody.mid", program=0, tempo=120)  #
 ```
 
 ##### BERTM: Music Classification
@@ -124,24 +124,24 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from mortm.models.bertm import BERTM, MORTMArgs as BERTMArgs
-from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_MUSIC
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_MUSIC
 from mortm.models.modules.progress import _DefaultLearningProgress
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu') #
-tokenizer = Tokenizer(music_token=get_token_converter(TO_MUSIC), load_data="vocab_list.json") #
-args = BERTMArgs("configs/models/bertm/class_file.json") #
-model = BERTM(progress=_DefaultLearningProgress(), args=args) #
-model.load_state_dict(torch.load("trained_bertm.pth", map_location=DEVICE)) #
-model.to(DEVICE).eval() #
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  #
+tokenizer = Tokenizer(music_token=get_token_converter_pro(TO_MUSIC), load_data="vocab_list.json")  #
+args = BERTMArgs("configs/models/bertm/class_file.json")  #
+model = BERTM(progress=_DefaultLearningProgress(), args=args)  #
+model.load_state_dict(torch.load("trained_bertm.pth", map_location=DEVICE))  #
+model.to(DEVICE).eval()  #
 
-input_npz = np.load("input_music.npz")['array1'] #
-input_ids = torch.tensor(input_npz, dtype=torch.long, device=DEVICE).unsqueeze(0) #
+input_npz = np.load("input_music.npz")['array1']  #
+input_ids = torch.tensor(input_npz, dtype=torch.long, device=DEVICE).unsqueeze(0)  #
 
-with torch.no_grad(): #
-    logits = model(input_ids) #
-    probs = F.softmax(logits, dim=-1) #
-    pred = "Human" if probs.argmax() == 0 else "AI" #
-    print(f"Prediction: {pred}, Probabilities: {probs.squeeze().tolist()}") #
+with torch.no_grad():  #
+    logits = model(input_ids)  #
+    probs = F.softmax(logits, dim=-1)  #
+    pred = "Human" if probs.argmax() == 0 else "AI"  #
+    print(f"Prediction: {pred}, Probabilities: {probs.squeeze().tolist()}")  #
 ```
 
 #### Training

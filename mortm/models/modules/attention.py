@@ -9,6 +9,7 @@ from torch.nn.functional import linear, softmax, dropout
 
 import torch
 import torch.nn as nn
+from torch import Tensor
 import math
 from einops import rearrange
 
@@ -84,7 +85,6 @@ class QKVLinear(nn.Module):
 
         total, D = q.size()
         qkv = self.qkv_weight(q).view(total, 3, self.num_heads, D // self.num_heads)
-
         return qkv
 
     def comp(self, o: Tensor):

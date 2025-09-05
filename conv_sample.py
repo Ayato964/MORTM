@@ -1,10 +1,10 @@
 import numpy as np
 
-from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_TOKEN
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_TOKEN
 
 TEST_MIDI = "out/np/Sax/"
 
-tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
+tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 
 #con = MIDI2Seq(tokenizer, "data/generate", TEST_MIDI, program_list=[0])
 

@@ -6,13 +6,13 @@ import os
 
 from mortm.train.train import train_bertm
 
-from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter
+from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter_pro
 from mortm.utils.gmail_messanger import GmailMessanger, Messenger
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
 
-tokenizer = Tokenizer(get_token_converter(TO_MUSIC), load_data="out/vocab/vocab_list.json")
+tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
 model = train_bertm(human_dir=("out/np/Piano/rl/human/", "out/np/Piano/pre_train/eval.json"), ai_dir="out/np/Piano/rl/ai/",
                     model_config="configs/models/bertm/class_file.json",

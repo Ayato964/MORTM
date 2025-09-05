@@ -2,17 +2,20 @@ from mortm.models.modules.config import MORTMArgs
 from mortm.models.mortm import MORTM
 from mortm.utils.generate import *
 from mortm.models.modules.progress import _DefaultLearningProgress
-from mortm.train.tokenizer import Tokenizer, TO_TOKEN, get_token_converter
+from mortm.train.tokenizer import Tokenizer, TO_TOKEN, get_token_converter_pro
 
-midi_path = "data/generate/Sample4.mid"
+midi_path = "data/generate/A_Beautiful_Friends_Phase2.mid"
 args_path = "configs/models/mortm/A.json"
-#model_save_path = "out/model/mortm/MORTM.4.0EX5-SAX-Phase1_1.4054.pth"
-model_save_path = "out/model/mortm/MORTM.4.1-SAX-Phase2_0.29.pth"
-sft_model = True
-program = [0]
+model_save_path = "out/model/mortm/MORTM.4.0EX5-SAX-Phase1_1.4054.pth"
+#model_save_path = "out/model/mortm/MORTM.4.1-SAX-Phase2_0.29.pth"
+sft_model = False
+generate_count = 10
+program = [0 for _ in range(generate_count)]
+out_program = [65 for _ in range(generate_count)]
+midi_path = [midi_path for _ in range(generate_count)]
 
 if __name__ == "__main__":
-    tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
     args = MORTMArgs(args_path)
     if sft_model:
         args.use_lora = True
@@ -22,7 +25,7 @@ if __name__ == "__main__":
     model.to(p.get_device())
 
     if not sft_model:
-        pre_train_generate(model, tokenizer, "out", midi_path, split_measure=4, program=program, temperature=1.0)
+        pre_train_generate(model, tokenizer, "out", midi_path, split_measure=6, program=program, output_program=out_program, temperature=1.1)
     else:
         """
         chord = np.array([tokenizer.get("<SME>"),
@@ -46,4 +49,4 @@ if __name__ == "__main__":
         chord = None
         task_trained_generate(model, tokenizer, "out",
                               input_prompt_midi=midi_path, chord_prompt=chord,
-                              program=program, task=MELODY_GEM, split_measure=3, temperature=1.2)
+                              program=program, task=MELODY_GEM, split_measure=6, temperature=1.0)

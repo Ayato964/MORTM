@@ -14,6 +14,7 @@ import soundfile as sf
 from mortm.train.custom_token import Token, ShiftTimeContainer, ChordToken, MeasureToken, Blank
 from mortm.train.tokenizer import Tokenizer, TO_MUSIC, TO_TOKEN
 from mortm.train.utils.chord_midi import ChordMidi, Chord
+from mortm.utils.key import get_key_dict
 
 T = TypeVar("T")
 
@@ -220,6 +221,10 @@ class MIDI2Seq(_AbstractMidiConverter):
         self.aya_node = [0]
         self.split_measure = split_measure
         self.is_include_special_token = is_include_special_token
+        if is_include_special_token:
+            self.key = get_key_dict(os.path.join(directory, file_name), window_measures=split_measure)
+            self.key_dict = self.key['segments']
+
 
     def convert(self):
         """
@@ -246,8 +251,11 @@ class MIDI2Seq(_AbstractMidiConverter):
     def ct_aya_node(self, inst: Instrument) -> list:
 
         clip = np.array([], dtype=int)
+        count = 0
         if self.is_include_special_token:
+            clip = np.append(clip, self.tokenizer.get("<EOS>"))
             clip = np.append(clip, self.tokenizer.get("<MGEN>"))
+            clip = np.append(clip, self.tokenizer.get(f"k_{self.key_dict[count]['tonic']}{'M' if self.key_dict[count]['mode'] == 'major' else 'minor'}"))
         aya_node_inst = []
         back_note = None
 
@@ -276,7 +284,10 @@ class MIDI2Seq(_AbstractMidiConverter):
                             aya_node_inst = self.marge_clip(clip, aya_node_inst)
                             clip = np.array([], dtype=int)
                             if self.is_include_special_token:
+                                count += 1
+                                clip = np.append(clip, self.tokenizer.get("<EOS>"))
                                 clip = np.append(clip, self.tokenizer.get("<MGEN>"))
+                                clip = np.append(clip, self.tokenizer.get(f"k_{self.key_dict[count]['tonic']}{'M' if self.key_dict[count]['mode'] == 'major' else 'minor'}"))
                             back_note = None
                             clip_count = 0
 

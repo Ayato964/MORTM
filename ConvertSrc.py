@@ -2,7 +2,7 @@ import json
 from typing import List
 
 from multiprocessing import Process, Manager
-from mortm.train.tokenizer import Tokenizer, get_token_converter
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro
 from mortm.utils.convert import *
 
 def find_midi_files(root_folder):
@@ -293,38 +293,39 @@ if __name__ == "__main__":
     SAX = [65, 66]
 
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/LMD/lmd_full"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
-    """
-    directory, md_file = find_midi_files(datasets)
-    """
     #"""
+    directory, md_file = find_midi_files(datasets)
+    #"""
+    """
     print("データ整理中・・・・")
     directory, md_file, system_file = find_midi_files_with_json(datasets)
     print("完了！！")
-    #"""
+    """
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
-    #"""
+    """
     system_file = np.array_split(system_file, THREAD_VALUE)
-    #"""
-    tokenizer = Tokenizer(get_token_converter(TO_TOKEN))
+    """
+    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            """
-            p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), PIANO, progress, "out/np/Piano/rl/human/"))
-            """
-
             #"""
+            p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
+                                              md_file[t].tolist(), SAX, progress, "out/np/research/"))
+            #"""
+
+            """
             p = Process(target=convert_task_seq, args=(t, tokenizer, directory[t].tolist(),
                                                          md_file[t].tolist(), system_file[t], SAX, progress, "out/np/Sax/task_train"))
-            #"""
+            """
 
             processes.append(p)
             p.start()

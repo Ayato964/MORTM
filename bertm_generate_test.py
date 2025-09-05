@@ -1,13 +1,13 @@
 import torch
 from mortm.models.bertm import BERTM, MORTMArgs
-from mortm.train.tokenizer import Tokenizer, get_token_converter
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro
 import numpy as np
 import torch.nn.functional as F
 from mortm.train.tokenizer import TO_MUSIC
 
 from mortm.models.modules.progress import _DefaultLearningProgress
 
-tokenizer:Tokenizer  = Tokenizer(music_token=get_token_converter(TO_MUSIC))
+tokenizer:Tokenizer  = Tokenizer(music_token=get_token_converter_pro(TO_MUSIC))
 tokenizer.mode()
 #args = MORTMArgs("configs/models/mortm/not_moe/A.json")
 args = MORTMArgs("configs/models/bertm/class_file.json")

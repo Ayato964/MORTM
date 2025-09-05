@@ -5,7 +5,7 @@ import os # ファイルパス操作のためにインポート
 
 # mortmライブラリからのインポート（ユーザー提供のコードと同様）
 from mortm.models.bertm import BERTM, MORTMArgs
-from mortm.train.tokenizer import Tokenizer, get_token_converter, TO_MUSIC
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_MUSIC
 from mortm.models.modules.progress import _DefaultLearningProgress
 # これで scikit-learn を使って評価指標を計算できる
 from sklearn.metrics import classification_report, roc_auc_score
@@ -13,7 +13,7 @@ from sklearn.metrics import classification_report, roc_auc_score
 
 # 1. モデルとトークナイザーの準備（ユーザー提供のコードと同様）
 # ----------------------------------------------------------------
-tokenizer: Tokenizer = Tokenizer(music_token=get_token_converter(TO_MUSIC))
+tokenizer: Tokenizer = Tokenizer(music_token=get_token_converter_pro(TO_MUSIC))
 tokenizer.mode()
 args = MORTMArgs("configs/models/bertm/class_file.json")
 model = BERTM(progress=_DefaultLearningProgress(), args=args)

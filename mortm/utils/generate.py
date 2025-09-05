@@ -53,7 +53,7 @@ def create_chord_prompt(tokenizer: Tokenizer, chord_prompt: List[np.ndarray]) ->
 
 
 def pre_train_generate(model: MORTM, tokenizer: Tokenizer, save_directory: str,
-                       midi_path: str | List[str], program: List[int], split_measure: int = 999,
+                       midi_path: str | List[str], program: List[int], output_program: List[int], split_measure: int = 999,
                        temperature: float = 1.0, p=0.95, print_log = True) -> PrettyMIDI | List[PrettyMIDI]:
 
     src_list = _create_midi_prompt(tokenizer, midi_path, split_measure, program)
@@ -62,11 +62,9 @@ def pre_train_generate(model: MORTM, tokenizer: Tokenizer, save_directory: str,
 
     tokenizer.mode(to=TO_MUSIC)
     midi = []
-    count = 0
-    for seq in all_seq:
-        m = ct_token_to_midi(tokenizer, seq, os.path.join(save_directory, f"generated_{os.path.basename(midi_path[count])}"))
+    for i, seq in enumerate(all_seq):
+        m = ct_token_to_midi(tokenizer, seq, os.path.join(save_directory, f"generated_{os.path.basename(midi_path[i])}_{i}.mid"), program=output_program[i])
         midi.append(m)
-        count += 1
 
     return midi if len(midi) != 1 else midi[0]
 
