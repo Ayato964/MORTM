@@ -271,7 +271,6 @@ def _set_train_data(directory, datasets, mortm_datasets, *args):
 
 def _set_train_data_preloading(directory, datasets, mortm_datasets, *args):
     print("Starting load....")
-    datasets_length = 0
     mortm_datasets.add_data(directory, datasets)
     print("load Successful!!")
     return mortm_datasets
@@ -299,7 +298,7 @@ def collate_fn_with_tgt(batch):
     tgt = torch.tensor(tgt_list, device=src.device)
     return src, tgt
 
-def save_val_path_json(val_loader: DataLoader, save_directory, version):
+def save_path_json(name, val_loader: DataLoader, save_directory, version):
     """
     検証データのパスをJSONファイルに保存する。
     :param val_loader: DataLoaderオブジェクト
@@ -311,9 +310,9 @@ def save_val_path_json(val_loader: DataLoader, save_directory, version):
     for v in val_loader:
         val_paths.append(v)
         counter += len(v)
-    with open(f"{save_directory}/val_paths_{version}.json", 'w') as f:
+    with open(f"{save_directory}/{name}_paths_{version}.json", 'w') as f:
         json.dump(val_paths, f, indent=4)
-    print(f"Validation paths saved to {save_directory}/val_paths_{version}.json   All Count = {counter}")
+    print(f"Validation paths saved to {save_directory}/{name}_{version}.json   All Count = {counter}")
 
 
 def update_log(model, writer, global_step):
@@ -347,18 +346,25 @@ def progress_bar_with_minibatch(epoch, sum_epoch, seq_count, all_pac, mini_seq_c
     print(f"\r learning Epoch {epoch + 1}/{sum_epoch} Package [{big_bar}] {big_per:.2f}%  Mini Package [{mini_bar}]  {mini_per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
 
 
-def get_data_loader(t_args: TrainArgs, mortm_dataset, shuffle=True, collate_fn=None):
-    train_size = int(t_args.train_dataset_split * len(mortm_dataset))
-    val_size = len(mortm_dataset) - train_size
-    train_dataset, val_dataset = random_split(mortm_dataset, [train_size, val_size])
+def get_data_loader(t_args: TrainArgs, mortm_dataset: tuple | Dataset, shuffle=True, collate_fn=None):
+    if isinstance(mortm_dataset, Dataset):
+        train_size = int(t_args.train_dataset_split * len(mortm_dataset))
+        val_size = len(mortm_dataset) - train_size
+        train_dataset, val_dataset = random_split(mortm_dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_dataset, batch_size=t_args.big_batch_size, shuffle=shuffle,
-                              num_workers=0, collate_fn=collate_fn)
+        train_loader = DataLoader(train_dataset, batch_size=t_args.big_batch_size, shuffle=shuffle,
+                                  num_workers=0, collate_fn=collate_fn)
 
-    val_loader = DataLoader(val_dataset, batch_size=t_args.big_batch_size, shuffle=shuffle,
-                            num_workers=0, collate_fn=collate_fn)
-    print(f"All Size:{len(mortm_dataset)} Train Size:{len(train_dataset)} Val Size:{len(val_dataset)}")
+        val_loader = DataLoader(val_dataset, batch_size=t_args.big_batch_size, shuffle=shuffle,
+                                num_workers=0, collate_fn=collate_fn)
+    else:
+        train_loader = DataLoader(mortm_dataset[0], batch_size=t_args.big_batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=0)
+        val_loader = DataLoader(mortm_dataset[1], batch_size=t_args.big_batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=0)
+
+    print(f"All Size:{len(mortm_dataset)} Train Size:{len(train_loader)} Val Size:{len(val_loader)}")
     return train_loader, val_loader
+
+
 
 
 def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: nn.Module, progress: LearningProgress,
@@ -444,12 +450,12 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                 writer.flush()
 
                 if (count + 1) % int(len(train_loader) // 5) == 0:
+                    update_log(model, writer, all_count)
                     print("検証損失を求めています")
                     torch.cuda.empty_cache()
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn)
                     writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss.get(),
                                                                    "Verification": verification_loss}, all_count)
-                    update_log(model, writer, all_count)
 
             message.send_message("機械学習の途中経過について",
                                  f"Epoch {epoch + 1}/{train_args.num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
@@ -473,7 +479,8 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
 def _train(args, t_args, save_directory, trainer, version, today_date,
            message, train_loader, val_loader,
            progress, coll_fn=None):
-    save_val_path_json(val_loader, save_directory, version)
+    save_path_json("eval", val_loader, save_directory, version)
+    save_path_json("train", train_loader, save_directory, version)
     try:
         writer = SummaryWriter(save_directory + f"/runs/{version}_{today_date}/")
 
@@ -500,7 +507,7 @@ def _train(args, t_args, save_directory, trainer, version, today_date,
 
 
 def train_mortm(model_config: str, train_config: str, root_directory, save_directory, version: str,
-                message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
+                message: Messenger = _DefaultMessenger(), load_model_directory: str=None, eval_list_json: str = None,
                 progress: LearningProgress = _DefaultLearningProgress(), ):
     args = MORTMArgs(json_directory=model_config)
     t_args = TrainArgs(json_directory=train_config)
@@ -517,17 +524,27 @@ def train_mortm(model_config: str, train_config: str, root_directory, save_direc
         else:
             directory, filename = find_files(root_directory, '.npz')
     elif isinstance(root_directory, tuple):
-        directory, filename = find_files_with_json(root_directory[1])
-
-        directory2, filename2 = find_files(root_directory[0], '.npz')
-        for d, f in zip(directory2, filename2):
-            directory.append(d)
-            filename.append(f)
+        directory = []
+        filename = []
+        for r in root_directory:
+            if r.endswith(".json"):
+                d, f = find_files_with_json(r)
+            else:
+                d, f = find_files(r, '.npz')
+            directory.extend(d)
+            filename.extend(f)
     else:
         directory, filename = root_directory
     print("データセットの規模：", len(filename))
     mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
-    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
+    if eval_list_json is None:
+        train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
+    else:
+        print("検証データセットが指定されました。")
+        directory, filename = find_files_with_json(eval_list_json)
+        val_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
+        train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=True)
+
 
     _train(args, t_args, save_directory, trainer,message=message, version=version, today_date=today_date,
            train_loader=train_loader, val_loader=val_loader,coll_fn=collate_fn,

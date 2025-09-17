@@ -2,7 +2,7 @@ import json
 from typing import List
 
 from multiprocessing import Process, Manager
-from mortm.train.tokenizer import Tokenizer, get_token_converter_pro
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, get_token_converter_melody_only
 from mortm.utils.convert import *
 
 def find_midi_files(root_folder):
@@ -76,13 +76,11 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
             is_saved, reason = con.save(save_path)
             if is_saved:
                 local_count += 1
-                if local_count >= 300:
-                    break
 
             for a in con.aya_node[1:]:
                 a:np.ndarray
                 if np.sum(a == 0) != 0:
-                    print(f"Error!!  {directory[i]}/{md_file[i]}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                    print(f"\033[31m Error!!  {directory[i]}/{md_file[i]}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                     is_error = True
                     break
             print(f"Process#{pid}: Running... {local_count}  {reason}")
@@ -292,8 +290,8 @@ if __name__ == "__main__":
     PIANO = [i for i in range(6)]
     SAX = [65, 66]
 
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/LMD/lmd_full"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/LMD/lmd_full"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
@@ -311,7 +309,7 @@ if __name__ == "__main__":
     """
     system_file = np.array_split(system_file, THREAD_VALUE)
     """
-    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_melody_only(TO_TOKEN))
 
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書
@@ -319,7 +317,7 @@ if __name__ == "__main__":
         for t in range(THREAD_VALUE):
             #"""
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), SAX, progress, "out/np/research/"))
+                                              md_file[t].tolist(), SAX, progress, "out/np/research"))
             #"""
 
             """

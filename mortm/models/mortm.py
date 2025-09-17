@@ -13,6 +13,9 @@ from .modules.config import MORTMArgs
 from .modules.layers import MORTMDecoder
 from flash_attn.bert_padding import pad_input, unpad_input
 
+from ..train.tokenizer import Tokenizer
+
+
 class MORTM(nn.Module):
     """
     Main class for the MORTM model.
@@ -78,7 +81,7 @@ class MORTM(nn.Module):
         return score
 
     @torch.inference_mode()
-    def top_sampling_measure_kv_cache(self, src: Tensor | numpy.ndarray, p=0.9, temperature=1.0, print_log=True):
+    def top_sampling_measure_kv_cache(self, tokenizer: Tokenizer, src: Tensor | numpy.ndarray, p=0.9, temperature=1.0, print_log=True):
         """
         Generates tokens using top-p sampling with KV cache.
 
@@ -90,6 +93,7 @@ class MORTM(nn.Module):
 
         Returns:
             Tuple[List[numpy.ndarray], Tuple[List[numpy.ndarray], List[numpy.ndarray]]]: Generated tokens and split sequences.
+            :param end_tokens:
         """
         self.eval()
         is_running = True
@@ -133,7 +137,7 @@ class MORTM(nn.Module):
         
             if print_log: print(f"\r Step {i+1}: Generated tokens {next_tokens.tolist()}", end="")
 
-            if self.is_end_point(all_tokens) or i > self.args.position_length:
+            if self.is_end_point(all_tokens, (tokenizer.get("<ESEQ>"), tokenizer.get("<TE>"))) or i > self.args.position_length:
                 is_running = False
 
             i += 1
@@ -146,7 +150,7 @@ class MORTM(nn.Module):
             seq: Tensor
             np_seq = np.array([], dtype=int)
             pad = (seq == 0).nonzero(as_tuple=True)[0]
-            eseq = (seq == 585).nonzero(as_tuple=True)[0]
+            eseq = (seq == tokenizer.get("<ESEQ>")).nonzero(as_tuple=True)[0]
             if len(eseq) == 0:
                 eseq = len(seq)-1
             elif len(eseq) != 1:
@@ -166,7 +170,7 @@ class MORTM(nn.Module):
                     generated.append(seq[end+1:eseq+1].cpu().numpy())
                     np_seq = np.append(np_seq, seq[end+1:eseq+1].cpu().numpy())
             else:
-                gen_id = ((seq == 6) | (seq == 7)).nonzero(as_tuple=True)[0]
+                gen_id = ((seq == tokenizer.get("<MGEN>")) | (seq == tokenizer.get("<CGEN>"))).nonzero(as_tuple=True)[0]
                 if eseq == len(seq):
                     generated.append(seq[gen_id+1:].cpu().numpy())
                     np_seq = np.append(np_seq, seq.cpu().numpy())
@@ -181,7 +185,7 @@ class MORTM(nn.Module):
 
         return np_all_tokens, (prompt, generated)
 
-    def is_end_point(self, x: torch.Tensor) -> bool:
+    def is_end_point(self, x: torch.Tensor, end_tokens) -> bool:
         """
         Check if all rows in the tensor contain at least one of the end tokens.
 
@@ -191,7 +195,9 @@ class MORTM(nn.Module):
         Returns:
             bool: True if all rows contain at least one end token, False otherwise.
         """
-        mask = (x == 585) | (x == 586)
+        mask = (x <= -1)
+        for e in end_tokens:
+            mask = mask | (x == e)
         per_row_has5 = mask.any(dim=1)
         # 3) 全行が True かを判定する
         all_rows_ok = per_row_has5.all()

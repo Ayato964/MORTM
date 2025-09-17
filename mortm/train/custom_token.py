@@ -10,8 +10,8 @@ qualities = [
     'sus2', 'sus4', '6', 'm6', '9', 'maj9', 'm9', '11', '13', 'add9'
 ]
 
-key = ['CM','DM','EM','FM','GM','AM','BM','C#M','D#M','F#M','G#M','AM', 'DbM','EbM','GbM','AbM','BbM',
-       'Cm','Dm','Em','Fm','Gm','Am','Bm','C#m','D#m','F#m','G#m','Am', 'Dbm','Ebm','Gbm','Abm','Bbm']
+key = ['CM','DM','EM','FM','GM','AM','BM','C#M','D#M','F#M','G#M','A#M', 'DbM','EbM','GbM','AbM','BbM', "Unknown",
+       'Cm','Dm','Em','Fm','Gm','Am','Bm','C#m','D#m','F#m','G#m','A#m', 'Dbm','Ebm','Gbm','Abm','Bbm']
 
 def parse_chord(chord: str):
     """
@@ -103,6 +103,7 @@ class ShiftTimeContainer:
 
     def shift(self):
         self.measure_start_time += (60 / self.tempo) * 4
+
         self.shift_measure = True
 
 
@@ -221,26 +222,23 @@ class ChordToken(Token):
     def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> int | str | None:
         pass
 
+
 class MeasureToken(SpecialToken):
     def __init__(self, convert_type: int):
 
         super().__init__("<SME>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int or None or str:
-
-        measure1 = 60 / tempo * 4
-        if back_notes is not None and not container.shift_measure:
-            note_measure = note.start // measure1
-            back_note_measure = back_notes.start // measure1
-            if note_measure > back_note_measure:
-                container.shift()
-                return self.token_type
-            else:
-
-                return None
-        else:
+        if back_notes is None:
             return self.token_type
+        note_tick = ct_time_to_beat(note.start, tempo)
+        container_tick = ct_time_to_beat(container.measure_start_time, tempo)
 
+        if note_tick - container_tick >= 96:
+            container.shift()
+            return self.token_type
+        else:
+            return None
 
 class TrackEnd(SpecialToken):
 
@@ -260,18 +258,13 @@ class Blank(SpecialToken):
         super().__init__("<BLANK>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
-        measure1 = 60 / tempo * 4
-        if back_notes is not None:
-            note_measure = note.start // measure1
-            back_note_measure = back_notes.start // measure1 if not container.shift_measure else container.measure_start_time // measure1
-            if note_measure > back_note_measure + 1:
-                container.shift()
-                return self.token_type
-            else:
-                return None
+        container_tick = ct_time_to_beat(container.measure_start_time, tempo)
+        note_tick = ct_time_to_beat(note.start, tempo)
+
+        if note_tick - container_tick >= 96:
+            return self.token_type
         else:
             return None
-
 
 class SequenceEnd(SpecialToken):
     def __init__(self, convert_type: int):
@@ -397,35 +390,14 @@ class StartRE(MusicToken):
 
     def de_convert(self, number: int, back_note, note: Note, tempo, container: ShiftTimeContainer):
         shift = ct_beat_to_time(number, tempo)
-        if not container.shift_measure:
-            note.start = shift if back_note is None else shift + back_note.start
-        else:
-            note.start = container.measure_start_time + shift
-            container.shift_measure = False
+        note.start = container.measure_start_time + shift
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo, container: ShiftTimeContainer) -> int:
-        measure1 = 60 / tempo * 4
-        now_start = ct_time_to_beat(note.start, tempo)
-        if back_notes is not None and not container.shift_measure:
-            note_measure = note.start // measure1
-            back_note_measure = back_notes.start // measure1
-            if note_measure > back_note_measure:
-                shift = int(now_start)
-                if shift < 0:
-                    container.is_error = True
-                return shift % 96
-            else:
-                back_start = ct_time_to_beat(back_notes.start, tempo)
-                shift = int(now_start - back_start)
-                if shift < 0:
-                    container.is_error = True
-                return shift
-        else:
-            shift = int(now_start - ct_time_to_beat(container.measure_start_time, tempo))
-            container.shift_measure = False
-            if shift < 0:
-                container.is_error = True
-            return shift % 96
+
+        time = note.start - container.measure_start_time
+        shift_time = ct_time_to_beat(time, tempo)
+        return int(shift_time % 96)
+
 
 
 class Duration(MusicToken):

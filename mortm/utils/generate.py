@@ -41,6 +41,10 @@ def _create_midi_prompt(tokenizer: Tokenizer, midi_path: str | List[str], split_
 
     return src_list
 
+def _print_gen(seq, tokenizer):
+    for s in seq:
+        for token in s:
+            print(token, tokenizer.rev_get(token))
 
 def create_chord_prompt(tokenizer: Tokenizer, chord_prompt: List[np.ndarray]) -> List[torch.Tensor]:
     if isinstance(chord_prompt, np.ndarray):
@@ -53,14 +57,15 @@ def create_chord_prompt(tokenizer: Tokenizer, chord_prompt: List[np.ndarray]) ->
 
 
 def pre_train_generate(model: MORTM, tokenizer: Tokenizer, save_directory: str,
-                       midi_path: str | List[str], program: List[int], output_program: List[int], split_measure: int = 999,
+                       midi_path: str | List[str], program: List[int], output_program: List[int],  end_tokens: tuple, split_measure: int = 999,
                        temperature: float = 1.0, p=0.95, print_log = True) -> PrettyMIDI | List[PrettyMIDI]:
 
     src_list = _create_midi_prompt(tokenizer, midi_path, split_measure, program)
     src_list = pad_sequence(src_list, batch_first=True, padding_value=tokenizer.get("<PAD>")).to(model.progress.get_device())
-    all_seq, _ = model.top_sampling_measure_kv_cache(src_list, temperature=temperature, p=p, print_log=print_log)
+    all_seq, _ = model.top_sampling_measure_kv_cache(tokenizer, src_list, temperature=temperature, p=p, print_log=print_log)
 
     tokenizer.mode(to=TO_MUSIC)
+    _print_gen(all_seq, tokenizer)
     midi = []
     for i, seq in enumerate(all_seq):
         m = ct_token_to_midi(tokenizer, seq, os.path.join(save_directory, f"generated_{os.path.basename(midi_path[i])}_{i}.mid"), program=output_program[i])

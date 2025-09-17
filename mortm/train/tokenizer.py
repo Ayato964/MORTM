@@ -43,7 +43,6 @@ def get_token_converter_pro(convert: int) -> List[Token]:
 
     register.append(EOS(convert))
     register.append(TagEnd(convert))
-    register.append(Key(convert))
 
     register.append(PastMelody(convert))
 
@@ -57,6 +56,7 @@ def get_token_converter_pro(convert: int) -> List[Token]:
     register.append(GenMotif(convert))
     register.append(MGen(convert))
     register.append(CGen(convert))
+    register.append(Key(convert))
 
     register.append(MeasureToken(convert))
     register.append(Blank(convert))
@@ -84,6 +84,7 @@ def get_token_converter_melody_only(convert: int) -> List[Token]:
 
     register.append(MGen(convert))
     register.append(CGen(convert))
+    register.append(Key(convert))
 
     register.append(MeasureToken(convert))
     register.append(Blank(convert))

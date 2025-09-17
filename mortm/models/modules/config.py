@@ -25,6 +25,8 @@ class MORTMArgs:
             self.use_moe_decoder = True if data.get('use_moe_decoder') is None else data['use_moe_decoder']
             self.is_not_flash = data.get("is_not_flash")
 
+            self.normalize_type = "tanh" if data.get('norm_type') is None else data['norm_type']
+
             self.use_lora = False if data.get('use_lora') is None else data['use_lora']
             self.lora_r = data['lora_r'] if data.get('lora_r') else 8
             self.lora_alpha = data['lora_alpha'] if data.get('lora_alpha') else 16

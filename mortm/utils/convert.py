@@ -126,7 +126,14 @@ class _AbstractMidiConverter(_AbstractConverter):
         if not self.is_error:
             self.tempo_change_time, self.tempo = self.midi_data.get_tempo_changes()
 
+    def is_in_correct_inst(self, program_list):
 
+        for inst in self.midi_data.instruments:
+            inst: Instrument
+            if not inst.is_drum and inst.program in program_list:
+                return True
+
+        return False
 
     def get_midi_change_scale(self, scale_up_key):
         '''
@@ -221,10 +228,11 @@ class MIDI2Seq(_AbstractMidiConverter):
         self.aya_node = [0]
         self.split_measure = split_measure
         self.is_include_special_token = is_include_special_token
-        if is_include_special_token:
-            self.key = get_key_dict(os.path.join(directory, file_name), window_measures=split_measure)
-            self.key_dict = self.key['segments']
-
+        if is_include_special_token and not self.is_error:
+            if self.is_in_correct_inst(program_list):
+                self.key = get_key_dict(os.path.join(directory, file_name), window_measures=split_measure * 2)
+                self.key_dict = self.key['segments']
+                print(self.key_dict)
 
     def convert(self):
         """
@@ -249,26 +257,63 @@ class MIDI2Seq(_AbstractMidiConverter):
                 self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
 
     def ct_aya_node(self, inst: Instrument) -> list:
-
+        """
+        無限ループ対策:
+          - 進捗ガード: 反復ごとに (note_count, clip_count, measure_start_time, len(clip)) を記録。
+            何も変わらなければ強制的に note を前進。
+          - 同一ノートでの再試行回数を制限（デフォ 8 回）。
+          - 全体ループ上限: 10 * N + 100
+        """
         clip = np.array([], dtype=int)
-        count = 0
         if self.is_include_special_token:
             clip = np.append(clip, self.tokenizer.get("<EOS>"))
             clip = np.append(clip, self.tokenizer.get("<MGEN>"))
-            clip = np.append(clip, self.tokenizer.get(f"k_{self.key_dict[count]['tonic']}{'M' if self.key_dict[count]['mode'] == 'major' else 'minor'}"))
+
         aya_node_inst = []
         back_note = None
 
         clip_count = 0
-
         sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
         shift_time_container = ShiftTimeContainer(0, 0)
         note_count = 0
+
+        # ループ安全上限（譜面長に応じてスケール）
+        hard_loop_cap = 10 * max(len(sorted_notes), 1) + 100
+        loop_count = 0
+
+        # 同一ノートでの再試行上限
+        max_retries_same_note = 8
+        retries_same_note = 0
+
         while note_count < len(sorted_notes):
             note: Note = sorted_notes[note_count]
+            loop_count += 1
+            if loop_count > hard_loop_cap:
+                # 完全に進めていない可能性あり。安全に脱出。
+                self.is_error = True
+                self.error_reason = "MIDIの変換中に無限ループの可能性を検出し、処理を中断しました。"
+                break
 
             tempo = self.get_tempo(note.start)
             shift_time_container.tempo = tempo
+
+            if back_note is None:
+                self.measure_time_sort(note.start, shift_time_container)
+
+            if self.is_include_special_token and back_note is None:
+                key = f"k_{self.get_key(note.start)}"
+                clip = np.append(clip, self.tokenizer.get(key))
+
+            # 進捗スナップショット
+            prev_state = (
+                note_count,
+                clip_count,
+                float(shift_time_container.measure_start_time),
+                int(len(clip))
+            )
+
+            is_continue_note = False
+            progressed = False
 
             for conv in self.token_converter:
                 conv: Token = conv
@@ -279,42 +324,186 @@ class MIDI2Seq(_AbstractMidiConverter):
                     if token is not None:
                         if conv.token_type == "<SME>":
                             clip_count += 1
+
                         if clip_count >= self.split_measure:
+                            # クリップを切って状態を初期化
                             clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                             aya_node_inst = self.marge_clip(clip, aya_node_inst)
                             clip = np.array([], dtype=int)
                             if self.is_include_special_token:
-                                count += 1
                                 clip = np.append(clip, self.tokenizer.get("<EOS>"))
                                 clip = np.append(clip, self.tokenizer.get("<MGEN>"))
-                                clip = np.append(clip, self.tokenizer.get(f"k_{self.key_dict[count]['tonic']}{'M' if self.key_dict[count]['mode'] == 'major' else 'minor'}"))
                             back_note = None
                             clip_count = 0
+                            is_continue_note = True  # 同じノートからやり直す（measure/key を更新済み）
+                            progressed = True        # クリップは確実に進展
+                            break
 
                         token_id = self.tokenizer.get(token)
                         clip = np.append(clip, token_id)
+                        progressed = True
+
                         if conv.token_type == "<BLANK>":
+                            # 小節またぎ待ち（次ループで同一ノート再試行）
+                            is_continue_note = True
                             break
+
                     if shift_time_container.is_error:
                         self.is_error = True
                         self.error_reason = "MIDIの変換中にエラーが発生しました。"
                         break
-            back_note = note
-            if not shift_time_container.shift_measure:
-                note_count += 1
 
-        if len(clip) > 4:
+            if self.is_error:
+                break
+
+            # 進捗が無かった（状態が完全一致）の場合のフォールバック
+            curr_state = (
+                note_count,
+                clip_count,
+                float(shift_time_container.measure_start_time),
+                int(len(clip))
+            )
+            if curr_state == prev_state:
+                retries_same_note += 1
+                if retries_same_note >= max_retries_same_note:
+                    # これ以上待っても前に進まないので、強制的に次のノートへ
+                    back_note = note
+                    note_count += 1
+                    retries_same_note = 0
+                else:
+                    # 軽い前進: 少なくとも back_note を埋めて意味的進展を誘発
+                    if back_note is None:
+                        back_note = note
+                    # 次ループで再試行
+                continue
+
+            # 進捗があった場合の後処理
+            if not is_continue_note:
+                back_note = note
+                note_count += 1
+                retries_same_note = 0
+            else:
+                # 同一ノート再試行（小節更新やクリップ確定などは済んでいる）
+                retries_same_note += 1
+                if retries_same_note >= max_retries_same_note:
+                    # フォールバック：強制前進
+                    back_note = note
+                    note_count += 1
+                    retries_same_note = 0
+
+        if not self.is_error and len(clip) > 4:
             aya_node_inst = self.marge_clip(clip, aya_node_inst)
         return aya_node_inst
 
+    def measure_time_sort(self, note_time, container: ShiftTimeContainer):
+        """
+        Calculates the start time of the most recent measure before a given note_time.
+        This method accounts for tempo changes within the MIDI file.
+
+        Args:
+            note_time (float): The time of the note in seconds.
+            container (ShiftTimeContainer): A container to store the calculated measure time.
+        """
+        tempo_change_times, tempos = self.tempo_change_time, self.tempo
+
+        # 【修正】テンポ情報が無いときのみ 120 BPM を仮定
+        if tempos is None or len(tempos) == 0:
+            tempo = 120.0
+            # For 4/4 time, a measure has 4 beats.
+            measure_duration = (60.0 / tempo) * 4.0
+            if measure_duration > 0:
+                num_measures = int(note_time / measure_duration)
+                container.measure_start_time = num_measures * measure_duration
+            else:
+                container.measure_start_time = 0.0
+            return
+
+        current_measure_start = 0.0
+        last_measure_start = 0.0
+        tempo_idx = 0
+
+        # Iterate through measures until we pass the note_time
+        while current_measure_start <= note_time:
+            last_measure_start = current_measure_start
+
+            # Find the correct tempo for the beginning of the current measure.
+            # Advance tempo_idx if the current measure starts after the next tempo change.
+            while (tempo_idx + 1 < len(tempo_change_times) and
+                   last_measure_start >= tempo_change_times[tempo_idx + 1]):
+                tempo_idx += 1
+
+            current_tempo = tempos[tempo_idx]
+            # Assuming 4/4 time signature (4 beats per measure)
+            measure_beats = 4.0
+
+            if current_tempo <= 0:  # Avoid division by zero or negative tempo
+                break
+
+            sec_per_beat = 60.0 / current_tempo
+
+            # Calculate the duration of the measure if there were no tempo changes.
+            measure_duration_sans_tempo_change = sec_per_beat * measure_beats
+            next_measure_start = last_measure_start + measure_duration_sans_tempo_change
+
+            # Check if the measure crosses a tempo change boundary.
+            next_tempo_change_idx = tempo_idx + 1
+            if (next_tempo_change_idx < len(tempo_change_times) and
+                    next_measure_start > tempo_change_times[next_tempo_change_idx]):
+
+                next_tempo_change_time = tempo_change_times[next_tempo_change_idx]
+
+                # Ensure the tempo change happens *within* this measure, not at the very start.
+                if next_tempo_change_time > last_measure_start:
+                    # Part 1: Time spent in the current tempo
+                    time_in_old_tempo = next_tempo_change_time - last_measure_start
+                    beats_in_old_tempo = time_in_old_tempo / sec_per_beat
+
+                    remaining_beats = measure_beats - beats_in_old_tempo
+
+                    if remaining_beats > 1e-9:  # Use epsilon for float comparison
+                        # Part 2: Time spent in the new tempo
+                        new_tempo = tempos[next_tempo_change_idx]
+                        if new_tempo > 0:
+                            new_sec_per_beat = 60.0 / new_tempo
+                            time_in_new_tempo = remaining_beats * new_sec_per_beat
+
+                            # The actual duration of this measure is the sum of the two parts.
+                            actual_measure_duration = time_in_old_tempo + time_in_new_tempo
+                            next_measure_start = last_measure_start + actual_measure_duration
+
+            current_measure_start = next_measure_start
+
+        container.measure_start_time = last_measure_start
+
+    def get_key(self, time):
+        for k in self.key_dict:
+            if k['start_time'] <= time < k['end_time']:
+                tonic = k['tonic']
+                if k['key_name'] == "Unknown":
+                    return k['key_name']
+                if '-' in tonic:
+                    tonic = tonic.replace('-', 'b')
+                mode = 'M' if k['mode'] == 'major' else 'm'
+                return f"{tonic}{mode}"
+
+        if self.key_dict[-1]['end_time'] >= time:
+            k = self.key_dict[-1]
+            tonic = k['tonic']
+            if k['key_name'] == "Unknown":
+                return k['key_name']
+            if '-' in tonic:
+                tonic = tonic.replace('-', 'b')
+            mode = 'M' if k['mode'] == 'major' else 'm'
+            return f"{tonic}{mode}"
+
+        return "Unknown"
+
     def marge_clip(self, clip, aya_node_inst):
         aya_node_inst.append(clip)
-
         return aya_node_inst
 
     def save(self, save_directory: str) -> [bool, str]:
         if not self.is_error:
-
             array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
             if len(array_dict) > 1:
                 np.savez(save_directory + "/" + self.file_name, **array_dict)
@@ -323,6 +512,7 @@ class MIDI2Seq(_AbstractMidiConverter):
                 return False, "オブジェクトが何らかの理由で見つかりませんでした。"
         else:
             return False, self.error_reason
+
 
 
 class Midi2SeqWithChord(_AbstractMidiConverter):
@@ -976,4 +1166,3 @@ class PareAudio2PareMelSpectrogram(_AbstractAudioConverter):
             return True, f"保存に成功しました: {save_path}"
         except Exception as e:
             return False, f"保存に失敗しました: {str(e)}"
-

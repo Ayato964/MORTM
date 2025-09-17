@@ -13,9 +13,11 @@ message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi
 
 tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC), load_data="out/vocab/vocab_list.json")
 
-model = train_mortm("configs/models/mortm/B.json", "configs/train/pre_training.json",
-                    "out/np/research/", "out/model/mortm/",
+model = train_mortm("configs/models/mortm/A.json", "configs/train/pre_training.json",
+                    "out/model/mortm/research/train_paths_Research_without_MoE_NoT.json",
+                    "out/model/mortm/research",
                     "Research_without_MoE",
+                    eval_list_json="out/model/mortm/research/eval_paths_Research_without_MoE_NoT.json",
                     message=message)
 
 

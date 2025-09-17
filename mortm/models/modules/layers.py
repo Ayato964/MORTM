@@ -129,7 +129,10 @@ class MORTMDecoder(nn.Module):
         super(MORTMDecoder, self).__init__()
         self.num_layer = args.d_layer
         self.layers = _get_clones(MORTMDecoderLayer(args, progress=progress), self.num_layer)
-        self.norm = DynamicTanh(args.d_model)
+        if args.normalize_type == "tanh":
+            self.norm = NormTanh(args.d_model)
+        elif args.normalize_type == "layernorm":
+            self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
 
     def forward(self, tgt: Tensor, tgt_is_causal: Optional[bool] = None,
                 cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False) -> Tensor:
@@ -160,10 +163,16 @@ class MORTMDecoderLayer(nn.Module):
         else:
             self.ffn = FFN(args.d_model, args.dim_feedforward, args.dropout)
 
-
-        self.norm1 = DynamicTanh(args.d_model)
-        self.norm2 = DynamicTanh(args.d_model)
-        self.norm3 = DynamicTanh(args.d_model)
+        if args.normalize_type == "tanh":
+            print("NORM TYPE: NormTanh")
+            self.norm1 = NormTanh(args.d_model)
+            self.norm2 = NormTanh(args.d_model)
+            self.norm3 = NormTanh(args.d_model)
+        elif args.normalize_type == "layernorm":
+            print("NORM TYPE: LayerNorm")
+            self.norm1 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
+            self.norm2 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
+            self.norm3 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
 
         self.dropout1 = nn.Dropout(args.dropout)
         self.dropout2 = nn.Dropout(args.dropout)
@@ -193,7 +202,7 @@ class SelectiveAttentionDecoder(nn.Module):
     def __init__(self, args: MORTMArgs):
         super().__init__()
         self.layers = _get_clones(SelectiveAttentionDecoderLayer(args), args.d_layer)
-        self.norm = DynamicTanh(args.d_model)
+        self.norm = NormTanh(args.d_model)
 
     def forward(self, x: Tensor):
         for layer in self.layers:
@@ -220,7 +229,7 @@ class SelectiveAttentionDecoderLayer(nn.Module):
         self.out_block = MoE(args)
 
         self.dropout = nn.Dropout(args.dropout)
-        self.norm = DynamicTanh(args.d_model)
+        self.norm = NormTanh(args.d_model)
 
     def forward(self, x: Tensor):
         ss_out = self.ssm_block(self.norm(x))
@@ -402,7 +411,7 @@ class MoE(nn.Module):
         return (y + z)
 
 
-class DynamicTanh(nn.Module):
+class NormTanh(nn.Module):
     def __init__(self, normalized_shape, alpha_init_value=0.5):
         super().__init__()
         self.normalized_shape = normalized_shape
