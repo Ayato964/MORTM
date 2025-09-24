@@ -6,7 +6,7 @@ from mortm.train.tokenizer import Tokenizer, TO_TOKEN, get_token_converter_pro, 
 
 midi_path = "data/generate/Sample4.mid"
 args_path = "configs/models/mortm/A.json"
-model_save_path = "out/model/mortm/research/MORTM.Research_without_MoE_NoT_1.2582153859345808.pth"
+model_save_path = "out/model/mortm/research/MORTM.Research_with_MoE_2.384454249003746.pth"
 #model_save_path = "out/model/mortm/MORTM.4.1-SAX-Phase2_0.29.pth"
 sft_model = False
 generate_count = 1

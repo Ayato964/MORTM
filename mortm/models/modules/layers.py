@@ -161,7 +161,7 @@ class MORTMDecoderLayer(nn.Module):
         if args.use_moe_decoder == True:
             self.ffn = MoE(args)
         else:
-            self.ffn = FFN(args.d_model, args.dim_feedforward, args.dropout)
+            self.ffn = Expert(args)
 
         if args.normalize_type == "tanh":
             print("NORM TYPE: NormTanh")

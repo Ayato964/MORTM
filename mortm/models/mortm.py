@@ -38,6 +38,7 @@ class MORTM(nn.Module):
         self.dim_feedforward = args.dim_feedforward
         self.dropout = args.dropout
         self.use_lora = args.use_lora
+        print("Use LoRA:", self.use_lora)
 
         self.decoder = MORTMDecoder(args, progress=progress)
 
@@ -109,6 +110,7 @@ class MORTM(nn.Module):
         # --- 1. プロンプト処理 (Pre-fill) ---
         if print_log: print("--- Pre-fill Phase ---")
         prompt_padding_mask = (src != self.embedding.padding_idx)
+        print(prompt_padding_mask, src)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = self.forward(src, padding_mask=prompt_padding_mask, is_causal=True, is_save_cache=True)
 

@@ -27,7 +27,7 @@ class MORTMArgs:
 
             self.normalize_type = "tanh" if data.get('norm_type') is None else data['norm_type']
 
-            self.use_lora = False if data.get('use_lora') is None else data['use_lora']
+            self.use_lora: bool = False if data.get('use_lora') is None else data['use_lora']
             self.lora_r = data['lora_r'] if data.get('lora_r') else 8
             self.lora_alpha = data['lora_alpha'] if data.get('lora_alpha') else 16
 

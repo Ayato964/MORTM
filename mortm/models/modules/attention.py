@@ -129,8 +129,10 @@ class FlashSelfAttentionM(nn.Module):
         )
         self.cache_seqlens = torch.zeros(batch_size, device=device, dtype=torch.int32)
 
-    def forward(self, x, is_causal=False, cu_seqlens=None, max_seqlen=None,
+    def forward(self, x: Tensor, is_causal=False, cu_seqlens=None, max_seqlen=None,
                 batch_size=None, indices=None, is_save_cache=False):
+        if x.dtype == torch.float32:
+            x = x.to(torch.bfloat16)
 
         # --- フェーズ1: 学習 または 推論のプロンプト処理 ---
         if cu_seqlens is not None:
