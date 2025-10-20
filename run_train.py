@@ -16,7 +16,7 @@ tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC), load_data="out/vocab/vo
 model = train_mortm("configs/models/mortm/A.json", "configs/train/pre_training.json",
                     "out/model/mortm/research/train_paths_Research_without_MoE.json",
                     "out/model/mortm/research",
-                    "Research_with_MoE",
+                    "Research_with_MoE_256",
                     eval_list_json="out/model/mortm/research/eval_paths_Research_without_MoE.json",
                     message=message)
 

@@ -27,15 +27,49 @@ from torch.utils.data.dataset import Dataset
 
 from mortm.utils.messager import Messenger, _DefaultMessenger
 from mortm.models.modules.progress import LearningProgress, _DefaultLearningProgress
-from .datasets import MORTM_SEQDataset, ClassDataSets, PreLoadingDatasets, TensorDataset
+from .datasets import MORTM_SEQDataset, ClassDataSets, PreLoadingDatasets, TensorDataset, PianoRollDataset
 from mortm.models.mortm import MORTM, MORTMArgs
 from mortm.models.bertm import BERTM
 from mortm.models.v_mortm import V_MORTM, V_MORTMArgs
+from mortm.models.mortm_live import MORTMLive, MORTM_LIVE_Args, Vision
+from mortm.utils.pianoroll_convert import *
+
 from .noam import noam_lr
 from .epoch import EpochObserver
 from .config import AbstractTrainSet, TrainArgs
+from .utils.loss import MusicEntropyLoss
 
 IS_DEBUG = False
+
+
+class VisionTrainSet(AbstractTrainSet):
+
+    def __init__(self, args: MORTM_LIVE_Args, progress: LearningProgress, load_directory=None):
+        self.args = args
+        self.model = Vision(args)
+        if load_directory is not None:
+            self.model.load_state_dict(torch.load(load_directory))
+        adam = torch.optim.Adam(self.model.parameters(), lr=1e-4, betas=(0.9, 0.98))
+        super().__init__(criterion=MusicEntropyLoss(),
+                         optimizer=adam,
+                         scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
+
+    def epoch_fc(self, model, pack, progress):
+        original = pack
+        print(original.shape)
+        decoded, mu, log_var = model(original.to(progress.get_device()))
+        return decoded, original, mu, log_var
+
+    def pre_processing(self, pack, progress):
+        dt: DataLoader = pack
+        mini_dataset = PianoRollDataset(progress)
+
+        for d in dt:
+            da = get_pianoroll(d, self.args.ticks_per_measure, self.args.inst_list)
+            mini_dataset.add_data(da)
+        mini_dataset.set_tokenizer_dataset()
+        return mini_dataset
+
 
 class MORTMTrainSet(AbstractTrainSet):
     def __init__(self, args: MORTMArgs, progress: LearningProgress, load_directory=None):
@@ -199,7 +233,6 @@ class V_MORTMTrainSet(AbstractTrainSet):
         input = rearrange(input, 'b s d -> b d s')
         target = rearrange(target, 'b s d -> b d s')
         return input.to(dtype=torch.float32), target
-
 
 def _send_prediction_end_time(message, loader_len, begin_time, end_time,
                               vocab_size: int, num_epochs: int, trans_layer, num_heads, d_model,

@@ -98,6 +98,31 @@ def get_token_converter_melody_only(convert: int) -> List[Token]:
 
     return register
 
+def get_token_converter_melody_only4_5(convert: int) -> List[Token]:
+    register: List[Token] = list()
+
+    register.append(EOS(convert))
+
+    register.append(System(convert))
+    register.append(TagEnd(convert))
+
+    register.append(MGen(convert))
+    register.append(CGen(convert))
+
+    register.append(Key(convert))
+    register.append(Instrument(convert))
+
+    register.append(MeasureToken(convert))
+    register.append(Blank(convert))
+    register.append(StartRE(START_TYPE, convert))
+
+    register.append(Pitch(PITCH_TYPE, convert))
+    register.append(Duration(DURATION_TYPE, convert))
+
+    register.append(SequenceEnd(convert))
+    register.append(TrackEnd(convert))
+
+    return register
 
 class Tokenizer:
     def __init__(self,music_token: List[Token], load_data: str = None):

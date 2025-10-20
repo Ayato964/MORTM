@@ -1,4 +1,5 @@
 import json
+from typing import List
 
 
 class MORTMArgs:
@@ -56,3 +57,17 @@ class V_MORTMArgs(MORTMArgs):
             self.score_type = data['score_type'] if data.get('score_type') else "softmax"
 
             self.use_moe_decoder = True if data.get('use_moe_decoder') is None else data['use_moe_decoder']
+
+class MORTM_LIVE_Args(MORTMArgs):
+    def __init__(self, json_directory: str):
+        super().__init__(json_directory)
+
+        self.name = "MORTM_LIVE"
+        with open(json_directory, 'r') as f:
+            data: dict = json.load(f)
+            self.name = "MORTM_LIVE"
+            self.inst_list: List[int] = data['inst_list'] if data.get('inst_list') else [1, 5, 19, 27, 34, 65, 10, 74]
+            self.instrument_num = data['instrument_num'] if data.get('instrument_num') else 8
+            self.ticks_per_measure = data['ticks_per_measure'] if data.get('ticks_per_measure') else 96
+            self.pianoroll_time_step = data['pianoroll_time_step'] if data.get('pianoroll_time_step') else 16
+

@@ -1,6 +1,6 @@
 {
-  "big_batch_size": 128,
-  "batch_size":128,
+  "big_batch_size": 64,
+  "batch_size":3,
   "accumulation_steps":1,
   "warmup_steps": 4000,
   "num_epochs": 40,

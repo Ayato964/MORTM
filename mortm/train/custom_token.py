@@ -339,6 +339,14 @@ class EOS(SpecialToken):
         pass
 
 
+class System(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<SYSTEM>", convert_type)
+
+def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+    pass
+
+
 class TagEnd(SpecialToken):
     def __init__(self, convert_type: int):
         super().__init__("<TAG_END>", convert_type)
@@ -378,6 +386,22 @@ class Key(MusicToken):
     def __init__(self, convert_type: int):
         super().__init__("k", convert_type)
 
+
+class Instrument(SpecialToken):
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int,
+                  container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):
+        pass
+
+    def _set_tokens(self, tokens: dict):
+        tokens[f'<INST_SAX>'] = len(tokens) + 1
+        tokens[f'<INST_PIANO>'] = len(tokens) + 1
+
+
+    def __init__(self, convert_type: int):
+        super().__init__("<INST>", convert_type)
 
 
 class StartRE(MusicToken):

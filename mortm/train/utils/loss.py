@@ -3,6 +3,57 @@ import torch
 
 import torch.nn.functional as F
 
+
+class MusicEntropyLoss(nn.Module):
+    """
+    VAEの損失を計算するカスタム損失関数。
+    - 復元誤差:
+      - 音高 (偶数ch): バイナリクロスエントロピー
+      - ベロシティ (奇数ch): 平均二乗誤差
+    - 正則化項:
+      - KLダイバージェンス
+    """
+    def __init__(self, beta: float = 1.0, pitch_weight: float = 1.0, velocity_weight: float = 1.0):
+        """
+        Args:
+            beta (float): KLダイバージェンスの重み (β-VAE)
+            pitch_weight (float): 音高(BCE)損失の重み
+            velocity_weight (float): ベロシティ(MSE)損失の重み
+        """
+        super().__init__()
+        self.beta = beta
+        self.pitch_weight = pitch_weight
+        self.velocity_weight = velocity_weight
+
+    def forward(self, decoded: torch.Tensor, original: torch.Tensor, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+
+        # 1. チャンネルを音高(pitch)とベロシティ(velocity)に分離
+        original_pitch = original[:, 0::2, :, :]
+        original_velocity = original[:, 1::2, :, :]
+
+        decoded_pitch_logits = decoded[:, 0::2, :, :]
+        decoded_velocity_logits = decoded[:, 1::2, :, :]
+
+        loss_pitch_bce = F.binary_cross_entropy_with_logits(
+            decoded_pitch_logits, original_pitch, reduction='sum'
+        )
+
+        # ベロシティの損失: 平均二乗誤差
+        loss_velocity_mse = F.mse_loss(
+            torch.sigmoid(decoded_velocity_logits), original_velocity, reduction='sum'
+        )
+
+        # KLダイバージェンス
+        loss_kl = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+
+        # 3. 重みを付けて全ての損失を合計する
+        total_loss = (self.pitch_weight * loss_pitch_bce +
+                      self.velocity_weight * loss_velocity_mse +
+                      self.beta * loss_kl)
+
+        return total_loss
+
+
 class MaskedCrossEntropyLoss(nn.Module):
     def __init__(self, ignore_index=0):
         super(MaskedCrossEntropyLoss, self).__init__()

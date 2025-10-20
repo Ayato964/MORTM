@@ -5,6 +5,7 @@ from typing import List, Any, Optional, Tuple
 import numpy as np
 import torch
 import torchaudio
+from fontTools.ttLib.tables.S__i_l_f import instre
 from pretty_midi.pretty_midi import PrettyMIDI, Instrument, Note, TimeSignature
 from abc import abstractmethod, ABC
 from typing import TypeVar, Generic
@@ -18,6 +19,16 @@ from mortm.utils.key import get_key_dict
 
 T = TypeVar("T")
 
+
+def convert_str_int_program(program_list: List[str]) -> List[Tuple[int]]:
+    pl = []
+    for p in program_list:
+        if p == "SAX":
+            pl.append((65, 66, 67, 68))
+        elif p == "PIANO":
+            pl.append((1,2,3,4,5,6))
+
+    return pl
 
 def conv_spectro(waveform, sample_rate, n_fft, hop_length, n_mels):
     """
@@ -126,14 +137,26 @@ class _AbstractMidiConverter(_AbstractConverter):
         if not self.is_error:
             self.tempo_change_time, self.tempo = self.midi_data.get_tempo_changes()
 
-    def is_in_correct_inst(self, program_list):
-
-        for inst in self.midi_data.instruments:
-            inst: Instrument
-            if not inst.is_drum and inst.program in program_list:
-                return True
-
-        return False
+    def is_in_correct_inst(self, program_list: List[str]) -> List[Instrument]:
+        program_list: List[Tuple[int]] = convert_str_int_program(program_list)
+        d_inst_list = []
+        black_list = []
+        inst_list = [i for i in self.midi_data.instruments if not i.is_drum]
+        inst_found = False
+        for i, p in enumerate(program_list):
+            for pp in p:
+                for inst in inst_list:
+                    inst: Instrument = inst
+                    if inst.program == pp:
+                        inst.notes.sort(key=lambda note: note.start)
+                        d_inst_list.append(inst)
+                        inst_found = True
+                        break
+                if inst_found:
+                    break
+            black_list.append(program_list[i])
+        self.program_list = list(set(self.program_list) - set(black_list))
+        return d_inst_list
 
     def get_midi_change_scale(self, scale_up_key):
         '''
@@ -223,16 +246,31 @@ class MIDI2Seq(_AbstractMidiConverter):
     MIDIをトークンのシーケンスに変換するクラス
     '''
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None, split_measure=12, is_include_special_token = True):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list: List[str], midi_data=None, split_measure=12, is_include_special_token = True):
         super().__init__(MIDI2Seq, tokenizer, directory, file_name, program_list, midi_data)
         self.aya_node = [0]
         self.split_measure = split_measure
         self.is_include_special_token = is_include_special_token
+        self.inst_list = self.is_in_correct_inst(program_list)
         if is_include_special_token and not self.is_error:
-            if self.is_in_correct_inst(program_list):
+            if len(self.inst_list) != 0:
                 self.key = get_key_dict(os.path.join(directory, file_name), window_measures=split_measure * 2)
                 self.key_dict = self.key['segments']
                 print(self.key_dict)
+        else:
+            self.is_error = True
+            self.error_reason = "欲しい楽器がMIDIにありません。"
+
+    def make_system_prompt(self, clip: np.ndarray, time):
+        prompt = [self.tokenizer.get("<EOS>"),
+             self.tokenizer.get("<SYSTEM>")]
+
+        for p in self.program_list:
+            prompt.append(self.tokenizer.get(f"<INST_{p}>"))
+        prompt.append(self.tokenizer.get(f"k_{self.get_key(time)}"))
+        prompt.append(self.tokenizer.get("<MGEN>"))
+        clip = np.append(clip, prompt)
+        return clip
 
     def convert(self):
         """
@@ -242,19 +280,70 @@ class MIDI2Seq(_AbstractMidiConverter):
         3. clip = [<START>, S, P, D, S, P, D, ...<END>]
         :return:なし
         """
+        clip = np.array([], dtype=int)
+        container = [ShiftTimeContainer(0, self.tempo[0]) for _ in self.inst_list]
+        note_counts = [0 for _ in self.inst_list]
+        is_continued = [False for _ in self.inst_list]
+        is_running = True
+
         if not self.is_error:
-            program_count = 0
+            while is_running:
+                clip = self.make_system_prompt(clip, container[0].measure_start_time)
+                for i, inst in enumerate(self.inst_list):
+                    print(self.inst_list[i], note_counts[i], len(inst.notes))
+                    inst_clip, note_count, is_finish = self.convert_inst(self.program_list[i], inst, container[i], note_counts[i])
+                    note_counts[i] = note_count
+                    clip = np.append(clip, inst_clip)
+                self.aya_node = self.aya_node + [clip]
 
-            for inst in self.midi_data.instruments:
-                inst: Instrument = inst
-                if not inst.is_drum and inst.program in self.program_list:
-                    aya_node_inst = self.ct_aya_node(inst)
-                    self.aya_node = self.aya_node + aya_node_inst
-                    program_count += 1
+    def convert_inst(self, program, inst: Instrument, container, note_count) -> np.ndarray | int:
+        clip = np.array([self.tokenizer.get(f"<INST_{program}>")], dtype=int)
+        clip_count = 0
+        back_note: Optional[Note] = None
 
-            if program_count == 0:
-                self.is_error = True
-                self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
+        while clip_count < self.split_measure:
+            if note_count >= len(inst.notes):
+                return clip, note_count, True
+            note: Note = inst.notes[note_count]
+            tempo = self.get_tempo(note.start)
+            container.tempo = tempo
+            is_continue_note = False
+
+            for conv in self.token_converter:
+                conv: Token = conv
+
+                if not isinstance(conv, ChordToken):
+                    token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo, container=container)
+
+                    if token is not None:
+                        if conv.token_type == "<SME>":
+                            clip_count += 1
+
+                        if clip_count >= self.split_measure:
+                            # クリップを切って状態を初期化
+                            back_note = None
+                            clip_count = 0
+                            is_continue_note = True  # 同じノートからやり直す（measure/key を更新済み）
+                            progressed = True        # クリップは確実に進展
+                            break
+
+                        token_id = self.tokenizer.get(token)
+                        clip = np.append(clip, token_id)
+                        progressed = True
+
+                        if conv.token_type == "<BLANK>":
+                            # 小節またぎ待ち（次ループで同一ノート再試行）
+                            is_continue_note = True
+                            break
+
+                    if container.is_error:
+                        self.is_error = True
+                        self.error_reason = "MIDIの変換中にエラーが発生しました。"
+                        break
+                    if not is_continue_note:
+                        note_count += 1
+                        back_note = note
+        return clip, note_count, False
 
     def ct_aya_node(self, inst: Instrument) -> list:
         """

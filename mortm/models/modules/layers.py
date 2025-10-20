@@ -14,13 +14,108 @@ from typing import Tuple, List
 import numpy as np
 
 from .attention import FlashSelfAttentionM, FlashCrossAttentionM, linear
-from .config import MORTMArgs
-
+from .config import MORTMArgs, MORTM_LIVE_Args
 
 world_size = 1
 rank = 0
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
+
+
+class VisionEncoder(nn.Module):
+    def __init__(self, args: MORTM_LIVE_Args, encoder_output_dim):
+        super(VisionEncoder, self).__init__()
+
+        # stride=(2, 2) -> 出力サイズ (64, 8)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(args.instrument_num * 2, args.instrument_num * 4, kernel_size=3, stride=(2, 2), padding=1),
+            nn.GroupNorm(args.instrument_num * 4 // 8, args.instrument_num * 4),
+            nn.SiLU()
+        )
+
+        # stride=(2, 2) -> 出力サイズ (32, 4)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(args.instrument_num * 4, args.instrument_num * 4, kernel_size=3, stride=(2, 2), padding=1),
+            nn.GroupNorm(args.instrument_num * 4 // 8, args.instrument_num * 4),
+            nn.SiLU()
+        )
+
+        # stride=(2, 1) -> 出力サイズ (16, 4)
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(args.instrument_num * 4, args.instrument_num * 8, kernel_size=3, stride=(2, 1), padding=1),
+            nn.GroupNorm(args.instrument_num * 8 // 8, args.instrument_num * 8),
+            nn.SiLU()
+        )
+
+        self.fc_mu = nn.Linear(encoder_output_dim, args.d_model)
+        self.fc_log_var = nn.Linear(encoder_output_dim, args.d_model)
+
+        self.out_channel = args.instrument_num * 8
+        self.width =  args.pianoroll_time_step // 4
+        self.height = 16
+
+
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std) # 標準正規分布からノイズをサンプリング
+        return mu + eps * std
+
+    def forward(self, x):
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
+            x = self.conv1(x)
+            x = self.conv2(x)
+            x = self.conv3(x)
+            h_flat = torch.flatten(x, start_dim=1)
+            mu = self.fc_mu(h_flat)
+            log_var = self.fc_log_var(h_flat)
+            z = self.reparameterize(mu, log_var)
+            return z, mu, log_var
+
+
+class VisionDecoder(nn.Module):
+    def __init__(self, args: MORTM_LIVE_Args, encoder_output_dim:int,  encoder_output_shape = (64, 16, 4)):
+        super().__init__()
+
+        # エンコーダーの最終出力次元 (平坦化前)
+        self.encoder_output_dim = encoder_output_dim
+        self.encoder_output_shape = encoder_output_shape # (C, H, W)
+
+        # 1. d_model次元の潜在変数zを、転置畳み込みできる形に復元する全結合層
+        self.fc = nn.Linear(args.d_model, self.encoder_output_dim)
+
+        # 2. 転置畳み込みで画像サイズを大きくしていく層 (エンコーダーの逆)
+        # 入力: (64, 16, 4)
+        self.deconv1 = nn.Sequential(
+            nn.ConvTranspose2d(self.encoder_output_shape[0], self.encoder_output_shape[0] // 2, kernel_size=3, stride=(2, 1), padding=1),
+            nn.GroupNorm(self.encoder_output_shape[0] // 2 // 8, self.encoder_output_shape[0] // 2),
+            nn.SiLU()
+        )
+        # 出力: (32, 32, 4)
+
+        # 入力: (32, 32, 4)
+        self.deconv2 = nn.Sequential(
+            nn.ConvTranspose2d(self.encoder_output_shape[0] // 2, self.encoder_output_shape[0] // 2, kernel_size=3, stride=(2, 2), padding=1, output_padding=1),
+            nn.GroupNorm(self.encoder_output_shape[0] // 2 // 8, self.encoder_output_shape[0] // 2),
+            nn.SiLU()
+        )
+        # 出力: (32, 64, 8)
+
+        # 入力: (32, 64, 8)
+        self.deconv3 = nn.Sequential(
+            nn.ConvTranspose2d(self.encoder_output_shape[0] // 2, args.instrument_num * 2, kernel_size=3, stride=(2, 2), padding=1, output_padding=1),
+        )
+        # 出力: (16, 128, 16) - 元のピアノロールサイズ
+
+    def forward(self, z):
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
+            # (N, d_model) -> (N, 4096)
+            h = self.fc(z)
+            # (N, 4096) -> (N, 64, 16, 4) に形状を復元
+            h_reshaped = h.view(-1, *self.encoder_output_shape)
+
+            x_recon = self.deconv3(self.deconv2(self.deconv1(h_reshaped)))
+
+            return x_recon
 
 class Pool(nn.Module):
     """Attention Poolingによるシーケンス集約モジュール"""

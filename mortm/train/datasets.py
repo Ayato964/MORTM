@@ -78,6 +78,31 @@ class ClassDataSets(Dataset):
         return suc_count
 
 
+class PianoRollDataset(Dataset):
+    def __init__(self, progress: LearningProgress):
+        self.progress = progress
+        self.src_list: List[np.ndarray] = list()
+
+    def __len__(self):
+        return len(self.src_list)
+
+    def __getitem__(self, item: int) :
+        return torch.tensor(self.src_list[item], dtype=torch.float32, device=self.progress.get_device())
+
+    def add_data(self, piano_roll: np.ndarray, *args):
+            self.src_list.append(piano_roll)
+
+    def set_tokenizer_dataset(self):
+        new_src_dataset = np.array([])
+        for i in range(len(self.src_list)):
+            if len(self.src_list[i]) > 0:
+                if len(new_src_dataset) == 0:
+                    new_src_dataset = self.src_list[i]
+                else:
+                    new_src_dataset = np.concatenate((new_src_dataset, self.src_list[i]), axis=0)
+        self.src_list = new_src_dataset
+
+
 class PreLoadingDatasets(Dataset):
     def __init__(self, progress: LearningProgress):
         self.progress = progress
