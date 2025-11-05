@@ -2,11 +2,11 @@ from mortm.models.modules.config import MORTMArgs
 from mortm.models.mortm import MORTM
 from mortm.utils.generate import *
 from mortm.models.modules.progress import _DefaultLearningProgress
-from mortm.train.tokenizer import Tokenizer, TO_TOKEN, get_token_converter_pro, get_token_converter_melody_only
+from mortm.train.tokenizer import *
 
 midi_path = "data/generate/Sample4.mid"
-args_path = "configs/models/mortm/A.json"
-model_save_path = "out/model/mortm/research/MORTM.Research_with_MoE_2.384454249003746.pth"
+args_path = "configs/models/mortm/4_5/research/A.json"
+model_save_path = "out/model/mortm/research/MORTM.Research_without_MoE_NoT_1.2582153859345808.pth"
 #model_save_path = "out/model/mortm/MORTM.4.1-SAX-Phase2_0.29.pth"
 sft_model = False
 generate_count = 1
@@ -15,7 +15,7 @@ out_program = [65 for _ in range(generate_count)]
 midi_path = [midi_path for _ in range(generate_count)]
 
 if __name__ == "__main__":
-    tokenizer = Tokenizer(get_token_converter_melody_only(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_melody_only_research45(TO_TOKEN))
     args = MORTMArgs(args_path)
     if sft_model:
         args.use_lora = True

@@ -1,3 +1,6 @@
+import math
+from typing import Optional
+
 import pylab as p
 from pretty_midi import Note, Instrument
 from abc import abstractmethod
@@ -100,11 +103,25 @@ class ShiftTimeContainer:
         self.is_error = False
         self.tempo = tempo
         self.is_code_mode = False
+        self.inst: Optional[str] = None
 
     def shift(self):
-        self.measure_start_time += (60 / self.tempo) * 4
-
+        increment = (60 / self.tempo) * 4
+        # 小数第4位以降を切り捨て（小数点以下3桁まで保持）
+        increment = math.floor(increment * 1000) / 1000.0
+        self.measure_start_time += increment
+        print(self.measure_start_time)
         self.shift_measure = True
+
+    def get_inst(self):
+        if self.inst is None:
+            return None
+        if self.inst == "<INST_SAX>":
+            return 66
+        elif self.inst == "<INST_PIANO>":
+            return 1
+        else:
+            return 1
 
 
 class Token:
@@ -165,7 +182,8 @@ class SpecialToken(Token):
         if self.convert_type == 0:
             return self.get_token(inst=inst, back_notes=back_notes, note=note, tempo=tempo, container=container)
         else:
-            return token == self.token_type
+            self.de_convert(token, back_notes, note, tempo, container)
+            return self.token_type
 
 
 class MusicToken(Token):
@@ -223,12 +241,25 @@ class ChordToken(Token):
         pass
 
 
+class TrackEnd(SpecialToken):
+
+    def __init__(self, convert_type: int):
+        super().__init__("<TE>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        if inst.notes[-1] == note:
+            return self.token_type
+        else:
+            return None
+
+
 class MeasureToken(SpecialToken):
     def __init__(self, convert_type: int):
 
         super().__init__("<SME>", convert_type)
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int or None or str:
+
         if back_notes is None:
             return self.token_type
         note_tick = ct_time_to_beat(note.start, tempo)
@@ -240,16 +271,9 @@ class MeasureToken(SpecialToken):
         else:
             return None
 
-class TrackEnd(SpecialToken):
-
-    def __init__(self, convert_type: int):
-        super().__init__("<TE>", convert_type)
-
-    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
-        if inst.notes[-1] == note:
-            return self.token_type
-        else:
-            return None
+    def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):
+        if number == self.token_type:
+            container.shift()
 
 
 class Blank(SpecialToken):
@@ -393,11 +417,12 @@ class Instrument(SpecialToken):
         pass
 
     def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):
-        pass
+        if "INST" in number:
+            container.inst = number
 
     def _set_tokens(self, tokens: dict):
-        tokens[f'<INST_SAX>'] = len(tokens) + 1
-        tokens[f'<INST_PIANO>'] = len(tokens) + 1
+        tokens[f'<INST_SAX>'] = len(tokens)
+        tokens[f'<INST_PIANO>'] = len(tokens)
 
 
     def __init__(self, convert_type: int):

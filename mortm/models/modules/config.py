@@ -25,6 +25,7 @@ class MORTMArgs:
             self.use_moe_encoder = False if data.get('use_moe_encoder') is None else data['use_moe_encoder'],
             self.use_moe_decoder = True if data.get('use_moe_decoder') is None else data['use_moe_decoder']
             self.is_not_flash = data.get("is_not_flash")
+            self.use_silu = False if data.get('use_silu') is None else data['use_silu']
 
             self.normalize_type = "tanh" if data.get('norm_type') is None else data['norm_type']
 
@@ -63,6 +64,7 @@ class MORTM_LIVE_Args(MORTMArgs):
         super().__init__(json_directory)
 
         self.name = "MORTM_LIVE"
+        self.device = "cuda"
         with open(json_directory, 'r') as f:
             data: dict = json.load(f)
             self.name = "MORTM_LIVE"
@@ -70,4 +72,4 @@ class MORTM_LIVE_Args(MORTMArgs):
             self.instrument_num = data['instrument_num'] if data.get('instrument_num') else 8
             self.ticks_per_measure = data['ticks_per_measure'] if data.get('ticks_per_measure') else 96
             self.pianoroll_time_step = data['pianoroll_time_step'] if data.get('pianoroll_time_step') else 16
-
+            self.chunk = data['chunk'] if data.get('chunk') else 16

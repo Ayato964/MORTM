@@ -137,26 +137,42 @@ class _AbstractMidiConverter(_AbstractConverter):
         if not self.is_error:
             self.tempo_change_time, self.tempo = self.midi_data.get_tempo_changes()
 
-    def is_in_correct_inst(self, program_list: List[str]) -> List[Instrument]:
-        program_list: List[Tuple[int]] = convert_str_int_program(program_list)
-        d_inst_list = []
-        black_list = []
-        inst_list = [i for i in self.midi_data.instruments if not i.is_drum]
-        inst_found = False
-        for i, p in enumerate(program_list):
-            for pp in p:
-                for inst in inst_list:
-                    inst: Instrument = inst
-                    if inst.program == pp:
-                        inst.notes.sort(key=lambda note: note.start)
-                        d_inst_list.append(inst)
-                        inst_found = True
-                        break
-                if inst_found:
-                    break
-            black_list.append(program_list[i])
-        self.program_list = list(set(self.program_list) - set(black_list))
-        return d_inst_list
+    def is_in_correct_inst(self, program_list: List[str]) -> Tuple[List[Tuple[Instrument, str]], List[str]]:
+        int_program_groups: List[Tuple[int]] = convert_str_int_program(program_list)
+
+        inst_by_program = {}
+        for inst in self.midi_data.instruments:
+            if not inst.is_drum:
+                inst_by_program.setdefault(inst.program, []).append(inst)
+
+        found_instruments_with_name: List[Tuple[Instrument, str]] = []
+        found_program_names: List[str] = []
+        added_instrument_ids: set = set()
+
+        # カテゴリごとにループ
+        for name, group in zip(program_list, int_program_groups):
+            candidate_instrument = None
+            
+            # カテゴリ内のプログラム番号をループして、最初に見つかった楽器を候補とする
+            for program_num in group:
+                if program_num in inst_by_program:
+                    for inst in inst_by_program[program_num]:
+                        # まだ全体で追加されていない楽器かチェック
+                        if id(inst) not in added_instrument_ids:
+                            candidate_instrument = inst
+                            break  # このプログラム番号での検索を終了
+                if candidate_instrument:
+                    break  # このカテゴリでの検索を終了
+            
+            # このカテゴリで楽器が見つかった場合、結果に追加
+            if candidate_instrument:
+                candidate_instrument.notes.sort(key=lambda note: note.start)
+                found_instruments_with_name.append((candidate_instrument, name))
+                added_instrument_ids.add(id(candidate_instrument))
+                if name not in found_program_names:
+                    found_program_names.append(name)
+
+        return found_instruments_with_name, found_program_names
 
     def get_midi_change_scale(self, scale_up_key):
         '''
@@ -251,15 +267,19 @@ class MIDI2Seq(_AbstractMidiConverter):
         self.aya_node = [0]
         self.split_measure = split_measure
         self.is_include_special_token = is_include_special_token
-        self.inst_list = self.is_in_correct_inst(program_list)
-        if is_include_special_token and not self.is_error:
-            if len(self.inst_list) != 0:
-                self.key = get_key_dict(os.path.join(directory, file_name), window_measures=split_measure * 2)
-                self.key_dict = self.key['segments']
+        if not self.is_error:
+            self.inst_list_with_name, found_program_names = self.is_in_correct_inst(program_list)
+            self.inst_list = [inst for inst, name in self.inst_list_with_name]
+            self.program_list = found_program_names
+
+            if len(self.inst_list) == 0 and not self.is_error:
+                self.is_error = True
+                self.error_reason = "欲しい楽器がMIDIにありません。"
+            elif is_include_special_token and not self.is_error:
+                if len(self.inst_list) > 0:
+                    self.key = get_key_dict(os.path.join(directory, file_name), window_measures=split_measure * 2)
+                    self.key_dict = self.key['segments']
                 print(self.key_dict)
-        else:
-            self.is_error = True
-            self.error_reason = "欲しい楽器がMIDIにありません。"
 
     def make_system_prompt(self, clip: np.ndarray, time):
         prompt = [self.tokenizer.get("<EOS>"),
@@ -280,21 +300,43 @@ class MIDI2Seq(_AbstractMidiConverter):
         3. clip = [<START>, S, P, D, S, P, D, ...<END>]
         :return:なし
         """
-        clip = np.array([], dtype=int)
-        container = [ShiftTimeContainer(0, self.tempo[0]) for _ in self.inst_list]
-        note_counts = [0 for _ in self.inst_list]
-        is_continued = [False for _ in self.inst_list]
-        is_running = True
-
         if not self.is_error:
-            while is_running:
-                clip = self.make_system_prompt(clip, container[0].measure_start_time)
-                for i, inst in enumerate(self.inst_list):
-                    print(self.inst_list[i], note_counts[i], len(inst.notes))
-                    inst_clip, note_count, is_finish = self.convert_inst(self.program_list[i], inst, container[i], note_counts[i])
-                    note_counts[i] = note_count
-                    clip = np.append(clip, inst_clip)
-                self.aya_node = self.aya_node + [clip]
+            print([i.program for i in self.midi_data.instruments])
+            container = [ShiftTimeContainer(0, self.tempo[0]) for _ in self.inst_list]
+            note_counts = [0 for _ in self.inst_list]
+            is_continued = [False for _ in self.inst_list]
+
+            # is_running ではなく、処理が完了していない楽器の数をカウントする
+            active_instruments = len(self.inst_list)
+
+            if not self.is_error and active_instruments > 0:
+                # アクティブな楽器が1つ以上ある間ループする
+                while active_instruments > 0:
+                    clip = np.array([], dtype=int)
+                    clip = self.make_system_prompt(clip, container[0].measure_start_time)
+
+                    # 今回のループで完了した楽器の数をカウント
+                    finished_in_this_loop = 0
+
+                    for i, (inst, name) in enumerate(self.inst_list_with_name):
+                        # すでに完了した楽器はスキップ (is_continued を流用)
+                        if is_continued[i]:
+                            continue
+
+                        #print(len(self.inst_list), self.inst_list[i], note_counts[i], len(inst.notes))
+                        inst_clip, note_count, is_finish = self.convert_inst(name, inst, container[i], note_counts[i])
+                        note_counts[i] = note_count
+                        clip = np.append(clip, inst_clip)
+
+                        if is_finish:
+                            is_continued[i] = True # この楽器を完了フラグにする
+                            finished_in_this_loop += 1
+
+                    clip = np.append(clip, self.tokenizer.get("<TE>"))
+                    self.aya_node = self.aya_node + [clip]
+
+                    # アクティブな楽器の数を減らす
+                    active_instruments -= finished_in_this_loop
 
     def convert_inst(self, program, inst: Instrument, container, note_count) -> np.ndarray | int:
         clip = np.array([self.tokenizer.get(f"<INST_{program}>")], dtype=int)
@@ -308,6 +350,8 @@ class MIDI2Seq(_AbstractMidiConverter):
             tempo = self.get_tempo(note.start)
             container.tempo = tempo
             is_continue_note = False
+            if back_note is None:
+                self.measure_time_sort(note.start, container)
 
             for conv in self.token_converter:
                 conv: Token = conv
@@ -320,15 +364,12 @@ class MIDI2Seq(_AbstractMidiConverter):
                             clip_count += 1
 
                         if clip_count >= self.split_measure:
-                            # クリップを切って状態を初期化
-                            back_note = None
-                            clip_count = 0
-                            is_continue_note = True  # 同じノートからやり直す（measure/key を更新済み）
-                            progressed = True        # クリップは確実に進展
-                            break
+                            clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
+                            return clip, note_count, False
 
                         token_id = self.tokenizer.get(token)
                         clip = np.append(clip, token_id)
+                        print(clip[-1], note.start)
                         progressed = True
 
                         if conv.token_type == "<BLANK>":
@@ -340,149 +381,11 @@ class MIDI2Seq(_AbstractMidiConverter):
                         self.is_error = True
                         self.error_reason = "MIDIの変換中にエラーが発生しました。"
                         break
-                    if not is_continue_note:
-                        note_count += 1
-                        back_note = note
+            if not is_continue_note:
+                note_count += 1
+                back_note = note
         return clip, note_count, False
 
-    def ct_aya_node(self, inst: Instrument) -> list:
-        """
-        無限ループ対策:
-          - 進捗ガード: 反復ごとに (note_count, clip_count, measure_start_time, len(clip)) を記録。
-            何も変わらなければ強制的に note を前進。
-          - 同一ノートでの再試行回数を制限（デフォ 8 回）。
-          - 全体ループ上限: 10 * N + 100
-        """
-        clip = np.array([], dtype=int)
-        if self.is_include_special_token:
-            clip = np.append(clip, self.tokenizer.get("<EOS>"))
-            clip = np.append(clip, self.tokenizer.get("<MGEN>"))
-
-        aya_node_inst = []
-        back_note = None
-
-        clip_count = 0
-        sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
-        shift_time_container = ShiftTimeContainer(0, 0)
-        note_count = 0
-
-        # ループ安全上限（譜面長に応じてスケール）
-        hard_loop_cap = 10 * max(len(sorted_notes), 1) + 100
-        loop_count = 0
-
-        # 同一ノートでの再試行上限
-        max_retries_same_note = 8
-        retries_same_note = 0
-
-        while note_count < len(sorted_notes):
-            note: Note = sorted_notes[note_count]
-            loop_count += 1
-            if loop_count > hard_loop_cap:
-                # 完全に進めていない可能性あり。安全に脱出。
-                self.is_error = True
-                self.error_reason = "MIDIの変換中に無限ループの可能性を検出し、処理を中断しました。"
-                break
-
-            tempo = self.get_tempo(note.start)
-            shift_time_container.tempo = tempo
-
-            if back_note is None:
-                self.measure_time_sort(note.start, shift_time_container)
-
-            if self.is_include_special_token and back_note is None:
-                key = f"k_{self.get_key(note.start)}"
-                clip = np.append(clip, self.tokenizer.get(key))
-
-            # 進捗スナップショット
-            prev_state = (
-                note_count,
-                clip_count,
-                float(shift_time_container.measure_start_time),
-                int(len(clip))
-            )
-
-            is_continue_note = False
-            progressed = False
-
-            for conv in self.token_converter:
-                conv: Token = conv
-
-                if not isinstance(conv, ChordToken):
-                    token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo, container=shift_time_container)
-
-                    if token is not None:
-                        if conv.token_type == "<SME>":
-                            clip_count += 1
-
-                        if clip_count >= self.split_measure:
-                            # クリップを切って状態を初期化
-                            clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
-                            aya_node_inst = self.marge_clip(clip, aya_node_inst)
-                            clip = np.array([], dtype=int)
-                            if self.is_include_special_token:
-                                clip = np.append(clip, self.tokenizer.get("<EOS>"))
-                                clip = np.append(clip, self.tokenizer.get("<MGEN>"))
-                            back_note = None
-                            clip_count = 0
-                            is_continue_note = True  # 同じノートからやり直す（measure/key を更新済み）
-                            progressed = True        # クリップは確実に進展
-                            break
-
-                        token_id = self.tokenizer.get(token)
-                        clip = np.append(clip, token_id)
-                        progressed = True
-
-                        if conv.token_type == "<BLANK>":
-                            # 小節またぎ待ち（次ループで同一ノート再試行）
-                            is_continue_note = True
-                            break
-
-                    if shift_time_container.is_error:
-                        self.is_error = True
-                        self.error_reason = "MIDIの変換中にエラーが発生しました。"
-                        break
-
-            if self.is_error:
-                break
-
-            # 進捗が無かった（状態が完全一致）の場合のフォールバック
-            curr_state = (
-                note_count,
-                clip_count,
-                float(shift_time_container.measure_start_time),
-                int(len(clip))
-            )
-            if curr_state == prev_state:
-                retries_same_note += 1
-                if retries_same_note >= max_retries_same_note:
-                    # これ以上待っても前に進まないので、強制的に次のノートへ
-                    back_note = note
-                    note_count += 1
-                    retries_same_note = 0
-                else:
-                    # 軽い前進: 少なくとも back_note を埋めて意味的進展を誘発
-                    if back_note is None:
-                        back_note = note
-                    # 次ループで再試行
-                continue
-
-            # 進捗があった場合の後処理
-            if not is_continue_note:
-                back_note = note
-                note_count += 1
-                retries_same_note = 0
-            else:
-                # 同一ノート再試行（小節更新やクリップ確定などは済んでいる）
-                retries_same_note += 1
-                if retries_same_note >= max_retries_same_note:
-                    # フォールバック：強制前進
-                    back_note = note
-                    note_count += 1
-                    retries_same_note = 0
-
-        if not self.is_error and len(clip) > 4:
-            aya_node_inst = self.marge_clip(clip, aya_node_inst)
-        return aya_node_inst
 
     def measure_time_sort(self, note_time, container: ShiftTimeContainer):
         """

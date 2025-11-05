@@ -33,14 +33,13 @@ class MusicEntropyLoss(nn.Module):
 
         decoded_pitch_logits = decoded[:, 0::2, :, :]
         decoded_velocity_logits = decoded[:, 1::2, :, :]
-
         loss_pitch_bce = F.binary_cross_entropy_with_logits(
-            decoded_pitch_logits, original_pitch, reduction='sum'
+            decoded_pitch_logits, original_pitch, reduction='mean'
         )
 
         # ベロシティの損失: 平均二乗誤差
         loss_velocity_mse = F.mse_loss(
-            torch.sigmoid(decoded_velocity_logits), original_velocity, reduction='sum'
+            torch.sigmoid(decoded_velocity_logits), original_velocity, reduction='mean'
         )
 
         # KLダイバージェンス

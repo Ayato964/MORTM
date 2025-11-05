@@ -19,7 +19,6 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, random_split
 import torch.nn as nn
-import numpy as np
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
@@ -44,19 +43,21 @@ IS_DEBUG = False
 
 class VisionTrainSet(AbstractTrainSet):
 
-    def __init__(self, args: MORTM_LIVE_Args, progress: LearningProgress, load_directory=None):
+    def __init__(self, args: MORTM_LIVE_Args, progress: LearningProgress, load_directory=None, beta: float = 1.0, pitch_weight: float = 1.0, velocity_weight: float = 1.0):
         self.args = args
+        self.args.device = progress.get_device()
         self.model = Vision(args)
+
         if load_directory is not None:
-            self.model.load_state_dict(torch.load(load_directory))
+            self.model.load_state_dict(torch.load(load_directory, map_location=progress.get_device()))
+        self.model.to(progress.get_device())
         adam = torch.optim.Adam(self.model.parameters(), lr=1e-4, betas=(0.9, 0.98))
-        super().__init__(criterion=MusicEntropyLoss(),
+        super().__init__(criterion=MusicEntropyLoss(beta=beta, pitch_weight=pitch_weight, velocity_weight=velocity_weight),
                          optimizer=adam,
-                         scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
+                         scheduler=None)
 
     def epoch_fc(self, model, pack, progress):
         original = pack
-        print(original.shape)
         decoded, mu, log_var = model(original.to(progress.get_device()))
         return decoded, original, mu, log_var
 
@@ -597,7 +598,7 @@ def train_bertm(model_config: str, train_config: str, human_dir, ai_dir, save_di
 
     args = MORTMArgs(json_directory=model_config)
     t_args = TrainArgs(json_directory=train_config)
-    trainer = BERTMTrainSet(args, progress, load_directory=load_model_directory)
+    trainer = BERTMTrainSet(args, progress, load_model_directory=load_model_directory)
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
 

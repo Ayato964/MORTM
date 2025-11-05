@@ -45,7 +45,7 @@ class AbstractTrainSet:
 
         if is_step:
             progress.step_optimizer(self.optimizer, self.model, accumulation_steps)
-            if lr_param is None:
+            if lr_param is None and self.scheduler is not None:
                 self.scheduler.step()
             torch.cuda.empty_cache()
 

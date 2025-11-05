@@ -53,6 +53,9 @@ def get_token_converter_pro(convert: int) -> List[Token]:
 
     register.append(Motif(convert))
 
+    register.append(System(convert))
+    register.append(Instrument(convert))
+
     register.append(GenMotif(convert))
     register.append(MGen(convert))
     register.append(CGen(convert))
@@ -98,7 +101,7 @@ def get_token_converter_melody_only(convert: int) -> List[Token]:
 
     return register
 
-def get_token_converter_melody_only4_5(convert: int) -> List[Token]:
+def get_token_converter_melody_only_research45(convert: int) -> List[Token]:
     register: List[Token] = list()
 
     register.append(EOS(convert))

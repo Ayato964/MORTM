@@ -1,48 +1,40 @@
+from pretty_midi import PrettyMIDI
+import pretty_midi.instrument as inst
 from torch import Tensor
-from pretty_midi import Instrument, Note, PrettyMIDI
 
-from mortm.train.tokenizer import Tokenizer, DURATION_TYPE
 from mortm.train.custom_token import ShiftTimeContainer, ChordToken
+from mortm.train.tokenizer import *
 
 
-
-
-def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, program=1, tempo=120):
-    """
-    Converts a sequence of tokens into a MIDI file.
-
-    Args:
-        tokenizer (Tokenizer): Tokenizer instance.
-        seq (Tensor): Sequence of tokens.
-        save_directory (str): Path to save the MIDI file.
-        program (int): MIDI program number (default: 1).
-        tempo (int): Tempo of the MIDI file (default: 120).
-
-    Returns:
-        PrettyMIDI: Generated MIDI object.
-    """
+def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, tempo=120):
     seq = seq[1:]
+    print("これから処理するトークン列:", seq)
     midi = PrettyMIDI()
-    inst: Instrument = Instrument(program=program)
-    note = Note(pitch=0, velocity=100, start=0, end=0)
     back_note = None
     token_converter_list = tokenizer.music_token_list
     container = ShiftTimeContainer(0, tempo)
+    init_inst = None
+    note = Note(pitch=0, velocity=100, start=0, end=0)
+
     for token_id in seq:
         token = tokenizer.rev_get(token_id.item())
-        if token_id == tokenizer.get("<TE>") or token_id == tokenizer.get("<ESEQ>"):
+        if token_id == tokenizer.get("<TE>"):
             break
-        if token_id == tokenizer.get("<SME>"):
-            container.shift()
 
         for con in token_converter_list:
             if not isinstance(con, ChordToken):
-                token_type = con(token=token, back_notes=back_note, note=note, container=container, tempo=tempo)
+                token_type = con(token=token, note=note, back_notes=back_note, container=container, tempo=tempo)
+
+                if container.get_inst() is not None:
+                    if init_inst is not None:
+                        midi.instruments.append(init_inst)
+                    init_inst = inst.Instrument(program=container.get_inst(), is_drum=False)
+                    container = ShiftTimeContainer(0, tempo)
+
                 if token_type == DURATION_TYPE:
-                    inst.notes.append(note)
                     back_note = note
+                    init_inst.notes.append(note)
                     note = Note(pitch=0, velocity=100, start=0, end=0)
-    midi.instruments.append(inst)
-    print(inst.notes)
+    midi.instruments.append(init_inst)
     midi.write(save_directory)
-    return midi
+
