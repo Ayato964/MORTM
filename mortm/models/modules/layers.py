@@ -223,8 +223,8 @@ class MORTMDecoder(nn.Module):
         elif args.normalize_type == "layernorm":
             self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
 
-    def forward(self, tgt: Tensor, tgt_is_causal: Optional[bool] = None,
-                cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False) -> Tensor:
+    def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False,
+                encoder_x: Tensor = None, cu_seqlens_k=None, max_seqlen_k=None) -> Tensor:
 
         output = tgt
         for mod in self.layers:
@@ -233,7 +233,10 @@ class MORTMDecoder(nn.Module):
                 output,
                 tgt_is_causal=tgt_is_causal,
                 cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                batch_size=batch_size, indices=indices, is_save_cache=is_save_cache
+                batch_size=batch_size, indices=indices, is_save_cache=is_save_cache,
+                encoder_x=encoder_x,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_k=max_seqlen_k
             )
 
         return self.norm(output)
@@ -244,10 +247,14 @@ class MORTMDecoderLayer(nn.Module):
     def __init__(self, args: MORTMArgs, progress):
         super(MORTMDecoderLayer, self).__init__()
         self.n_head = args.num_heads
+        self.args = args
         self.d_model = args.d_model
         self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(args, progress=progress)
 
-        if args.use_moe_decoder == True:
+        if args.use_cross_attention:
+            self.cross_attention: FlashCrossAttentionM =FlashCrossAttentionM(args, progress=progress)
+
+        if args.use_moe_decoder:
             self.ffn = MoE(args)
         else:
             if args.use_silu:
@@ -270,13 +277,17 @@ class MORTMDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(args.dropout)
         self.dropout3 = nn.Dropout(args.dropout)
 
-    def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False)-> Tensor:
-
+    def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False,
+                encoder_x: Tensor = None, cu_seqlens_k=None, max_seqlen_k=None)-> Tensor:
         y = tgt
         y = y + self.self_block(self.norm1(y), tgt_is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, batch_size=batch_size, indices=indices, is_save_cache=is_save_cache) # 自己注意機構を適用
 
-        y = y + self.ff_block(self.norm3(y)) # フィードフォワード層を適用
+        if self.args.use_cross_attention:
+            y = y + self.cross_attention(self.norm2(y), encoder_x, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens_k,
+                                         max_seqlen_q=max_seqlen,
+                                         max_seqlen_k=max_seqlen_k)
 
+        y = y + self.ff_block(self.norm3(y)) # フィードフォワード層を適用
         return y
 
     def self_block(self, y: Tensor, is_causal: bool, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False):
@@ -285,84 +296,18 @@ class MORTMDecoderLayer(nn.Module):
 
         return self.dropout1(y)
 
-    def ff_block(self, y: Tensor):
+    def cross_attention(self,  x: Tensor, encoder_x: Tensor,cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None,
+                        max_seqlen_k=None):
+        y = self.cross_attention(x, encoder_x,cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                                    max_seqlen_q=max_seqlen_q,
+                                    max_seqlen_k=max_seqlen_k)
 
+        return self.dropout2(y)
+
+    def ff_block(self, y: Tensor):
         return self.dropout3(self.ffn(y))
 
 
-class SelectiveAttentionDecoder(nn.Module):
-    def __init__(self, args: MORTMArgs):
-        super().__init__()
-        self.layers = _get_clones(SelectiveAttentionDecoderLayer(args), args.d_layer)
-        self.norm = NormTanh(args.d_model)
-
-    def forward(self, x: Tensor):
-        for layer in self.layers:
-            x = layer(x)
-        return self.norm(x)
-
-
-class SelectiveAttentionDecoderLayer(nn.Module):
-    def __init__(self, args: MORTMArgs):
-        super().__init__()
-        self.expand = 2
-        self.d_inner = int(args.d_model * self.expand)
-
-        self.in_proj = nn.Module(args.d_model, args.d_model * 2)
-        self.conv1d = nn.Conv1d(args.d_model, args.d_model, kernel_size=4)
-
-        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.d_state, self.d_inner, bias=True)
-
-        A = rearrange(torch.arange(1, self.d_state + 1), "n -> 1 n")
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-
-        self.out_block = MoE(args)
-
-        self.dropout = nn.Dropout(args.dropout)
-        self.norm = NormTanh(args.d_model)
-
-    def forward(self, x: Tensor):
-        ss_out = self.ssm_block(self.norm(x))
-
-        y = x + self.dropout(self.out_block(ss_out))
-
-        return y
-
-    def ssm_block(self, x: Tensor):
-        x_and_res: Tensor = self.in_proj(x)
-        x, res = x_and_res.split(split_size=[self.d_inner, self.d_inner], dim=-1)
-        x = rearrange(x, "b l d -> b d l")
-        x_conv = self.conv1d(x)[:, :, :x.shape[-1]]
-        x_conv = rearrange(x_conv, "b d l -> b l d")
-
-        x = F.silu(x_conv)
-        y = self.ssm(x)
-
-        res = F.silu(res)
-        gated_output = y * res
-
-        return gated_output
-
-    def ssm(self, x):
-        # A, D は学習可能なパラメータ
-        A = -torch.exp(self.A_log.float())
-        D = self.D.float()
-
-        # Δ, B, C は入力xに応じて動的に決まる
-        x_doubled = self.x_proj(x)
-        delta, B = x_doubled.split(split_size=[self.d_state, self.d_state], dim=-1)
-        C = B # 簡略化のためBとCを共有
-
-        delta = F.softplus(self.dt_proj(delta))
-
-        # ★★★ ここでCUDAカーネルを呼び出す ★★★
-        #y = selective_scan_fn(
-        #    x, delta, A, B, C, D=D, delta_softplus=True
-        #)
-
-        return delta
 
 class FFN(nn.Module):
 

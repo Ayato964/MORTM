@@ -68,24 +68,37 @@ def get_alibi_slopes(n_heads):
 
 
 class QKVLinear(nn.Module):
-    def __init__(self, args: MORTMArgs):
+    def __init__(self, args: MORTMArgs, use_cross_attention: bool=False):
         super(QKVLinear, self).__init__()
         self.num_heads = args.num_heads
         self.drop_out = nn.Dropout(args.dropout)
+        self.use_cross_attention  = use_cross_attention
 
-        if not  args.use_lora:
-            self.qkv_weight = nn.Linear(args.d_model, 3 * args.d_model, bias=True, dtype=torch.bfloat16)
-            self.W_o = nn.Linear(args.d_model, args.d_model, dtype=torch.bfloat16)
+        if not use_cross_attention:
+            if not  args.use_lora:
+                self.qkv_weight = nn.Linear(args.d_model, 3 * args.d_model, bias=True, dtype=torch.bfloat16)
+                self.W_o = nn.Linear(args.d_model, args.d_model, dtype=torch.bfloat16)
+            else:
+                self.qkv_weight = lora.Linear(args.d_model, 3 * args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=True, dtype=torch.bfloat16)
+                self.W_o = lora.Linear(args.d_model, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=True, dtype=torch.bfloat16)
         else:
-            self.qkv_weight = lora.Linear(args.d_model, 3 * args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=True, dtype=torch.bfloat16)
-            self.W_o = lora.Linear(args.d_model, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=True, dtype=torch.bfloat16)
+            self.q_weight = nn.Linear(args.d_model, args.d_model, bias=True, dtype=torch.bfloat16)
+            self.kv_weight = nn.Linear(args.d_model, 2 * args.d_model, bias=True, dtype=torch.bfloat16)
+            self.W_o = nn.Linear(args.d_model, args.d_model, dtype=torch.bfloat16)
 
 
-    def forward(self, q: Tensor, k: Tensor=None, v: Tensor=None, ):
+    def forward(self, q: Tensor, kv: Tensor = None):
+        if not self.use_cross_attention:
+            total, D = q.size()
+            qkv = self.qkv_weight(q).view(total, 3, self.num_heads, D // self.num_heads)
+            return qkv
+        else:
+            total_q, D_q = q.size()
+            total_kv, D_kv = kv.size()
 
-        total, D = q.size()
-        qkv = self.qkv_weight(q).view(total, 3, self.num_heads, D // self.num_heads)
-        return qkv
+            q = self.q_weight(q).view(total_q, self.num_heads, D_q // self.num_heads)
+            kv = self.kv_weight(kv).view(total_kv, 2, self.num_heads, D_kv // self.num_heads)
+            return q, kv
 
     def comp(self, o: Tensor):
         out: Tensor = self.W_o(o)
@@ -107,7 +120,7 @@ class FlashSelfAttentionM(nn.Module):
         self.kv_cache: Optional[Tuple[Tensor, Tensor]] = None
         self.cache_seqlens: Tensor = None
 
-        if IS_NOT_LINUX:
+        if not self.args.use_rope:
             print("FlashAttention2のALiBiを使用します。")
             self.alibi_slopes = torch.tensor(get_alibi_slopes(args.num_heads), dtype=torch.float32, device=progress.get_device())
         else:
@@ -143,7 +156,7 @@ class FlashSelfAttentionM(nn.Module):
             qkv: Tensor = self.qkv_block(q=x)
 
             # RoPE/ALiBiの適用とアテンション計算 (この部分は元のロジックを維持)
-            if IS_NOT_LINUX:
+            if not self.args.use_rope:
                 out = flash_attn_varlen_qkvpacked_func(qkv, dropout_p=self.drop, causal=is_causal,
                                                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                                                        alibi_slopes=self.alibi_slopes)
@@ -241,40 +254,47 @@ class FlashSelfAttentionM(nn.Module):
 
 
 class FlashCrossAttentionM(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.2):
+    def __init__(self, args: MORTMArgs, progress=None):
         super(FlashCrossAttentionM, self).__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.drop = dropout
-        self.qkv_block = QKVLinear(embed_dim, 256, 128, num_heads, dropout)
+        self.batch_first = True
+        self._qkv_same_embed_dim = True
+        self.in_proj_bias = None
+        self.args = args
 
-    def forward(self, tgt, memory, memory_key_padding_mask=None, tgt_key_padding_mask=None,
-                need_weights=True, attn_mask=None, is_causal=False):
-        batch, tgt_len, embed_dim = tgt.size()
-        assert embed_dim == self.embed_dim
-        assert list(tgt.size()) == [batch, tgt_len, embed_dim]
-        tgt = tgt.to(dtype=torch.bfloat16)
-        memory = memory.to(dtype=torch.bfloat16)
+        self.embed_dim = args.d_model
+        self.qkv_block = QKVLinear(args, use_cross_attention=True)
+        self.drop = args.dropout
 
-        q, k, v, cu_seqlens, max_s, indices, cu_seqlens_k, max_s_k = self.qkv_block(q=tgt, k=memory, v=memory,
-                                                                                    key_padding_mask=tgt_key_padding_mask,
-                                                                                    memory_padding_mask=memory_key_padding_mask)
 
-        k_unpad = torch.stack([k, v], dim=1 if tgt_key_padding_mask is not None else 2)
-        if tgt_key_padding_mask is not None:
-            out = flash_attn_varlen_kvpacked_func(q, k_unpad, causal=is_causal, dropout_p=self.drop,
-                                                  cu_seqlens_q=cu_seqlens,
-                                                  max_seqlen_q=max_s,
-                                                  cu_seqlens_k=cu_seqlens_k,
-                                                  max_seqlen_k=max_s_k)
+    def forward(self, x: Tensor, encoder_x: Tensor,cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None,
+                    max_seqlen_k=None):
+        if x.dtype == torch.float32:
+            x = x.to(torch.bfloat16)
+        if encoder_x.dtype == torch.float32:
+            encoder_x = encoder_x.to(torch.bfloat16)
+
+        # --- フェーズ1: 学習 または 推論のプロンプト処理 ---
+        if cu_seqlens_q is not None:
+            q, kv = self.qkv_block(q=x, kv=encoder_x)
+
+            out = flash_attn_varlen_kvpacked_func(
+                q=q,
+                kv=kv,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                causal=False,
+                dropout_p=self.drop
+            )
         else:
-            out = flash_attn_kvpacked_func(q, k_unpad, causal=is_causal, dropout_p=0)
+            q, kv = self.qkv_block(q=x, kv=encoder_x)
+            q = q.unsqueeze(0)
+            kv = kv.unsqueeze(0)
+            out = flash_attn_kvpacked_func(q=q, kv=kv, dropout_p=self.drop, causal=False)
+            out = rearrange(out, "b s h d -> (b s) (h d)")
+            return self.qkv_block.comp(out)
 
-        if tgt_key_padding_mask is not None:
-            out = rearrange(out, "total h d -> total (h d)")
-            out: Tensor = pad_input(out, indices, batch, tgt_len)
-        else:
-            out: Tensor = rearrange(out, "b s h d -> b s (h d)")
-
-        out = self.qkv_block.comp(out)
-        return out, None
+        # 最終的な出力層
+        out = rearrange(out, "total h d -> total (h d)")
+        return self.qkv_block.comp(out)

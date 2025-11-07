@@ -26,6 +26,8 @@ class MORTMArgs:
             self.use_moe_decoder = True if data.get('use_moe_decoder') is None else data['use_moe_decoder']
             self.is_not_flash = data.get("is_not_flash")
             self.use_silu = False if data.get('use_silu') is None else data['use_silu']
+            self.use_rope = False if data.get('use_rope') is None else data['use_rope']
+            self.use_cross_attention = False if data.get('use_cross_attention') is None else data['use_cross_attention']
 
             self.normalize_type = "tanh" if data.get('norm_type') is None else data['norm_type']
 

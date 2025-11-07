@@ -107,8 +107,8 @@ class ShiftTimeContainer:
 
     def shift(self):
         increment = (60 / self.tempo) * 4
-        # 小数第4位以降を切り捨て（小数点以下3桁まで保持）
-        increment = math.floor(increment * 1000) / 1000.0
+        # 丸め誤差を減らすために、小数点以下6桁まで丸める
+        increment = round(increment, 6)
         self.measure_start_time += increment
         print(self.measure_start_time)
         self.shift_measure = True
@@ -366,7 +366,6 @@ class EOS(SpecialToken):
 class System(SpecialToken):
     def __init__(self, convert_type: int):
         super().__init__("<SYSTEM>", convert_type)
-
 def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
     pass
 
