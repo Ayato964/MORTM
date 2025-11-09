@@ -283,7 +283,7 @@ class MORTMDecoderLayer(nn.Module):
         y = y + self.self_block(self.norm1(y), tgt_is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, batch_size=batch_size, indices=indices, is_save_cache=is_save_cache) # 自己注意機構を適用
 
         if self.args.use_cross_attention:
-            y = y + self.cross_attention(self.norm2(y), encoder_x, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens_k,
+            y = y + self.cross_block(self.norm2(y), encoder_x, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens_k,
                                          max_seqlen_q=max_seqlen,
                                          max_seqlen_k=max_seqlen_k)
 
@@ -296,7 +296,7 @@ class MORTMDecoderLayer(nn.Module):
 
         return self.dropout1(y)
 
-    def cross_attention(self,  x: Tensor, encoder_x: Tensor,cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None,
+    def cross_block(self,  x: Tensor, encoder_x: Tensor,cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None,
                         max_seqlen_k=None):
         y = self.cross_attention(x, encoder_x,cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
                                     max_seqlen_q=max_seqlen_q,

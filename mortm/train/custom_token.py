@@ -108,9 +108,7 @@ class ShiftTimeContainer:
     def shift(self):
         increment = (60 / self.tempo) * 4
         # 丸め誤差を減らすために、小数点以下6桁まで丸める
-        increment = round(increment, 6)
         self.measure_start_time += increment
-        print(self.measure_start_time)
         self.shift_measure = True
 
     def get_inst(self):
@@ -260,11 +258,9 @@ class MeasureToken(SpecialToken):
 
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int or None or str:
 
-        if back_notes is None:
-            return self.token_type
         note_tick = ct_time_to_beat(note.start, tempo)
         container_tick = ct_time_to_beat(container.measure_start_time, tempo)
-
+        #print(f"SME: {note_tick - container_tick >= 96}")
         if note_tick - container_tick >= 96:
             container.shift()
             return self.token_type
@@ -286,6 +282,7 @@ class Blank(SpecialToken):
         note_tick = ct_time_to_beat(note.start, tempo)
 
         if note_tick - container_tick >= 96:
+            #print(round(container.measure_start_time, 4), note.start)
             return self.token_type
         else:
             return None

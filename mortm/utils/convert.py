@@ -342,6 +342,8 @@ class MIDI2Seq(_AbstractMidiConverter):
         clip = np.array([self.tokenizer.get(f"<INST_{program}>")], dtype=int)
         clip_count = 0
         back_note: Optional[Note] = None
+        is_first = True
+        print(f"Program: {inst.program}  Notes: {inst.notes[note_count].start}")
 
         while clip_count < self.split_measure:
             if note_count >= len(inst.notes):
@@ -350,8 +352,9 @@ class MIDI2Seq(_AbstractMidiConverter):
             tempo = self.get_tempo(note.start)
             container.tempo = tempo
             is_continue_note = False
-            if back_note is None:
-                self.measure_time_sort(note.start, container)
+            #if is_first:
+            #    self.measure_time_sort(note.start, container)
+            #    is_first = False
 
             for conv in self.token_converter:
                 conv: Token = conv
@@ -369,7 +372,6 @@ class MIDI2Seq(_AbstractMidiConverter):
 
                         token_id = self.tokenizer.get(token)
                         clip = np.append(clip, token_id)
-                        print(clip[-1], note.start)
                         progressed = True
 
                         if conv.token_type == "<BLANK>":

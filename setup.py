@@ -3,8 +3,8 @@ from setuptools import setup, find_packages
 with open('README.md', 'r', encoding='utf-8-sig') as f:
     long_description = f.read()
 setup(
-    name='MORTM',
-    version='4.1.33',
+    name='mortm',
+    version='4.5b2',
     author='Nagoshi Takaaki',
     author_email='nagoshi@kthrlab.jp',
     description='旋律生成、コード推定、マルチタスクな音楽生成を行うライブラリ',
