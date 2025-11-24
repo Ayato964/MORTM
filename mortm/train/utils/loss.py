@@ -57,6 +57,7 @@ class MaskedCrossEntropyLoss(nn.Module):
     def __init__(self, ignore_index=0):
         super(MaskedCrossEntropyLoss, self).__init__()
         self.ignore_index = ignore_index
+        # reduction='none' は正しい
         self.cross_entropy = nn.CrossEntropyLoss(ignore_index=self.ignore_index, reduction='none')
 
     def forward(self, inputs, targets, mask=None):
@@ -64,9 +65,13 @@ class MaskedCrossEntropyLoss(nn.Module):
             mask = torch.ones_like(targets, dtype=torch.bool)
 
         cross_loss = self.cross_entropy(inputs, targets)
-        cross_loss = cross_loss * mask
+        cross_loss = cross_loss * mask # MGEN以前の損失が 0 になる
 
-        return cross_loss.sum() / (mask.sum() + 1e-12)
+        true_mask = (targets != self.ignore_index).long()
+
+        final_mask = mask * true_mask
+
+        return cross_loss.sum() / (final_mask.sum() + 1e-12)
 
 
 class RLDFLoss(nn.Module):

@@ -76,11 +76,11 @@ class QKVLinear(nn.Module):
 
         if not use_cross_attention:
             if not  args.use_lora:
-                self.qkv_weight = nn.Linear(args.d_model, 3 * args.d_model, bias=True, dtype=torch.bfloat16)
+                self.qkv_weight = nn.Linear(args.d_model, 3 * args.d_model, bias=False, dtype=torch.bfloat16)
                 self.W_o = nn.Linear(args.d_model, args.d_model, dtype=torch.bfloat16)
             else:
-                self.qkv_weight = lora.Linear(args.d_model, 3 * args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=True, dtype=torch.bfloat16)
-                self.W_o = lora.Linear(args.d_model, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=True, dtype=torch.bfloat16)
+                self.qkv_weight = lora.Linear(args.d_model, 3 * args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=False, dtype=torch.bfloat16)
+                self.W_o = lora.Linear(args.d_model, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, dtype=torch.bfloat16)
         else:
             self.q_weight = nn.Linear(args.d_model, args.d_model, bias=True, dtype=torch.bfloat16)
             self.kv_weight = nn.Linear(args.d_model, 2 * args.d_model, bias=True, dtype=torch.bfloat16)

@@ -28,7 +28,7 @@ def _create_midi_prompt(tokenizer: Tokenizer, midi_path: str | List[str], split_
     for path in midi_list:
         if not os.path.exists(path):
             assert FileNotFoundError(f"MIDI file not found: {path}")
-        converter = MIDI2Seq(tokenizer, os.path.dirname(path), os.path.basename(path), split_measure=split_measure, program_list=program, is_include_special_token=not is_add_query_symbol)
+        converter = MIDI2Seq(tokenizer, os.path.dirname(path), os.path.basename(path), split_measure=split_measure, program_list=program, is_include_special_token=False)
         converter.convert()
         if not converter.is_error:
             if is_add_query_symbol:
@@ -55,12 +55,40 @@ def create_chord_prompt(tokenizer: Tokenizer, chord_prompt: List[np.ndarray]) ->
 
     return chord_prompt
 
+def create_system_prompt(tokenizer: Tokenizer, program: List[List[str]], key: List[str]) -> List[torch.Tensor]:
+    prompt = []
+    if isinstance(program[0], str):
+        program = [program]
+    if isinstance(key, str):
+        key = [key]
+    for i, k in enumerate(key):
+        t = []
+        t.append(tokenizer.get("<EOS>"))
+        t.append(tokenizer.get("<SYSTEM>"))
+        if program[i] is not None:
+            for p in program[i]:
+                t.append(tokenizer.get(f"<INST_{p}>"))
+        if k is not None:
+            t.append(tokenizer.get(f"k_{k}"))
+        t.append(tokenizer.get("<TAG_END>"))
+        t.append(tokenizer.get("<MGEN>"))
+        prompt.append(torch.tensor(t))
+    return prompt
+
+
 
 def pre_train_generate(model: MORTM, tokenizer: Tokenizer, save_directory: str,
-                       midi_path: str | List[str], program: List[int], output_program: List[int],  end_tokens: tuple, split_measure: int = 999,
+                       midi_path: str | List[str], program: List[str] | List[List[str]], key:str | List[str], end_tokens: tuple, split_measure: int = 999,
                        temperature: float = 1.0, p=0.95, print_log = True) -> PrettyMIDI | List[PrettyMIDI]:
 
-    src_list = _create_midi_prompt(tokenizer, midi_path, split_measure, program)
+    system_prompt = create_system_prompt(tokenizer, program, key)
+    if midi_path is not None:
+        src_list = _create_midi_prompt(tokenizer, midi_path, split_measure, program)
+        for i in range(len(src_list)):
+            src_list[i] = torch.cat([system_prompt[i], src_list[i]])
+    else:
+        src_list = system_prompt
+
     src_list = pad_sequence(src_list, batch_first=True, padding_value=tokenizer.get("<PAD>")).to(model.progress.get_device())
     all_seq, _ = model.top_sampling_measure_kv_cache(tokenizer, src_list, temperature=temperature, p=p, print_log=print_log)
 
@@ -68,7 +96,10 @@ def pre_train_generate(model: MORTM, tokenizer: Tokenizer, save_directory: str,
     _print_gen(all_seq, tokenizer)
     midi = []
     for i, seq in enumerate(all_seq):
-        m = ct_token_to_midi(tokenizer, seq, os.path.join(save_directory, f"generated_{os.path.basename(midi_path[i])}_{i}.mid"), program=output_program[i])
+        if midi_path is not None:
+            m = ct_token_to_midi(tokenizer, seq, os.path.join(save_directory, f"generated_{os.path.basename(midi_path[i])}_{i}.mid"))
+        else:
+            m = ct_token_to_midi(tokenizer, seq, os.path.join(save_directory, f"generated_system_prompt_{i}.mid"))
         midi.append(m)
 
     return midi if len(midi) != 1 else midi[0]

@@ -565,24 +565,9 @@ class ChordShiftRE(ChordToken):
     def get_token(self, note: Note, chords: ChordMidi, container: ShiftTimeContainer) -> int | str | None:
         if container.is_code_mode:
             now_c, i = chords.get_chord(note.start)
-            now_tick = ct_time_to_beat(now_c.time_stamp, container.tempo)
-            if container.shift_measure:
-                container.shift_measure = False
-                shift = int(now_tick - ct_time_to_beat(container.measure_start_time, container.tempo))
-                if shift < 0:
-                    container.is_error = True
-                return shift % 96
-
-            if i == 0:
-                #print(now_tick)
-                return 0
-            back_c = chords[i - 1]
-            back_tick = ct_time_to_beat(back_c.time_stamp, container.tempo)
-            shift = int(now_tick - back_tick)
-            if shift < 0:
-                container.is_error = True
-            return shift % 96
-        return None
+            time = now_c.time_stamp - container.measure_start_time
+            shift_time = ct_time_to_beat(time, container.tempo)
+            return int(shift_time % 96)
 
 
     def de_convert(self, number: int | str, back_note: Note, note: Note, tempo: int, container: ShiftTimeContainer):

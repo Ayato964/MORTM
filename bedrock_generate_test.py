@@ -4,18 +4,18 @@ from mortm.utils.generate import *
 from mortm.models.modules.progress import _DefaultLearningProgress
 from mortm.train.tokenizer import *
 
-midi_path = "data/generate/Sample4.mid"
-args_path = "configs/models/mortm/4_5/research/A.json"
-model_save_path = "out/model/mortm/research/MORTM.Research_without_MoE_NoT_1.2582153859345808.pth"
+midi_path = "data/generate/Piano_Sample.mid"
+args_path = "configs/models/mortm/A.json"
+model_save_path = "out/model/mortm/45_research/MORTM.4.5-PRO_1.0899.pth"
 #model_save_path = "out/model/mortm/MORTM.4.1-SAX-Phase2_0.29.pth"
 sft_model = False
 generate_count = 1
-program = [0 for _ in range(generate_count)]
+program = ["PIANO", "SAX"]
 out_program = [65 for _ in range(generate_count)]
 midi_path = [midi_path for _ in range(generate_count)]
 
 if __name__ == "__main__":
-    tokenizer = Tokenizer(get_token_converter_melody_only_research45(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
     args = MORTMArgs(args_path)
     if sft_model:
         args.use_lora = True
@@ -25,7 +25,7 @@ if __name__ == "__main__":
     model.to(p.get_device())
 
     if not sft_model:
-        pre_train_generate(model, tokenizer, "out", midi_path, end_tokens=(tokenizer.get("<ESEQ>"), tokenizer.get("<TE>")), split_measure=3, program=program, output_program=out_program, temperature=1.1)
+        pre_train_generate(model, tokenizer, "out", midi_path, end_tokens=(tokenizer.get("<TE>")), split_measure=3, program=program, key="Fm",  temperature=1.2)
     else:
         """
         chord = np.array([tokenizer.get("<SME>"),

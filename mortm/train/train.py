@@ -36,7 +36,8 @@ from mortm.utils.pianoroll_convert import *
 from .noam import noam_lr
 from .epoch import EpochObserver
 from .config import AbstractTrainSet, TrainArgs
-from .utils.loss import MusicEntropyLoss
+from .tokenizer import Tokenizer
+from .utils.loss import MusicEntropyLoss, MaskedCrossEntropyLoss
 
 IS_DEBUG = False
 
@@ -73,8 +74,9 @@ class VisionTrainSet(AbstractTrainSet):
 
 
 class MORTMTrainSet(AbstractTrainSet):
-    def __init__(self, args: MORTMArgs, progress: LearningProgress, load_directory=None):
+    def __init__(self, args: MORTMArgs, tokenizer, progress: LearningProgress,  load_directory=None):
         self.args = args
+        self.tokenizer: Tokenizer = tokenizer
         self.model = MORTM(progress=progress, args=args).to(progress.get_device())
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
@@ -82,13 +84,16 @@ class MORTMTrainSet(AbstractTrainSet):
         adam = torch.optim.Adam(self.model.parameters(), lr=5e-1)
         #self.model = torch.compile(self.model)
 
-        super().__init__(criterion=nn.CrossEntropyLoss(ignore_index=0).to(progress.get_device()),
+        super().__init__(criterion=MaskedCrossEntropyLoss(ignore_index=0).to(progress.get_device()),
                         optimizer=adam,
                         scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
 
     def pre_processing(self, pack, progress):
         dt: DataLoader = pack
-        mini_dataset = MORTM_SEQDataset(progress, self.args.position_length, self.args.min_length)
+        mini_dataset = MORTM_SEQDataset(progress, self.args.position_length, self.args.min_length,
+                                        is_random_delete_key=True, mask_sample_task=[self.tokenizer.get("<MGEN>")],
+                                        program_token_id=[self.tokenizer.get("<INST_PIANO>"), self.tokenizer.get("<INST_SAX>")],
+                                        system_tag=(self.tokenizer.get("<SYSTEM>"), self.tokenizer.get("<TAG_END>")), sampling_inst_max=2)
         for d in dt:
             np_load_data = np.load(d, allow_pickle=True)
             mini_dataset.add_data(np_load_data)
@@ -99,13 +104,43 @@ class MORTMTrainSet(AbstractTrainSet):
     def epoch_fc(self, model, pack, progress):
         src = pack
         target: Tensor = src[:, 1:].to(progress.get_device())
+        mask = self.loss_mask(target)
         target = target.reshape(-1).long()
+        mask = mask.reshape(-1).long()
 
         src = src[:, :-1]
         padding_mask_in: Tensor = _get_padding_mask(src, progress)
+
         input: Tensor = model(x=src, padding_mask=padding_mask_in, is_causal=True)
         input = input.view(-1, input.size(-1)).to(progress.get_device())
-        return input.to(device=progress.get_device()), target
+        return input.to(device=progress.get_device(), dtype=torch.float32), target, mask
+
+    def loss_mask(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        バッチ処理に対応した損失マスクを作成する。
+
+        Args:
+            x (torch.Tensor): 形状が (batch_size, sequence_length) の入力テンソル。
+
+        Returns:
+            torch.Tensor: 形状が (batch_size, sequence_length) のマスクテンソル。
+        """
+        # x が (batch_size, sequence_length) の場合、
+        # 以下の比較も要素ごとに行われ、結果は (batch_size, sequence_length) の
+        # ブール型テンソルになる。
+        mgen_id = self.tokenizer.get("<MGEN>")
+        cgen_id = self.tokenizer.get("<CGEN>")
+        is_start_token = ((x == mgen_id) | (x == cgen_id)).long()
+
+        # `dim=1` を指定しているため、累積和はシーケンス長（次元1）に沿って
+        # バッチ内の各サンプル（各行）ごとに独立して計算される。
+        # バッチをまたいで計算されることはない。
+        cumulative_mask = torch.cumsum(is_start_token, dim=1)
+
+        # この比較も要素ごとに行われる。
+        mask_x = (cumulative_mask > 0).long()
+        # マスクを入力`x`と同じデバイスに転送する。
+        return mask_x.to(x.device)
 
 
 class BERTMTrainSet(AbstractTrainSet):
@@ -540,12 +575,12 @@ def _train(args, t_args, save_directory, trainer, version, today_date,
 
 
 
-def train_mortm(model_config: str, train_config: str, root_directory, save_directory, version: str,
+def train_mortm(tokenizer, model_config: str, train_config: str, root_directory, save_directory, version: str,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, eval_list_json: str = None,
                 progress: LearningProgress = _DefaultLearningProgress(), ):
     args = MORTMArgs(json_directory=model_config)
     t_args = TrainArgs(json_directory=train_config)
-    trainer = MORTMTrainSet(args, progress, load_directory=load_model_directory)
+    trainer = MORTMTrainSet(args, tokenizer, progress, load_directory=load_model_directory)
 
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')

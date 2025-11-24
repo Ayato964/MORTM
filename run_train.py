@@ -11,13 +11,11 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
 
-tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC), load_data="out/vocab/vocab_list.json")
+tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC))
 
-model = train_mortm("configs/models/mortm/A.json", "configs/train/pre_training.json",
-                    "out/model/mortm/research/train_paths_Research_without_MoE.json",
-                    "out/model/mortm/research",
-                    "Research_with_MoE_256",
-                    eval_list_json="out/model/mortm/research/eval_paths_Research_without_MoE.json",
+model = train_mortm(tokenizer, "configs/models/mortm/A.json", "configs/train/pre_training.json",
+                    "out/model/mortm/45_research/train_paths_Research_Flash.json",
+                    "out/model/mortm/45_research",
+                    "4.5-PRO2",
+                    eval_list_json="out/model/mortm/45_research/eval_paths_Research_Flash.json",
                     message=message)
-
-

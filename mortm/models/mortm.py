@@ -139,7 +139,7 @@ class MORTM(nn.Module):
         
             if print_log: print(f"\r Step {i+1}: Generated tokens {next_tokens.tolist()}", end="")
 
-            if self.is_end_point(all_tokens, (tokenizer.get("<ESEQ>"), tokenizer.get("<TE>"))) or i > self.args.position_length:
+            if self.is_end_point(all_tokens, [tokenizer.get("<TE>")]) or i > self.args.position_length:
                 is_running = False
 
             i += 1
@@ -152,7 +152,7 @@ class MORTM(nn.Module):
             seq: Tensor
             np_seq = np.array([], dtype=int)
             pad = (seq == 0).nonzero(as_tuple=True)[0]
-            eseq = (seq == tokenizer.get("<ESEQ>")).nonzero(as_tuple=True)[0]
+            eseq = (seq == tokenizer.get("<TE>")).nonzero(as_tuple=True)[0]
             if len(eseq) == 0:
                 eseq = len(seq)-1
             elif len(eseq) != 1:

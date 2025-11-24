@@ -60,7 +60,7 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
         tokenizer (Tokenizer): Tokenizer instance for conversion.
         directory (List[str]): List of directories containing MIDI files.
         md_file (List[str]): List of MIDI file names.
-        program (List[int]): List of MIDI program numbers.
+        program (List[str]): List of MIDI program numbers.
         progress (Manager.dict): Shared dictionary to track progress.
         save_path (str): Directory to save the converted sequences.
 
@@ -287,43 +287,42 @@ def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progr
 
 if __name__ == "__main__":
     THREAD_VALUE = 10
-    PIANO = [i for i in range(6)]
-    SAX = [65, 66]
+    PROGRAM = ['PIANO', 'SAX']
 
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/LMD/lmd_full"
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
-    #"""
-    directory, md_file = find_midi_files(datasets)
-    #"""
     """
+    directory, md_file = find_midi_files(datasets)
+    """
+    #"""
     print("データ整理中・・・・")
     directory, md_file, system_file = find_midi_files_with_json(datasets)
     print("完了！！")
-    """
+    #"""
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
-    """
+    #"""
     system_file = np.array_split(system_file, THREAD_VALUE)
-    """
-    tokenizer = Tokenizer(get_token_converter_melody_only(TO_TOKEN))
+    #"""
+    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            #"""
+            """
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), SAX, progress, "out/np/research"))
-            #"""
+                                              md_file[t].tolist(), PROGRAM, progress, "out/np/research/midi"))
+            """
 
-            """
-            p = Process(target=convert_task_seq, args=(t, tokenizer, directory[t].tolist(),
-                                                         md_file[t].tolist(), system_file[t], SAX, progress, "out/np/Sax/task_train"))
-            """
+            #"""
+            p = Process(target=convert_chord, args=(t, tokenizer, directory[t].tolist(),
+                                                         md_file[t].tolist(), system_file[t], PROGRAM, progress, "out/np/research/chord"))
+            #"""
 
             processes.append(p)
             p.start()

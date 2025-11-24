@@ -26,7 +26,7 @@ def convert_str_int_program(program_list: List[str]) -> List[Tuple[int]]:
         if p == "SAX":
             pl.append((65, 66, 67, 68))
         elif p == "PIANO":
-            pl.append((1,2,3,4,5,6))
+            pl.append((0, 1,2,3,4,5,6))
 
     return pl
 
@@ -262,7 +262,7 @@ class MIDI2Seq(_AbstractMidiConverter):
     MIDIをトークンのシーケンスに変換するクラス
     '''
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list: List[str], midi_data=None, split_measure=12, is_include_special_token = True):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list: List[str], midi_data=None, split_measure=12, is_include_special_token=True):
         super().__init__(MIDI2Seq, tokenizer, directory, file_name, program_list, midi_data)
         self.aya_node = [0]
         self.split_measure = split_measure
@@ -281,16 +281,20 @@ class MIDI2Seq(_AbstractMidiConverter):
                     self.key_dict = self.key['segments']
                 print(self.key_dict)
 
-    def make_system_prompt(self, clip: np.ndarray, time):
-        prompt = [self.tokenizer.get("<EOS>"),
-             self.tokenizer.get("<SYSTEM>")]
+    def make_system_prompt(self, clip: np.ndarray, time, found_list):
+        if self.is_include_special_token:
+            prompt = [self.tokenizer.get("<EOS>"),
+                 self.tokenizer.get("<SYSTEM>")]
 
-        for p in self.program_list:
-            prompt.append(self.tokenizer.get(f"<INST_{p}>"))
-        prompt.append(self.tokenizer.get(f"k_{self.get_key(time)}"))
-        prompt.append(self.tokenizer.get("<MGEN>"))
-        clip = np.append(clip, prompt)
-        return clip
+            for p in found_list:
+                prompt.append(self.tokenizer.get(f"<INST_{p}>"))
+            prompt.append(self.tokenizer.get(f"k_{self.get_key(time)}"))
+            prompt.append(self.tokenizer.get("<TAG_END>"))
+            prompt.append(self.tokenizer.get("<MGEN>"))
+            cap = np.concatenate((np.array(prompt), clip))
+            return cap
+        else:
+            return clip
 
     def convert(self):
         """
@@ -313,26 +317,29 @@ class MIDI2Seq(_AbstractMidiConverter):
                 # アクティブな楽器が1つ以上ある間ループする
                 while active_instruments > 0:
                     clip = np.array([], dtype=int)
-                    clip = self.make_system_prompt(clip, container[0].measure_start_time)
 
                     # 今回のループで完了した楽器の数をカウント
                     finished_in_this_loop = 0
+                    found_inst = []
 
                     for i, (inst, name) in enumerate(self.inst_list_with_name):
                         # すでに完了した楽器はスキップ (is_continued を流用)
                         if is_continued[i]:
                             continue
 
-                        #print(len(self.inst_list), self.inst_list[i], note_counts[i], len(inst.notes))
                         inst_clip, note_count, is_finish = self.convert_inst(name, inst, container[i], note_counts[i])
                         note_counts[i] = note_count
-                        clip = np.append(clip, inst_clip)
+                        s_e = self.tokenizer.get_length_tuple("s")
+                        if np.any(np.isin(inst_clip, [s for s in range(s_e[0], s_e[1])])):
+                            found_inst.append(name)
+                            clip = np.append(clip, inst_clip)
 
                         if is_finish:
                             is_continued[i] = True # この楽器を完了フラグにする
                             finished_in_this_loop += 1
-
-                    clip = np.append(clip, self.tokenizer.get("<TE>"))
+                    if self.is_include_special_token:
+                        clip = np.append(clip, self.tokenizer.get("<TE>"))
+                    clip = self.make_system_prompt(clip, container[0].measure_start_time, found_inst)
                     self.aya_node = self.aya_node + [clip]
 
                     # アクティブな楽器の数を減らす
@@ -343,7 +350,7 @@ class MIDI2Seq(_AbstractMidiConverter):
         clip_count = 0
         back_note: Optional[Note] = None
         is_first = True
-        print(f"Program: {inst.program}  Notes: {inst.notes[note_count].start}")
+        #print(f"Program: {inst.program}  Notes: {inst.notes[note_count].start}")
 
         while clip_count < self.split_measure:
             if note_count >= len(inst.notes):
@@ -367,7 +374,8 @@ class MIDI2Seq(_AbstractMidiConverter):
                             clip_count += 1
 
                         if clip_count >= self.split_measure:
-                            clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
+                            if self.is_include_special_token:
+                                clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
                             return clip, note_count, False
 
                         token_id = self.tokenizer.get(token)
@@ -633,6 +641,15 @@ class MetaData2Chord(_AbstractConverter):
         else:
             return False, self.error_reason
 
+    def make_system_prompt(self, clip: np.ndarray, key: str):
+        prompt = [self.tokenizer.get("<EOS>"), self.tokenizer.get("<SYSTEM>")]
+
+        prompt.append(self.tokenizer.get(f"k_{key}"))
+        prompt.append(self.tokenizer.get("<TAG_END>"))
+        prompt.append(self.tokenizer.get("<CGEN>"))
+        cap = np.concatenate((np.array(prompt), clip))
+        return cap
+
     def convert(self, *args, **kwargs):
         token_converter: List[Token] = self.tokenizer.music_token_list
         shift_time_container = ShiftTimeContainer(0, self.tempo)
@@ -641,14 +658,15 @@ class MetaData2Chord(_AbstractConverter):
         aya_node_split = []
         clip = np.array([], dtype=int)
         if self.is_include_special_token:
-            clip = np.append(clip, self.tokenizer.get("<CGEN>"))
-            clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
+            clip = self.make_system_prompt(clip, self.key)
         clip_count = 0
 
         self.chords.sort(self.chords[0].time_stamp)
         chord_count = 0
+
         while chord_count < len(self.chords):
             c: Chord = self.chords[chord_count]
+            is_continue_note = False
             for conv in token_converter:
                 token = None
                 if isinstance(conv, ChordToken):
@@ -665,24 +683,26 @@ class MetaData2Chord(_AbstractConverter):
                                  container=shift_time_container, tempo=shift_time_container.tempo)
 
                 if token is not None:
+
                     if clip_count >= self.split_measure:
                         clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
+                        clip = np.append(clip, self.tokenizer.get("<TE>"))
                         aya_node_split.append(clip)
                         clip = np.array([], dtype=int)
                         if self.is_include_special_token:
-                            clip = np.append(clip, self.tokenizer.get("<CGEN>"))
-                            clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
+                            clip = self.make_system_prompt(clip, self.key)
                         back_chord = None
                         clip_count = 0
                     token_id = self.tokenizer.get(token)
                     clip = np.append(clip, token_id)
 
                     if conv.token_type == "<BLANK>":
+                        is_continue_note = True
                         break
 
-            back_chord = c
-            if not shift_time_container.shift_measure:
+            if not is_continue_note:
                 chord_count += 1
+                back_chord = c
         if len(clip) > 10:
             aya_node_split.append(clip)
         self.aya_node = self.aya_node + aya_node_split
