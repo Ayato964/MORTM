@@ -102,6 +102,7 @@ class MORTMTrainSet(AbstractTrainSet):
 
 
     def epoch_fc(self, model, pack, progress):
+        model: MORTM
         src = pack
         target: Tensor = src[:, 1:].to(progress.get_device())
         mask = self.loss_mask(target)
@@ -110,7 +111,8 @@ class MORTMTrainSet(AbstractTrainSet):
 
         src = src[:, :-1]
         padding_mask_in: Tensor = _get_padding_mask(src, progress)
-
+        if model.training:
+            progress.count(torch.sum(padding_mask_in == 1).item())
         input: Tensor = model(x=src, padding_mask=padding_mask_in, is_causal=True)
         input = input.view(-1, input.size(-1)).to(progress.get_device())
         return input.to(device=progress.get_device(), dtype=torch.float32), target, mask
@@ -402,7 +404,7 @@ def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
     print(f"\r learning Epoch {epoch + 1}/{sum_epoch} [{bar}] {per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
 
 
-def progress_bar_with_minibatch(epoch, sum_epoch, seq_count, all_pac, mini_seq_count, mini_seq_pac, loss, lr, verif_loss):
+def progress_bar_with_minibatch(epoch, sum_epoch, seq_count, all_pac, mini_seq_count, mini_seq_pac, loss, lr, verif_loss, tokens):
     big_per = seq_count / all_pac * 100
     block = int(big_per / 100 * 50)
     color_bar = "\033[32m"
@@ -412,7 +414,7 @@ def progress_bar_with_minibatch(epoch, sum_epoch, seq_count, all_pac, mini_seq_c
     mini_block = int(mini_per / 100 * 20)
     mini_bar = f"{color_bar}{'#' * mini_block}\033[31m{'-' * (20 - mini_block)} \033[0m"
 
-    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} Package [{big_bar}] {big_per:.2f}%  Mini Package [{mini_bar}]  {mini_per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}", end="")
+    print(f"\r learning Epoch {epoch + 1}/{sum_epoch} Package [{big_bar}] {big_per:.2f}%  Mini Package [{mini_bar}]  {mini_per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}  Learning tokens:{tokens}", end="")
 
 
 def get_data_loader(t_args: TrainArgs, mortm_dataset: tuple | Dataset, shuffle=True, collate_fn=None):
@@ -470,6 +472,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
     print(f"検証損失計算回数:{len(train_loader) // 20}")
 
     mail_bool = True
+    epoch1_end = False
     all_count = 1
     verification_loss = 0.0
     for epoch in range(train_args.num_epochs):
@@ -502,7 +505,7 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                     epoch_loss.add(loss.item())
 
 
-                    progress_bar_with_minibatch(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss)
+                    progress_bar_with_minibatch(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss, progress.token_num)
 
                 end_time = time.time()
                 if mail_bool and message is not None:
@@ -525,10 +528,14 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn)
                     writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss.get(),
                                                                    "Verification": verification_loss}, all_count)
+            if not epoch1_end:
+                epoch1_end = True
+                print("１エポック当たりのトークン数：", progress.token_num)
 
             message.send_message("機械学習の途中経過について",
                                  f"Epoch {epoch + 1}/{train_args.num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
-                                 f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
+                                 f"また、検証データの損失は{verification_loss:.4f}となっています。\n　"
+                                 f"また現在学習中のトークン数は{progress.token_num}です。\n 以上です。")
                 #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
             loss_val = verification_loss
             writer.add_scalar('EpochLoss', epoch_loss.get(), epoch)  # 損失値を記録
@@ -619,49 +626,6 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
            train_loader=train_loader, val_loader=val_loader,coll_fn=collate_fn,
            progress=progress)
 
-def train_bertm(model_config: str, train_config: str, human_dir, ai_dir, save_directory, version: str,
-                message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
-                progress: LearningProgress = _DefaultLearningProgress()):
-    def collate_fn(batch):
-
-        src_list = [item[0] for item in batch]  # 各タプルのsrcを抽出
-        tgt_list = [item[1] for item in batch]  # 各タプルのtgtを抽出
-
-        tgt_list = torch.tensor(tgt_list)
-        src = pad_sequence(src_list, batch_first=True, padding_value=0)
-        return src, tgt_list
-
-    args = MORTMArgs(json_directory=model_config)
-    t_args = TrainArgs(json_directory=train_config)
-    trainer = BERTMTrainSet(args, progress, load_model_directory=load_model_directory)
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-    today_date = datetime.date.today().strftime('%Y%m%d')
-
-    print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
-    if isinstance(human_dir, str):
-        if human_dir.endswith(".json"):
-            directory, filename = find_files_with_json(human_dir)
-        else:
-            directory, filename = find_files(human_dir, '.npz')
-    elif isinstance(human_dir, tuple):
-        directory, filename = find_files_with_json(human_dir[1])
-
-        directory2, filename2 = find_files(human_dir[0], '.npz')
-        for d, f in zip(directory2, filename2):
-            directory.append(d)
-            filename.append(f)
-    else:
-        directory, filename = human_dir
-    mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress), )
-
-    directory, filename = find_files(ai_dir, '.npz')
-    mortm_dataset = _set_train_data_preloading(directory, filename, mortm_dataset, )
-    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
-
-    _train(args, t_args, save_directory, trainer,message=message, version=version, today_date=today_date,
-           train_loader=train_loader, val_loader=val_loader, coll_fn=collate_fn_with_tgt,
-           progress=progress)
-
 
 def train_v_mortm(model_config: str, train_config: str, root_directory, save_directory, version: str,
                   message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
@@ -682,8 +646,10 @@ def train_v_mortm(model_config: str, train_config: str, root_directory, save_dir
            train_loader=train_loader, val_loader=val_loader,
            progress=progress)
 
-def train_custom(trainer, t_args, root_directory, save_directory, version: str, extention: str = '.npz', coll_fn=None,
-                 message: Messenger = _DefaultMessenger(), progress: LearningProgress = _DefaultLearningProgress()):
+
+def train_custom(trainer: AbstractTrainSet, t_args, root_directory, save_directory, version: str,
+                 message: Messenger = _DefaultMessenger(), eval_list_json: str = None,
+                 progress: LearningProgress = _DefaultLearningProgress(), coll_fn=None):
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
     print(f"ToDay is{datetime.date.today()}! start learning. {trainer.args.name}.Ver.{version}_{today_date}")
@@ -692,18 +658,28 @@ def train_custom(trainer, t_args, root_directory, save_directory, version: str, 
         if root_directory.endswith(".json"):
             directory, filename = find_files_with_json(root_directory)
         else:
-            directory, filename = find_files(root_directory, extention)
+            directory, filename = find_files(root_directory, '.npz')
     elif isinstance(root_directory, tuple):
-        directory, filename = find_files_with_json(root_directory[1])
-
-        directory2, filename2 = find_files(root_directory[0], extention)
-        for d, f in zip(directory2, filename2):
-            directory.append(d)
-            filename.append(f)
+        directory = []
+        filename = []
+        for r in root_directory:
+            if r.endswith(".json"):
+                d, f = find_files_with_json(r)
+            else:
+                d, f = find_files(r, '.npz')
+            directory.extend(d)
+            filename.extend(f)
     else:
         directory, filename = root_directory
+    print("データセットの規模：", len(filename))
     mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
-    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
+    if eval_list_json is None:
+        train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
+    else:
+        print("検証データセットが指定されました。")
+        directory, filename = find_files_with_json(eval_list_json)
+        val_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
+        train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=True)
 
     _train(trainer.args, t_args, save_directory, trainer, message=message, version=version, today_date=today_date,
            train_loader=train_loader, val_loader=val_loader, coll_fn=coll_fn,

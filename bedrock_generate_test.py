@@ -25,7 +25,7 @@ if __name__ == "__main__":
     model.to(p.get_device())
 
     if not sft_model:
-        pre_train_generate(model, tokenizer, "out", midi_path, end_tokens=(tokenizer.get("<TE>")), split_measure=3, program=program, key="Fm",  temperature=1.2)
+        pre_train_generate(model, tokenizer, "out", None, end_tokens=(tokenizer.get("<TE>")), split_measure=3, program=program, key="Cm",  temperature=1.0)
     else:
         """
         chord = np.array([tokenizer.get("<SME>"),

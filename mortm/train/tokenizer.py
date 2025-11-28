@@ -19,24 +19,6 @@ TO_TOKEN = 0
 TO_MUSIC = 1
 
 
-def bertm_converter(convert: int) -> List[Token]:
-    register: List[Token] = list()
-
-    register.append(CLS(convert))
-    register.append(MGen(convert))
-
-    register.append(MeasureToken(convert))
-    register.append(Blank(convert))
-    register.append(StartRE(START_TYPE, convert))
-
-    register.append(Pitch(PITCH_TYPE, convert))
-    register.append(Duration(DURATION_TYPE, convert))
-
-    register.append(SequenceEnd(convert))
-    register.append(TrackEnd(convert))
-
-    return register
-
 
 def get_token_converter_pro(convert: int) -> List[Token]:
     register: List[Token] = list()
@@ -126,6 +108,15 @@ def get_token_converter_melody_only_research45(convert: int) -> List[Token]:
     register.append(TrackEnd(convert))
 
     return register
+
+
+def bertm_converter(convert: int) -> List[Token]:
+    register: List[Token] = get_token_converter_pro(convert)
+    register.append(Eval(convert))
+    register.append(Human(convert))
+    register.append(AI(convert))
+    return register
+
 
 class Tokenizer:
     def __init__(self,music_token: List[Token], load_data: str = None):

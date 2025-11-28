@@ -425,6 +425,29 @@ class Instrument(SpecialToken):
         super().__init__("<INST>", convert_type)
 
 
+class Eval(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<EVAL>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+
+class Human(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<HUMAN>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+
+class AI(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<AI>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
 class StartRE(MusicToken):
 
     def _set_tokens(self, tokens: dict):

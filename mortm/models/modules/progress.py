@@ -12,6 +12,12 @@ class LearningProgress:
     def get_device(self):
         pass
 
+    def count(self, token_num):
+        self.token_num += token_num
+
+    def __init__(self):
+        self.token_num = 0
+
 
 class _DefaultLearningProgress(LearningProgress):
 
@@ -43,3 +49,4 @@ class _DefaultLearningProgress(LearningProgress):
                 total_norm += param_norm.item() ** 2  # 勾配ノルムの2乗を足す
         total_norm = total_norm ** 0.5  # 最終的に平方根をとってL2ノルムを計算
         return total_norm
+

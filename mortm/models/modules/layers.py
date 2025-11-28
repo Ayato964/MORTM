@@ -255,11 +255,14 @@ class MORTMDecoderLayer(nn.Module):
             self.cross_attention: FlashCrossAttentionM =FlashCrossAttentionM(args, progress=progress)
 
         if args.use_moe_decoder:
+            print("FFN TYPE: Gate Network")
             self.ffn = MoE(args)
         else:
             if args.use_silu:
+                print("FFN TYPE: MLP with SiLU")
                 self.ffn = Expert(args)
             else:
+                print("FFN TYPE: Standard FFN")
                 self.ffn = FFN(args.d_model, args.dim_feedforward, args.dropout)
 
         if args.normalize_type == "tanh":

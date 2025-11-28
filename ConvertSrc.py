@@ -1,9 +1,12 @@
 import json
+from pathlib import Path
 from typing import List
 
 from multiprocessing import Process, Manager
-from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, get_token_converter_melody_only
+from mortm.train.tokenizer import *
 from mortm.utils.convert import *
+from test import datasets
+
 
 def find_midi_files(root_folder):
     """
@@ -49,7 +52,39 @@ def find_midi_files_with_json(root_folder):
 
     return direct, midi_files, data
 
+def extract_midi_npz_paths(json_file_path: str) -> Tuple[List[str], List[str]]:
+    """
+    Extracts paths for .npz files located within a 'midi' directory from a JSON file.
 
+    Args:
+        json_file_path (str): Path to the target JSON file.
+
+    Returns:
+        List[str]: A flattened list of filtered file paths.
+    """
+    base_paths = []
+    file_paths = []
+
+    try:
+        with open(json_file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        for sublist in data:
+            for path_str in sublist:
+                path = Path(path_str)
+
+                if path.suffix == '.npz' and 'midi' in path.parts:
+                    base_paths.append(os.path.dirname(path_str))
+                    file_paths.append(os.path.basename(path_str))
+
+    except FileNotFoundError:
+        print(f"Error: File not found at {json_file_path}")
+        return [], []
+    except json.JSONDecodeError:
+        print(f"Error: Failed to decode JSON.")
+        return [], []
+
+    return base_paths, file_paths
 
 def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
     """
@@ -243,6 +278,19 @@ def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress
 
                 print(f"Process#{pid}: Running... {local_count}  Reason: {reason}")
 
+def convert_class_seq(pid, tokenizer, directory, md_file, cls, save_path):
+    local_count = 0
+    for i in range(len(md_file)):
+        con = Seq2ClassficationDiscrimination(tokenizer, directory[i], md_file[i], cls)
+        con.convert()
+        is_saved, reason = con.save(save_path)
+
+        if is_saved:
+            local_count += 1
+        #if local_count >= 30:
+        #    break
+        print(f"Process#{pid}: Running... {local_count}  {reason}")
+
 def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progress, save_directory):
     """
     Converts MIDI files to task sequences using the specified tokenizer.
@@ -288,27 +336,31 @@ def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progr
 if __name__ == "__main__":
     THREAD_VALUE = 10
     PROGRAM = ['PIANO', 'SAX']
+    tokenizer = Tokenizer(bertm_converter(TO_TOKEN))
 
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/LMD/lmd_full"
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
-    """
-    directory, md_file = find_midi_files(datasets)
-    """
+    datasets = "./out/model/mortm/45_research/datasets/eval.json"
+
     #"""
+    #directory, md_file = find_midi_files(datasets)
+    directory, md_file = extract_midi_npz_paths(datasets)
+    #"""
+    """
     print("データ整理中・・・・")
     directory, md_file, system_file = find_midi_files_with_json(datasets)
     print("完了！！")
-    #"""
+    """
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
-    #"""
+    """
     system_file = np.array_split(system_file, THREAD_VALUE)
-    #"""
-    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
+    """
+
 
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書
@@ -320,9 +372,13 @@ if __name__ == "__main__":
             """
 
             #"""
+            p = Process(target=convert_class_seq, args=(t, tokenizer, directory[t], md_file[t], "HUMAN", "out/np/bertm/"))
+            #"""
+
+            """
             p = Process(target=convert_chord, args=(t, tokenizer, directory[t].tolist(),
                                                          md_file[t].tolist(), system_file[t], PROGRAM, progress, "out/np/research/chord"))
-            #"""
+            """
 
             processes.append(p)
             p.start()

@@ -12,11 +12,12 @@ from typing import TypeVar, Generic
 from midi2audio import FluidSynth
 import soundfile as sf
 
+from mortm.train.custom_token import Human
 from mortm.train.custom_token import Token, ShiftTimeContainer, ChordToken, MeasureToken, Blank
 from mortm.train.tokenizer import Tokenizer, TO_MUSIC, TO_TOKEN
 from mortm.train.utils.chord_midi import ChordMidi, Chord
 from mortm.utils.key import get_key_dict
-
+from mortm.utils.tag import extract_tagged_sequences_batch
 T = TypeVar("T")
 
 
@@ -515,6 +516,43 @@ class MIDI2Seq(_AbstractMidiConverter):
         else:
             return False, self.error_reason
 
+
+class Seq2ClassficationDiscrimination(_AbstractConverter):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, correct_token: str):
+        super().__init__(Seq2ClassficationDiscrimination, directory, file_name)
+        print(directory, file_name)
+        self.base_aya_node = np.load(os.path.join(directory, file_name))
+        self.aya_node = [0]
+        self.tokenizer = tokenizer
+        self.correct_token = correct_token
+
+    def convert(self, *args, **kwargs):
+        for i in range(1, len(self.base_aya_node) - 1):
+            seq = self.base_aya_node[f"array{i}"]
+
+            seq: np.ndarray
+            system_tag = extract_tagged_sequences_batch(seq, self.tokenizer.get("<SYSTEM>"), self.tokenizer.get("<TAG_END>"))
+            gen = extract_tagged_sequences_batch(seq, self.tokenizer.get("<MGEN>"), self.tokenizer.get("<TE>"), include_tags=False)
+
+            new_seq = np.array([self.tokenizer.get("<EOS>"), self.tokenizer.get("<CONST_M>")], dtype=int)
+            new_seq = np.concatenate((new_seq, gen[0][0].tolist()))
+            new_seq = np.append(new_seq, self.tokenizer.get("<TAG_END>"))
+            new_seq = np.append(new_seq, system_tag[0][0].tolist())
+            new_seq = np.append(new_seq, self.tokenizer.get("<EVAL>"))
+            new_seq = np.append(new_seq, self.tokenizer.get(f"<{self.correct_token}>"))
+            self.aya_node = self.aya_node + [new_seq]
+
+    def save(self, save_directory: str) -> Tuple[bool, str]:
+        if not self.is_error:
+
+            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
+            if len(array_dict) > 1:
+                np.savez(save_directory + "/" + self.file_name, **array_dict)
+                return True, "処理が正常に終了しました。"
+            else:
+                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+        else:
+            return False, self.error_reason
 
 
 class Midi2SeqWithChord(_AbstractMidiConverter):
