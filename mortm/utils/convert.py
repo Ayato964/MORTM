@@ -1,6 +1,6 @@
 import os
 import random
-from typing import List, Any, Optional, Tuple
+from typing import List, Any, Optional, Tuple, Dict
 
 import numpy as np
 import torch
@@ -19,6 +19,54 @@ from mortm.train.utils.chord_midi import ChordMidi, Chord
 from mortm.utils.key import get_key_dict
 from mortm.utils.tag import extract_tagged_sequences_batch
 T = TypeVar("T")
+
+
+def split_sequence_measure(sequence: np.ndarray, measure_length: int, measure_token_id: int) -> List[np.ndarray]:
+    """
+    文脈Mの法則に基づき、指定された小節数ごとにシーケンスを分割する関数。
+
+    Args:
+        sequence (np.ndarray): <SME>を含むトークンIDの配列 (文脈M)。
+        measure_length (int): 分割する単位となる小節数 (例: 4小節ごとに分割)。
+        measure_token_id (int): <SME> (小節境界) のトークンID。
+
+    Returns:
+        List[np.ndarray]: 指定小節数ごとに分割されたシーケンスのリスト。
+    """
+
+    # 1. シーケンス内の <SME> トークンのインデックスを全て取得する
+    # これが各小節の開始位置に相当します
+    sme_indices = np.where(sequence == measure_token_id)[0]
+
+    # <SME> が存在しない場合は分割できないため、元のシーケンスをリストに入れて返す
+    if len(sme_indices) == 0:
+        return [sequence]
+
+    chunks = []
+
+    # 2. measure_length ごとにインデックスをステップさせて分割を行う
+    # range(開始位置, 終了位置, ステップ数)
+    for i in range(0, len(sme_indices), measure_length):
+
+        # 現在のチャンクの開始位置 (<SME>のインデックス)
+        start_index = sme_indices[i]
+
+        # 次のチャンクの開始位置を計算 (現在のインデックス + 指定小節数)
+        next_chunk_sme_index_pos = i + measure_length
+
+        if next_chunk_sme_index_pos < len(sme_indices):
+            # 次の区切りとなる <SME> が存在する場合
+            # 現在の <SME> から、次の区切りの <SME> の直前までを取得する
+            end_index = sme_indices[next_chunk_sme_index_pos]
+            chunk = sequence[start_index : end_index]
+        else:
+            # 次の区切りが存在しない場合 (最後のチャンク)
+            # 現在の <SME> からシーケンスの最後までを取得する
+            chunk = sequence[start_index : ]
+
+        chunks.append(chunk)
+
+    return chunks
 
 
 def convert_str_int_program(program_list: List[str]) -> List[Tuple[int]]:
@@ -105,7 +153,7 @@ class _AbstractConverter(ABC):
 
 class _AbstractMidiConverter(_AbstractConverter):
     def __init__(self, instance: Generic[T], tokenizer: Tokenizer, directory: str, file_name: str, program_list,
-                 midi_data=None):
+                 key=None, inst_list_with_name=None, midi_data=None):
         '''
         MIDIをトークンのシーケンスに変換するクラスの抽象クラス
         :param instance: 子クラスのインスタンス
@@ -116,7 +164,6 @@ class _AbstractMidiConverter(_AbstractConverter):
         :param midi_data: PrettyMIDIのインスタンス(Optinal)
         '''
         super().__init__(instance, directory, file_name)
-        self.program_list = program_list
         self.token_converter: List[Token] = tokenizer.music_token_list
         self.tokenizer = tokenizer
         if midi_data is not None:
@@ -137,6 +184,29 @@ class _AbstractMidiConverter(_AbstractConverter):
 
         if not self.is_error:
             self.tempo_change_time, self.tempo = self.midi_data.get_tempo_changes()
+            if inst_list_with_name is not None:
+                self.inst_list_with_name = inst_list_with_name
+                self.inst_list = [inst for inst, name in self.inst_list_with_name]
+            else:
+                self.inst_list_with_name, found_program_names = self.is_in_correct_inst(program_list)
+                self.inst_list = [inst for inst, name in self.inst_list_with_name]
+                self.program_list = found_program_names
+
+            if len(self.inst_list) == 0 and not self.is_error:
+                self.is_error = True
+                self.error_reason = "欲しい楽器がMIDIにありません。"
+            elif not self.is_error and key is None:
+                if len(self.inst_list) > 0:
+                    self.key = get_key_dict(os.path.join(directory, file_name), window_measures=12)
+                    self.key_dict = self.key['segments']
+                print(f"{self.key_dict} <- キー情報")
+            elif key is not None:
+                if "major" in key:
+                    self.key = f"{key.split(' major')[0]}M"
+                elif "minor" in key:
+                    self.key = f"{key.split(' minor')[0]}m"
+                else:
+                    self.key = key
 
     def is_in_correct_inst(self, program_list: List[str]) -> Tuple[List[Tuple[Instrument, str]], List[str]]:
         int_program_groups: List[Tuple[int]] = convert_str_int_program(program_list)
@@ -263,39 +333,13 @@ class MIDI2Seq(_AbstractMidiConverter):
     MIDIをトークンのシーケンスに変換するクラス
     '''
 
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list: List[str], midi_data=None, split_measure=12, is_include_special_token=True):
-        super().__init__(MIDI2Seq, tokenizer, directory, file_name, program_list, midi_data)
-        self.aya_node = [0]
-        self.split_measure = split_measure
-        self.is_include_special_token = is_include_special_token
-        if not self.is_error:
-            self.inst_list_with_name, found_program_names = self.is_in_correct_inst(program_list)
-            self.inst_list = [inst for inst, name in self.inst_list_with_name]
-            self.program_list = found_program_names
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str,  program_list: List[str],
+                 key=None, inst_list_with_name=None,
+                 midi_data=None):
+        super().__init__(MIDI2Seq, tokenizer, directory, file_name, program_list, key=key, inst_list_with_name=inst_list_with_name, midi_data=midi_data)
+        self.aya_node = {}
 
-            if len(self.inst_list) == 0 and not self.is_error:
-                self.is_error = True
-                self.error_reason = "欲しい楽器がMIDIにありません。"
-            elif is_include_special_token and not self.is_error:
-                if len(self.inst_list) > 0:
-                    self.key = get_key_dict(os.path.join(directory, file_name), window_measures=split_measure * 2)
-                    self.key_dict = self.key['segments']
-                print(self.key_dict)
 
-    def make_system_prompt(self, clip: np.ndarray, time, found_list):
-        if self.is_include_special_token:
-            prompt = [self.tokenizer.get("<EOS>"),
-                 self.tokenizer.get("<SYSTEM>")]
-
-            for p in found_list:
-                prompt.append(self.tokenizer.get(f"<INST_{p}>"))
-            prompt.append(self.tokenizer.get(f"k_{self.get_key(time)}"))
-            prompt.append(self.tokenizer.get("<TAG_END>"))
-            prompt.append(self.tokenizer.get("<MGEN>"))
-            cap = np.concatenate((np.array(prompt), clip))
-            return cap
-        else:
-            return clip
 
     def convert(self):
         """
@@ -306,56 +350,29 @@ class MIDI2Seq(_AbstractMidiConverter):
         :return:なし
         """
         if not self.is_error:
-            print([i.program for i in self.midi_data.instruments])
+            print(f"Programs: {[i.program for i in self.midi_data.instruments]}")
             container = [ShiftTimeContainer(0, self.tempo[0]) for _ in self.inst_list]
             note_counts = [0 for _ in self.inst_list]
-            is_continued = [False for _ in self.inst_list]
 
-            # is_running ではなく、処理が完了していない楽器の数をカウントする
-            active_instruments = len(self.inst_list)
+            for i, (inst, program) in enumerate(self.inst_list_with_name):
 
-            if not self.is_error and active_instruments > 0:
-                # アクティブな楽器が1つ以上ある間ループする
-                while active_instruments > 0:
-                    clip = np.array([], dtype=int)
+                inst_clip, note_count, is_finish = self.convert_inst(program, inst, container[i], note_counts[i])
+                note_counts[i] = note_count
+                s_e = self.tokenizer.get_length_tuple("s")
 
-                    # 今回のループで完了した楽器の数をカウント
-                    finished_in_this_loop = 0
-                    found_inst = []
+                if np.any(np.isin(inst_clip, [s for s in range(s_e[0], s_e[1])])):
+                    self.aya_node[program] = inst_clip
 
-                    for i, (inst, name) in enumerate(self.inst_list_with_name):
-                        # すでに完了した楽器はスキップ (is_continued を流用)
-                        if is_continued[i]:
-                            continue
-
-                        inst_clip, note_count, is_finish = self.convert_inst(name, inst, container[i], note_counts[i])
-                        note_counts[i] = note_count
-                        s_e = self.tokenizer.get_length_tuple("s")
-                        if np.any(np.isin(inst_clip, [s for s in range(s_e[0], s_e[1])])):
-                            found_inst.append(name)
-                            clip = np.append(clip, inst_clip)
-
-                        if is_finish:
-                            is_continued[i] = True # この楽器を完了フラグにする
-                            finished_in_this_loop += 1
-                    if self.is_include_special_token:
-                        clip = np.append(clip, self.tokenizer.get("<TE>"))
-                    clip = self.make_system_prompt(clip, container[0].measure_start_time, found_inst)
-                    self.aya_node = self.aya_node + [clip]
-
-                    # アクティブな楽器の数を減らす
-                    active_instruments -= finished_in_this_loop
 
     def convert_inst(self, program, inst: Instrument, container, note_count) -> np.ndarray | int:
-        clip = np.array([self.tokenizer.get(f"<INST_{program}>")], dtype=int)
+        clip = []
         clip_count = 0
         back_note: Optional[Note] = None
         is_first = True
-        #print(f"Program: {inst.program}  Notes: {inst.notes[note_count].start}")
 
-        while clip_count < self.split_measure:
+        while clip_count < 999:
             if note_count >= len(inst.notes):
-                return clip, note_count, True
+                return np.array(clip), note_count, True
             note: Note = inst.notes[note_count]
             tempo = self.get_tempo(note.start)
             container.tempo = tempo
@@ -374,13 +391,11 @@ class MIDI2Seq(_AbstractMidiConverter):
                         if conv.token_type == "<SME>":
                             clip_count += 1
 
-                        if clip_count >= self.split_measure:
-                            if self.is_include_special_token:
-                                clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
-                            return clip, note_count, False
+                        if clip_count >= 999:
+                            return np.array(clip), note_count, False
 
                         token_id = self.tokenizer.get(token)
-                        clip = np.append(clip, token_id)
+                        clip.append(token_id)
                         progressed = True
 
                         if conv.token_type == "<BLANK>":
@@ -395,7 +410,7 @@ class MIDI2Seq(_AbstractMidiConverter):
             if not is_continue_note:
                 note_count += 1
                 back_note = note
-        return clip, note_count, False
+        return np.array(clip), note_count, False
 
 
     def measure_time_sort(self, note_time, container: ShiftTimeContainer):
@@ -478,6 +493,51 @@ class MIDI2Seq(_AbstractMidiConverter):
 
         container.measure_start_time = last_measure_start
 
+    def marge_clip(self, clip, aya_node_inst):
+        aya_node_inst.append(clip)
+        return aya_node_inst
+
+    def save(self, save_directory: str) -> Tuple[bool, str]:
+        if not self.is_error:
+            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
+            if len(array_dict) > 1:
+                np.savez(save_directory + "/" + self.file_name, **array_dict)
+                return True, "処理が正常に終了しました。"
+            else:
+                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+        else:
+            return False, self.error_reason
+
+
+class MIDIConverter(_AbstractMidiConverter):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list: List[str],
+                 use_midi2seq=True,
+                 all_chords: Optional[List[str]]=None, all_chord_timestamps: Optional[List[float]]=None,
+                 key=None):
+        super().__init__(MIDIConverter, tokenizer, directory, file_name, program_list, key=key)
+        if not self.is_error:
+            self.midi2seq = MIDI2Seq(tokenizer, directory, file_name, program_list, key=self.key, inst_list_with_name=self.inst_list_with_name, midi_data=self.midi_data) if use_midi2seq else None
+
+    def make_system_prompt(self, time, found_list):
+        prompt = [self.tokenizer.get("<EOS>"),
+                  self.tokenizer.get("<SYSTEM>")]
+
+        for p in found_list:
+            prompt.append(self.tokenizer.get(f"<INST_{p}>"))
+        prompt.append(self.tokenizer.get(f"k_{self.get_key(time) if isinstance(self.key, dict) else self.key}"))
+        prompt.append(self.tokenizer.get("<TAG_END>"))
+        return np.array(prompt)
+
+    def convert(self, *args, **kwargs):
+        if self.is_error:
+            return
+
+        if self.midi2seq is not None:
+            self.midi2seq.convert()
+
+    def save(self, save_directory: str) -> Tuple[bool, str]:
+        raise NotImplementedError("これ単体では保存できません。　DataMakerに受け渡してください")
+
     def get_key(self, time):
         for k in self.key_dict:
             if k['start_time'] <= time < k['end_time']:
@@ -501,169 +561,122 @@ class MIDI2Seq(_AbstractMidiConverter):
 
         return "Unknown"
 
-    def marge_clip(self, clip, aya_node_inst):
-        aya_node_inst.append(clip)
-        return aya_node_inst
 
-    def save(self, save_directory: str) -> [bool, str]:
-        if not self.is_error:
-            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
-            if len(array_dict) > 1:
-                np.savez(save_directory + "/" + self.file_name, **array_dict)
-                return True, "処理が正常に終了しました。"
-            else:
-                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
-        else:
-            return False, self.error_reason
-
-
-class Seq2ClassficationDiscrimination(_AbstractConverter):
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, correct_token: str):
-        super().__init__(Seq2ClassficationDiscrimination, directory, file_name)
-        print(directory, file_name)
-        self.base_aya_node = np.load(os.path.join(directory, file_name))
+class PreTrainDataMaker(_AbstractConverter):
+    def __init__(self, converter: MIDIConverter, split_measure=12):
+        super().__init__(PreTrainDataMaker, None, None)
+        self.converter = converter
+        self.tokenizer = converter.tokenizer
         self.aya_node = [0]
-        self.tokenizer = tokenizer
-        self.correct_token = correct_token
-
-    def convert(self, *args, **kwargs):
-        for i in range(1, len(self.base_aya_node) - 1):
-            seq = self.base_aya_node[f"array{i}"]
-
-            seq: np.ndarray
-            system_tag = extract_tagged_sequences_batch(seq, self.tokenizer.get("<SYSTEM>"), self.tokenizer.get("<TAG_END>"))
-            gen = extract_tagged_sequences_batch(seq, self.tokenizer.get("<MGEN>"), self.tokenizer.get("<TE>"), include_tags=False)
-
-            new_seq = np.array([self.tokenizer.get("<EOS>"), self.tokenizer.get("<CONST_M>")], dtype=int)
-            new_seq = np.concatenate((new_seq, gen[0][0].tolist()))
-            new_seq = np.append(new_seq, self.tokenizer.get("<TAG_END>"))
-            new_seq = np.append(new_seq, system_tag[0][0].tolist())
-            new_seq = np.append(new_seq, self.tokenizer.get("<EVAL>"))
-            new_seq = np.append(new_seq, self.tokenizer.get(f"<{self.correct_token}>"))
-            self.aya_node = self.aya_node + [new_seq]
+        self.seq_dict = converter.midi2seq.aya_node
+        self.split_measure = split_measure
 
     def save(self, save_directory: str) -> Tuple[bool, str]:
         if not self.is_error:
-
             array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
             if len(array_dict) > 1:
-                np.savez(save_directory + "/" + self.file_name, **array_dict)
+                np.savez(save_directory + "/" + self.converter.file_name, **array_dict)
                 return True, "処理が正常に終了しました。"
             else:
                 return False, "オブジェクトが何らかの理由で見つかりませんでした。"
         else:
             return False, self.error_reason
 
-
-class Midi2SeqWithChord(_AbstractMidiConverter):
-
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name, key: str, all_chords: List[str], all_chord_timestamps: List[float],
-                 program_list, split_measure=12, is_include_special_token=True):
-        super().__init__(Midi2SeqWithChord, tokenizer, directory, file_name, program_list)
-        self.aya_node = [0]
-        if "major" in key:
-            self.key = f"{key.split(' major')[0]}M"
-        elif "minor" in key:
-            self.key = f"{key.split(' minor')[0]}m"
-        else:
-            self.key = None
-        self.split_measure = split_measure
-        self.chords = ChordMidi(all_chords, all_chord_timestamps)
-        self.is_include_special_token = is_include_special_token
-
-
     def convert(self, *args, **kwargs):
-        if not self.is_error:
-            program_count = 0
+        for program in self.converter.program_list:
+            seq = self.seq_dict[program]
+            measure_token_id = self.tokenizer.get("<SME>")
+            split_seqs = split_sequence_measure(seq, self.split_measure, measure_token_id)
+            self.seq_dict[program] = split_seqs
+        inst_finish_dict = {program: False for program in self.converter.program_list}
+        count = 0
+        while not all(inst_finish_dict.values()):
+            clip = np.array([], dtype=int)
+            active_program_list = []
+            for program in self.converter.program_list:
+                if inst_finish_dict[program]:
+                    continue
+                inst = self.seq_dict[program][count]
+                s_e = self.tokenizer.get_length_tuple("s")
 
-            for inst in self.midi_data.instruments:
-                inst: Instrument = inst
-                if not inst.is_drum and inst.program in self.program_list:
-                    aya_node_inst = self.ct_aya_node(inst)
-                    self.aya_node = self.aya_node + aya_node_inst
-                    program_count += 1
+                if np.any(np.isin(inst, [s for s in range(s_e[0], s_e[1])])):
+                    inst: np.ndarray
+                    inst = np.concatenate([np.array([self.tokenizer.get(f"<INST_{program}>")]), inst, np.array([self.tokenizer.get("<ESEQ>")])])
+                    clip = np.concatenate([clip, inst])
+                    active_program_list.append(program)
+                if count + 1 >= len(self.seq_dict[program]):
+                    inst_finish_dict[program] = True
+            if len(active_program_list) == 0:
+                count += 1
+                continue
 
-            if program_count == 0:
-                self.is_error = True
-                self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
+            prompt = self.converter.make_system_prompt(0, active_program_list)
+            clip = np.concatenate([prompt, np.array([self.tokenizer.get("<MGEN>")]), clip, np.array([self.tokenizer.get("<TE>")])])
+            self.aya_node = self.aya_node + [clip]
+            count += 1
 
+class OmegaMIDI2SeqWithChord(MIDI2Seq):
+    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list: List[str],
+                 all_chords: List[str], all_chord_timestamps: List[float], midi_data=None,
+                 key=None, split_measure=12, is_include_special_token=True):
+        super().__init__(tokenizer, directory, file_name, program_list, key, midi_data, split_measure, is_include_special_token)
+        self.chords = ChordMidi(all_chords, all_chord_timestamps)
 
-    def ct_aya_node(self, inst: Instrument) -> list:
-
-        clip = np.array([], dtype=int)
-        if self.is_include_special_token:
-            clip = np.append(clip, self.tokenizer.get("<MGEN>"))
-            clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
-        aya_node_inst = []
-        back_note = None
-
+    def convert_inst(self, program, inst: Instrument, container, note_count) -> np.ndarray | int:
+        clip = np.array([self.tokenizer.get(f"<INST_{program}>")], dtype=int)
         clip_count = 0
+        back_note: Optional[Note] = None
+        is_first = True
 
-        sorted_notes = sorted(inst.notes, key=lambda notes: notes.start)
-        shift_time_container = ShiftTimeContainer(0, 0)
-        note_count = 0
-        while note_count < len(sorted_notes):
-            note: Note = sorted_notes[note_count]
-
+        while clip_count < 999:
+            if note_count >= len(inst.notes):
+                return clip, note_count, True
+            note: Note = inst.notes[note_count]
             tempo = self.get_tempo(note.start)
-            shift_time_container.tempo = tempo
+            container.tempo = tempo
+            is_continue_note = False
+            #if is_first:
+            #    self.measure_time_sort(note.start, container)
+            #    is_first = False
 
             for conv in self.token_converter:
                 conv: Token = conv
 
-                if isinstance(conv, ChordToken):
-                    conv: ChordToken
-                    token = conv(note=note, chords=self.chords, container=shift_time_container)
+                if not isinstance(conv, ChordToken):
+                    token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo, container=container)
+
+                    if token is not None:
+                        if conv.token_type == "<SME>":
+                            clip_count += 1
+
+                        if clip_count >= 999:
+                            if self.is_include_special_token:
+                                clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
+                            return clip, note_count, False
+
+                        token_id = self.tokenizer.get(token)
+                        clip = np.append(clip, token_id)
+                        progressed = True
+
+                        if conv.token_type == "<BLANK>":
+                            # 小節またぎ待ち（次ループで同一ノート再試行）
+                            is_continue_note = True
+                            break
+
+                    if container.is_error:
+                        self.is_error = True
+                        self.error_reason = "MIDIの変換中にエラーが発生しました。"
+                        break
                 else:
-                    token = conv(inst=inst, back_notes=back_note, note=note, tempo=tempo, container=shift_time_container)
-
-                if token is not None:
-                    if conv.token_type == "<SME>":
-                        clip_count += 1
-                    if clip_count >= self.split_measure:
-                        clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
-                        aya_node_inst = self.marge_clip(clip, aya_node_inst)
-                        clip = np.array([], dtype=int)
-                        if self.is_include_special_token:
-                            clip = np.append(clip, self.tokenizer.get("<MGEN>"))
-                            clip = np.append(clip, self.tokenizer.get(f"k_{self.key}"))
-                        back_note = None
-                        clip_count = 0
-
+                    token = conv(note=note,
+                                 chords=self.chords, container=container)
                     token_id = self.tokenizer.get(token)
                     clip = np.append(clip, token_id)
-                    if conv.token_type == "<BLANK>":
-                        break
-                if shift_time_container.is_error:
-                    self.is_error = True
-                    self.error_reason = "MIDIの変換中にエラーが発生しました。"
-                    break
-            back_note = note
-            if not shift_time_container.shift_measure:
+
+            if not is_continue_note:
                 note_count += 1
-
-        if len(clip) > 4:
-            aya_node_inst = self.marge_clip(clip, aya_node_inst)
-
-        self.chords.reset()
-        return aya_node_inst
-
-    def marge_clip(self, clip, aya_node_inst):
-        aya_node_inst.append(clip)
-
-        return aya_node_inst
-
-    def save(self, save_directory: str) -> [bool, str]:
-        if not self.is_error:
-
-            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
-            if len(array_dict) > 1:
-                np.savez(save_directory + "/" + self.file_name, **array_dict)
-                return True, "処理が正常に終了しました。"
-            else:
-                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
-        else:
-            return False, self.error_reason
+                back_note = note
+        return clip, note_count, False
 
 
 class MetaData2Chord(_AbstractConverter):
@@ -768,230 +781,64 @@ class MetaData2Chord(_AbstractConverter):
         print(self.key)
 
 
-class MIDI2TaskSeq(_AbstractMidiConverter):
-    def __init__(self, tokenizer: Tokenizer, system: dict, directory: str, file_name: str, program_list, split_measure=8, out_measure=4):
-        super().__init__(MIDI2TaskSeq, tokenizer, directory, file_name, program_list)
-        self.aya_node = [0]
-        self.system = system
-        self.out_measure = out_measure
-        self.prompt_max_measure = split_measure
-
-    def save(self, save_directory: str) -> [bool, str]:
-        if not self.is_error:
-
-            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
-            if len(array_dict) > 1:
-                np.savez(save_directory + "/" + self.file_name, **array_dict)
-                return True, "処理が正常に終了しました。"
-            else:
-                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
-        else:
-            return False, self.error_reason
-
-    def convert(self, *args, **kwargs):
-        if not self.is_error:
-            program_count = 0
-
-            for inst in self.midi_data.instruments:
-                inst: Instrument = inst
-                if not inst.is_drum and inst.program in self.program_list:
-                    aya_node_inst = self.ct_inst2seq(inst)
-                    if aya_node_inst is None:
-                        break
-                    self.aya_node = self.aya_node + aya_node_inst
-                    program_count += 1
-                    break
-
-            if program_count == 0:
-                self.is_error = True
-                self.error_reason = f"{self.directory}/{self.file_name}に、欲しい楽器がありませんでした。"
-
-    def ct_inst2seq(self, inst: Instrument) -> list:
-        aya_node_inst = []
-        melody_clip = MIDI2Seq(tokenizer=self.tokenizer, directory=self.directory, file_name=self.file_name,is_include_special_token=False,
-                               program_list=self.program_list, midi_data=self.midi_data, split_measure=999)
-        melody_clip.convert()
-        melody_with_chord_clip = Midi2SeqWithChord(self.tokenizer, self.directory, self.file_name, is_include_special_token=False,
-                                                   key=self.system["key"], all_chords=self.system["all_chords"],
-                                                   all_chord_timestamps= self.system["all_chords_timestamps"],program_list=self.program_list, split_measure=999)
-        melody_with_chord_clip.convert()
-        chord_clip = SeqWithChord2Chord(self.tokenizer,melody_with_chord_clip.aya_node)
-        chord_clip.convert()
-
-        if melody_clip.is_error and melody_with_chord_clip.is_error and chord_clip.is_error:
-            self.is_error = True
-            self.error_reason = "MIDIの変換中にエラーが発生しました。"
-            return None
-        melody_all: np.ndarray = melody_clip.aya_node[1]
-        melody_all_ind = np.where(melody_all == self.tokenizer.get("<SME>"))[0]
-
-        if len(chord_clip.aya_node) == 1:
-            self.is_error = True
-            self.error_reason = "コード進行の情報がありませんでした。"
-            print(chord_clip.aya_node)
-            return None
-        chord_all = chord_clip.aya_node[1]
-        chord_all_ind = np.where(chord_all == self.tokenizer.get("<SME>"))[0]
-
-        melody_with_chord_all = melody_with_chord_clip.aya_node[1]
-        melody_with_chord_all_ind = np.where(melody_with_chord_all == self.tokenizer.get("<SME>"))[0]
-        back_ind = 0
-
-        print(len(melody_all_ind), len(chord_all_ind), len(melody_with_chord_all_ind))
-        is_running = back_ind + self.prompt_max_measure + self.out_measure < len(melody_all_ind)
-        self.tokenizer.mode(to=TO_TOKEN)
-
-        while is_running:
-            prompt_measure = random.randint(back_ind + 1, back_ind + self.prompt_max_measure)
-            #print(f"Test Seq MIDI2Seq: {melody_all[melody_all_ind[back_ind]: melody_all_ind[prompt_measure]]}")
-            #print(f"Test Seq With Chord: {melody_with_chord_all[melody_with_chord_all_ind[back_ind]: melody_with_chord_all_ind[prompt_measure]]}")
-            #print(f"Test Chord: {chord_all[chord_all_ind[back_ind]: chord_all_ind[prompt_measure]]}")
-            melody_task = self.get_melody_task(melody_with_chord_clip.key, melody_all, prompt_measure, melody_all_ind, back_ind)
-            melody_task_with_chord = self.get_melody_task_with_chord(melody_with_chord_clip.key, melody_with_chord_all, prompt_measure, melody_with_chord_all_ind, back_ind)
-            chord_task = self.get_chord_task(melody_with_chord_clip.key, melody_all, chord_all, prompt_measure, melody_all_ind, chord_all_ind, back_ind)
-            melody_task_add_chord = self.get_melody_task_add_chord(melody_with_chord_clip.key, melody_with_chord_all, chord_all, prompt_measure, melody_with_chord_all_ind, chord_all_ind, back_ind)
-
-            self.marge(aya_node_inst, melody_task, melody_task_with_chord, chord_task, melody_task_add_chord)
-
-            back_ind = prompt_measure + self.out_measure
-            is_running = back_ind + self.prompt_max_measure + self.out_measure < len(melody_all_ind)
-        return aya_node_inst
-
-    def marge(self, aya_node_inst, melody_task, melody_task_with_chord, chord_task, melody_task_add_chord):
-        if len(np.where(melody_task == self.tokenizer.get("<BLANK>"))[0]) < 4:
-            aya_node_inst.append(melody_task)
-            aya_node_inst.append(melody_task_with_chord)
-        if len(np.where(chord_task == self.tokenizer.get("<BLANK>"))[0]) < 4:
-            aya_node_inst.append(chord_task)
-            aya_node_inst.append(melody_task_add_chord)
-
-    def get_melody_task_add_chord(self, key, melody_all_with_chord, chord_all, prompt_measure, melody_with_chord_ind, chord_ind, back_ind) -> np.ndarray:
-        """
-        コード進行制約付き旋律生成タスクを取得する関数
-        :param key:
-        :param melody_all_with_chord:
-        :param chord_all:
-        :param prompt_measure:
-        :param melody_with_chord_ind:
-        :param back_ind:
-        :return:
-        """
-        melody_prompt: np.ndarray = melody_all_with_chord[melody_with_chord_ind[back_ind]:melody_with_chord_ind[prompt_measure]]
-        chord_prompt: np.ndarray  = chord_all[chord_ind[prompt_measure]:chord_ind[prompt_measure + self.out_measure]]
-        melody_tgt: np.ndarray    = melody_all_with_chord[melody_with_chord_ind[prompt_measure]:melody_with_chord_ind[prompt_measure + self.out_measure]]
-        melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
-        melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
-
-        melody_task = np.concatenate((melody_task, melody_prompt))
-        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
-        melody_task = np.append(melody_task, self.tokenizer.get("<QUERY_C>"))
-        melody_task = np.concatenate((melody_task, chord_prompt))
-        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_C>"))
-        melody_task = np.append(melody_task, self.tokenizer.get("<MGEN>"))
-        melody_task = np.append(melody_task, self.tokenizer.get(f"k_{key}"))
-
-        melody_task = np.concatenate((melody_task, melody_tgt))
-        melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
-        return melody_task
-
-
-
-    def get_chord_task(self, key, melody_all, chord_all, prompt_measure, melody_ind, chord_ind, back_ind) -> np.ndarray:
-        """
-        メロディからコード進行を予測するタスクを取得する関数
-        :param melody_all: メロディの全体の配列
-        :param chord_all: コード進行の全体の配列
-        :param prompt_measure: プロンプトの小節数
-        :return: メロディのタスクの配列
-        """
-        melody_prompt: np.ndarray = melody_all[melody_ind[back_ind]:melody_ind[prompt_measure]]
-        chord_tgt: np.ndarray    = chord_all[chord_ind[back_ind]:chord_ind[prompt_measure]]
-
-        melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
-        melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
-
-        melody_task = np.concatenate((melody_task, melody_prompt))
-        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
-        melody_task = np.append(melody_task, self.tokenizer.get("<CGEN>"))
-        melody_task = np.append(melody_task, self.tokenizer.get(f"k_{key}"))
-        melody_task = np.concatenate((melody_task, chord_tgt))
-        melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
-
-        return melody_task
-
-    def get_melody_task(self, key,  melody_all, prompt_measure, ind, back_ind) -> np.ndarray:
-        """
-        単純メロディ生成タスクを取得する関数
-        :param melody_all: メロディの全体の配列
-        :param prompt_measure: プロンプトの小節数
-        :return: メロディのタスクの配列
-        """
-        melody_prompt: np.ndarray = melody_all[ind[back_ind]:ind[prompt_measure]]
-        melody_tgt: np.ndarray    = melody_all[ind[prompt_measure]:ind[prompt_measure + self.out_measure]]
-
-        melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
-        melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
-
-        melody_task = np.concatenate((melody_task, melody_prompt))
-        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
-        melody_task = np.append(melody_task, self.tokenizer.get("<MGEN>"))
-        melody_task = np.append(melody_task, self.tokenizer.get(f"k_{key}"))
-        melody_task = np.concatenate((melody_task, melody_tgt))
-        melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
-
-        return melody_task
-
-    def get_melody_task_with_chord(self, key, melody_all_with_chord, prompt_measure, ind, back_ind) -> np.ndarray:
-        """
-        コード進行付きメロディ生成タスクを取得する関数
-        :param key:
-        :param melody_all_with_chord:
-        :param prompt_measure:
-        :param ind:
-        :param back_ind:
-        :return:
-        """
-        melody_prompt: np.ndarray = melody_all_with_chord[ind[back_ind]:ind[prompt_measure]]
-        melody_tgt: np.ndarray    = melody_all_with_chord[ind[prompt_measure]:ind[prompt_measure + self.out_measure]]
-
-        melody_task = np.array([self.tokenizer.get(f"k_{key}")], dtype=int)
-        melody_task = np.append(melody_task,self.tokenizer.get("<QUERY_M>"))
-
-        melody_task = np.concatenate((melody_task, melody_prompt))
-        melody_task = np.append(melody_task, self.tokenizer.get("</QUERY_M>"))
-        melody_task = np.append(melody_task, self.tokenizer.get("<MGEN>"))
-        melody_task = np.append(melody_task, self.tokenizer.get(f"k_{key}"))
-        melody_task = np.concatenate((melody_task, melody_tgt))
-        melody_task = np.append(melody_task, self.tokenizer.get("<ESEQ>"))
-        return melody_task
-
-
-
 class SeqWithChord2Chord(_AbstractConverter):
     def save(self, save_directory: str) -> [bool, str]:
         pass
 
     def convert(self, *args, **kwargs):
+        # トークンの範囲を取得
         shift_time = self.tokenizer.get_length_tuple("s")
         chord_root = self.tokenizer.get_length_tuple("CR")
         chord_quarter = self.tokenizer.get_length_tuple("CQ")
         chord_base = self.tokenizer.get_length_tuple("CB")
+
+        # 【追加修正】取得した範囲が None でないかチェック (デバッグ用)
+        if not self._check_tuple("s", shift_time) or \
+                not self._check_tuple("CR", chord_root) or \
+                not self._check_tuple("CQ", chord_quarter) or \
+                not self._check_tuple("CB", chord_base):
+            self.is_error = True
+            return
+
         blank = self.tokenizer.get("<BLANK>")
         sme = self.tokenizer.get("<SME>")
+
         for s in self.base:
             if not self.is_error:
-                in_shift = (s >= shift_time[0]) & (s <= shift_time[1])
-                in_chord = (s >= chord_root[0]) & (s <= chord_root[1])
-                in_quarter = (s >= chord_quarter[0]) & (s <= chord_quarter[1])
-                in_base = (s >= chord_base[0]) & (s <= chord_base[1])
-                bs = (s == blank) | (s == sme)
-                mask = (in_shift | in_chord | in_quarter | in_base | bs)
-                filter_seq = s[mask]
-                tokens = []
-                self.tokenizer.mode(to=TO_MUSIC)
-                for id in filter_seq:
-                    tokens.append(self.tokenizer.rev_get(id))
-                self.aya_node = self.aya_node + [self._ct_seq(tokens)]
+                # 配列自体が None でないかチェック
+                if s is None:
+                    continue
+
+                try:
+                    # マスク処理 (ここで NoneType エラーが起きていた)
+                    in_shift = (s >= shift_time[0]) & (s <= shift_time[1])
+                    in_chord = (s >= chord_root[0]) & (s <= chord_root[1])
+                    in_quarter = (s >= chord_quarter[0]) & (s <= chord_quarter[1])
+                    in_base = (s >= chord_base[0]) & (s <= chord_base[1])
+
+                    bs = (s == blank) | (s == sme)
+                    mask = (in_shift | in_chord | in_quarter | in_base | bs)
+                    filter_seq = s[mask]
+
+                    tokens = []
+                    self.tokenizer.mode(to=TO_MUSIC)
+                    for id in filter_seq:
+                        tokens.append(self.tokenizer.rev_get(id))
+
+                    # 変換して格納
+                    self.aya_node = self.aya_node + [self._ct_seq(tokens)]
+
+                except TypeError as e:
+                    print(f"\033[31m[Error in SeqWithChord2Chord] {e}\033[0m")
+                    print(f"Debug Info -> shift_time: {shift_time}, s type: {type(s)}")
+                    self.is_error = True
+
+    def _check_tuple(self, name, val):
+        """範囲タプルが有効か確認するヘルパー関数"""
+        if val is None or len(val) < 2 or val[0] is None or val[1] is None:
+            print(f"\033[31m[Critical Error] Tokenizer definition missing for '{name}'. Got: {val}\033[0m")
+            return False
+        return True
 
     def _ct_seq(self, s):
         self.tokenizer.mode(to=TO_TOKEN)
@@ -1033,24 +880,6 @@ class SeqWithChord2Chord(_AbstractConverter):
         self.tokenizer = tokenizer
         self.tokenizer.mode()
         self.aya_node = [0]
-
-
-
-class MidiExpantion(_AbstractMidiConverter):
-
-    def save(self, save_directory: str) -> [bool, str]:
-        if not self.is_error:
-            self.midi_data.write(f"{save_directory}/{self.file_name}.mid")
-            return True, "正常に完了しました"
-        else:
-            return False, "MIDIを読み込む事ができませんでした。"
-
-    def convert(self, *args, **kwargs):
-        pass
-
-    def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list, midi_data=None):
-        super().__init__(MidiExpantion, tokenizer, directory, file_name, program_list, midi_data=midi_data)
-
 
 
 class PackSeq:

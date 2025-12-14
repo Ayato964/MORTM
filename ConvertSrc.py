@@ -5,7 +5,6 @@ from typing import List
 from multiprocessing import Process, Manager
 from mortm.train.tokenizer import *
 from mortm.utils.convert import *
-from test import datasets
 
 
 def find_midi_files(root_folder):
@@ -106,13 +105,20 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
     is_error = False
     for i in range(len(md_file)):
         if not is_error:
-            con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
+            con = MIDIConverter(tokenizer, directory[i], md_file[i], program)
             con.convert()
-            is_saved, reason = con.save(save_path)
+
+            if con.is_error:
+                continue
+
+            maker = PreTrainDataMaker(con, 12)
+            maker.convert()
+
+            is_saved, reason = maker.save(save_path)
             if is_saved:
                 local_count += 1
 
-            for a in con.aya_node[1:]:
+            for a in maker.aya_node[1:]:
                 a:np.ndarray
                 if np.sum(a == 0) != 0:
                     print(f"\033[31m Error!!  {directory[i]}/{md_file[i]}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -121,77 +127,6 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
             print(f"Process#{pid}: Running... {local_count}  {reason}")
     progress[pid] = local_count
 
-
-def expansion(pid, tokenizer, directory, md_file, program, progress, save_path):
-    """
-    Expands and converts MIDI files to sequences using the specified tokenizer.
-
-    Args:
-        pid (int): Process ID.
-        tokenizer (Tokenizer): Tokenizer instance for conversion.
-        directory (List[str]): List of directories containing MIDI files.
-        md_file (List[str]): List of MIDI file names.
-        program (List[int]): List of MIDI program numbers.
-        progress (Manager.dict): Shared dictionary to track progress.
-        save_path (str): Directory to save the converted sequences.
-
-    Returns:
-        None
-    """
-    local_count = 0
-    for i in range(len(md_file)):
-        con = MidiExpantion(tokenizer, directory[i], md_file[i], program)
-        ex_midi = con.expansion_midi()
-        con.convert()
-        is_saved, reason = con.save(save_path)
-
-        for ex in ex_midi:
-            ex.convert()
-            is_saved, reason = ex.save(save_path)
-            print(f"Process#{pid}: データ拡張中...{is_saved}  {reason}")
-
-        if is_saved:
-            local_count += 1
-        #if local_count >= 30:
-        #    break
-        print(f"Process#{pid}: Running... {local_count}  {reason}")
-    progress[pid] = local_count
-
-
-def convert_ex(pid, tokenizer, directory, md_file, program, progress, save_path):
-    """
-    Converts MIDI files to sequences in all keys using the specified tokenizer.
-
-    Args:
-        pid (int): Process ID.
-        tokenizer (Tokenizer): Tokenizer instance for conversion.
-        directory (List[str]): List of directories containing MIDI files.
-        md_file (List[str]): List of MIDI file names.
-        program (List[int]): List of MIDI program numbers.
-        progress (Manager.dict): Shared dictionary to track progress.
-        save_path (str): Directory to save the converted sequences.
-
-    Returns:
-        None
-    """
-    local_count = 0
-    for i in range(len(md_file)):
-        con = MIDI2Seq(tokenizer, directory[i], md_file[i], program)
-        ex_midi = con.expansion_midi()
-        con.convert()
-        is_saved, reason = con.save(save_path)
-
-        for ex in ex_midi:
-            ex.convert()
-            is_saved, reason = ex.save(save_path)
-            print(f"Process#{pid}: データ拡張中...{is_saved}  {reason}")
-
-        if is_saved:
-            local_count += 1
-        #if local_count >= 30:
-        #    break
-        print(f"Process#{pid}: Running... {local_count}  {reason}")
-    progress[pid] = local_count
 
 
 def convert_with_chord(pid, tokenizer, directory: List[str], md_file: List[str], system_file: List[dict], program, progress, save_path):
@@ -217,7 +152,7 @@ def convert_with_chord(pid, tokenizer, directory: List[str], md_file: List[str],
         if (system_file[i]["key"] and system_file[i]["all_chords"] and not ("N" in system_file[i]["all_chords"])
                 and system_file[i]["all_chords_timestamps"] and system_file[i]["tempo"]):
 
-            con = Midi2SeqWithChord(tokenizer, directory[i], md_file[i],key=system_file[i]["key"], all_chords=system_file[i]["all_chords"],
+            con = OmegaMIDI2SeqWithChord(tokenizer, directory[i], md_file[i],key=system_file[i]["key"], all_chords=system_file[i]["all_chords"],
                                     all_chord_timestamps=system_file[i]["all_chords_timestamps"],  program_list=program)
             con.convert()
             print("SSS?")
@@ -278,20 +213,8 @@ def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress
 
                 print(f"Process#{pid}: Running... {local_count}  Reason: {reason}")
 
-def convert_class_seq(pid, tokenizer, directory, md_file, cls, save_path):
-    local_count = 0
-    for i in range(len(md_file)):
-        con = Seq2ClassficationDiscrimination(tokenizer, directory[i], md_file[i], cls)
-        con.convert()
-        is_saved, reason = con.save(save_path)
 
-        if is_saved:
-            local_count += 1
-        #if local_count >= 30:
-        #    break
-        print(f"Process#{pid}: Running... {local_count}  {reason}")
-
-def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progress, save_directory):
+def convert_task_seq(pid, tokenizer, directory, md_file, system_file, program, progress, save_directory):
     """
     Converts MIDI files to task sequences using the specified tokenizer.
 
@@ -314,8 +237,9 @@ def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progr
                 and len(system_file[i]["all_chords_timestamps"]) != 0 and system_file[i]["tempo"]):
             #print(system_file[i]["location"], system_file[i]["all_chords"], system_file[i]["all_chords_timestamps"])
             is_error = False
-            con = MIDI2TaskSeq(tokenizer, system=system_file[i], split_measure=8, out_measure=12,
-                                 directory=directory[i], file_name=md_file[i], program_list=SAX)
+            con = Task1_Continuation(tokenizer, directory[i], md_file[i], program,
+            system_file[i]["all_chords"], system_file[i]["all_chords_timestamps"],
+            key=system_file[i]["key"], split_measure=8)
             con.convert()
 
             for a in con.aya_node[1:]:
@@ -334,20 +258,21 @@ def convert_task_seq(pid, tokenizer, directory, md_file, system_file, SAX, progr
 
 
 if __name__ == "__main__":
+    print("やあっほう！変換開始だよ！！")
     THREAD_VALUE = 10
     PROGRAM = ['PIANO', 'SAX']
-    tokenizer = Tokenizer(bertm_converter(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/LMD/lmd_full"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
-    datasets = "./out/model/mortm/45_research/datasets/eval.json"
+    #datasets = "./out/model/mortm/45_research/datasets/eval.json"
 
     #"""
-    #directory, md_file = find_midi_files(datasets)
-    directory, md_file = extract_midi_npz_paths(datasets)
+    directory, md_file = find_midi_files(datasets)
+    #directory, md_file = extract_midi_npz_paths(datasets)
     #"""
     """
     print("データ整理中・・・・")
@@ -361,23 +286,22 @@ if __name__ == "__main__":
     system_file = np.array_split(system_file, THREAD_VALUE)
     """
 
-
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            """
+            #"""
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), PROGRAM, progress, "out/np/research/midi"))
-            """
-
+                                              md_file[t].tolist(), PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/music"))
             #"""
+
+            """
             p = Process(target=convert_class_seq, args=(t, tokenizer, directory[t], md_file[t], "HUMAN", "out/np/bertm/"))
-            #"""
+            """
 
             """
-            p = Process(target=convert_chord, args=(t, tokenizer, directory[t].tolist(),
-                                                         md_file[t].tolist(), system_file[t], PROGRAM, progress, "out/np/research/chord"))
+            p = Process(target=convert_task_seq, args=(t, tokenizer, directory[t].tolist(),
+                                                         md_file[t].tolist(), system_file[t], PROGRAM, progress, "out/np/omega/task1"))
             """
 
             processes.append(p)

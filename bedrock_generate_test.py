@@ -6,7 +6,7 @@ from mortm.train.tokenizer import *
 
 midi_path = "data/generate/Piano_Sample.mid"
 args_path = "configs/models/mortm/A.json"
-model_save_path = "out/model/mortm/45_research/MORTM.4.5-PRO_1.0899.pth"
+model_save_path = "out/model/mortm/45_research/MORTM.4.5-Pro_1.04.pth"
 #model_save_path = "out/model/mortm/MORTM.4.1-SAX-Phase2_0.29.pth"
 sft_model = False
 generate_count = 1

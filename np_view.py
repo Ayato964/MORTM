@@ -1,8 +1,8 @@
 import numpy as np
 
-TEST_MIDI = "000c004a21a44e2c80f3f549f4abc8b5.mid"
+TEST_MIDI = "16b9a230fb007c0009feee532c3c4686.mid.npz"
 
-node = np.load(f"out/np/research/chord/{TEST_MIDI}.npz")
+node = np.load(f"out/np/omega/task1/{TEST_MIDI}")
 
 for i in range(len(node) - 1):
     print(node[f'array{i + 1}'])

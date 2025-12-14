@@ -117,6 +117,11 @@ def bertm_converter(convert: int) -> List[Token]:
     register.append(AI(convert))
     return register
 
+def omega_converter(convert: int) -> List[Token]:
+    register: List[Token] = get_token_converter_pro(convert)
+    register.append(GenMeasureCount(convert))
+    return register
+
 
 class Tokenizer:
     def __init__(self,music_token: List[Token], load_data: str = None):

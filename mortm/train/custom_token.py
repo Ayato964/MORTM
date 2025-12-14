@@ -390,6 +390,18 @@ class FutureMelody(SpecialToken):
         pass
 
 
+class GenMeasureCount(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<GEN_MEASURE_COUNT>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+    def _set_tokens(self, tokens: dict):
+        base = len(tokens)
+        for i in range(1, 9):
+            tokens[f'<GEN_MEASURE_COUNT_{i}>'] = base + i - 1
+
 class Key(MusicToken):
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int,
                   container: ShiftTimeContainer) -> int | str | None:
