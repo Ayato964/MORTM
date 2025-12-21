@@ -11,7 +11,7 @@ class MORTMArgs:
             self.d_layer = data['d_layer'] if data.get('d_layer') else 12
             self.e_layer = data['e_layer'] if data.get('e_layer') else 12
             self.num_heads = data['num_heads']
-            self.d_model = data['d_model']
+            self.d_model: int = data['d_model']
             self.dim_feedforward = data['dim_feedforward']
             self.dropout = data['dropout']
             self.position_length = data['position_length'] if data.get('position_length') else 512
@@ -31,7 +31,9 @@ class MORTMArgs:
 
             self.normalize_type = "tanh" if data.get('norm_type') is None else data['norm_type']
 
-            self.use_lora: bool = False if data.get('use_lora') is None else data['use_lora']
+            self.use_attn_lora: bool = False if data.get('use_attn_lora') is None else data['use_attn_lora']
+            self.use_gate_lora: bool = False if data.get('use_gate_lora') is None else data['use_gate_lora']
+            self.use_ffn_lora: bool = False if data.get('use_ffn_lora') is None else data['use_ffn_lora']
             self.lora_r = data['lora_r'] if data.get('lora_r') else 8
             self.lora_alpha = data['lora_alpha'] if data.get('lora_alpha') else 16
 

@@ -334,7 +334,7 @@ class MLP(nn.Module):
 
     def __init__(self, args: MORTMArgs):
         super().__init__()
-        if not args.use_lora:
+        if not args.use_ffn_lora:
             self.w1 = nn.Linear(args.d_model, args.dim_feedforward)
             self.w2 = nn.Linear(args.dim_feedforward, args.d_model)
             self.w3 = nn.Linear(args.d_model, args.dim_feedforward)
@@ -401,7 +401,7 @@ class Expert(nn.Module):
 
     def __init__(self, args: MORTMArgs):
         super().__init__()
-        if not args.use_lora:
+        if not args.use_ffn_lora:
             self.w1 = nn.Linear(args.d_model, args.dim_feedforward)
             self.w2 = nn.Linear(args.dim_feedforward, args.d_model)
             self.w3 = nn.Linear(args.d_model, args.dim_feedforward)

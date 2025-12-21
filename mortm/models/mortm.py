@@ -37,17 +37,13 @@ class MORTM(nn.Module):
         self.d_model = args.d_model
         self.dim_feedforward = args.dim_feedforward
         self.dropout = args.dropout
-        self.use_lora = args.use_lora
-        print("Use LoRA:", self.use_lora)
+        print(f"Use LoRA Selection: Attention LoRA: {args.use_attn_lora}, Gate LoRA: {args.use_gate_lora}, FFN LoRA: {args.use_ffn_lora}")
 
         self.decoder = MORTMDecoder(args, progress=progress)
 
         print(f"Input Vocab Size:{args.vocab_size}")
         self.embedding: nn.Embedding = nn.Embedding(args.vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
-        if not self.use_lora:
-            self.Wout: nn.Linear = nn.Linear(self.d_model, args.vocab_size).to(self.progress.get_device())
-        else:
-            self.Wout: lora.Linear = lora.Linear(self.d_model, args.vocab_size, r=args.lora_r, lora_alpha=args.lora_alpha)
+        self.Wout: nn.Linear = nn.Linear(self.d_model, args.vocab_size).to(self.progress.get_device())
 
         self.softmax: nn.Softmax = nn.Softmax(dim=-1).to(self.progress.get_device())
 

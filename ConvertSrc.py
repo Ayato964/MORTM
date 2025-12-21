@@ -129,49 +129,6 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
 
 
 
-def convert_with_chord(pid, tokenizer, directory: List[str], md_file: List[str], system_file: List[dict], program, progress, save_path):
-    """
-    Converts MIDI files to sequences considering chord progressions using the specified tokenizer.
-
-    Args:
-        pid (int): Process ID.
-        tokenizer (Tokenizer): Tokenizer instance for conversion.
-        directory (List[str]): List of directories containing MIDI files.
-        md_file (List[str]): List of MIDI file names.
-        system_file (List[dict]): List of JSON data containing song information.
-        program (List[int]): List of MIDI program numbers.
-        progress (Manager.dict): Shared dictionary to track progress.
-        save_path (str): Directory to save the converted sequences.
-
-    Returns:
-        None
-    """
-    local_count = 0
-
-    for i in range(len(md_file)):
-        if (system_file[i]["key"] and system_file[i]["all_chords"] and not ("N" in system_file[i]["all_chords"])
-                and system_file[i]["all_chords_timestamps"] and system_file[i]["tempo"]):
-
-            con = OmegaMIDI2SeqWithChord(tokenizer, directory[i], md_file[i],key=system_file[i]["key"], all_chords=system_file[i]["all_chords"],
-                                    all_chord_timestamps=system_file[i]["all_chords_timestamps"],  program_list=program)
-            con.convert()
-            print("SSS?")
-            is_saved, reason = con.save(save_path)
-            for a in con.aya_node[1:]:
-                a:np.ndarray
-                if np.sum(a == 0) != 0:
-                    print(f"Error!!  : {system_file[i]["location"]}")
-                    is_error = True
-                    break
-            if is_saved:
-                local_count += 1
-                #if local_count >= 10:
-                #    break
-
-            print(f"Process#{pid}: Running... {local_count}  {reason}")
-
-    progress[pid] = local_count
-
 def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress, save_directory):
     """
     Converts MIDI files to chord sequences using the specified tokenizer.
@@ -237,12 +194,23 @@ def convert_task_seq(pid, tokenizer, directory, md_file, system_file, program, p
                 and len(system_file[i]["all_chords_timestamps"]) != 0 and system_file[i]["tempo"]):
             #print(system_file[i]["location"], system_file[i]["all_chords"], system_file[i]["all_chords_timestamps"])
             is_error = False
-            con = Task1_Continuation(tokenizer, directory[i], md_file[i], program,
-            system_file[i]["all_chords"], system_file[i]["all_chords_timestamps"],
-            key=system_file[i]["key"], split_measure=8)
+            con = MIDIConverter(tokenizer, directory[i], md_file[i], program, key=system_file[i]["key"])
             con.convert()
 
-            for a in con.aya_node[1:]:
+            if con.is_error:
+                continue
+
+            maker1 = Task1DataMaker(con, 8)
+            maker1.convert()
+            maker2 = Task2DataMaker(con, 8)
+            maker2.convert()
+
+            #con = Task1DataMaker(tokenizer, directory[i], md_file[i], program,
+            #system_file[i]["all_chords"], system_file[i]["all_chords_timestamps"],
+            #key=system_file[i]["key"], split_measure=8)
+            #con.convert()
+
+            for a in maker1.aya_node[1:]:
                 a:np.ndarray
                 if np.sum(a == 0) != 0:
                     print(a)
@@ -251,7 +219,8 @@ def convert_task_seq(pid, tokenizer, directory, md_file, system_file, program, p
                     break
 
             if not is_error:
-                is_saved, reason = con.save(save_directory)
+                is_saved, reason = maker1.save(os.path.join(save_directory, "task1/"))
+                is_saved, reason = maker2.save(os.path.join(save_directory, "task2/"))
                 if is_saved:
                     local_count += 1
                 print(f"Process#{pid}: Running... {local_count}  Reason: {reason}")
@@ -261,10 +230,9 @@ if __name__ == "__main__":
     print("やあっほう！変換開始だよ！！")
     THREAD_VALUE = 10
     PROGRAM = ['PIANO', 'SAX']
-    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
+    tokenizer = Tokenizer(omega_converter(TO_TOKEN))
 
     datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MMD_MIDI"
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/LMD/lmd_full"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
@@ -301,7 +269,7 @@ if __name__ == "__main__":
 
             """
             p = Process(target=convert_task_seq, args=(t, tokenizer, directory[t].tolist(),
-                                                         md_file[t].tolist(), system_file[t], PROGRAM, progress, "out/np/omega/task1"))
+                                                         md_file[t].tolist(), system_file[t], PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/post_train/omega/"))
             """
 
             processes.append(p)

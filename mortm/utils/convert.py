@@ -197,7 +197,7 @@ class _AbstractMidiConverter(_AbstractConverter):
                 self.error_reason = "欲しい楽器がMIDIにありません。"
             elif not self.is_error and key is None:
                 if len(self.inst_list) > 0:
-                    self.key = get_key_dict(os.path.join(directory, file_name), window_measures=12)
+                    self.key = get_key_dict(os.path.join(directory, file_name), window_measures=999)
                     self.key_dict = self.key['segments']
                 print(f"{self.key_dict} <- キー情報")
             elif key is not None:
@@ -512,21 +512,26 @@ class MIDI2Seq(_AbstractMidiConverter):
 class MIDIConverter(_AbstractMidiConverter):
     def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list: List[str],
                  use_midi2seq=True,
+                 use_midi2seq_with_chord=False,
                  all_chords: Optional[List[str]]=None, all_chord_timestamps: Optional[List[float]]=None,
                  key=None):
         super().__init__(MIDIConverter, tokenizer, directory, file_name, program_list, key=key)
         if not self.is_error:
             self.midi2seq = MIDI2Seq(tokenizer, directory, file_name, program_list, key=self.key, inst_list_with_name=self.inst_list_with_name, midi_data=self.midi_data) if use_midi2seq else None
+            self.midi2seq_with_chord = OmegaMIDI2SeqWithChord(tokenizer, directory, file_name, program_list, all_chords, all_chord_timestamps, key=self.key, midi_data=self.midi_data, inst_list_with_name=self.inst_list_with_name) if use_midi2seq_with_chord else None
 
-    def make_system_prompt(self, time, found_list):
+
+    def make_system_prompt(self, time, found_list, call_function = None) -> List[int]:
         prompt = [self.tokenizer.get("<EOS>"),
                   self.tokenizer.get("<SYSTEM>")]
 
         for p in found_list:
             prompt.append(self.tokenizer.get(f"<INST_{p}>"))
+        if call_function is not None:
+            call_function(prompt)
         prompt.append(self.tokenizer.get(f"k_{self.get_key(time) if isinstance(self.key, dict) else self.key}"))
         prompt.append(self.tokenizer.get("<TAG_END>"))
-        return np.array(prompt)
+        return prompt
 
     def convert(self, *args, **kwargs):
         if self.is_error:
@@ -534,6 +539,8 @@ class MIDIConverter(_AbstractMidiConverter):
 
         if self.midi2seq is not None:
             self.midi2seq.convert()
+        if self.midi2seq_with_chord is not None:
+            self.midi2seq_with_chord.convert()
 
     def save(self, save_directory: str) -> Tuple[bool, str]:
         raise NotImplementedError("これ単体では保存できません。　DataMakerに受け渡してください")
@@ -611,26 +618,243 @@ class PreTrainDataMaker(_AbstractConverter):
                 continue
 
             prompt = self.converter.make_system_prompt(0, active_program_list)
-            clip = np.concatenate([prompt, np.array([self.tokenizer.get("<MGEN>")]), clip, np.array([self.tokenizer.get("<TE>")])])
+            clip = np.concatenate([np.array(prompt), np.array([self.tokenizer.get("<MGEN>")]), clip, np.array([self.tokenizer.get("<TE>")])])
             self.aya_node = self.aya_node + [clip]
             count += 1
 
+class Task1DataMaker(_AbstractConverter):
+
+    def __init__(self, converter: MIDIConverter, measure_max=8):
+        super().__init__(Task1DataMaker, None, None)
+        self.converter = converter
+        self.tokenizer = converter.tokenizer
+        self.aya_node = [0]
+        self.seq_dict = converter.midi2seq.aya_node.copy()
+        self.measure_max = measure_max
+
+    def save(self, save_directory: str) -> Tuple[bool, str]:
+        if not self.is_error:
+            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
+            if len(array_dict) > 1:
+                np.savez(save_directory + "/" + self.converter.file_name, **array_dict)
+                return True, "処理が正常に終了しました。"
+            else:
+                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+        else:
+            return False, self.error_reason
+
+    def _has_notes(self, sequence_slice: np.ndarray, s_range: Tuple[int, int]) -> bool:
+        """
+        スライス内に 's' トークン(Note On)が含まれているか判定するヘルパー関数
+        """
+        s_start, s_end = s_range
+        # 範囲内にあるIDが一つでもあれば True (isinより高速)
+        return np.any((sequence_slice >= s_start) & (sequence_slice <= s_end))
+
+    def convert(self, *args, **kwargs):
+        seq_inds = {}
+        for program in self.converter.program_list:
+            seq = self.seq_dict[program]
+            measure_token_id = self.tokenizer.get("<SME>")
+            seq_inds[program] = np.where(seq == measure_token_id)[0]
+
+        inst_finish_dict = {program: False for program in self.converter.program_list}
+
+        now_measure = 0
+        split_context_measure = random.randint(1, self.measure_max)
+        split_genfield_measure = random.randint(1, self.measure_max)
+
+        # sトークンのID範囲を取得 (start, end)
+        s_e = self.tokenizer.get_length_tuple("s")
+
+        while not all(inst_finish_dict.values()):
+            prompt = [self.tokenizer.get("<PAST_M>")]
+            genfield = [self.tokenizer.get("<MGEN>")]
+            active_program_list = []
+
+            for program in self.converter.program_list:
+                if inst_finish_dict[program]:
+                    continue
+                inds = seq_inds[program]
+                if now_measure + split_context_measure + split_genfield_measure >= len(inds):
+                    inst_finish_dict[program] = True
+                    continue
+
+                seq: np.ndarray = self.seq_dict[program]
+                context_start_ind = inds[now_measure]
+                context_end_ind = inds[now_measure + split_context_measure]
+                genfield_end_ind = inds[now_measure + split_context_measure + split_genfield_measure]
+
+                if self._has_notes(seq[context_start_ind:context_end_ind], s_e):
+                    prompt.append(self.tokenizer.get(f"<INST_{program}>"))
+                    prompt.extend(seq[context_start_ind:context_end_ind].tolist())
+                    prompt.append(self.tokenizer.get(f"<ESEQ>"))
+
+                # 【修正】音が含まれている場合のみ追加 (not を削除)
+                if self._has_notes(seq[context_end_ind:genfield_end_ind], s_e):
+                    genfield.append(self.tokenizer.get(f"<INST_{program}>"))
+                    genfield.extend(seq[context_end_ind:genfield_end_ind].tolist())
+                    genfield.append(self.tokenizer.get(f"<ESEQ>"))
+                    active_program_list.append(program)
+
+            if len(active_program_list) == 0:
+                now_measure += split_context_measure
+                split_context_measure = random.randint(1, self.measure_max)
+                split_genfield_measure = random.randint(1, self.measure_max)
+                continue
+
+            def call(prompt: list):
+                prompt.append(self.tokenizer.get(f"<GEN_MEASURE_COUNT_{split_genfield_measure}>"))
+
+            sequence = self.converter.make_system_prompt(0, active_program_list, call_function=call)
+            sequence.extend(prompt)
+            sequence.append(self.tokenizer.get("<TAG_END>"))
+
+            genfield.append(self.tokenizer.get("<TE>"))
+            sequence.extend(genfield)
+            self.aya_node = self.aya_node + [np.array(sequence)]
+
+            now_measure += split_context_measure
+            split_context_measure = random.randint(1, self.measure_max)
+            split_genfield_measure = random.randint(1, self.measure_max)
+
+
+class Task2DataMaker(_AbstractConverter):
+
+    def __init__(self, converter: MIDIConverter, measure_max=8):
+        super().__init__(Task2DataMaker, None, None)
+        self.converter = converter
+        self.tokenizer = converter.tokenizer
+        self.aya_node = [0]
+        self.seq_dict = converter.midi2seq.aya_node.copy()
+        self.measure_max = measure_max
+
+        if len(self.converter.program_list) < 2:
+            self.is_error = True
+            self.error_reason = "楽器数が少なすぎるため(1つ以下)、Task2のデータセットを作成できません。"
+
+    def save(self, save_directory: str) -> Tuple[bool, str]:
+        if not self.is_error:
+            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
+            if len(array_dict) > 1:
+                np.savez(save_directory + "/" + self.converter.file_name, **array_dict)
+                return True, "処理が正常に終了しました。"
+            else:
+                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+        else:
+            return False, self.error_reason
+
+    def _has_notes(self, sequence_slice: np.ndarray, s_range: Tuple[int, int]) -> bool:
+        s_start, s_end = s_range
+        return np.any((sequence_slice >= s_start) & (sequence_slice <= s_end))
+
+    def convert(self, *args, **kwargs):
+        if self.is_error:
+            return
+
+        seq_inds = {}
+        for program in self.converter.program_list:
+            seq = self.seq_dict[program]
+            measure_token_id = self.tokenizer.get("<SME>")
+            seq_inds[program] = np.where(seq == measure_token_id)[0]
+
+        inst_finish_dict = {program: False for program in self.converter.program_list}
+
+        now_measure = 0
+        split_context_measure = random.randint(1, self.measure_max)
+        split_genfield_measure = random.randint(1, self.measure_max)
+        s_e = self.tokenizer.get_length_tuple("s")
+
+        while not all(inst_finish_dict.values()):
+
+            target_program = random.choice(self.converter.program_list)
+
+            prompt = [self.tokenizer.get("<PAST_M>")]
+            const_part = [self.tokenizer.get("<CONST_M>")]
+            genfield = [self.tokenizer.get("<MGEN>")]
+
+            active_target_program = []
+
+            for program in self.converter.program_list:
+                if inst_finish_dict[program]:
+                    continue
+
+                inds = seq_inds[program]
+                if now_measure + split_context_measure + split_genfield_measure >= len(inds):
+                    inst_finish_dict[program] = True
+                    continue
+
+                seq: np.ndarray = self.seq_dict[program]
+                context_start_ind = inds[now_measure]
+                context_end_ind = inds[now_measure + split_context_measure]
+                genfield_end_ind = inds[now_measure + split_context_measure + split_genfield_measure]
+
+                # --- Past Part ---
+                # 【修正】音がある場合のみ追加
+                if self._has_notes(seq[context_start_ind:context_end_ind], s_e):
+                    prompt.append(self.tokenizer.get(f"<INST_{program}>"))
+                    prompt.extend(seq[context_start_ind:context_end_ind].tolist())
+                    prompt.append(self.tokenizer.get(f"<ESEQ>"))
+
+
+                # --- Gen & Const Part ---
+                # 【修正】音がある場合のみ追加
+                if self._has_notes(seq[context_end_ind:genfield_end_ind], s_e):
+                    if program == target_program:
+                        genfield.append(self.tokenizer.get(f"<INST_{program}>"))
+                        genfield.extend(seq[context_end_ind:genfield_end_ind].tolist())
+                        genfield.append(self.tokenizer.get(f"<ESEQ>"))
+                        active_target_program.append(program)
+                    else:
+                        const_part.append(self.tokenizer.get(f"<INST_{program}>"))
+                        const_part.extend(seq[context_end_ind:genfield_end_ind].tolist())
+                        const_part.append(self.tokenizer.get("<ESEQ>"))
+
+            if len(active_target_program) == 0:
+                now_measure += split_context_measure
+                split_context_measure = random.randint(1, self.measure_max)
+                split_genfield_measure = random.randint(1, self.measure_max)
+                continue
+
+            def call(p: list):
+                p.append(self.tokenizer.get(f"<GEN_MEASURE_COUNT_{split_genfield_measure}>"))
+
+            sequence = self.converter.make_system_prompt(0, active_target_program, call_function=call)
+
+            sequence.extend(prompt)
+            sequence.append(self.tokenizer.get("<TAG_END>"))
+            sequence.extend(const_part)
+            sequence.append(self.tokenizer.get("<TAG_END>"))
+
+            genfield.append(self.tokenizer.get("<TE>"))
+            sequence.extend(genfield)
+
+            self.aya_node = self.aya_node + [np.array(sequence)]
+
+            now_measure += split_context_measure
+            split_context_measure = random.randint(1, self.measure_max)
+            split_genfield_measure = random.randint(1, self.measure_max)
+
+
+
 class OmegaMIDI2SeqWithChord(MIDI2Seq):
+
     def __init__(self, tokenizer: Tokenizer, directory: str, file_name: str, program_list: List[str],
-                 all_chords: List[str], all_chord_timestamps: List[float], midi_data=None,
+                 all_chords: List[str], all_chord_timestamps: List[float], midi_data=None, inst_list_with_name=None,
                  key=None, split_measure=12, is_include_special_token=True):
-        super().__init__(tokenizer, directory, file_name, program_list, key, midi_data, split_measure, is_include_special_token)
+
+        super().__init__(tokenizer, directory, file_name, program_list, key=key, inst_list_with_name=inst_list_with_name, midi_data=midi_data)
         self.chords = ChordMidi(all_chords, all_chord_timestamps)
 
     def convert_inst(self, program, inst: Instrument, container, note_count) -> np.ndarray | int:
-        clip = np.array([self.tokenizer.get(f"<INST_{program}>")], dtype=int)
+        clip = []
         clip_count = 0
         back_note: Optional[Note] = None
         is_first = True
 
         while clip_count < 999:
             if note_count >= len(inst.notes):
-                return clip, note_count, True
+                return np.array(clip), note_count, True
             note: Note = inst.notes[note_count]
             tempo = self.get_tempo(note.start)
             container.tempo = tempo
@@ -650,12 +874,10 @@ class OmegaMIDI2SeqWithChord(MIDI2Seq):
                             clip_count += 1
 
                         if clip_count >= 999:
-                            if self.is_include_special_token:
-                                clip = np.append(clip, self.tokenizer.get("<ESEQ>"))
-                            return clip, note_count, False
+                            return np.array(clip), note_count, False
 
                         token_id = self.tokenizer.get(token)
-                        clip = np.append(clip, token_id)
+                        clip.append(token_id)
                         progressed = True
 
                         if conv.token_type == "<BLANK>":
@@ -672,11 +894,10 @@ class OmegaMIDI2SeqWithChord(MIDI2Seq):
                                  chords=self.chords, container=container)
                     token_id = self.tokenizer.get(token)
                     clip = np.append(clip, token_id)
-
             if not is_continue_note:
                 note_count += 1
                 back_note = note
-        return clip, note_count, False
+        return np.array(clip), note_count, False
 
 
 class MetaData2Chord(_AbstractConverter):

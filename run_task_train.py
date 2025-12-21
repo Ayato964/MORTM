@@ -5,7 +5,7 @@ from mortm.utils.gmail_messanger import GmailMessanger
 from mortm.utils.messager import Messenger
 from mortm.models.modules.progress import _DefaultLearningProgress
 import loralib as lora
-from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_TOKEN
+from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_TOKEN, omega_converter
 from mortm.train.train import _get_padding_mask
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
@@ -42,7 +42,7 @@ class TTMORTM(AbstractTrainSet):
                 p.requires_grad = True
 
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
-        adam = torch.optim.Adam(trainable_params, lr=2e-1)
+        adam = torch.optim.AdamW(trainable_params, lr=2e-1)
 
         super().__init__(optimizer=adam,
                          scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=self.args.d_model, warmup_steps=4000)),
@@ -125,14 +125,14 @@ class TTMORTM(AbstractTrainSet):
 if __name__ == "__main__":
     MODEL_CONFIG =  "configs/models/mortm/A.json"
     TRAIN_CONFIG = "configs/train/task_training.json"
-    LOOT_DIRECTORY = "out/np/Sax/task_train/"
-    LOAD_MODEL_DIRECTORY = "out/model/mortm/MORTM.4.0EX5-SAX-Phase1_1.4054.pth"
-    SAVE_DIRECTORY = "out/model/mortm"
-    VERSION = "4.1-SAX-Phase2"
+    LOOT_DIRECTORY = "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/post_train/omega"
+    LOAD_MODEL_DIRECTORY = "out/models/mortm/4_5/MORTM.4.5-Pro.pth"
+    SAVE_DIRECTORY = "out/models/mortm/4_5/"
+    VERSION = "4.5-Pro-TaskResearch"
 
     message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
     progress = _DefaultLearningProgress()
-    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
+    tokenizer = Tokenizer(omega_converter(TO_TOKEN))
     trainer = TTMORTM(args_config=MODEL_CONFIG, load_model_directory=LOAD_MODEL_DIRECTORY, tokenizer=tokenizer, progress=progress)
     t_args = TrainArgs(TRAIN_CONFIG)
 

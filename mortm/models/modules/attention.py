@@ -75,7 +75,7 @@ class QKVLinear(nn.Module):
         self.use_cross_attention  = use_cross_attention
 
         if not use_cross_attention:
-            if not  args.use_lora:
+            if not  args.use_attn_lora:
                 self.qkv_weight = nn.Linear(args.d_model, 3 * args.d_model, bias=False, dtype=torch.bfloat16)
                 self.W_o = nn.Linear(args.d_model, args.d_model, dtype=torch.bfloat16)
             else:
