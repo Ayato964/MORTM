@@ -14,5 +14,7 @@
   "use_moe_encoder": false,
   "use_moe_decoder": true,
   "norm_type": "layernorm",
-  "use_silu": true
+  "use_silu": true,
+  "use_attn_lora": true,
+  "use_ffn_lora": true
 }

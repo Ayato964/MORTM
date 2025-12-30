@@ -34,8 +34,8 @@ class MORTMArgs:
             self.use_attn_lora: bool = False if data.get('use_attn_lora') is None else data['use_attn_lora']
             self.use_gate_lora: bool = False if data.get('use_gate_lora') is None else data['use_gate_lora']
             self.use_ffn_lora: bool = False if data.get('use_ffn_lora') is None else data['use_ffn_lora']
-            self.lora_r = data['lora_r'] if data.get('lora_r') else 8
-            self.lora_alpha = data['lora_alpha'] if data.get('lora_alpha') else 16
+            self.lora_r = data['lora_r'] if data.get('lora_r') else 16
+            self.lora_alpha = data['lora_alpha'] if data.get('lora_alpha') else 32
 
 
 class V_MORTMArgs(MORTMArgs):
