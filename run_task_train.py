@@ -127,8 +127,8 @@ if __name__ == "__main__":
     TRAIN_CONFIG = "configs/train/task_training.json"
     LOOT_DIRECTORY = "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/post_train/omega"
     LOAD_MODEL_DIRECTORY = "out/models/mortm/4_5/MORTM.4.5-Pro-Preview2.pth"
-    SAVE_DIRECTORY = "out/models/mortm/4_5/"
-    VERSION = "4.5-Pro-TaskResearch2"
+    SAVE_DIRECTORY = "out/models/mortm/4_5/omega/"
+    VERSION = "4.5-Pro-Omega-Preview"
 
     message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
     progress = _DefaultLearningProgress()
