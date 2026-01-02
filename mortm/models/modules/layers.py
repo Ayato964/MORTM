@@ -143,75 +143,6 @@ class DummyDecoder(nn.Module):
         return memory
 
 
-class MORTMEncoder(nn.Module):
-    def __init__(self, args: MORTMArgs, layer_norm_eps, progress):
-        super(MORTMEncoder, self).__init__()
-        self.num_layer = args.e_layer
-        self.layers = _get_clones(MORTMEncoderLayer(args, layer_norm_eps=layer_norm_eps, progress=progress), self.num_layer)
-
-        self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
-
-    def forward(self, src, mask, src_key_padding_mask, is_causal):
-        memory = src
-
-        for mod in self.layers:
-            memory = mod(
-                memory,
-                mask,
-                src_key_padding_mask,
-                is_causal
-            )
-
-        return self.norm(memory)
-
-
-class MORTMEncoderLayer(nn.Module):
-    def __init__(self, args: MORTMArgs, layer_norm_eps, progress):
-        super(MORTMEncoderLayer, self).__init__()
-
-        self.d_model = args.d_model
-        self.dim_ff = args.dim_feedforward
-        self.dropout = args.dropout
-
-
-        self.self_attn =FlashSelfAttentionM(args.d_model, args.num_heads, args.dropout, progress=progress)
-        if args.use_moe_encoder == True:
-            self.ffn = MoE(args.d_model, args.dim_feedforward, args.num_experts, args.topk_experts, args.num_groups, args.topk_groups)
-        else:
-            self.ffn = self.mlp
-            self.ff_linear = nn.Linear(args.d_model, args.dim_feedforward)
-            self.ff_linear2 = nn.Linear(args.dim_feedforward, args.d_model)
-
-        self.norm1 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
-        self.norm2 = LayerNorm(args.d_model, eps=layer_norm_eps, bias=True, dtype=torch.float32)
-
-        self.dropout1 = nn.Dropout(args.dropout)
-        self.dropout2 = nn.Dropout(args.dropout)
-
-    def forward(self, memory, mask, src_key_padding_mask, is_causal):
-        y = memory
-
-        y = y + self.self_block(self.norm1(y), mask, src_key_padding_mask, is_causal)
-
-        y = y + self.ff_block(self.norm2(y))
-
-        return y
-
-    def mlp(self, x:  Tensor):
-        x = self.ff_linear(x)
-        x = F.gelu(x)
-        return self.ff_linear2(x)
-
-    def self_block(self, y, mask, src_key_padding_mask, is_causal):
-
-        y,  _ = self.self_attn(y, key_padding_mask=src_key_padding_mask,
-                               need_weights=True, attn_mask=mask, is_causal=is_causal)
-
-        return self.dropout1(y)
-
-    def ff_block(self, y: Tensor):
-        return self.dropout2(self.ffn(y))
-
 
 class MORTMDecoder(nn.Module):
     def __init__(self, args: MORTMArgs, progress):
@@ -275,6 +206,11 @@ class MORTMDecoderLayer(nn.Module):
             self.norm1 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
             self.norm2 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
             self.norm3 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
+        elif args.normalize_type == "rmsnorm":
+            print("NORM TYPE: RMSNorm")
+            self.norm1 = nn.RMSNorm(args.d_model, eps=1e-5)
+            self.norm2 = nn.RMSNorm(args.d_model, eps=1e-5)
+            self.norm3 = nn.RMSNorm(args.d_model, eps=1e-5)
 
         self.dropout1 = nn.Dropout(args.dropout)
         self.dropout2 = nn.Dropout(args.dropout)
@@ -335,13 +271,13 @@ class MLP(nn.Module):
     def __init__(self, args: MORTMArgs):
         super().__init__()
         if not args.use_ffn_lora:
-            self.w1 = nn.Linear(args.d_model, args.dim_feedforward)
-            self.w2 = nn.Linear(args.dim_feedforward, args.d_model)
-            self.w3 = nn.Linear(args.d_model, args.dim_feedforward)
+            self.w1 = nn.Linear(args.d_model, args.dim_feedforward, bias=args.use_bias)
+            self.w2 = nn.Linear(args.dim_feedforward, args.d_model, bias=args.use_bias)
+            self.w3 = nn.Linear(args.d_model, args.dim_feedforward, bias=args.use_bias)
         else:
-            self.w1 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha)
-            self.w2 = lora.Linear(args.dim_feedforward, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha)
-            self.w3 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha)
+            self.w1 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
+            self.w2 = lora.Linear(args.dim_feedforward, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
+            self.w3 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -349,7 +285,7 @@ class MLP(nn.Module):
 
 class Gate(nn.Module):
 
-    def __init__(self, d_model, num_experts, activated_experts, num_groups, top_k_groups, route_scale=1, score_type="softmax"):
+    def __init__(self, args: MORTMArgs, route_scale=1, score_type="softmax"):
         """
 
         :param d_model: 埋め込み次元数
@@ -361,31 +297,31 @@ class Gate(nn.Module):
         :param score_type:　スケールのタイプ
         """
         super().__init__()
-        self.dim = d_model
-        self.topk = activated_experts
-        self.n_groups = num_groups
-        self.topk_groups = top_k_groups
+        self.dim = args.d_model
+        self.topk = args.topk_experts
+        self.n_groups = args.num_groups
+        self.topk_groups = args.topk_groups
         self.score_func = score_type
         self.route_scale = route_scale
-        self.weight = nn.Parameter(torch.empty(num_experts, d_model))
-        self.bias = nn.Parameter(torch.empty(num_experts)) if self.dim == 7168 else None
+        #self.weight = nn.Parameter(torch.empty(num_experts, d_model))
+        #self.bias = nn.Parameter(torch.empty(num_experts)) if self.dim == 7168 else None
+        if args.use_gate_lora:
+            self.gate_proj = lora.Linear(args.d_model, args.num_experts, r=args.lora_r, lora_alpha=args.lora_alpha, bias=False)
+        else:
+            self.gate_proj = nn.Linear(args.d_model, args.num_experts, bias=False)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.autocast(device_type=x.device.type):
-            scores = linear(x, self.weight)
+            scores = self.gate_proj(x)
             if self.score_func == "softmax":
                 scores = scores.softmax(dim=-1)
             else:
                 scores = scores.sigmoid()
             original_scores = scores
-            if self.bias is not None:
-                scores = scores + self.bias
+
             if self.n_groups > 1:
                 scores = scores.view(x.size(0), self.n_groups, -1)
-                if self.bias is None:
-                    group_scores = scores.amax(dim=-1)
-                else:
-                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                group_scores = scores.amax(dim=-1)
                 indices = group_scores.topk(self.topk_groups, dim=-1)[1]
                 mask = scores.new_ones(x.size(0), self.n_groups, dtype=torch.bool).scatter_(1, indices, False)
                 scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
@@ -402,13 +338,13 @@ class Expert(nn.Module):
     def __init__(self, args: MORTMArgs):
         super().__init__()
         if not args.use_ffn_lora:
-            self.w1 = nn.Linear(args.d_model, args.dim_feedforward)
-            self.w2 = nn.Linear(args.dim_feedforward, args.d_model)
-            self.w3 = nn.Linear(args.d_model, args.dim_feedforward)
+            self.w1 = nn.Linear(args.d_model, args.dim_feedforward, bias=args.use_bias)
+            self.w2 = nn.Linear(args.dim_feedforward, args.d_model, bias=args.use_bias)
+            self.w3 = nn.Linear(args.d_model, args.dim_feedforward, bias=args.use_bias)
         else:
-            self.w1 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha)
-            self.w2 = lora.Linear(args.dim_feedforward, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha)
-            self.w3 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha)
+            self.w1 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
+            self.w2 = lora.Linear(args.dim_feedforward, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
+            self.w3 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -423,7 +359,7 @@ class MoE(nn.Module):
         self.n_activated_experts = args.topk_experts
         self.experts_start_idx = 0
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = Gate(args.d_model, args.num_experts, args.topk_experts, args.num_groups, args.topk_groups, route_scale=route_scale)
+        self.gate = Gate(args, route_scale=route_scale)
 
         self.experts = nn.ModuleList([Expert(args) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])

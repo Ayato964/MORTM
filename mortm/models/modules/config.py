@@ -28,6 +28,7 @@ class MORTMArgs:
             self.use_silu = False if data.get('use_silu') is None else data['use_silu']
             self.use_rope = False if data.get('use_rope') is None else data['use_rope']
             self.use_cross_attention = False if data.get('use_cross_attention') is None else data['use_cross_attention']
+            self.use_bias = True if data.get('use_bias') is None else data['use_bias']
 
             self.normalize_type = "tanh" if data.get('norm_type') is None else data['norm_type']
 
