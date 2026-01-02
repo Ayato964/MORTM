@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="asset/concept1.png" width="100%" alt="MORTM Structure"/>
+  <img src="asset/concept2.png" width="100%" alt="MORTM Structure"/>
 
   <h1>MORTM: Metric-Oriented Rhythmic Transformer for Music Generation</h1>
 
