@@ -37,6 +37,7 @@ class MORTM(nn.Module):
         self.d_model = args.d_model
         self.dim_feedforward = args.dim_feedforward
         self.dropout = args.dropout
+        print("Bias:", args.use_bias)
         print(f"Use LoRA Selection: Attention LoRA: {args.use_attn_lora}, Gate LoRA: {args.use_gate_lora}, FFN LoRA: {args.use_ffn_lora}")
 
         self.decoder = MORTMDecoder(args, progress=progress)

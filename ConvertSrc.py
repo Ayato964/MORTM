@@ -232,45 +232,45 @@ if __name__ == "__main__":
     PROGRAM = ['PIANO', 'SAX']
     tokenizer = Tokenizer(omega_converter(TO_TOKEN))
 
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/GMD/training/all-instruments-with-drums/"
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/GMD/training/"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
     #datasets = "./out/model/mortm/45_research/datasets/eval.json"
 
-    """
+    #"""
     directory, md_file = find_midi_files(datasets)
     #directory, md_file = extract_midi_npz_paths(datasets)
-    """
     #"""
+    """
     print("データ整理中・・・・")
     directory, md_file, system_file = find_midi_files_with_json(datasets)
     print("完了！！")
-    #"""
+    """
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
-    #"""
+    """
     system_file = np.array_split(system_file, THREAD_VALUE)
-    #"""
+    """
 
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            """
+            #"""
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
                                               md_file[t].tolist(), PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/music"))
-            """
+            #"""
 
             """
             p = Process(target=convert_class_seq, args=(t, tokenizer, directory[t], md_file[t], "HUMAN", "out/np/bertm/"))
             """
 
-            #"""
+            """
             p = Process(target=convert_task_seq, args=(t, tokenizer, directory[t].tolist(),
                                                          md_file[t].tolist(), system_file[t], PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/post_train/omega/"))
-            #"""
+            """
 
             processes.append(p)
             p.start()

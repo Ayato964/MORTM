@@ -303,6 +303,12 @@ class MGen(SpecialToken):
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
         return None
 
+class Meta(SpecialToken):
+    def __init__(self, convert_type: int):
+        super().__init__("<META>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
 
 class CGen(SpecialToken):
     def __init__(self, convert_type: int):

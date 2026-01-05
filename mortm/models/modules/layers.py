@@ -153,6 +153,8 @@ class MORTMDecoder(nn.Module):
             self.norm = NormTanh(args.d_model)
         elif args.normalize_type == "layernorm":
             self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
+        elif args.normalize_type == "rmsnorm":
+            self.norm = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.float32)
 
     def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False,
                 encoder_x: Tensor = None, cu_seqlens_k=None, max_seqlen_k=None) -> Tensor:
@@ -208,9 +210,9 @@ class MORTMDecoderLayer(nn.Module):
             self.norm3 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
         elif args.normalize_type == "rmsnorm":
             print("NORM TYPE: RMSNorm")
-            self.norm1 = nn.RMSNorm(args.d_model, eps=1e-5)
-            self.norm2 = nn.RMSNorm(args.d_model, eps=1e-5)
-            self.norm3 = nn.RMSNorm(args.d_model, eps=1e-5)
+            self.norm1 = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.float32)
+            self.norm2 = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.float32)
+            self.norm3 = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.float32)
 
         self.dropout1 = nn.Dropout(args.dropout)
         self.dropout2 = nn.Dropout(args.dropout)

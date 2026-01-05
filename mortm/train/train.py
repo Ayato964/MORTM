@@ -127,16 +127,11 @@ class MORTMTrainSet(AbstractTrainSet):
         Returns:
             torch.Tensor: 形状が (batch_size, sequence_length) のマスクテンソル。
         """
-        # x が (batch_size, sequence_length) の場合、
-        # 以下の比較も要素ごとに行われ、結果は (batch_size, sequence_length) の
-        # ブール型テンソルになる。
         mgen_id = self.tokenizer.get("<MGEN>")
         cgen_id = self.tokenizer.get("<CGEN>")
-        is_start_token = ((x == mgen_id) | (x == cgen_id)).long()
+        meta_id = self.tokenizer.get("<META>")
+        is_start_token = ((x == mgen_id) | (x == cgen_id) | (x == meta_id)).long()
 
-        # `dim=1` を指定しているため、累積和はシーケンス長（次元1）に沿って
-        # バッチ内の各サンプル（各行）ごとに独立して計算される。
-        # バッチをまたいで計算されることはない。
         cumulative_mask = torch.cumsum(is_start_token, dim=1)
 
         # この比較も要素ごとに行われる。

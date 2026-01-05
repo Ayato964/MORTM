@@ -13,8 +13,8 @@ message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi
 
 tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC))
 
-model = train_mortm(tokenizer, "configs/models/mortm/A.json", "configs/train/pre_training.json",
+model = train_mortm(tokenizer, "configs/models/mortm/4_5/research/pro.json", "configs/train/pre_training.json",
                     "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/",
                     "out/models/mortm/4_5/",
-                    "4.5-Pro-Preview-2",
+                    "4.5-Pro-Preview-3",
                     message=message)

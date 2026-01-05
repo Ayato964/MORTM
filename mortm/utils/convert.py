@@ -618,8 +618,10 @@ class PreTrainDataMaker(_AbstractConverter):
                 continue
 
             prompt = self.converter.make_system_prompt(0, active_program_list)
-            clip = np.concatenate([np.array(prompt), np.array([self.tokenizer.get("<MGEN>")]), clip, np.array([self.tokenizer.get("<TE>")])])
-            self.aya_node = self.aya_node + [clip]
+            meta = np.concatenate([np.array([prompt[0]]), clip, np.array([self.tokenizer.get("<META>")]), np.array(prompt[1:]), np.array([self.tokenizer.get("<TE>")])])
+            music = np.concatenate([np.array(prompt), np.array([self.tokenizer.get("<MGEN>")]), clip, np.array([self.tokenizer.get("<TE>")])])
+            self.aya_node = self.aya_node + [music]
+            self.aya_node = self.aya_node + [meta]
             count += 1
 
 class Task1DataMaker(_AbstractConverter):

@@ -58,6 +58,7 @@ def get_token_converter_pro(convert: int) -> List[Token]:
 
     register.append(SequenceEnd(convert))
     register.append(TrackEnd(convert))
+    register.append(Meta(convert))
 
     return register
 
