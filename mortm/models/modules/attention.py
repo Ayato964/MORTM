@@ -67,6 +67,55 @@ def get_alibi_slopes(n_heads):
     return slopes
 
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        # キャッシュ（sin/cosテーブル）の初期化
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # 初回のキャッシュ構築
+        self._set_cos_sin_cache(max_position_embeddings, device=device, dtype=torch.get_default_dtype())
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_position_embeddings = seq_len
+        t = torch.arange(self.max_position_embeddings, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        if seq_len > self.max_position_embeddings:
+            self._set_cos_sin_cache(seq_len, x.device, x.dtype)
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
+
+def rotate_half(x):
+    """xの後半の符号を反転して前半と入れ替える（[-x2, x1]を作る操作）"""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    """
+    q, k: [batch, seq_len, head_dim] or [total_tokens, head_dim]
+    cos, sin: [max_seq, head_dim] -> position_idsに従って取得
+    position_ids: [batch, seq_len] or [total_tokens]
+    """
+    cos = cos[position_ids].unsqueeze(-2) # [..., 1, head_dim] (head次元用)
+    sin = sin[position_ids].unsqueeze(-2)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 class QKVLinear(nn.Module):
     def __init__(self, args: MORTMArgs, use_cross_attention: bool=False):
         super(QKVLinear, self).__init__()
@@ -109,148 +158,161 @@ class QKVLinear(nn.Module):
 class FlashSelfAttentionM(nn.Module):
     def __init__(self, args: MORTMArgs, progress=None):
         super(FlashSelfAttentionM, self).__init__()
-        self.batch_first = True
-        self._qkv_same_embed_dim = True
-        self.in_proj_bias = None
         self.args = args
-
-        self.embed_dim = args.d_model
-        self.qkv_block = QKVLinear(args)
+        self.head_dim = args.d_model // args.num_heads
         self.drop = args.dropout
-        self.kv_cache: Optional[Tuple[Tensor, Tensor]] = None
-        self.cache_seqlens: Tensor = None
 
-        if not self.args.use_rope:
-            print("FlashAttention2のALiBiを使用します。")
-            self.alibi_slopes = torch.tensor(get_alibi_slopes(args.num_heads), dtype=torch.float32, device=progress.get_device())
+        self.qkv_block = QKVLinear(args)
+
+        # KV Cache の初期化
+        self.kv_cache: Optional[Tuple[Tensor, Tensor]] = None
+        self.cache_seqlens: Optional[Tensor] = None
+
+        # Positional Embedding の選択
+        if self.args.use_rope:
+            print(f"FlashSelfAttentionM: Using Pure PyTorch RoPE (dim={self.head_dim})")
+            device = progress.get_device() if progress else torch.device("cuda")
+            self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=args.position_length, device=device)
+            self.alibi_slopes = None
         else:
-            print("FlashAttention2のRoPEを使用します。")
-            head_dim = args.d_model // args.num_heads
-            device = progress.get_device() if progress else None
-            self.rotary_emb = RotaryEmbedding(dim=head_dim, base=10000.0, interleaved=False, device=device)
+            print("FlashSelfAttentionM: Using ALiBi")
+            device = progress.get_device() if progress else torch.device("cuda")
+            self.alibi_slopes = torch.tensor(get_alibi_slopes(args.num_heads), dtype=torch.float32, device=device)
+            self.rotary_emb = None
 
     def _init_kv_cache(self, batch_size, device, dtype):
-        """最初の呼び出し時に、バッチサイズに合わせてキャッシュを初期化する"""
-        max_seq_len = self.args.position_length + 100 # 設定ファイルなどから最大長を取得
-        head_dim = self.args.d_model // self.args.num_heads
-        shape = (batch_size, max_seq_len, self.args.num_heads, head_dim)
+        max_seq_len = self.args.position_length + 512 # マージンを持たせる
+        shape = (batch_size, max_seq_len, self.args.num_heads, self.head_dim)
 
-        # torch.emptyでメモリを確保するだけ。0で埋める必要はない
         self.kv_cache = (
-            torch.empty(shape, device=device, dtype=dtype),
-            torch.empty(shape, device=device, dtype=dtype)
+            torch.zeros(shape, device=device, dtype=dtype), # 安全のためzeros推奨
+            torch.zeros(shape, device=device, dtype=dtype)
         )
         self.cache_seqlens = torch.zeros(batch_size, device=device, dtype=torch.int32)
 
-    def forward(self, x: Tensor, is_causal=False, cu_seqlens=None, max_seqlen=None,
+    def forward(self, x: Tensor, is_causal=True, cu_seqlens=None, max_seqlen=None,
                 batch_size=None, indices=None, is_save_cache=False):
+
         if x.dtype == torch.float32:
             x = x.to(torch.bfloat16)
 
-        # --- フェーズ1: 学習 または 推論のプロンプト処理 ---
+        # ==========================================
+        # Phase 1: Prefill (Prompt Processing / Training)
+        # ==========================================
         if cu_seqlens is not None:
-            # プロンプト処理時にはキャッシュを初期化
+            # キャッシュ初期化
             if is_save_cache and (self.kv_cache is None or self.kv_cache[0].shape[0] != batch_size):
                 self._init_kv_cache(batch_size, x.device, x.dtype)
 
-            qkv: Tensor = self.qkv_block(q=x)
+            # Linear projection
+            qkv = self.qkv_block(q=x) # [total_tokens, 3 * d_model]
 
-            # RoPE/ALiBiの適用とアテンション計算 (この部分は元のロジックを維持)
-            if not self.args.use_rope:
-                out = flash_attn_varlen_qkvpacked_func(qkv, dropout_p=self.drop, causal=is_causal,
-                                                       cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                                                       alibi_slopes=self.alibi_slopes)
-            else:
-                q, k, v = qkv.unbind(1)
-                self.rotary_emb._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)
-                q = apply_rotary_emb(q, self.rotary_emb._cos_cached, self.rotary_emb._sin_cached, interleaved=False, cu_seqlens=cu_seqlens)
-                k = apply_rotary_emb(k, self.rotary_emb._cos_cached, self.rotary_emb._sin_cached, interleaved=False, cu_seqlens=cu_seqlens)
-                qkv_rotated = torch.stack([q, k, v], dim=1)
-                out = flash_attn_varlen_qkvpacked_func(qkv_rotated, dropout_p=self.drop, causal=is_causal,
-                                                       cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            # FlashAttention varlen packed 用に整形: [total_tokens, 3, num_heads, head_dim]
+            total_tokens = x.shape[0]
+            qkv = qkv.view(total_tokens, 3, self.args.num_heads, self.head_dim)
 
-            # is_save_cacheがTrueの場合、計算結果を事前確保したキャッシュに書き込む
-            if is_save_cache:
-                with torch.no_grad():
-                    # RoPE適用済みのk,vをキャッシュするのが望ましい場合があるが、ここではqkvから取得
-                    _, k_unpad, v_unpad = qkv.unbind(dim=1)
+            # --- RoPE 適用 (ここが重要) ---
+            if self.args.use_rope:
 
-                    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+                q, k, v = qkv.unbind(1) # 各 [total_tokens, num_heads, head_dim]
 
-                    # 各シーケンスのK,Vを、事前確保したキャッシュの先頭に書き込む
-                    for i in range(batch_size):
-                        start, end = cu_seqlens[i], cu_seqlens[i+1]
-                        seq_len = end - start
-                        self.kv_cache[0][i, :seq_len] = k_unpad[start:end]
-                        self.kv_cache[1][i, :seq_len] = v_unpad[start:end]
+                position_ids_list = []
+                for i in range(len(cu_seqlens) - 1):
+                    seq_len_i = cu_seqlens[i+1] - cu_seqlens[i]
+                    position_ids_list.append(torch.arange(0, seq_len_i, device=x.device, dtype=torch.long))
+                position_ids = torch.cat(position_ids_list) # [total_tokens]
 
-                    self.cache_seqlens = seqlens
+                cos, sin = self.rotary_emb(v, seq_len=max_seqlen)
+                q_rot, k_rot = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
-        # --- フェーズ2: 1トークンずつの推論 ---
-        else:
-            if is_save_cache:
-                # このパスでは、xは (batch_size, d_model) の形状を想定
-                qkv: Tensor = self.qkv_block(q=x)
-                # (batch_size, 3, num_heads, head_dim) -> (3, batch_size, num_heads, head_dim)
-                qkv = qkv.permute(1, 0, 2, 3)
-                q, k, v = qkv[0], qkv[1], qkv[2]
+                qkv = torch.stack([q_rot, k_rot, v], dim=1)
 
-                # (batch_size, num_heads, head_dim) -> (batch_size, 1, num_heads, head_dim)
-                # flash_attn_with_kvcache の入力形状に合わせる
-                q, k, v = q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
-
-                # RoPE / ALiBi の引数を準備
-                rotary_kwargs = {}
-                if not IS_NOT_LINUX:
-                    self.rotary_emb._update_cos_sin_cache(self.args.position_length, device=x.device, dtype=x.dtype)
-                    rotary_kwargs = {
-                        "rotary_cos": self.rotary_emb.cos_cached,
-                        "rotary_sin": self.rotary_emb.sin_cached,
-                        "rotary_interleaved": False
-                    }
-
-                # flash_attn_with_kvcache を呼び出すだけで、計算とキャッシュ更新が完了
-                out = flash_attn_with_kvcache(
-                    q,
-                    k_cache=self.kv_cache[0],
-                    v_cache=self.kv_cache[1],
-                    k=k,
-                    v=v,
-                    cache_seqlens=self.cache_seqlens,
-                    alibi_slopes=self.alibi_slopes if IS_NOT_LINUX else None,
-                    causal=True,
-                    **rotary_kwargs
+                out = flash_attn_varlen_qkvpacked_func(
+                    qkv, dropout_p=self.drop, causal=is_causal,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
                 )
 
-                # キャッシュの有効長をインクリメント
+                if is_save_cache:
+                    with torch.no_grad():
+                        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+                        for i in range(batch_size):
+                            start, end = cu_seqlens[i], cu_seqlens[i+1]
+                            l = end - start
+                            self.kv_cache[0][i, :l] = k_rot[start:end] # 回転済み
+                            self.kv_cache[1][i, :l] = v[start:end]
+                        self.cache_seqlens = seqlens
+
+            # --- ALiBi の場合 ---
+            else:
+                out = flash_attn_varlen_qkvpacked_func(
+                    qkv, dropout_p=self.drop, causal=is_causal,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    alibi_slopes=self.alibi_slopes
+                )
+                if is_save_cache:
+                    with torch.no_grad():
+                        _, k, v = qkv.unbind(1)
+                        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+                        for i in range(batch_size):
+                            start, end = cu_seqlens[i], cu_seqlens[i+1]
+                            l = end - start
+                            self.kv_cache[0][i, :l] = k[start:end]
+                            self.kv_cache[1][i, :l] = v[start:end]
+                        self.cache_seqlens = seqlens
+
+        # ==========================================
+        # Phase 2: Decoding (Token by Token)
+        # ==========================================
+        else:
+            if x.dim() == 2:
+                x = x.unsqueeze(1) # [batch, 1, d_model]
+
+            qkv = self.qkv_block(q=x) # [batch, 1, 3*d_model]
+            qkv = qkv.view(x.shape[0], 1, 3, self.args.num_heads, self.head_dim)
+
+            q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
+            if is_save_cache:
+                if self.args.use_rope:
+                    position_ids = self.cache_seqlens.clone() # [batch]
+
+                    cos, sin = self.rotary_emb(v, seq_len=position_ids.max().item() + 1)
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids.unsqueeze(1))
+
+                    out = flash_attn_with_kvcache(
+                        q,
+                        self.kv_cache[0],
+                        self.kv_cache[1],
+                        k=k, # 回転済み
+                        v=v,
+                        cache_seqlens=self.cache_seqlens,
+                        causal=True,
+                        # rotary_... は渡さない！
+                    )
+                else:
+                    # ALiBi
+                    out = flash_attn_with_kvcache(
+                        q,
+                        self.kv_cache[0],
+                        self.kv_cache[1],
+                        k=k,
+                        v=v,
+                        cache_seqlens=self.cache_seqlens,
+                        alibi_slopes=self.alibi_slopes,
+                        causal=True
+                    )
+
+                # カウンタ更新
                 self.cache_seqlens += 1
 
-                # (batch_size, 1, h, d_model) -> (batch_size, h, d_model)
-                out = out.squeeze(1)
             else:
-                qkv = self.qkv_block(q=x)
-                qkv = qkv.unsqueeze(0)
-                out = flash_attn_qkvpacked_func(qkv=qkv, dropout_p=self.drop, causal=is_causal)
-                out = rearrange(out, "b s h d -> (b s) (h d)")
-                return self.qkv_block.comp(out)
+                pass
 
-        # 最終的な出力層
-        out = rearrange(out, "total h d -> total (h d)")
+            out = out.squeeze(1) # [batch, heads, dim]
+
+        # out: [total, heads, dim] or [batch, heads, dim]
+        out = rearrange(out, "... h d -> ... (h d)")
         return self.qkv_block.comp(out)
-
-    def compute_cache_seqlens(self, k: torch.Tensor) -> torch.Tensor:
-        """
-        k: Tensor of shape [batch_size, max_seq_len, num_heads, head_dim]
-        Returns:
-            cache_seqlens: Tensor of shape [batch_size]  (実際のシーケンス長)
-        """
-        # 各タイムステップが "all-zero" かどうかを判定
-        is_nonzero = k.abs().sum(dim=(-1, -2)) != 0  # shape: [batch_size, max_seq_len]
-
-        # True/False → int に変換して累積和で長さを求める（ただし最初の False 位置でもOK）
-        seqlens = is_nonzero.sum(dim=1)  # shape: [batch_size]
-
-        return seqlens
 
 
 class FlashCrossAttentionM(nn.Module):

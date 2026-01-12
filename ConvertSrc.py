@@ -105,26 +105,30 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
     is_error = False
     for i in range(len(md_file)):
         if not is_error:
-            con = MIDIConverter(tokenizer, directory[i], md_file[i], program)
-            con.convert()
+            try:
+                con = MIDIConverter(tokenizer, directory[i], md_file[i], program)
+                con.convert()
 
-            if con.is_error:
+                if con.is_error:
+                    continue
+
+                maker = PreTrainDataMaker(con, 12)
+                maker.convert()
+
+                is_saved, reason = maker.save(save_path)
+                if is_saved:
+                    local_count += 1
+
+                for a in maker.aya_node[1:]:
+                    a:np.ndarray
+                    if np.sum(a == 0) != 0:
+                        print(f"\033[31m Error!!  {directory[i]}/{md_file[i]}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                        is_error = True
+                        break
+                print(f"Process#{pid}: Running... {local_count}  {reason}")
+            except Exception as e:
+                print(f"\033[31m Process#{pid} encountered an error with file {directory[i]}/{md_file[i]}: {e}")
                 continue
-
-            maker = PreTrainDataMaker(con, 12)
-            maker.convert()
-
-            is_saved, reason = maker.save(save_path)
-            if is_saved:
-                local_count += 1
-
-            for a in maker.aya_node[1:]:
-                a:np.ndarray
-                if np.sum(a == 0) != 0:
-                    print(f"\033[31m Error!!  {directory[i]}/{md_file[i]}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                    is_error = True
-                    break
-            print(f"Process#{pid}: Running... {local_count}  {reason}")
     progress[pid] = local_count
 
 
@@ -230,7 +234,7 @@ if __name__ == "__main__":
     print("やあっほう！変換開始だよ！！")
     THREAD_VALUE = 10
     PROGRAM = ['PIANO', 'SAX']
-    tokenizer = Tokenizer(omega_converter(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_pro2(TO_TOKEN))
 
     datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/GMD/training/"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"

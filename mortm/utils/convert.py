@@ -339,8 +339,6 @@ class MIDI2Seq(_AbstractMidiConverter):
         super().__init__(MIDI2Seq, tokenizer, directory, file_name, program_list, key=key, inst_list_with_name=inst_list_with_name, midi_data=midi_data)
         self.aya_node = {}
 
-
-
     def convert(self):
         """
         以下のステップでMidiが変換される
@@ -351,7 +349,7 @@ class MIDI2Seq(_AbstractMidiConverter):
         """
         if not self.is_error:
             print(f"Programs: {[i.program for i in self.midi_data.instruments]}")
-            container = [ShiftTimeContainer(0, self.tempo[0]) for _ in self.inst_list]
+            container = [ShiftTimeContainer(0, self.tempo[0], True) for _ in self.inst_list]
             note_counts = [0 for _ in self.inst_list]
 
             for i, (inst, program) in enumerate(self.inst_list_with_name):
@@ -390,6 +388,9 @@ class MIDI2Seq(_AbstractMidiConverter):
                     if token is not None:
                         if conv.token_type == "<SME>":
                             clip_count += 1
+
+                        if not container.is_velocity and conv.token_type == "v":
+                            continue
 
                         if clip_count >= 999:
                             return np.array(clip), note_count, False
@@ -618,7 +619,7 @@ class PreTrainDataMaker(_AbstractConverter):
                 continue
 
             prompt = self.converter.make_system_prompt(0, active_program_list)
-            meta = np.concatenate([np.array([prompt[0]]), clip, np.array([self.tokenizer.get("<META>")]), np.array(prompt[1:]), np.array([self.tokenizer.get("<TE>")])])
+            meta = np.concatenate([np.array([prompt[0]]), np.array([self.tokenizer.get("<CONST_M>")]), clip, np.array([self.tokenizer.get("<TAG_END>")]), np.array([self.tokenizer.get("<META>")]), np.array(prompt[1:]), np.array([self.tokenizer.get("<TE>")])])
             music = np.concatenate([np.array(prompt), np.array([self.tokenizer.get("<MGEN>")]), clip, np.array([self.tokenizer.get("<TE>")])])
             self.aya_node = self.aya_node + [music]
             self.aya_node = self.aya_node + [meta]

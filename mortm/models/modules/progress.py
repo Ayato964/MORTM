@@ -42,7 +42,6 @@ class _DefaultLearningProgress(LearningProgress):
 
     def get_gradient_norm(self, model):
         total_norm = 0
-        # モデルのすべてのパラメータについて、勾配がNoneでないものを対象にする
         for param in model.parameters():
             if param.grad is not None:
                 param_norm = param.grad.detach().data.norm(2)  # L2ノルムを計算

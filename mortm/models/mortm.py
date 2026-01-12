@@ -69,6 +69,7 @@ class MORTM(nn.Module):
             tgt_len, embed_dim = x.size()
             batch = None
             indices = cu_seqlens = max_s = used_seqlens = None
+        #print("\n Seq_length is :",x.shape[0])
         out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s,
                            batch_size=batch, indices=indices, is_save_cache=is_save_cache)
         if padding_mask is not None:

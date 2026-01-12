@@ -12,7 +12,7 @@ def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, temp
     midi = PrettyMIDI()
     back_note = None
     token_converter_list = tokenizer.music_token_list
-    container = ShiftTimeContainer(0, tempo)
+    container = ShiftTimeContainer(0, tempo, True)
     init_inst = None
     note = Note(pitch=0, velocity=100, start=0, end=0)
 
@@ -29,7 +29,7 @@ def ct_token_to_midi(tokenizer: Tokenizer, seq: Tensor, save_directory:str, temp
                     if init_inst is not None:
                         midi.instruments.append(init_inst)
                     init_inst = inst.Instrument(program=container.get_inst(), is_drum=False)
-                    container = ShiftTimeContainer(0, tempo)
+                    container = ShiftTimeContainer(0, tempo, True)
 
                 if token_type == DURATION_TYPE:
                     back_note = note

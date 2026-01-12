@@ -97,10 +97,11 @@ def _get_symbol(token: str):
 
 
 class ShiftTimeContainer:
-    def __init__(self, time, tempo):
+    def __init__(self, time, tempo, is_velocity):
         self.measure_start_time = time
         self.shift_measure = False
         self.is_error = False
+        self.is_velocity = is_velocity
         self.tempo = tempo
         self.is_code_mode = False
         self.inst: Optional[str] = None
@@ -529,6 +530,24 @@ class Pitch(MusicToken):
         p: int = note.pitch
         return p
 
+
+class Velocity(MusicToken):
+
+    def is_my_token(self, seq):
+        pass
+
+    def _set_tokens(self, tokens: dict):
+        max_length = 127
+        tokens_length = len(tokens)
+        for i in range(max_length + 1):
+            tokens[f'v_{i}'] = tokens_length + i
+
+    def de_convert(self, number: int, back_note, note: Note, tempo, container: ShiftTimeContainer):
+        note.velocity = int(number)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo, container: ShiftTimeContainer) -> int:
+        v: int = note.velocity
+        return v
 
 #--- ChordRoot トークン ------------------------------------------------
 class ChordRoot(ChordToken):

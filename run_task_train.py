@@ -42,7 +42,7 @@ class TTMORTM(AbstractTrainSet):
                 p.requires_grad = True
 
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
-        adam = torch.optim.AdamW(trainable_params, lr=2e-1)
+        adam = torch.optim.AdamW(trainable_params, lr=2e-2)
 
         super().__init__(optimizer=adam,
                          scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=self.args.d_model, warmup_steps=4000)),
@@ -126,9 +126,9 @@ if __name__ == "__main__":
     MODEL_CONFIG =  "configs/models/mortm/4_5/omega/pro.json"
     TRAIN_CONFIG = "configs/train/task_training.json"
     LOOT_DIRECTORY = "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/post_train/omega"
-    LOAD_MODEL_DIRECTORY = "out/models/mortm/4_5/MORTM.4.5-Pro-Preview2.pth"
+    LOAD_MODEL_DIRECTORY = "out/models/mortm/4_5/MORTM.4.5-Pro-Preview3.pth"
     SAVE_DIRECTORY = "out/models/mortm/4_5/omega/"
-    VERSION = "4.5-Pro-Omega-Preview"
+    VERSION = "4.5-Pro-Omega-Preview2"
 
     message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
     progress = _DefaultLearningProgress()
