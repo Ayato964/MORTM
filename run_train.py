@@ -16,5 +16,5 @@ tokenizer = Tokenizer(get_token_converter_pro2(TO_MUSIC))
 model = train_mortm(tokenizer, "configs/models/mortm/4_5/research/preview3/pro.json", "configs/train/pre_training.json",
                     "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/",
                     "out/models/mortm/4_5/",
-                    "4.5-Pro-Preview-3",
+                    "4.5-Pro-Preview-0",
                     message=message)

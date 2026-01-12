@@ -4,9 +4,10 @@ from mortm.utils.generate import *
 from mortm.models.modules.progress import _DefaultLearningProgress
 from mortm.train.tokenizer import *
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 midi_path = "data/generate/Piano_Sample.mid"
-args_path = "configs/models/mortm/A.json"
-model_save_path = "out/model/mortm/45_research/MORTM.4.5-Pro_1.04.pth"
+args_path = "configs/models/mortm/4_5/research/preview3/pro.json"
+model_save_path = "out/models/mortm/4_5/MORTM.4.5-Pro-Preview3.pth"
 #model_save_path = "out/model/mortm/MORTM.4.1-SAX-Phase2_0.29.pth"
 sft_model = False
 generate_count = 1
@@ -15,7 +16,7 @@ out_program = [65 for _ in range(generate_count)]
 midi_path = [midi_path for _ in range(generate_count)]
 
 if __name__ == "__main__":
-    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_pro2(TO_TOKEN))
     args = MORTMArgs(args_path)
     if sft_model:
         args.use_lora = True
