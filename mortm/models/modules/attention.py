@@ -44,20 +44,29 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    # cos, sin: [seq_len, head_dim] or [1, head_dim] depending on usage
-    # position_ids: [batch] or [total_tokens]
+    # position_ids に基づいて取得
+    # cos, sin: [max_seq, dim] -> [Batch, Dim] (Decoding時) または [Total, Dim] (Prefill時)
+    cos = cos[position_ids]
+    sin = sin[position_ids]
 
-    # 形状を合わせるためのunsqueeze処理
-    # cos: [..., 1, head_dim]
-    cos = cos[position_ids].unsqueeze(-2)
-    sin = sin[position_ids].unsqueeze(-2)
+    # 次元拡張（ここが修正箇所）
+    # q との計算時に [Batch, Batch, ...] にならないよう、明示的に次元を合わせます
+    if q.dim() == 4:
+        # Decoding時: qは [Batch, 1, Heads, Dim]
+        # cos/sinを [Batch, 1, 1, Dim] に変形
+        # これで Batch次元同士が正しく対応し、Heads次元にブロードキャストされます
+        cos = cos.unsqueeze(1).unsqueeze(1)
+        sin = sin.unsqueeze(1).unsqueeze(1)
+    else:
+        # Prefill時: qは [Total, Heads, Dim]
+        # cos/sinを [Total, 1, Dim] に変形
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
 
-    # unsqueeze logic for broadcasting if necessary
-    # q, k shape: [batch, seq, heads, head_dim] or [total, heads, head_dim]
-    # cos shape after idx: [batch/total, 1, head_dim] -> Broadcast to heads
-
+    # 型変換は行わず、そのまま計算 (bfloat16 なら bfloat16 のまま)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
+
     return q_embed, k_embed
 
 class RotaryEmbedding(nn.Module):
@@ -149,12 +158,13 @@ class FlashSelfAttentionM(nn.Module):
 
         device = progress.get_device() if progress else torch.device("cuda")
 
+        # RoPE / ALiBi の初期化
         if self.args.use_rope:
-            print(f"FlashSelfAttentionM: Using RoPE (dim={self.head_dim})")
+            # print(f"FlashSelfAttentionM: Using RoPE (dim={self.head_dim})")
             self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=args.position_length, device=device)
             self.alibi_slopes = None
         else:
-            print("FlashSelfAttentionM: Using ALiBi")
+            # print("FlashSelfAttentionM: Using ALiBi")
             self.alibi_slopes = torch.tensor(get_alibi_slopes(args.num_heads), dtype=torch.float32, device=device)
             self.rotary_emb = None
 
@@ -174,14 +184,14 @@ class FlashSelfAttentionM(nn.Module):
             x = x.to(torch.bfloat16)
 
         # ==========================================
-        # Phase 1: Prefill / Training (Parallel Processing)
+        # Phase 1: Prefill / Training (Parallel)
         # ==========================================
         if cu_seqlens is not None:
-            # Linear Projection & Reshape
+            # [Total_Tokens, Dim] -> [Total_Tokens, 3, Heads, HeadDim]
             qkv = self.qkv_block(q=x)
 
             if self.args.use_rope:
-                q, k, v = qkv.unbind(1) # [total_tokens, heads, dim]
+                q, k, v = qkv.unbind(1)
 
                 # Position IDs Gen
                 position_ids_list = []
@@ -190,13 +200,13 @@ class FlashSelfAttentionM(nn.Module):
                     position_ids_list.append(torch.arange(0, seq_len_i, device=x.device, dtype=torch.long))
                 position_ids = torch.cat(position_ids_list)
 
-                # Apply RoPE
+                # Apply RoPE (Safe float32)
                 cos, sin = self.rotary_emb(v, seq_len=max_seqlen)
                 q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
-                # Re-pack for FlashAttention
                 qkv = torch.stack([q, k, v], dim=1)
 
+                # Cache Update (if needed)
                 if is_save_cache:
                     if self.kv_cache is None or self.kv_cache[0].shape[0] != batch_size:
                         self._init_kv_cache(batch_size, x.device, x.dtype)
@@ -213,10 +223,8 @@ class FlashSelfAttentionM(nn.Module):
                     qkv, dropout_p=self.drop, causal=is_causal,
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
                 )
-                # out shape: [total_tokens, num_heads, head_dim]
-
             else:
-                # ALiBi case
+                # ALiBi
                 out = flash_attn_varlen_qkvpacked_func(
                     qkv, dropout_p=self.drop, causal=is_causal,
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
@@ -225,7 +233,6 @@ class FlashSelfAttentionM(nn.Module):
                 if is_save_cache:
                     if self.kv_cache is None or self.kv_cache[0].shape[0] != batch_size:
                         self._init_kv_cache(batch_size, x.device, x.dtype)
-
                     _, k, v = qkv.unbind(1)
                     with torch.no_grad():
                         for i in range(batch_size):
@@ -235,15 +242,31 @@ class FlashSelfAttentionM(nn.Module):
                             self.kv_cache[1][i, :l] = v[start:end]
                             self.cache_seqlens[i] = l
 
+            # Prefill Output: [Total, Heads, Dim] -> [Total, Heads*Dim]
+            # (Prefill時はもともと2次元[Total, Dim]で返すのが正解)
+            out = rearrange(out, "t h d -> t (h d)")
+
         # ==========================================
         # Phase 2: Decoding (Step-by-Step)
         # ==========================================
         else:
+            # 1. 入力を [Batch, 1, Dim] に統一
             if x.dim() == 2:
                 x = x.unsqueeze(1)
 
+            # 2. QKV計算 [Batch, 1, 3, Heads, Dim]
             qkv = self.qkv_block(q=x)
-            q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
+            # 3の次元で分割し、それぞれ [Batch, Heads, Dim] を取得
+            q, k, v = qkv.unbind(2)
+
+
+            # Seq次元 (=1) を復元して [Batch, 1, Heads, Dim] にする
+            # ※ この unbind -> unsqueeze の過程でメモリが完全に独立・整列します
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+
 
             if is_save_cache:
                 if self.args.use_rope:
@@ -251,37 +274,39 @@ class FlashSelfAttentionM(nn.Module):
                     max_pos = position_ids.max().item()
                     cos, sin = self.rotary_emb(v, seq_len=max_pos + 1)
 
+                    # RoPE適用 (q, k はここで新しく計算されるため安全)
                     q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-
                     out = flash_attn_with_kvcache(
-                        q, self.kv_cache[0], self.kv_cache[1],
-                        k=k, v=v,
+                        q,
+                        self.kv_cache[0],
+                        self.kv_cache[1],
+                        k=k,
+                        v=v, # ここで渡す v が完全に整列された状態になる
                         cache_seqlens=self.cache_seqlens,
                         causal=True
                     )
                 else:
                     out = flash_attn_with_kvcache(
-                        q, self.kv_cache[0], self.kv_cache[1],
-                        k=k, v=v,
+                        q,
+                        self.kv_cache[0],
+                        self.kv_cache[1],
+                        k=k,
+                        v=v,
                         cache_seqlens=self.cache_seqlens,
                         alibi_slopes=self.alibi_slopes,
                         causal=True
                     )
                 self.cache_seqlens += 1
             else:
-                raise NotImplementedError("Decoding without cache not implemented.")
+                raise NotImplementedError("Decoding without cache is not implemented.")
 
-            # out shape: [batch, 1, num_heads, head_dim] (usually)
+            # Decoding Output: [Batch, 1, Heads, Dim] -> [Batch, Heads, Dim]
+            out = out.squeeze(1)
 
-        # ==========================================
-        # Unified Output Reshape
-        # ==========================================
-        # Prefill: [total, heads, dim] -> [total, heads*dim]
-        # Decoding: [batch, seq, heads, dim] -> [batch, seq, heads*dim]
-        # "..." が任意の次元（batch, seq, totalなど）を吸収し、
-        # 最後の2次元 (heads, head_dim) を結合します。
-        out = rearrange(out, "... h d -> ... (h d)")
+            # [Batch, Heads, Dim] -> [Batch, Heads*Dim]
+            out = rearrange(out, "b h d -> b (h d)")
 
+        # 最終出力
         return self.qkv_block.comp(out)
 
 class FlashCrossAttentionM(nn.Module):
@@ -298,7 +323,7 @@ class FlashCrossAttentionM(nn.Module):
 
 
     def forward(self, x: Tensor, encoder_x: Tensor,cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None,
-                    max_seqlen_k=None):
+                max_seqlen_k=None):
         if x.dtype == torch.float32:
             x = x.to(torch.bfloat16)
         if encoder_x.dtype == torch.float32:

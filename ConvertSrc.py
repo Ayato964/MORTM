@@ -234,7 +234,7 @@ if __name__ == "__main__":
     print("やあっほう！変換開始だよ！！")
     THREAD_VALUE = 10
     PROGRAM = ['PIANO', 'SAX']
-    tokenizer = Tokenizer(get_token_converter_pro2(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 
     datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/GMD/training/"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
@@ -264,7 +264,7 @@ if __name__ == "__main__":
         for t in range(THREAD_VALUE):
             #"""
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/music"))
+                                              md_file[t].tolist(), PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/none_velocity/music"))
             #"""
 
             """
