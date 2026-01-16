@@ -127,7 +127,7 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
                         break
                 print(f"Process#{pid}: Running... {local_count}  {reason}")
             except Exception as e:
-                print(f"\033[31m Process#{pid} encountered an error with file {directory[i]}/{md_file[i]}: {e}")
+                print(f" Process#{pid} encountered an error with file {directory[i]}/{md_file[i]}: {e}")
                 continue
     progress[pid] = local_count
 

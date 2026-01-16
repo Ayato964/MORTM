@@ -12,11 +12,6 @@ class LearningProgress:
     def get_device(self):
         pass
 
-    def count(self, token_num):
-        self.token_num += token_num
-
-    def __init__(self):
-        self.token_num = 0
 
 
 class _DefaultLearningProgress(LearningProgress):

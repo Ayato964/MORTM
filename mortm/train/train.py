@@ -11,6 +11,7 @@ import os
 import time
 
 import torchaudio
+import wandb
 from einops import rearrange
 import soundfile as sf
 
@@ -74,24 +75,35 @@ class VisionTrainSet(AbstractTrainSet):
 
 
 class MORTMTrainSet(AbstractTrainSet):
-    def __init__(self, args: MORTMArgs, tokenizer, progress: LearningProgress,  load_directory=None):
+    def __init__(self, args: MORTMArgs, tokenizer, calc_val_loss_tokens, progress: LearningProgress, log_scale=False, project_name="", config=None,  load_directory=None):
         self.args = args
         self.tokenizer: Tokenizer = tokenizer
         self.model = MORTM(progress=progress, args=args).to(progress.get_device())
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
 
+        self.params = sum(p.numel() for p in self.model.parameters())
+        if log_scale:
+            with open(config, 'r') as f:
+                data: dict = json.load(f)
+            data['model_params'] = self.params
+            wandb.init(
+                project=project_name,
+                config=data
+            )
+
         adam = torch.optim.Adam(self.model.parameters(), lr=5e-1)
         #self.model = torch.compile(self.model)
 
         super().__init__(criterion=MaskedCrossEntropyLoss(ignore_index=0).to(progress.get_device()),
                         optimizer=adam,
-                        scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
+                        scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)),
+                         calc_val_loss_tokens=calc_val_loss_tokens)
 
     def pre_processing(self, pack, progress):
         dt: DataLoader = pack
         mini_dataset = MORTM_SEQDataset(progress, self.args.position_length, self.args.min_length,
-                                        is_random_delete_key=True, mask_sample_task=[self.tokenizer.get("<MGEN>")],
+                                        is_random_delete_key=False, mask_sample_task=[self.tokenizer.get("<MGEN>")],
                                         program_token_id=[self.tokenizer.get("<INST_PIANO>"), self.tokenizer.get("<INST_SAX>")],
                                         system_tag=(self.tokenizer.get("<SYSTEM>"), self.tokenizer.get("<TAG_END>")), sampling_inst_max=2)
         for d in dt:
@@ -112,10 +124,22 @@ class MORTMTrainSet(AbstractTrainSet):
         src = src[:, :-1]
         padding_mask_in: Tensor = _get_padding_mask(src, progress)
         if model.training:
-            progress.count(torch.sum(padding_mask_in == 1).item())
+            self.all_tokens += torch.sum(padding_mask_in == 1)
         input: Tensor = model(x=src, padding_mask=padding_mask_in, is_causal=True)
         input = input.view(-1, input.size(-1)).to(progress.get_device())
         return input.to(device=progress.get_device(), dtype=torch.float32), target, mask
+
+    def view_logs(self, epoch, sum_epoch, seq_count, all_pac, mini_seq_count, mini_seq_pac, loss, lr, verif_loss, tokens):
+        progress_bar_with_minibatch(epoch, sum_epoch, seq_count, all_pac, mini_seq_count, mini_seq_pac, loss, lr, verif_loss, tokens)
+
+    def optional_logging(self, val_loss, step):
+        all_tokens = self.all_tokens.item()
+        wandb.log({
+            "axis/val_loss": val_loss,
+            "axis/tokens": all_tokens,  # 横軸に使う重要な指標
+            "axis/flops": 6 * self.params * all_tokens,  # 横軸に使う重要な指標
+            "trainer/global_step": step
+        })
 
     def loss_mask(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -453,7 +477,7 @@ def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: n
     return val_loss / all_count
 
 
-def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTrainSet,
+def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:AbstractTrainSet,
                 train_loader: DataLoader, val_loader: DataLoader,
                 message: Messenger, progress: LearningProgress,
                 writer,  coll_fn=None):
@@ -500,43 +524,42 @@ def self_turing(args, train_args: TrainArgs, save_directory, trainer:AbstractTra
                     epoch_loss.add(loss.item())
 
 
-                    progress_bar_with_minibatch(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss, progress.token_num)
+                    trainer.view_logs(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss, trainer.all_tokens)
 
                 end_time = time.time()
-                if mail_bool and message is not None:
-                    _send_prediction_end_time(message, len(train_loader), begin_time, end_time, args.vocab_size, train_args.num_epochs,
-                                              args.e_layer, args.num_heads, args.d_model, args.dim_feedforward, args.dropout,
-                                              args.position_length)
+                if mail_bool:
+                    t = end_time - begin_time
+                    end_time_progress = (t * len(train_loader) * train_args.num_epochs) / 3600
+                    message.send_message(
+                        "学習開始のお知らせ",
+                        f"{model_name}の学習が開始されました。"
+                            f"\n\n シーケンスの1回目の処理が終了しました。かかった時間は{t:.1f}秒でした。\n"
+                            f"終了見込み時間は{end_time_progress:.2f}時間です"
+                    )
                     mail_bool = False
-
-                if (count + 1) % message.step_by_message_count == 0:
-                    message.send_message("機械学習の途中経過について", f"Epoch {epoch + 1}/{train_args.num_epochs}の"
-                                                                       f"learning sequence {count}結果は、\n {epoch_loss.get():.4f}でした。\n"
-                                                                       f"また、検証データの損失は{verification_loss:.4f}となっています。\n以上です。")
-                    #f"損失関数スケジューラーは{criterion.cs}です。")
                 writer.flush()
 
-                if (count + 1) % int(len(train_loader) // 5) == 0:
+                if trainer.is_need_calc_val():
                     update_log(model, writer, all_count)
                     print("検証損失を求めています")
                     torch.cuda.empty_cache()
                     verification_loss = get_verification_loss(model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn)
+
                     writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss.get(),
                                                                    "Verification": verification_loss}, all_count)
+                    trainer.optional_logging(verification_loss, all_count)
             if not epoch1_end:
                 epoch1_end = True
-                print("１エポック当たりのトークン数：", progress.token_num)
+                print("１エポック当たりのトークン数：", trainer.all_tokens)
 
-            message.send_message("機械学習の途中経過について",
+            message.send_message(f"{model_name}の途中経過について",
                                  f"Epoch {epoch + 1}/{train_args.num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
                                  f"また、検証データの損失は{verification_loss:.4f}となっています。\n　"
-                                 f"また現在学習中のトークン数は{progress.token_num}です。\n 以上です。")
+                                 f"また現在学習中のトークン数は{trainer.all_tokens}です。\n 以上です。")
                 #f"現在の損失関数スケジューラーの重みは{criterion.cs}となっています。")
-            loss_val = verification_loss
-            writer.add_scalar('EpochLoss', epoch_loss.get(), epoch)  # 損失値を記録
 
             if train_args.is_save_training_progress:
-                torch.save(model.state_dict(), f"{save_directory}/{args.name}.train.{epoch}.{verification_loss:.4f}.pth") #エポック終了時に途中経過を保存
+                torch.save(model.state_dict(), f"{save_directory}/{model_name}.train.{epoch}.{verification_loss:.4f}.pth") #エポック終了時に途中経過を保存
                 print("途中経過を保存しました。")
 
 
@@ -555,7 +578,7 @@ def _train(args, t_args, save_directory, trainer, version, today_date,
     try:
         writer = SummaryWriter(save_directory + f"/runs/{version}_{today_date}/")
 
-        model, loss = self_turing(args, t_args, save_directory, trainer,
+        model, loss = self_turing(f"{args.name}.{version}", t_args, save_directory, trainer,
                                          message=message,
                                          train_loader=train_loader, val_loader=val_loader,
                                          progress=progress,
@@ -579,15 +602,16 @@ def _train(args, t_args, save_directory, trainer, version, today_date,
 
 def train_mortm(tokenizer, model_config: str, train_config: str, root_directory, save_directory, version: str,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, eval_list_json: str = None,
-                progress: LearningProgress = _DefaultLearningProgress(), ):
+                progress: LearningProgress = _DefaultLearningProgress(), log_scale=False,project_name=None):
     args = MORTMArgs(json_directory=model_config)
     t_args = TrainArgs(json_directory=train_config)
-    trainer = MORTMTrainSet(args, tokenizer, progress, load_directory=load_model_directory)
+    trainer = MORTMTrainSet(args, tokenizer, t_args.val_total_tokens, progress, load_directory=load_model_directory, project_name=project_name, config=model_config, log_scale=log_scale)
 
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
 
     print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
+    print(f"Need to calc val loss tokens:{t_args.val_total_tokens}")
 
     if isinstance(root_directory, str):
         if root_directory.endswith(".json"):

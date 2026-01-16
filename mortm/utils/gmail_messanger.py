@@ -1,6 +1,8 @@
 import os
 import base64
 
+import httplib2.error
+
 from mortm.utils.messager import Messenger
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -63,4 +65,7 @@ class GmailMessanger(Messenger):
         message = self.create_message(self.send_address, subject, body)
 
         # メールを送信
-        self._send_email(service, 'me', message)
+        try:
+            self._send_email(service, 'me', message)
+        except httplib2.error.ServerNotFoundError as e:
+            print(f'An error occurred: {e}')

@@ -5,7 +5,7 @@
   "num_heads": 8,
   "d_layer": 12,
   "dropout": 0.2,
-  "position_length": 3000,
+  "position_length": 5000,
   "min_length": 180,
   "num_experts": 8,
   "topk_experts": 2,

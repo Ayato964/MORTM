@@ -1,11 +1,11 @@
 import json
 from typing import List
 
-
 class MORTMArgs:
-    def __init__(self, json_directory: str):
+    def __init__(self, json_directory: str, log_scale=False):
         with open(json_directory, 'r') as f:
             data: dict = json.load(f)
+
             self.name = "MORTM"
             self.vocab_size = data['vocab_size'] if data.get('vocab_size') else 128
             self.d_layer = data['d_layer'] if data.get('d_layer') else 12

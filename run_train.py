@@ -5,16 +5,18 @@
 import os
 from mortm.train.train import train_mortm
 
-from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter_pro2
+from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter_pro
 from mortm.utils.gmail_messanger import GmailMessanger, Messenger
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
 
-tokenizer = Tokenizer(get_token_converter_pro2(TO_MUSIC))
+tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC))
 
 model = train_mortm(tokenizer, "configs/models/mortm/4_5/research/preview3/pro.json", "configs/train/pre_training.json",
-                    "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/",
+                    "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/none_velocity/",
                     "out/models/mortm/4_5/",
-                    "4.5-Pro-Preview-0",
+                    "4.5-Pro-Preview-4",
+                    log_scale=True,
+                    project_name="MORTM4.5_Scale",
                     message=message)
