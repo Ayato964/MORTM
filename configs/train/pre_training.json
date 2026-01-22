@@ -3,7 +3,7 @@
   "batch_size": 16,
   "accumulation_steps":4,
   "warmup_steps": 4000,
-  "num_epochs": 1,
+  "num_epochs": 4,
   "is_save_training_progress": true,
   "val_total_tokens": 50000000,
   "train_dataset_split": 0.99

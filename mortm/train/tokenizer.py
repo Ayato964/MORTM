@@ -20,7 +20,7 @@ TO_MUSIC = 1
 
 
 
-def get_token_converter_pro(convert: int) -> List[Token]:
+def get_token_converter_pro(convert: int, old_version=True) -> List[Token]:
     register: List[Token] = list()
 
     register.append(EOS(convert))
@@ -60,49 +60,7 @@ def get_token_converter_pro(convert: int) -> List[Token]:
     register.append(TrackEnd(convert))
     register.append(Meta(convert))
 
-    return register
-
-def get_token_converter_pro2(convert: int) -> List[Token]:
-    register: List[Token] = list()
-
-    register.append(EOS(convert))
-    register.append(TagEnd(convert))
-
-    register.append(PastMelody(convert))
-
-    register.append(ConstChord(convert))
-    register.append(ConstMelody(convert))
-
-    register.append(FutureMelody(convert))
-
-    register.append(Motif(convert))
-
-    register.append(System(convert))
-    register.append(Instrument(convert))
-
-    register.append(GenMotif(convert))
-    register.append(MGen(convert))
-    register.append(CGen(convert))
-    register.append(Key(convert))
-
-    register.append(MeasureToken(convert))
-    register.append(Blank(convert))
-
-    register.append(StartRE(START_TYPE, convert))
-    register.append(ChordShiftRE(START_TYPE, convert))
-
-    register.append(ChordRoot(convert))
-    register.append(ChordQuality(convert))
-    register.append(ChordBass(convert))
-
-    register.append(Pitch(PITCH_TYPE, convert))
-    register.append(Duration(DURATION_TYPE, convert))
-    register.append(Velocity(VELOCITY_TYPE, convert))
-
-    register.append(SequenceEnd(convert))
-    register.append(TrackEnd(convert))
-    register.append(Meta(convert))
-
+    register.append(GenMeasureCount(convert))
     return register
 
 

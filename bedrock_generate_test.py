@@ -16,7 +16,7 @@ out_program = [65 for _ in range(generate_count)]
 midi_path = [midi_path for _ in range(generate_count)]
 
 if __name__ == "__main__":
-    tokenizer = Tokenizer(get_token_converter_pro2(TO_TOKEN))
+    tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
     args = MORTMArgs(args_path)
     if sft_model:
         args.use_lora = True

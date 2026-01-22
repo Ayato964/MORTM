@@ -571,13 +571,14 @@ class MIDIConverter(_AbstractMidiConverter):
 
 
 class PreTrainDataMaker(_AbstractConverter):
-    def __init__(self, converter: MIDIConverter, split_measure=12):
+    def __init__(self, converter: MIDIConverter, split_measure=12, additional_prompt=None):
         super().__init__(PreTrainDataMaker, None, None)
         self.converter = converter
         self.tokenizer = converter.tokenizer
         self.aya_node = [0]
         self.seq_dict = converter.midi2seq.aya_node
         self.split_measure = split_measure
+        self.additional_prompt = additional_prompt
 
     def save(self, save_directory: str) -> Tuple[bool, str]:
         if not self.is_error:
@@ -621,6 +622,8 @@ class PreTrainDataMaker(_AbstractConverter):
             prompt = self.converter.make_system_prompt(0, active_program_list)
             meta = np.concatenate([np.array([prompt[0]]), np.array([self.tokenizer.get("<CONST_M>")]), clip, np.array([self.tokenizer.get("<TAG_END>")]), np.array([self.tokenizer.get("<META>")]), np.array(prompt[1:]), np.array([self.tokenizer.get("<TE>")])])
             music = np.concatenate([np.array(prompt), np.array([self.tokenizer.get("<MGEN>")]), clip, np.array([self.tokenizer.get("<TE>")])])
+            if self.additional_prompt is not None:
+                music = self.additional_prompt(meta, music)
             self.aya_node = self.aya_node + [music]
             self.aya_node = self.aya_node + [meta]
             count += 1

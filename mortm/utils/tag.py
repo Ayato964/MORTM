@@ -98,4 +98,3 @@ def extract_tagged_sequences_batch(
                 last_end_pos = found_e_pos
 
     return results
-
