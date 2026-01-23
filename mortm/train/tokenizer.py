@@ -61,6 +61,7 @@ def get_token_converter_pro(convert: int, old_version=True) -> List[Token]:
     register.append(Meta(convert))
 
     register.append(GenMeasureCount(convert))
+    register.append(NoteDense(convert))
     return register
 
 

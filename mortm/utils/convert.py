@@ -1,3 +1,4 @@
+import math
 import os
 import random
 from typing import List, Any, Optional, Tuple, Dict
@@ -18,6 +19,23 @@ from mortm.train.tokenizer import Tokenizer, TO_MUSIC, TO_TOKEN
 from mortm.train.utils.chord_midi import ChordMidi, Chord
 from mortm.utils.key import get_key_dict
 from mortm.utils.tag import extract_tagged_sequences_batch
+from dataclasses import dataclass
+
+# ---------------------------------------------------------
+# Instrument Constraints Definition
+# ---------------------------------------------------------
+
+@dataclass
+class InstrumentConstraint:
+    programs: Tuple[int, ...]
+    is_polyphonic: bool
+
+# 楽器ごとの制約定義
+# ここに定義されていない楽器名が来た場合は ValueError が発生します
+INSTRUMENT_RULES = {
+    "PIANO": InstrumentConstraint(programs=(0, 1, 2, 3, 4, 5, 6), is_polyphonic=True),
+    "SAX": InstrumentConstraint(programs=(64, 65, 66, 67), is_polyphonic=False),
+}
 T = TypeVar("T")
 
 
@@ -521,15 +539,25 @@ class MIDIConverter(_AbstractMidiConverter):
             self.midi2seq = MIDI2Seq(tokenizer, directory, file_name, program_list, key=self.key, inst_list_with_name=self.inst_list_with_name, midi_data=self.midi_data) if use_midi2seq else None
             self.midi2seq_with_chord = OmegaMIDI2SeqWithChord(tokenizer, directory, file_name, program_list, all_chords, all_chord_timestamps, key=self.key, midi_data=self.midi_data, inst_list_with_name=self.inst_list_with_name) if use_midi2seq_with_chord else None
 
-
-    def make_system_prompt(self, time, found_list, call_function = None) -> List[int]:
+    def make_system_prompt(self, time, found_list: List[Tuple[str, int]], call_function=None) -> List[int]:
+        """
+        Args:
+            found_list: List of tuples (instrument_program_str, density_token_id)
+        """
         prompt = [self.tokenizer.get("<EOS>"),
                   self.tokenizer.get("<SYSTEM>")]
 
-        for p in found_list:
-            prompt.append(self.tokenizer.get(f"<INST_{p}>"))
+        # found_list は (program_name, density_token_id) のタプルのリストを想定
+        for p_name, density_id in found_list:
+            # <INST_...>
+            prompt.append(self.tokenizer.get(f"<INST_{p_name}>"))
+            # <NOTE_DENSE_X>
+            if density_id is not None:
+                prompt.append(density_id)
+
         if call_function is not None:
             call_function(prompt)
+
         prompt.append(self.tokenizer.get(f"k_{self.get_key(time) if isinstance(self.key, dict) else self.key}"))
         prompt.append(self.tokenizer.get("<TAG_END>"))
         return prompt
@@ -571,13 +599,14 @@ class MIDIConverter(_AbstractMidiConverter):
 
 
 class PreTrainDataMaker(_AbstractConverter):
-    def __init__(self, converter: MIDIConverter, split_measure=12, additional_prompt=None):
+    def __init__(self, converter: MIDIConverter, min_measure=1, max_measure=8, additional_prompt=None):
         super().__init__(PreTrainDataMaker, None, None)
         self.converter = converter
         self.tokenizer = converter.tokenizer
         self.aya_node = [0]
         self.seq_dict = converter.midi2seq.aya_node
-        self.split_measure = split_measure
+        self.min_measure = min_measure
+        self.max_measure = max_measure
         self.additional_prompt = additional_prompt
 
     def save(self, save_directory: str) -> Tuple[bool, str]:
@@ -591,42 +620,525 @@ class PreTrainDataMaker(_AbstractConverter):
         else:
             return False, self.error_reason
 
+    def _is_monophonic_sequence(self, sequence: np.ndarray) -> bool:
+        """
+        絶対位置(Position)ベースのトークン列に対して、単旋律チェックを行う。
+
+        判定ロジック:
+        1. <SME> でカウントリセット。
+        2. sトークン(Position)のIDが *変化した時のみ* カウントをリセットする。
+           (s_0 -> p -> s_0 -> p のような同位置の連打は和音とみなすためリセットしない)
+        3. 1つのPosition区間内で pトークンが2つ以上検出されたら False を返す。
+        """
+        s_range = self.tokenizer.get_length_tuple("s") # (min_s_id, max_s_id)
+        p_range = self.tokenizer.get_length_tuple("p") # (min_p_id, max_p_id)
+        sme_id = self.tokenizer.get("<SME>")
+
+        current_notes_in_step = 0
+        last_s_id = -1  # 無効なIDで初期化
+
+        for token_id in sequence:
+            # Case 1: 小節の開始 (<SME>) -> 文脈リセット
+            if token_id == sme_id:
+                current_notes_in_step = 0
+                last_s_id = -1
+
+            # Case 2: Position Token (s_x)
+            elif s_range[0] <= token_id <= s_range[1]:
+                # Position ID が変化した場合のみ、時間が進んだとみなしてカウントをリセット
+                if token_id != last_s_id:
+                    current_notes_in_step = 0
+                    last_s_id = token_id
+                # token_id == last_s_id の場合は、同一時刻(和音記述など)なのでリセットしない
+
+            # Case 3: Pitch Token (p_x)
+            elif p_range[0] <= token_id <= p_range[1]:
+                current_notes_in_step += 1
+                if current_notes_in_step > 1:
+                    return False  # 同一時刻に2つ以上の音が検出されたため、多旋律と判定
+
+        return True
+    def _calculate_density_token(self, sequence: np.ndarray, program_name: str) -> Optional[int]:
+        """
+        シーケンスの音密度を計算し、NoteDenseトークンのIDを返す。
+        閾値を超えた場合は None を返す。
+        """
+        # 1. パラメータ設定
+        rule = INSTRUMENT_RULES.get(program_name)
+        if rule is None:
+            raise ValueError(f"Undefined instrument rule: {program_name}")
+
+        max_notes_per_measure = 36 if rule.is_polyphonic else 24
+
+        # 2. 小節ごとの分割 (SMEトークンで分割)
+        sme_id = self.tokenizer.get("<SME>")
+        measures = split_sequence_measure(sequence, 1, sme_id)
+
+        # sトークンの範囲取得
+        s_range = self.tokenizer.get_length_tuple("s")
+        s_min, s_max = s_range
+
+        total_density_score = 0.0
+        valid_measures_count = 0
+
+        for measure in measures:
+            # この小節内の sトークン の数をカウント (Note数と等価)
+            note_count = np.sum((measure >= s_min) & (measure <= s_max))
+
+            # 閾値チェック: 最大値を超えたらその時点でスキップ対象
+            if note_count > max_notes_per_measure:
+                return None
+
+            # 密度計算 (0.0 ~ 1.0)
+            density = note_count / max_notes_per_measure
+            total_density_score += density
+            valid_measures_count += 1
+
+        if valid_measures_count == 0:
+            return self.tokenizer.get("<NOTE_DENSE_1>") # 安全策
+
+        # 3. 平均化と正規化 (1 ~ 10)
+        avg_density = total_density_score / valid_measures_count
+
+        # 0.0 -> 1, 1.0 -> 10 にマッピング
+        # math.ceil(0.001 * 10) = 1, math.ceil(1.0 * 10) = 10
+        # 密度0の場合は1とする
+        if avg_density <= 0:
+            score = 1
+        else:
+            score = math.ceil(avg_density * 10)
+            if score > 10: score = 10
+            if score < 1: score = 1
+
+        return self.tokenizer.get(f"<NOTE_DENSE_{score}>")
+    def _check_instrument_constraint(self, program_name: str, sequence: np.ndarray) -> bool:
+        """
+        楽器ごとの制約を確認する。
+        定義されていない楽器の場合は例外を投げる。
+        """
+        if program_name not in INSTRUMENT_RULES:
+            # 厳密なデータセット作成のため、未知の楽器は許容せずエラーとする
+            raise ValueError(f"Undefined instrument rule for program: {program_name}. Please update INSTRUMENT_RULES.")
+
+        rule = INSTRUMENT_RULES[program_name]
+
+        if rule.is_polyphonic:
+            return True
+        else:
+            return self._is_monophonic_sequence(sequence)
+
     def convert(self, *args, **kwargs):
+        measure_token_id = self.tokenizer.get("<SME>")
+
+        seq_inds = {}
         for program in self.converter.program_list:
             seq = self.seq_dict[program]
-            measure_token_id = self.tokenizer.get("<SME>")
-            split_seqs = split_sequence_measure(seq, self.split_measure, measure_token_id)
-            self.seq_dict[program] = split_seqs
+            seq_inds[program] = np.where(seq == measure_token_id)[0]
+
         inst_finish_dict = {program: False for program in self.converter.program_list}
-        count = 0
+        now_measure = 0
+        current_split_length = random.randint(self.min_measure, self.max_measure)
+
         while not all(inst_finish_dict.values()):
             clip = np.array([], dtype=int)
-            active_program_list = []
+            active_program_info = [] # (program_name, density_token_id) のリスト
+
+            is_skip_window = False # このウィンドウをスキップするかどうかのフラグ
+
             for program in self.converter.program_list:
                 if inst_finish_dict[program]:
                     continue
-                inst = self.seq_dict[program][count]
+
+                inds = seq_inds[program]
+                if now_measure + current_split_length >= len(inds):
+                    inst_finish_dict[program] = True
+                    continue
+
+                start_idx = inds[now_measure]
+                end_idx = inds[now_measure + current_split_length]
+                inst_seq = self.seq_dict[program][start_idx:end_idx]
                 s_e = self.tokenizer.get_length_tuple("s")
 
-                if np.any(np.isin(inst, [s for s in range(s_e[0], s_e[1])])):
-                    inst: np.ndarray
-                    inst = np.concatenate([np.array([self.tokenizer.get(f"<INST_{program}>")]), inst, np.array([self.tokenizer.get("<ESEQ>")])])
-                    clip = np.concatenate([clip, inst])
-                    active_program_list.append(program)
-                if count + 1 >= len(self.seq_dict[program]):
-                    inst_finish_dict[program] = True
-            if len(active_program_list) == 0:
-                count += 1
+                # 音がある場合のみ処理
+                if np.any(np.isin(inst_seq, [s for s in range(s_e[0], s_e[1])])):
+
+                    # 1. 楽器制約チェック
+                    if self._check_instrument_constraint(program, inst_seq):
+
+                        # 2. 密度計算 & 閾値チェック
+                        density_token = self._calculate_density_token(inst_seq, program)
+
+                        if density_token is None:
+                            # 閾値を超えたため、このウィンドウ全体をスキップする
+                            is_skip_window = True
+                            break
+
+                        # クリップ結合
+                        inst_seq_framed = np.concatenate([
+                            np.array([self.tokenizer.get(f"<INST_{program}>")]),
+                            inst_seq,
+                            np.array([self.tokenizer.get("<ESEQ>")])
+                        ])
+                        clip = np.concatenate([clip, inst_seq_framed])
+
+                        # プロンプト用情報を保存
+                        active_program_info.append((program, density_token))
+
+            # スキップ判定 または 有効な楽器がない場合
+            if is_skip_window or len(active_program_info) == 0:
+                now_measure += current_split_length
+                current_split_length = random.randint(self.min_measure, self.max_measure)
                 continue
 
-            prompt = self.converter.make_system_prompt(0, active_program_list)
-            meta = np.concatenate([np.array([prompt[0]]), np.array([self.tokenizer.get("<CONST_M>")]), clip, np.array([self.tokenizer.get("<TAG_END>")]), np.array([self.tokenizer.get("<META>")]), np.array(prompt[1:]), np.array([self.tokenizer.get("<TE>")])])
-            music = np.concatenate([np.array(prompt), np.array([self.tokenizer.get("<MGEN>")]), clip, np.array([self.tokenizer.get("<TE>")])])
+            # --- プロンプト作成 ---
+            def append_measure_count(p: list):
+                p.append(self.tokenizer.get(f"<GEN_MEASURE_COUNT_{current_split_length}>"))
+
+            # active_program_info は [(program, density_token), ...] となっている
+            prompt = self.converter.make_system_prompt(0, active_program_info, call_function=append_measure_count)
+
+            # --- データ構築 ---
+            meta = np.concatenate([
+                np.array([prompt[0]]),
+                np.array([self.tokenizer.get("<CONST_M>")]),
+                clip,
+                np.array([self.tokenizer.get("<TAG_END>")]),
+                np.array([self.tokenizer.get("<META>")]),
+                np.array(prompt[1:]),
+                np.array([self.tokenizer.get("<TE>")])
+            ])
+
+            music = np.concatenate([
+                np.array(prompt),
+                np.array([self.tokenizer.get("<MGEN>")]),
+                clip,
+                np.array([self.tokenizer.get("<TE>")])
+            ])
+
             if self.additional_prompt is not None:
                 music = self.additional_prompt(meta, music)
-            self.aya_node = self.aya_node + [music]
-            self.aya_node = self.aya_node + [meta]
-            count += 1
+
+            self.aya_node.append(music)
+            self.aya_node.append(meta)
+
+            now_measure += current_split_length
+            current_split_length = random.randint(self.min_measure, self.max_measure)
+
+
+class PreTrainWithChordDataMaker(_AbstractConverter):
+    """
+    Chord <-> MIDI 双方向事前学習データメーカー
+
+    生成タスク:
+    1. Chord2MIDI: <CONST_C> (Chord) -> <MGEN> (Melody)
+       - AIへの生成指示用なので、密度トークン(<NOTE_DENSE>)を含める。
+
+    2. MIDI2Chord: <CONST_M> (Melody) -> <CGEN> (Chord)
+       - ユーザー入力からの推論用なので、密度トークンは含めない。
+    """
+
+    def __init__(self, converter: MIDIConverter, min_measure=1, max_measure=8, additional_prompt=None):
+        super().__init__(PreTrainWithChordDataMaker, None, None)
+        self.converter = converter
+        self.tokenizer = converter.tokenizer
+        self.aya_node = [0]
+        self.min_measure = min_measure
+        self.max_measure = max_measure
+        self.additional_prompt = additional_prompt
+
+        # コード情報付きのシーケンスを使用 (必須)
+        if converter.midi2seq_with_chord is None:
+            self.is_error = True
+            self.error_reason = "PreTrainWithChordDataMakerを使用するには、MIDIConverterでuse_midi2seq_with_chord=Trueにする必要があります。"
+        else:
+            self.seq_dict = converter.midi2seq_with_chord.aya_node.copy()
+
+    def save(self, save_directory: str) -> Tuple[bool, str]:
+        if not self.is_error:
+            array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
+            if len(array_dict) > 1:
+                np.savez(save_directory + "/" + self.converter.file_name, **array_dict)
+                return True, "処理が正常に終了しました。"
+            else:
+                return False, "オブジェクトが何らかの理由で見つかりませんでした。"
+        else:
+            return False, self.error_reason
+
+    # ---------------------------------------------------------
+    # ヘルパーメソッド: 制約チェック & 密度計算
+    # ---------------------------------------------------------
+
+    def _is_monophonic_sequence(self, sequence: np.ndarray) -> bool:
+        """Position変化監視による厳密な単旋律チェック"""
+        s_range = self.tokenizer.get_length_tuple("s")
+        p_range = self.tokenizer.get_length_tuple("p")
+        sme_id = self.tokenizer.get("<SME>")
+
+        current_notes_in_step = 0
+        last_s_id = -1
+
+        for token_id in sequence:
+            # 小節開始 -> リセット
+            if token_id == sme_id:
+                current_notes_in_step = 0
+                last_s_id = -1
+            # Positionトークン -> ID変化時のみリセット(時間経過)
+            elif s_range[0] <= token_id <= s_range[1]:
+                if token_id != last_s_id:
+                    current_notes_in_step = 0
+                    last_s_id = token_id
+            # Pitchトークン -> カウント
+            elif p_range[0] <= token_id <= p_range[1]:
+                current_notes_in_step += 1
+                if current_notes_in_step > 1:
+                    return False  # 多旋律検知
+        return True
+
+    def _check_instrument_constraint(self, program_name: str, sequence: np.ndarray) -> bool:
+        """楽器ごとの単旋律/多旋律制約を確認"""
+        if program_name not in INSTRUMENT_RULES:
+            raise ValueError(f"Undefined instrument rule: {program_name}")
+
+        rule = INSTRUMENT_RULES[program_name]
+        if rule.is_polyphonic:
+            return True
+        else:
+            return self._is_monophonic_sequence(sequence)
+
+    def _calculate_density_token(self, sequence: np.ndarray, program_name: str) -> Optional[int]:
+        """音密度を計算しトークンIDを返す。閾値超えはNone"""
+        rule = INSTRUMENT_RULES.get(program_name)
+        max_notes = 36 if rule.is_polyphonic else 24
+
+        sme_id = self.tokenizer.get("<SME>")
+        blank_id = self.tokenizer.get("<BLANK>")
+        measures = split_sequence_measure(sequence, 1, sme_id)
+
+        s_min, s_max = self.tokenizer.get_length_tuple("s")
+        total_density = 0.0
+        valid_measures = 0
+
+        for measure in measures:
+            # BLANKを含む場合は強制的にノート数0とする
+            if blank_id in measure:
+                count = 0
+            else:
+                count = np.sum((measure >= s_min) & (measure <= s_max))
+
+            if count > max_notes:
+                return None # 閾値オーバー
+
+            total_density += (count / max_notes)
+            valid_measures += 1
+
+        if valid_measures == 0:
+            return self.tokenizer.get("<NOTE_DENSE_1>")
+
+        avg = total_density / valid_measures
+        score = 1 if avg <= 0 else math.ceil(avg * 10)
+        score = max(1, min(10, score)) # 1~10にクランプ
+
+        return self.tokenizer.get(f"<NOTE_DENSE_{score}>")
+
+    def _get_mask(self, seq: np.ndarray, ranges: List[Tuple[int, int]]) -> np.ndarray:
+        mask = np.zeros(seq.shape, dtype=bool)
+        for start, end in ranges:
+            mask |= (seq >= start) & (seq <= end)
+        return mask
+
+    def _separate_seq(self, sequence: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """シーケンスをMelody(Inst, Note)とChord(CR, CQ, CB)に分離"""
+        s_range = self.tokenizer.get_length_tuple("s")
+        p_range = self.tokenizer.get_length_tuple("p")
+        d_range = self.tokenizer.get_length_tuple("d")
+        cr_range = self.tokenizer.get_length_tuple("CR")
+        cq_range = self.tokenizer.get_length_tuple("CQ")
+        cb_range = self.tokenizer.get_length_tuple("CB")
+
+        sme = self.tokenizer.get("<SME>")
+        blank = self.tokenizer.get("<BLANK>")
+        eseq = self.tokenizer.get("<ESEQ>")
+
+        melody_ranges = [p_range, d_range]
+        chord_ranges = [cr_range, cq_range, cb_range]
+        common_ranges = [s_range]
+
+        sme_indices = np.where(sequence == sme)[0]
+        melody_result = []
+        chord_result = []
+
+        current_idx = sme_indices[0] if len(sme_indices) > 0 and sme_indices[0] != 0 else 0
+
+        for i, idx in enumerate(sme_indices):
+            next_idx = sme_indices[i+1] if i + 1 < len(sme_indices) else len(sequence)
+            chunk = sequence[idx : next_idx]
+
+            # Melody Part Extraction
+            is_mel = self._get_mask(chunk, melody_ranges)
+            if np.any(is_mel):
+                mask = self._get_mask(chunk, common_ranges + melody_ranges)
+                mask |= (chunk == sme) | (chunk == blank) | (chunk == eseq)
+                melody_result.extend(chunk[mask].tolist())
+            else:
+                melody_result.extend([sme, blank])
+
+            # Chord Part Extraction
+            is_chd = self._get_mask(chunk, chord_ranges)
+            if np.any(is_chd):
+                mask = self._get_mask(chunk, common_ranges + chord_ranges)
+                mask |= (chunk == sme) | (chunk == blank) | (chunk == eseq)
+                chord_result.extend(chunk[mask].tolist())
+            else:
+                chord_result.extend([sme, blank])
+
+        return np.array(melody_result, dtype=int), np.array(chord_result, dtype=int)
+
+    # ---------------------------------------------------------
+    # メイン変換ロジック
+    # ---------------------------------------------------------
+    def convert(self, *args, **kwargs):
+        if self.is_error: return
+        measure_token_id = self.tokenizer.get("<SME>")
+
+        # インデックスの準備
+        seq_inds = {}
+        for program in self.converter.program_list:
+            seq = self.seq_dict[program]
+            seq_inds[program] = np.where(seq == measure_token_id)[0]
+
+        inst_finish_dict = {program: False for program in self.converter.program_list}
+        now_measure = 0
+        current_split_length = random.randint(self.min_measure, self.max_measure)
+
+        while not all(inst_finish_dict.values()):
+            clip_melody_all = np.array([], dtype=int) # 全楽器の旋律を結合するバッファ
+            global_chord_clip = None # 全楽器共通のコード進行
+
+            active_program_info = [] # (program_name, density_token_id)
+            is_skip_window = False
+
+            # --- 楽器ループ ---
+            for program in self.converter.program_list:
+                if inst_finish_dict[program]: continue
+
+                inds = seq_inds[program]
+                if now_measure + current_split_length >= len(inds):
+                    inst_finish_dict[program] = True
+                    continue
+
+                start_idx = inds[now_measure]
+                end_idx = inds[now_measure + current_split_length]
+                inst_seq = self.seq_dict[program][start_idx:end_idx]
+                s_e = self.tokenizer.get_length_tuple("s")
+
+                # 音が含まれている場合のみ処理
+                if np.any(np.isin(inst_seq, [s for s in range(s_e[0], s_e[1])])):
+
+                    # 1. 楽器制約チェック
+                    if self._check_instrument_constraint(program, inst_seq):
+
+                        # 2. 密度計算
+                        density_token = self._calculate_density_token(inst_seq, program)
+                        if density_token is None:
+                            is_skip_window = True; break
+
+                        # 3. 分離処理 (Melody / Chord)
+                        mel_seq, chord_seq = self._separate_seq(inst_seq)
+
+                        # 旋律部分の結合 (<INST> ... <ESEQ>)
+                        inst_mel_framed = np.concatenate([
+                            np.array([self.tokenizer.get(f"<INST_{program}>")]),
+                            mel_seq,
+                            np.array([self.tokenizer.get("<ESEQ>")])
+                        ])
+                        clip_melody_all = np.concatenate([clip_melody_all, inst_mel_framed])
+
+                        # コード進行の確保 (最初の有効なものをグローバルとして採用)
+                        if global_chord_clip is None:
+                            global_chord_clip = chord_seq
+
+                        active_program_info.append((program, density_token))
+
+            # --- スキップ判定 ---
+            # スキップフラグ、有効楽器なし、コード情報なしのいずれかでスキップ
+            if is_skip_window or len(active_program_info) == 0 or global_chord_clip is None:
+                now_measure += current_split_length
+                current_split_length = random.randint(self.min_measure, self.max_measure)
+                continue
+
+            # =================================================================
+            # プロンプトの作成
+            # =================================================================
+
+            # 生成長を指定するコールバック
+            def append_measure_count(p: list):
+                p.append(self.tokenizer.get(f"<GEN_MEASURE_COUNT_{current_split_length}>"))
+
+            # Pattern A: 密度あり (Chord2MIDI用 - AI生成制御用)
+            # active_program_info は [(PROG, DENSE_ID), ...] なのでそのまま渡す
+            prompt_with_density = self.converter.make_system_prompt(0, active_program_info, call_function=append_measure_count)
+
+            # Pattern B: 密度なし (MIDI2Chord用 - ユーザー入力想定)
+            # 密度IDをNoneにしたリストを作成
+            active_program_info_no_dense = [(prog, None) for prog, _ in active_program_info]
+            prompt_no_density = self.converter.make_system_prompt(0, active_program_info_no_dense, call_function=append_measure_count)
+
+            # --- 各パートデータの準備 ---
+            # 1. Const Chord Part
+            const_chord_part = np.concatenate([
+                np.array([self.tokenizer.get("<CONST_C>")]),
+                global_chord_clip,
+                np.array([self.tokenizer.get("<ESEQ>")]),
+                np.array([self.tokenizer.get("<TAG_END>")])
+            ])
+
+            # 2. Const Melody Part
+            const_melody_part = np.concatenate([
+                np.array([self.tokenizer.get("<CONST_M>")]),
+                clip_melody_all,
+                np.array([self.tokenizer.get("<TAG_END>")])
+            ])
+
+            # 3. Gen Melody Part
+            gen_melody_part = np.concatenate([
+                np.array([self.tokenizer.get("<MGEN>")]),
+                clip_melody_all,
+                np.array([self.tokenizer.get("<TE>")])
+            ])
+
+            # 4. Gen Chord Part
+            gen_chord_part = np.concatenate([
+                np.array([self.tokenizer.get("<CGEN>")]),
+                global_chord_clip,
+                np.array([self.tokenizer.get("<ESEQ>")]),
+                np.array([self.tokenizer.get("<TE>")])
+            ])
+
+            # ==========================================
+            # Task A: Chord2MIDI (Chord -> Melody)
+            # ==========================================
+            # 密度情報: あり
+            seq_c2m = np.concatenate([
+                np.array(prompt_with_density),
+                const_chord_part,
+                gen_melody_part
+            ])
+            self.aya_node.append(seq_c2m)
+
+            # ==========================================
+            # Task B: MIDI2Chord (Melody -> Chord)
+            # ==========================================
+            # 密度情報: なし (ユーザー入力は密度不明のため)
+            seq_m2c = np.concatenate([
+                np.array(prompt_no_density),
+                const_melody_part,
+                gen_chord_part
+            ])
+            self.aya_node.append(seq_m2c)
+
+            # --- 次のステップへ ---
+            now_measure += current_split_length
+            current_split_length = random.randint(self.min_measure, self.max_measure)
 
 class Task1DataMaker(_AbstractConverter):
 

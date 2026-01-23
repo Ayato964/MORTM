@@ -55,9 +55,7 @@ def create_subset_dataset_with_seq_filter(
                     for key in data.files:
                         arr = data[key]
 
-                        # 【修正箇所】
-                        # 0次元配列(スカラ)の場合、len()を使うとエラーになるため
-                        # 強制的に1次元配列として扱って長さを取得する
+
                         if arr.ndim == 0:
                             arr = np.atleast_1d(arr)
 
@@ -76,7 +74,10 @@ def create_subset_dataset_with_seq_filter(
         if current_valid_tokens + group_valid_tokens <= max_tokens:
             new_dataset_structure.append(group)
             current_valid_tokens += group_valid_tokens
+            print(f"\r Index {i}: Added group with {group_valid_tokens} valid tokens. Total: {current_valid_tokens}", end="")
         else:
+            new_dataset_structure.append(group)
+            current_valid_tokens += group_valid_tokens
             print(f"Limit reached at index {i}.")
             print(f"Current Valid Total: {current_valid_tokens}, Next Group Valid: {group_valid_tokens}, Limit: {max_tokens}")
             break
@@ -96,9 +97,9 @@ def create_subset_dataset_with_seq_filter(
 
 # --- 使用例 ---
 if __name__ == "__main__":
-    input_json = "out/models/mortm/4_5/train_paths_4.5-Pro-Preview-4.json"
-    output_json = "out/models/mortm/4_5/scaled_dataset_filtered.json"
-    target_tokens = 1396597367 // 4
+    input_json = "out/models/mortm/4_5/scaling_test/train_paths_Scaling_.json"
+    output_json = "out/models/mortm/4_5/scaling_test/1.6B/train.json"
+    target_tokens = 1_600_000_000  # 1億トークン
 
     # フィルタ条件 (例: 128トークン以上、2048トークン以下のシーケンスのみカウント)
     min_len = 180

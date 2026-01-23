@@ -112,7 +112,7 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
                 if con.is_error:
                     continue
 
-                maker = PreTrainDataMaker(con, 12)
+                maker = PreTrainDataMaker(con, 1, 8)
                 maker.convert()
 
                 is_saved, reason = maker.save(save_path)
@@ -155,24 +155,33 @@ def convert_chord(pid, tokenizer, directory, md_file, system_file, SAX, progress
     for i in range(len(md_file)):
         if (system_file[i]["key"] and system_file[i]["all_chords"] and not ("N" in system_file[i]["all_chords"])
                 and system_file[i]["all_chords_timestamps"] and system_file[i]["tempo"]):
-            is_error = False
-            con = MetaData2Chord(tokenizer, key=system_file[i]["key"], all_chords=system_file[i]["all_chords"],
-                                 all_chord_timestamps=system_file[i]["all_chords_timestamps"], tempo=system_file[i]["tempo"],
-                                 directory=directory[i], file_name=md_file[i])
-            con.convert()
+            try:
+                con = MIDIConverter(tokenizer, directory[i], md_file[i], SAX, key=system_file[i]["key"],
+                                    all_chords=system_file[i]["all_chords"], all_chord_timestamps=system_file[i]["all_chords_timestamps"],
+                                    use_midi2seq=False, use_midi2seq_with_chord=True)
+                con.convert()
 
-            for a in con.aya_node[1:]:
-                a:np.ndarray
-                if np.sum(a == 0) != 0:
-                    print(f"\033[31m 警告, 今すぐ処理を中断してください！！！  : {system_file[i]["location"]}  {np.where(a == 0)}")
-                    is_error = True
-                    break
-            if not is_error:
-                is_saved, reason = con.save(save_directory)
+                if con.is_error:
+                    continue
+
+                maker = PreTrainWithChordDataMaker(con, 1, 8)
+                maker.convert()
+
+                is_saved, reason = maker.save(save_directory)
                 if is_saved:
                     local_count += 1
 
-                print(f"Process#{pid}: Running... {local_count}  Reason: {reason}")
+                for a in maker.aya_node[1:]:
+                    a:np.ndarray
+                    if np.sum(a == 0) != 0:
+                        print(f"\033[31m Error!!  {directory[i]}/{md_file[i]}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                        is_error = True
+                        break
+                print(f"Process#{pid}: Running... {local_count}  {reason}")
+            except Exception as e:
+                print(f" Process#{pid} encountered an error with file {directory[i]}/{md_file[i]}: {e}")
+                continue
+
 
 
 def convert_task_seq(pid, tokenizer, directory, md_file, system_file, program, progress, save_directory):
@@ -236,45 +245,45 @@ if __name__ == "__main__":
     PROGRAM = ['PIANO', 'SAX']
     tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/GMD/training/"
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/GMD/training/"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
     #datasets = "./out/model/mortm/45_research/datasets/eval.json"
 
-    #"""
+    """
     directory, md_file = find_midi_files(datasets)
     #directory, md_file = extract_midi_npz_paths(datasets)
-    #"""
     """
+    #"""
     print("データ整理中・・・・")
     directory, md_file, system_file = find_midi_files_with_json(datasets)
     print("完了！！")
-    """
+    #"""
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
-    """
+    #"""
     system_file = np.array_split(system_file, THREAD_VALUE)
-    """
+    #"""
 
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            #"""
+            """
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/none_velocity/music"))
-            #"""
+                                              md_file[t].tolist(), PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/ver2/music"))
+            """
 
             """
             p = Process(target=convert_class_seq, args=(t, tokenizer, directory[t], md_file[t], "HUMAN", "out/np/bertm/"))
             """
 
-            """
-            p = Process(target=convert_task_seq, args=(t, tokenizer, directory[t].tolist(),
-                                                         md_file[t].tolist(), system_file[t], PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/post_train/omega/"))
-            """
+            #"""
+            p = Process(target=convert_chord, args=(t, tokenizer, directory[t].tolist(),
+                                                         md_file[t].tolist(), system_file[t], PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/ver2/cm/"))
+            #"""
 
             processes.append(p)
             p.start()
