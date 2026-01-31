@@ -13,11 +13,13 @@ message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi
 
 tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC))
 
-model = train_mortm(tokenizer, "configs/models/mortm/4_5/research/preview3/pro.json", "configs/train/pre_training.json",
-                    "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/ver2",
-                    "out/models/mortm/4_5/",
-                    "Scaling_",
-                    log_scale=False,
-                    project_name="MORTM4.5_Scale",
-#                    eval_list_json="out/models/mortm/4_5/eval_paths_4.5-Pro-Preview-4.json",
-                    message=message)
+param = ["10M", "20M", "40M", "80M", "160M"]
+for p in param:
+    model = train_mortm(tokenizer, f"configs/models/mortm/4_5/research/preview4/{p}.json", f"configs/train/mortm/4_5/preview4/{p}.json",
+                        "out/models/mortm/4_5/scaling_test/800M/train.json",
+                        f"out/models/mortm/4_5/scaling_test/800M/",
+                        f"D800M_N{p}",
+                        log_scale=True,
+                        project_name="MORTM4.5_Scale2",
+                        eval_list_json="out/models/mortm/4_5/scaling_test/eval.json",
+                        message=message)

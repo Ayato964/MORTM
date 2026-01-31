@@ -33,8 +33,6 @@ from mortm.models.bertm import BERTM
 from mortm.models.v_mortm import V_MORTM, V_MORTMArgs
 from mortm.models.mortm_live import MORTMLive, MORTM_LIVE_Args, Vision
 from mortm.utils.pianoroll_convert import *
-
-from .noam import noam_lr
 from .epoch import EpochObserver
 from .config import AbstractTrainSet, TrainArgs
 from .tokenizer import Tokenizer
@@ -43,61 +41,31 @@ from .utils.loss import MusicEntropyLoss, MaskedCrossEntropyLoss
 IS_DEBUG = False
 
 
-class VisionTrainSet(AbstractTrainSet):
-
-    def __init__(self, args: MORTM_LIVE_Args, progress: LearningProgress, load_directory=None, beta: float = 1.0, pitch_weight: float = 1.0, velocity_weight: float = 1.0):
-        self.args = args
-        self.args.device = progress.get_device()
-        self.model = Vision(args)
-
-        if load_directory is not None:
-            self.model.load_state_dict(torch.load(load_directory, map_location=progress.get_device()))
-        self.model.to(progress.get_device())
-        adam = torch.optim.Adam(self.model.parameters(), lr=1e-4, betas=(0.9, 0.98))
-        super().__init__(criterion=MusicEntropyLoss(beta=beta, pitch_weight=pitch_weight, velocity_weight=velocity_weight),
-                         optimizer=adam,
-                         scheduler=None)
-
-    def epoch_fc(self, model, pack, progress):
-        original = pack
-        decoded, mu, log_var = model(original.to(progress.get_device()))
-        return decoded, original, mu, log_var
-
-    def pre_processing(self, pack, progress):
-        dt: DataLoader = pack
-        mini_dataset = PianoRollDataset(progress)
-
-        for d in dt:
-            da = get_pianoroll(d, self.args.ticks_per_measure, self.args.inst_list)
-            mini_dataset.add_data(da)
-        mini_dataset.set_tokenizer_dataset()
-        return mini_dataset
-
 
 class MORTMTrainSet(AbstractTrainSet):
-    def __init__(self, args: MORTMArgs, tokenizer, calc_val_loss_tokens, progress: LearningProgress, log_scale=False, project_name="", config=None,  load_directory=None):
-        self.args = args
+    def __init__(self, args: MORTMArgs, t_args, tokenizer, calc_val_loss_tokens, progress: LearningProgress, log_scale=False, project_name="", config=None,  load_directory=None, model_name=None):
         self.tokenizer: Tokenizer = tokenizer
         self.model = MORTM(progress=progress, args=args).to(progress.get_device())
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
 
         self.params = sum(p.numel() for p in self.model.parameters())
-        if log_scale:
-            with open(config, 'r') as f:
-                data: dict = json.load(f)
-            data['model_params'] = self.params
-            wandb.init(
-                project=project_name,
-                config=data
-            )
+        adam = torch.optim.Adam(self.model.parameters(), lr=t_args.lr_param)
 
-        adam = torch.optim.Adam(self.model.parameters(), lr=5e-1)
-        #self.model = torch.compile(self.model)
+        with open(config, 'r') as f:
+            data: dict = json.load(f)
+            if log_scale:
+                data['model_params'] = self.params
+                wandb.init(
+                    project=project_name,
+                    name=model_name,
+                    config=data
+                )
 
         super().__init__(criterion=MaskedCrossEntropyLoss(ignore_index=0).to(progress.get_device()),
-                        optimizer=adam,
-                        scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)),
+                         optimizer=adam,
+                         t_args=t_args,
+                         m_args=args,
                          calc_val_loss_tokens=calc_val_loss_tokens)
 
     def pre_processing(self, pack, progress):
@@ -164,132 +132,6 @@ class MORTMTrainSet(AbstractTrainSet):
         return mask_x.to(x.device)
 
 
-class BERTMTrainSet(AbstractTrainSet):
-
-    def __init__(self, args: MORTMArgs, progress: LearningProgress, load_directory=None):
-        self.model = BERTM(progress=progress, args=args).to(progress.get_device())
-        if load_directory is not None:
-            self.model.load_state_dict(torch.load(load_directory))
-
-        adam = torch.optim.Adam(self.model.parameters(), lr=5e-1, betas=(0.9, 0.98))
-
-        super().__init__(criterion=nn.BCEWithLogitsLoss().to(progress.get_device()),
-                         optimizer=adam,
-                         scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
-
-
-    def pre_processing(self, pack, progress):
-        dt: DataLoader = pack
-        mini_dataset = ClassDataSets(progress, self.model.args.position_length)
-        for d in dt:
-            d: str
-            np_load_data = np.load(d, allow_pickle=True)
-            if "/ai" in d:
-                mini_dataset.add_data(np_load_data, 1)
-            elif "/human" in d or "/pre_train" in d:
-                mini_dataset.add_data(np_load_data, 0)
-        return mini_dataset
-
-    def epoch_fc(self, model, pack, progress):
-        src, tgt = pack
-        target: Tensor = tgt.to(progress.get_device())
-        src = src.to(progress.get_device())
-        src_pad = _get_padding_mask(src, progress)
-        #print(src.max(), target)
-        out = model(src, padding_mask=src_pad)
-        inputs = out.view(-1, out.size(-1)).to(progress.get_device())
-        return inputs.squeeze(-1).to(dtype=torch.float32), target.to(dtype=torch.float32)
-
-
-class V_MORTMTrainSet(AbstractTrainSet):
-    def __init__(self, args: V_MORTMArgs, progress: LearningProgress, load_directory=None, split_time=10,
-        n_fft: int = 1024,
-        hop_length: int = 256,
-        n_mels: int = 80,
-                 ):
-        self.split_time = split_time
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.n_mels = n_mels
-
-        self.model = V_MORTM(progress=progress, args=args).to(progress.get_device())
-        if load_directory is not None:
-            self.model.load_state_dict(torch.load(load_directory))
-
-        adam = torch.optim.Adam(self.model.parameters(), lr=1e-1, betas=(0.9, 0.98))
-
-        super().__init__(criterion=nn.MSELoss().to(progress.get_device()),
-                         optimizer=adam,
-                         scheduler=LambdaLR(optimizer=adam, lr_lambda=noam_lr(d_model=args.d_model, warmup_steps=4000)))
-
-    def pre_processing(self, pack, progress):
-        wav_set = pack
-        comp = []
-        for ws in wav_set:
-            wav_np, sr = sf.read(ws, always_2d=True)
-            wav_np = wav_np.T.astype("float32")       # shape: (ch, time)
-            waveform = torch.from_numpy(wav_np)
-
-            # 3) モノラル化
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)  # → [1, time]
-
-            # 4) 分割長サンプル数の決定（必ず split_time 秒ごと）
-            if self.split_time:
-                seg_len = int(self.split_time * sr)
-                total = waveform.shape[1]
-                num_segments = (total + seg_len - 1) // seg_len  # ceil
-            else:
-                seg_len = waveform.shape[1]
-                num_segments = 1
-
-            # 5) メル変換器を一度だけ生成
-            mel_tf = torchaudio.transforms.MelSpectrogram(
-                sample_rate=sr,
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                n_mels=self.n_mels,
-            )
-
-            # 6) 各セグメントを切り出し、最後は無音でパディング
-            for i in range(num_segments):
-                start = i * seg_len
-                end = start + seg_len
-                if end <= waveform.shape[1]:
-                    seg = waveform[:, start:end]
-                else:
-                    # 残り部分 + 無音パディング
-                    rest = waveform[:, start:]
-                    pad_len = end - waveform.shape[1]
-                    pad = torch.zeros((waveform.shape[0], pad_len), dtype=waveform.dtype)
-                    seg = torch.cat([rest, pad], dim=1)
-
-                # mel: [1, n_mels, T]
-                mel = mel_tf(seg)
-                # squeeze → [n_mels, T]
-                mel = mel.squeeze(0)
-                # log1p
-                logmel = torch.log1p(mel)
-                comp.append(logmel)
-
-        # 7) バッチ化
-        datasets = TensorDataset(progress)
-        datasets.add_data(comp)
-        return datasets
-
-
-    def epoch_fc(self, model, pack, progress):
-        src: Tensor = pack
-
-        src = rearrange(src, 'b d s -> b s d')
-
-        target: Tensor = src[:, 1:, :]
-        src = src[:, :-1, :]
-
-        input: Tensor = model(src=src)
-        input = rearrange(input, 'b s d -> b d s')
-        target = rearrange(target, 'b s d -> b d s')
-        return input.to(dtype=torch.float32), target
 
 def _send_prediction_end_time(message, loader_len, begin_time, end_time,
                               vocab_size: int, num_epochs: int, trans_layer, num_heads, d_model,
@@ -508,7 +350,7 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:Abstr
             for pack in train_loader:
                 begin_time = time.time()
                 pre_processing: Dataset = trainer.pre_processing(pack, progress)
-                loader = DataLoader(pre_processing, batch_size=train_args.batch_size, shuffle=True, collate_fn=coll_fn)
+                loader = DataLoader(pre_processing, batch_size=train_args.batch_size, shuffle=train_args.shuffle, collate_fn=coll_fn)
                 mini_c = 0
                 count += 1
                 for pack2 in loader:
@@ -524,7 +366,7 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:Abstr
                     epoch_loss.add(loss.item())
 
 
-                    trainer.view_logs(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if train_args.lr_param is None else train_args.lr_param, verification_loss, trainer.all_tokens)
+                    trainer.view_logs(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(loader),  epoch_loss.get(), scheduler.get_last_lr() if scheduler is not None else train_args.lr_param, verification_loss, trainer.all_tokens)
 
                 end_time = time.time()
                 if mail_bool:
@@ -551,6 +393,8 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:Abstr
             if not epoch1_end:
                 epoch1_end = True
                 print("１エポック当たりのトークン数：", trainer.all_tokens)
+                verification_loss = get_verification_loss(model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn)
+                trainer.optional_logging(verification_loss, all_count)
 
             message.send_message(f"{model_name}の途中経過について",
                                  f"Epoch {epoch + 1}/{train_args.num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
@@ -605,7 +449,7 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
                 progress: LearningProgress = _DefaultLearningProgress(), log_scale=False,project_name=None):
     args = MORTMArgs(json_directory=model_config)
     t_args = TrainArgs(json_directory=train_config)
-    trainer = MORTMTrainSet(args, tokenizer, t_args.val_total_tokens, progress, load_directory=load_model_directory, project_name=project_name, config=model_config, log_scale=log_scale)
+    trainer = MORTMTrainSet(args, t_args, tokenizer, t_args.val_total_tokens, progress, load_directory=load_model_directory, project_name=project_name, config=model_config, log_scale=log_scale, model_name=version)
 
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
@@ -633,36 +477,16 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
     print("データセットの規模：", len(filename))
     mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
     if eval_list_json is None:
-        train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
+        train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=t_args.shuffle)
     else:
         print("検証データセットが指定されました。")
         directory, filename = find_files_with_json(eval_list_json)
         val_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
-        train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=True)
+        train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=t_args.shuffle)
 
 
     _train(args, t_args, save_directory, trainer,message=message, version=version, today_date=today_date,
            train_loader=train_loader, val_loader=val_loader,coll_fn=collate_fn,
-           progress=progress)
-
-
-def train_v_mortm(model_config: str, train_config: str, root_directory, save_directory, version: str,
-                  message: Messenger = _DefaultMessenger(), load_model_directory: str=None,
-                  progress: LearningProgress = _DefaultLearningProgress()):
-
-    args = V_MORTMArgs(json_directory=model_config)
-    t_args = TrainArgs(json_directory=train_config)
-    trainer = V_MORTMTrainSet(args, progress, load_directory=load_model_directory)
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-    today_date = datetime.date.today().strftime('%Y%m%d')
-    print(f"ToDay is{datetime.date.today()}! start learning. {args.name}.Ver.{version}_{today_date}")
-
-    directory, filename = find_files(root_directory, '.wav')
-    mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
-    train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
-
-    _train(args, t_args, save_directory, trainer, message=message, version=version, today_date=today_date,
-           train_loader=train_loader, val_loader=val_loader,
            progress=progress)
 
 

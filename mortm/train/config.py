@@ -4,7 +4,9 @@ from typing import Optional
 
 import torch
 from torch import nn, Tensor
+from torch.optim.lr_scheduler import LambdaLR
 
+from .noam import *
 
 class TrainArgs:
     def __init__(self, json_directory: str):
@@ -14,23 +16,33 @@ class TrainArgs:
             self.is_save_training_progress = data['is_save_training_progress'] if data.get('is_save_training_progress') else False
             self.train_dataset_split:float = data['train_dataset_split'] if data.get('train_dataset_split') else 0.9
             self.accumulation_steps= data['accumulation_steps'] if data.get('accumulation_steps') else 4
-            self.warmup_steps= data['warmup_steps'] if data.get('warmup_steps') else 4000
             self.lr_param: Optional[float]= data['lr_param'] if data.get('lr_param') else None
+            self.scheduler: dict = data['scheduler'] if data.get('scheduler') else {"type": "noam", "warmup_steps": 4000}
             self.num_epochs = data['num_epochs'] if data.get('num_epochs') else 20
             self.big_batch_size = data['big_batch_size'] if data.get('big_batch_size') else 16
             self.val_total_tokens = data['val_total_tokens'] if data.get('val_total_tokens') else 50000000
+            self.shuffle = data['shuffle'] if data.get('shuffle') else True
 
 
 class AbstractTrainSet:
     model: nn.Module
 
-    def __init__(self, criterion: nn.Module, optimizer: torch.optim.Optimizer, scheduler: Optional[torch.optim.lr_scheduler.LambdaLR], calc_val_loss_tokens=50000000):
+    def __init__(self, criterion: nn.Module, optimizer: torch.optim.Optimizer,t_args: TrainArgs, m_args, calc_val_loss_tokens=50000000):
         self.criterion = criterion
         self.optimizer = optimizer
-        self.scheduler = scheduler
+        self.t_args = t_args
         self.calc_val_loss_tokens = calc_val_loss_tokens
         self.all_tokens = torch.tensor(0, device="cuda", dtype=torch.long)
         self.last_val_calc_tokens = 0
+        self.args=m_args
+
+        if t_args.scheduler['type'] == "noam":
+            print("Using Noam Scheduler")
+            self.scheduler = LambdaLR(optimizer=optimizer, lr_lambda=noam_lr(m_args.d_model, warmup_steps=t_args.scheduler['warmup_steps']))
+        elif t_args.scheduler['type'] == "cos":
+            print("Using Cosine Annealing Scheduler")
+            self.scheduler = LambdaLR(optimizer=optimizer, lr_lambda=get_cosine_schedule_with_warmup(warmup_ratio=t_args.scheduler['warmup_ratio'], total_steps=t_args.scheduler['total_steps']))
+
 
     @abstractmethod
     def epoch_fc(self, model, pack, progress):
@@ -65,7 +77,7 @@ class AbstractTrainSet:
 
         if is_step:
             progress.step_optimizer(self.optimizer, self.model, accumulation_steps)
-            if lr_param is None and self.scheduler is not None:
+            if self.scheduler is not None:
                 self.scheduler.step()
             torch.cuda.empty_cache()
 
