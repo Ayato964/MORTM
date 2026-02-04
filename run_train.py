@@ -7,6 +7,7 @@ from mortm.train.train import train_mortm
 
 from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter_pro
 from mortm.utils.gmail_messanger import GmailMessanger, Messenger
+import wandb
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi@kthrlab.jp', step_by_message_count=100000)
@@ -23,3 +24,4 @@ for p in param:
                         project_name="MORTM4.5_Scale2",
                         eval_list_json="out/models/mortm/4_5/scaling_test/eval.json",
                         message=message)
+    wandb.finish()

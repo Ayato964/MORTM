@@ -334,3 +334,9 @@ class MORTM(nn.Module):
             log_probs = log_probs * padding_mask[:, 1:]
 
         return log_probs
+
+    def get_param(self):
+        if not self.args.use_moe_decoder:
+            p = sum(p.numel() for p in self.model.parameters())
+            return p, p
+        else:

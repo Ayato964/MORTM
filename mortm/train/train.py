@@ -49,17 +49,19 @@ class MORTMTrainSet(AbstractTrainSet):
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
 
-        self.params = sum(p.numel() for p in self.model.parameters())
+        self.active_params, total_param = self.model.get_param()
         adam = torch.optim.Adam(self.model.parameters(), lr=t_args.lr_param)
 
         with open(config, 'r') as f:
             data: dict = json.load(f)
             if log_scale:
-                data['model_params'] = self.params
+                data['model_params'] = self.active_params
+                data['total_params'] = total_param
                 wandb.init(
                     project=project_name,
                     name=model_name,
-                    config=data
+                    config=data,
+                    reinit=True
                 )
 
         super().__init__(criterion=MaskedCrossEntropyLoss(ignore_index=0).to(progress.get_device()),
