@@ -1,3 +1,4 @@
+import copy
 import math
 import os
 import random
@@ -266,31 +267,29 @@ class _AbstractMidiConverter(_AbstractConverter):
     def get_midi_change_scale(self, scale_up_key):
         '''
         MIDIの音程を変更する。
+        DeepCopyを使用することで、テンポ情報やプログラム番号を確実に維持する。
         :param scale_up_key: いくつ音程を上げるか
         :return:
         '''
-        midi = PrettyMIDI()
+        # 1. オブジェクト全体を完全複製（テンポ、拍子、解像度などを維持）
+        midi = copy.deepcopy(self.midi_data)
 
-        for ins in self.midi_data.instruments:
-            ins: Instrument = ins
+        # 2. 音程の変更処理
+        for ins in midi.instruments:
+            # ドラムは移調しない
             if not ins.is_drum:
-                new_inst = Instrument(program=ins.program)
                 for note in ins.notes:
-                    note: Note = note
                     pitch = note.pitch + scale_up_key
-                    if pitch > 127:
+
+                    # MIDIの範囲(0-127)に収めるループ処理
+                    # 単純な加減算ではなく、whileで回すか剰余を使うのが安全ですが
+                    # 元のロジックに合わせるなら以下のように修正推奨
+                    while pitch > 127:
                         pitch -= 12
-                    if pitch < 0:
+                    while pitch < 0:
                         pitch += 12
 
-                    start = note.start
-                    end = note.end
-                    velo = note.velocity
-                    new_note = Note(pitch=pitch, velocity=velo, start=start, end=end)
-                    new_inst.notes.append(new_note)
-                midi.instruments.append(new_inst)
-            else:
-                midi.instruments.append(ins)
+                    note.pitch = int(pitch)
 
         return midi
 
@@ -533,8 +532,8 @@ class MIDIConverter(_AbstractMidiConverter):
                  use_midi2seq=True,
                  use_midi2seq_with_chord=False,
                  all_chords: Optional[List[str]]=None, all_chord_timestamps: Optional[List[float]]=None,
-                 key=None):
-        super().__init__(MIDIConverter, tokenizer, directory, file_name, program_list, key=key)
+                 key=None, midi_data=None):
+        super().__init__(MIDIConverter, tokenizer, directory, file_name, program_list, key=key, midi_data=midi_data)
         if not self.is_error:
             self.midi2seq = MIDI2Seq(tokenizer, directory, file_name, program_list, key=self.key, inst_list_with_name=self.inst_list_with_name, midi_data=self.midi_data) if use_midi2seq else None
             self.midi2seq_with_chord = OmegaMIDI2SeqWithChord(tokenizer, directory, file_name, program_list, all_chords, all_chord_timestamps, key=self.key, midi_data=self.midi_data, inst_list_with_name=self.inst_list_with_name) if use_midi2seq_with_chord else None
@@ -575,27 +574,239 @@ class MIDIConverter(_AbstractMidiConverter):
         raise NotImplementedError("これ単体では保存できません。　DataMakerに受け渡してください")
 
     def get_key(self, time):
+        """
+        指定された時刻のキーを取得する。
+        Tokenizerに存在しないキーが生成された場合は、強制的に "Unknown" を返す。
+        """
+        # 1. 該当する時間のキーセグメントを探す
+        target_k = None
         for k in self.key_dict:
             if k['start_time'] <= time < k['end_time']:
-                tonic = k['tonic']
-                if k['key_name'] == "Unknown":
-                    return k['key_name']
-                if '-' in tonic:
-                    tonic = tonic.replace('-', 'b')
-                mode = 'M' if k['mode'] == 'major' else 'm'
-                return f"{tonic}{mode}"
+                target_k = k
+                break
 
-        if self.key_dict[-1]['end_time'] >= time:
-            k = self.key_dict[-1]
-            tonic = k['tonic']
-            if k['key_name'] == "Unknown":
-                return k['key_name']
-            if '-' in tonic:
-                tonic = tonic.replace('-', 'b')
-            mode = 'M' if k['mode'] == 'major' else 'm'
-            return f"{tonic}{mode}"
+        # 見つからない場合は最後のセグメント、それもなければUnknown
+        if target_k is None:
+            if self.key_dict and self.key_dict[-1]['end_time'] >= time:
+                target_k = self.key_dict[-1]
+            else:
+                return "Unknown"
 
-        return "Unknown"
+        # 2. キー情報の抽出と構築
+        # key_name や tonic が Unknown なら即リターン
+        if target_k.get('key_name') == "Unknown": return "Unknown"
+        tonic = target_k.get('tonic')
+        if not tonic or tonic == "Unknown": return "Unknown"
+
+        # 表記揺れの吸収 ('-' -> 'b')
+        if '-' in tonic:
+            tonic = tonic.replace('-', 'b')
+
+        mode = 'M' if target_k.get('mode') == 'major' else 'm'
+
+        # 候補となるキー文字列 (例: "C#M", "UnknownM" など)
+        candidate_key = f"{tonic}{mode}"
+
+        # 3. 【重要】Tokenizerの語彙チェック (最終防衛ライン)
+        # Tokenizerが知っているキーかどうかを確認する。知らないキーなら Unknown に倒す。
+        # トークン名は "k_" + キー名 で定義されている前提
+        token_str = f"k_{candidate_key}"
+
+        # self.tokenizer.tokens にキーが存在するかチェック
+        if token_str in self.tokenizer.tokens:
+            return candidate_key
+        else:
+            # 異名同音の救済措置 (例: C#MがないならDbMを試す)
+            enharmonic_map = {
+                'C#': 'Db', 'Db': 'C#',
+                'D#': 'Eb', 'Eb': 'D#',
+                'F#': 'Gb', 'Gb': 'F#',
+                'G#': 'Ab', 'Ab': 'G#',
+                'A#': 'Bb', 'Bb': 'A#'
+            }
+            if tonic in enharmonic_map:
+                alt_tonic = enharmonic_map[tonic]
+                alt_candidate = f"{alt_tonic}{mode}"
+                if f"k_{alt_candidate}" in self.tokenizer.tokens:
+                    return alt_candidate
+
+            # どうやっても辞書にない場合は Unknown (これで0生成は確実に防げる)
+            return "Unknown"
+
+    def _shift_pitch_name(self, pitch_name: str, shift: int, mode: str = "M") -> str:
+        """
+        [修正版] 決定論的キー取得メソッド。
+        旧名: _shift_pitch_name を維持していますが、内部ロジックは
+        動的計算ではなく「静的辞書マッピング」に変更されています。
+
+        Args:
+            pitch_name (str): 元のトニック (例: "C", "C#", "Unknown")
+            shift (int): 移調する半音数
+            mode (str): "M" (Major) または "m" (Minor)。
+                        ※引数シグネチャに mode を追加しましたが、
+                        呼び出し元でこれを渡さない場合、デフォルトで "M" として処理されます。
+                        正しく動作させるには呼び出し元で mode を渡すことを強く推奨します。
+
+        Returns:
+            str: Tokenizerに確実に存在するキー文字列 (例: "C#M", "Fm", "Unknown")
+        """
+        # 1. Input Normalization (Any Notation -> Pitch Class Integer 0-11)
+        # あらゆる異名同音を 0-11 に集約
+        pitch_to_int = {
+            'C': 0,  'B#': 0,
+            'C#': 1, 'Db': 1,
+            'D': 2,  'Cx': 2, 'Ebb': 2,
+            'D#': 3, 'Eb': 3,
+            'E': 4,  'Fb': 4, 'Dx': 4,
+            'F': 5,  'E#': 5,
+            'F#': 6, 'Gb': 6,
+            'G': 7,  'Fx': 7, 'Abb': 7,
+            'G#': 8, 'Ab': 8,
+            'A': 9,  'Gx': 9, 'Bbb': 9,
+            'A#': 10,'Bb': 10,
+            'B': 11, 'Cb': 11, 'Ax': 11
+        }
+
+        # 2. Output Mapping (Integer 0-11 -> Guaranteed Valid Token String)
+        # Tokenizerのリストに存在する文字列だけを定義
+
+        # Major Keys (Mode: M)
+        int_to_key_major = {
+            0: 'CM',  1: 'C#M', 2: 'DM',  3: 'D#M',
+            4: 'EM',  5: 'FM',  6: 'F#M', 7: 'GM',
+            8: 'G#M', 9: 'AM',  10: 'A#M',11: 'BM'
+        }
+
+        # Minor Keys (Mode: m)
+        int_to_key_minor = {
+            0: 'Cm',  1: 'C#m', 2: 'Dm',  3: 'D#m',
+            4: 'Em',  5: 'Fm',  6: 'F#m', 7: 'Gm',
+            8: 'G#m', 9: 'Am',  10: 'A#m',11: 'Bm'
+        }
+
+        # --- 処理実行 ---
+
+        # 入力チェック
+        if not pitch_name or pitch_name == "Unknown" or pitch_name == "None":
+            return "Unknown"
+
+        # 表記揺れ除去
+        norm_tonic = pitch_name.replace('-', 'b')
+
+        if norm_tonic not in pitch_to_int:
+            return "Unknown"
+
+        current_pitch_id = pitch_to_int[norm_tonic]
+
+        # シフト計算
+        shifted_pitch_id = (current_pitch_id + shift) % 12
+
+        # 出力マッピング
+        # モード判定 ("major", "M" 等の揺れ吸収)
+        is_major = (mode == "M" or mode == "major" or mode == "Major")
+
+        if is_major:
+            return int_to_key_major[shifted_pitch_id]
+        else:
+            return int_to_key_minor[shifted_pitch_id]
+
+
+    def expansion_midi(self) -> List['MIDIConverter']:
+        converts = []
+        if self.midi2seq_with_chord is not None:
+            return converts
+        if self.is_error:
+            return converts
+
+        shifts = range(-5, 7)
+
+        # --- Base Key Extraction ---
+        origin_tonic = "Unknown"
+        origin_mode = "M"
+
+        # 1. key_dictから取得
+        if self.key_dict and len(self.key_dict) > 0:
+            top = self.key_dict[0]
+            t = top.get('tonic')
+            if t and t != "Unknown":
+                origin_tonic = t
+                origin_mode = 'M' if top.get('mode') == 'major' else 'm'
+
+        # 2. key文字列から取得
+        if origin_tonic == "Unknown" and isinstance(self.key, str) and self.key != "Unknown":
+            k_str = self.key
+            if "major" in k_str.lower() or k_str.endswith("M"):
+                origin_mode = "M"
+                origin_tonic = k_str.replace(" major", "").replace("major", "").replace("M", "")
+            elif "minor" in k_str.lower() or k_str.endswith("m"):
+                origin_mode = "m"
+                origin_tonic = k_str.replace(" minor", "").replace("minor", "").replace("m", "")
+            else:
+                origin_tonic = k_str
+
+        for shift in shifts:
+            if shift == 0: continue
+
+            try:
+                # 1. MIDI移調
+                transposed_midi = self.get_midi_change_scale(shift)
+
+                # 2. Key移調 (辞書ベースの確定マッピング)
+                new_key_dict = []
+
+                # A. セグメントキーの更新
+                if hasattr(self, 'key_dict') and self.key_dict is not None:
+                    for segment in self.key_dict:
+                        new_segment = segment.copy()
+                        seg_tonic = segment.get('tonic', 'Unknown')
+
+                        if seg_tonic != "Unknown":
+                            seg_mode = 'M' if segment.get('mode') == 'major' else 'm'
+
+                            # ★ _shift_pitch_name を使用するが、引数に mode を追加している点に注意
+                            new_key_str = self._shift_pitch_name(seg_tonic, shift, mode=seg_mode)
+
+                            if new_key_str == "Unknown":
+                                new_segment['key_name'] = "Unknown"
+                                new_segment['tonic'] = "Unknown"
+                            else:
+                                new_segment['key_name'] = new_key_str
+                                new_segment['tonic'] = new_key_str[:-1]
+
+                        new_key_dict.append(new_segment)
+
+                # B. グローバルキーの更新
+                new_global_key_str = "Unknown"
+                if origin_tonic != "Unknown":
+                    # ★ ここも同様
+                    new_global_key_str = self._shift_pitch_name(origin_tonic, shift, mode=origin_mode)
+
+                # 3. インスタンス生成
+                new_converter = MIDIConverter(
+                    tokenizer=self.tokenizer,
+                    directory=self.directory,
+                    file_name=f"{self.file_name}_shift_{shift}",
+                    program_list=self.program_list,
+                    use_midi2seq=(self.midi2seq is not None),
+                    use_midi2seq_with_chord=False,
+                    key=new_global_key_str,
+                    midi_data=transposed_midi
+                )
+
+                new_converter.key_dict = new_key_dict
+                if new_converter.midi2seq:
+                    new_converter.midi2seq.key_dict = new_key_dict
+
+                # 4. 変換実行
+                new_converter.convert()
+
+                converts.append(new_converter)
+
+            except Exception as e:
+                print(f"Error in expansion_midi shift={shift}: {e}")
+                continue
+
+        return converts
 
 
 class PreTrainDataMaker(_AbstractConverter):
@@ -730,22 +941,33 @@ class PreTrainDataMaker(_AbstractConverter):
     def convert(self, *args, **kwargs):
         measure_token_id = self.tokenizer.get("<SME>")
 
+        # 【修正1】seq_dict にキーが存在する（有効なデータがある）プログラムのみを抽出する
+        valid_programs = [p for p in self.converter.program_list if p in self.seq_dict]
+
+        # 有効な楽器が一つもない場合は処理を終了
+        if not valid_programs:
+            return
+
         seq_inds = {}
-        for program in self.converter.program_list:
+        # 【修正2】valid_programs を使ってインデックス辞書を作成
+        for program in valid_programs:
             seq = self.seq_dict[program]
             seq_inds[program] = np.where(seq == measure_token_id)[0]
 
-        inst_finish_dict = {program: False for program in self.converter.program_list}
+        # 【修正3】終了フラグ辞書も valid_programs をキーにする
+        inst_finish_dict = {program: False for program in valid_programs}
+
         now_measure = 0
         current_split_length = random.randint(self.min_measure, self.max_measure)
 
         while not all(inst_finish_dict.values()):
             clip = np.array([], dtype=int)
-            active_program_info = [] # (program_name, density_token_id) のリスト
+            active_program_info = []
 
-            is_skip_window = False # このウィンドウをスキップするかどうかのフラグ
+            is_skip_window = False
 
-            for program in self.converter.program_list:
+            # 【修正4】ループ対象を converter.program_list ではなく valid_programs に変更
+            for program in valid_programs:
                 if inst_finish_dict[program]:
                     continue
 
@@ -759,33 +981,28 @@ class PreTrainDataMaker(_AbstractConverter):
                 inst_seq = self.seq_dict[program][start_idx:end_idx]
                 s_e = self.tokenizer.get_length_tuple("s")
 
-                # 音がある場合のみ処理
                 if np.any(np.isin(inst_seq, [s for s in range(s_e[0], s_e[1])])):
-
                     # 1. 楽器制約チェック
                     if self._check_instrument_constraint(program, inst_seq):
-
                         # 2. 密度計算 & 閾値チェック
                         density_token = self._calculate_density_token(inst_seq, program)
 
                         if density_token is None:
-                            # 閾値を超えたため、このウィンドウ全体をスキップする
                             is_skip_window = True
                             break
 
-                        # クリップ結合
                         inst_seq_framed = np.concatenate([
                             np.array([self.tokenizer.get(f"<INST_{program}>")]),
                             inst_seq,
                             np.array([self.tokenizer.get("<ESEQ>")])
                         ])
                         clip = np.concatenate([clip, inst_seq_framed])
-
-                        # プロンプト用情報を保存
                         active_program_info.append((program, density_token))
 
-            # スキップ判定 または 有効な楽器がない場合
             if is_skip_window or len(active_program_info) == 0:
+                # 全ての楽器が終了しているかチェックしてからインクリメント
+                if all(inst_finish_dict.values()):
+                    break
                 now_measure += current_split_length
                 current_split_length = random.randint(self.min_measure, self.max_measure)
                 continue
@@ -794,7 +1011,6 @@ class PreTrainDataMaker(_AbstractConverter):
             def append_measure_count(p: list):
                 p.append(self.tokenizer.get(f"<GEN_MEASURE_COUNT_{current_split_length}>"))
 
-            # active_program_info は [(program, density_token), ...] となっている
             prompt = self.converter.make_system_prompt(0, active_program_info, call_function=append_measure_count)
 
             # --- データ構築 ---
@@ -823,7 +1039,6 @@ class PreTrainDataMaker(_AbstractConverter):
 
             now_measure += current_split_length
             current_split_length = random.randint(self.min_measure, self.max_measure)
-
 
 class PreTrainWithChordDataMaker(_AbstractConverter):
     """

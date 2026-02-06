@@ -112,6 +112,7 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
                 if con.is_error:
                     continue
 
+                con_list = con.expansion_midi()
                 maker = PreTrainDataMaker(con, 1, 8)
                 maker.convert()
 
@@ -126,6 +127,20 @@ def convert(pid, tokenizer, directory, md_file, program, progress, save_path):
                         is_error = True
                         break
                 print(f"Process#{pid}: Running... {local_count}  {reason}")
+
+                for cl in con_list:
+                    cl.convert()
+                    maker = PreTrainDataMaker(cl, 1, 8)
+                    maker.convert()
+                    is_saved, reason = maker.save(save_path)
+                    for a in maker.aya_node[1:]:
+                        a:np.ndarray
+                        if np.sum(a == 0) != 0:
+                            print(f"\033[31m Error!!  {maker.converter.file_name}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                            is_error = True
+                            break
+                    print(f"Process#{pid}: Running...{maker.converter.file_name} {local_count}  {reason}")
+
             except Exception as e:
                 print(f" Process#{pid} encountered an error with file {directory[i]}/{md_file[i]}: {e}")
                 continue
@@ -245,45 +260,45 @@ if __name__ == "__main__":
     PROGRAM = ['PIANO', 'SAX']
     tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 
-    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/GMD/training/"
-    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
+    datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/GMD/training/"
+    #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/MIDI_Caps"
     #datasets = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/midi_hawthorne/midi/live"
     #datasets = "./data/other"
     #datasets = "./out/model/mortm/45_research/datasets/eval.json"
 
-    """
+    #"""
     directory, md_file = find_midi_files(datasets)
     #directory, md_file = extract_midi_npz_paths(datasets)
-    """
     #"""
+    """
     print("データ整理中・・・・")
     directory, md_file, system_file = find_midi_files_with_json(datasets)
     print("完了！！")
-    #"""
+    """
 
     directory = np.array_split(directory, THREAD_VALUE)
     md_file = np.array_split(md_file, THREAD_VALUE)
-    #"""
+    """
     system_file = np.array_split(system_file, THREAD_VALUE)
-    #"""
+    """
 
     with Manager() as manager:
         progress = manager.dict()  # 共有辞書
         processes = []
         for t in range(THREAD_VALUE):
-            """
+            #"""
             p = Process(target=convert, args=(t, tokenizer, directory[t].tolist(),
-                                              md_file[t].tolist(), PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/ver2/music"))
-            """
+                                              md_file[t].tolist(), PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/ver3/music"))
+            #"""
 
             """
             p = Process(target=convert_class_seq, args=(t, tokenizer, directory[t], md_file[t], "HUMAN", "out/np/bertm/"))
             """
 
-            #"""
+            """
             p = Process(target=convert_chord, args=(t, tokenizer, directory[t].tolist(),
                                                          md_file[t].tolist(), system_file[t], PROGRAM, progress, "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/ver2/cm/"))
-            #"""
+            """
 
             processes.append(p)
             p.start()

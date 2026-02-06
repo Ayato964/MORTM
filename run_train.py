@@ -14,9 +14,9 @@ message: Messenger = GmailMessanger("token.json", "client_secret.json", 'nagoshi
 
 tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC))
 
-param = ["10M", "20M", "40M", "80M", "160M"]
+param = ["10M_E4","10M_E4_2", "10M_E4_3"]
 for p in param:
-    model = train_mortm(tokenizer, f"configs/models/mortm/4_5/research/preview4/{p}.json", f"configs/train/mortm/4_5/preview4/{p}.json",
+    model = train_mortm(tokenizer, f"configs/models/mortm/4_5/research/preview4/10M_E4.json", f"configs/train/mortm/4_5/preview4/{p}.json",
                         "out/models/mortm/4_5/scaling_test/800M/train.json",
                         f"out/models/mortm/4_5/scaling_test/800M/",
                         f"D800M_N{p}",

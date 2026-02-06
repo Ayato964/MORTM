@@ -20,7 +20,6 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, random_split
 import torch.nn as nn
-from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.dataset import Dataset
@@ -29,9 +28,6 @@ from mortm.utils.messager import Messenger, _DefaultMessenger
 from mortm.models.modules.progress import LearningProgress, _DefaultLearningProgress
 from .datasets import MORTM_SEQDataset, ClassDataSets, PreLoadingDatasets, TensorDataset, PianoRollDataset
 from mortm.models.mortm import MORTM, MORTMArgs
-from mortm.models.bertm import BERTM
-from mortm.models.v_mortm import V_MORTM, V_MORTMArgs
-from mortm.models.mortm_live import MORTMLive, MORTM_LIVE_Args, Vision
 from mortm.utils.pianoroll_convert import *
 from .epoch import EpochObserver
 from .config import AbstractTrainSet, TrainArgs
@@ -49,7 +45,7 @@ class MORTMTrainSet(AbstractTrainSet):
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory))
 
-        self.active_params, total_param = self.model.get_param()
+        total_param, self.active_params, = self.model.get_param()
         adam = torch.optim.Adam(self.model.parameters(), lr=t_args.lr_param)
 
         with open(config, 'r') as f:
@@ -107,7 +103,7 @@ class MORTMTrainSet(AbstractTrainSet):
         wandb.log({
             "axis/val_loss": val_loss,
             "axis/tokens": all_tokens,  # 横軸に使う重要な指標
-            "axis/flops": 6 * self.params * all_tokens,  # 横軸に使う重要な指標
+            "axis/flops": 6 * self.active_params * all_tokens,  # 横軸に使う重要な指標
             "trainer/global_step": step
         })
 

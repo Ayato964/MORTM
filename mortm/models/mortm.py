@@ -336,7 +336,42 @@ class MORTM(nn.Module):
         return log_probs
 
     def get_param(self):
-        if not self.args.use_moe_decoder:
-            p = sum(p.numel() for p in self.model.parameters())
-            return p, p
-        else:
+        """
+        Calculate the total number of parameters and the number of active parameters.
+        Includes safeguards against None types in MoE experts list.
+
+        Returns:
+            Tuple[int, int]: (Total parameters, Active parameters during inference)
+        """
+        total_params = sum(p.numel() for p in self.parameters())
+
+        if not getattr(self.args, 'use_moe_decoder', False):
+            return total_params, total_params
+
+        if not hasattr(self, 'decoder') or not hasattr(self.decoder, 'layers'):
+            return total_params, total_params
+
+        first_layer = self.decoder.layers[0]
+
+        if not hasattr(first_layer, 'ffn') or not hasattr(first_layer.ffn, 'experts'):
+            return total_params, total_params
+
+        moe_module = first_layer.ffn
+        experts_list = moe_module.experts
+
+        valid_expert = next((e for e in experts_list if e is not None), None)
+
+        if valid_expert is None:
+            return total_params, total_params
+
+        one_expert_params = sum(p.numel() for p in valid_expert.parameters())
+
+        num_routed_experts = self.args.num_experts
+        num_active_experts = self.args.topk_experts
+        num_inactive_experts_per_layer = max(0, num_routed_experts - num_active_experts)
+
+        total_inactive_params = num_inactive_experts_per_layer * one_expert_params * self.args.d_layer
+
+        active_params = total_params - total_inactive_params
+
+        return total_params, active_params
