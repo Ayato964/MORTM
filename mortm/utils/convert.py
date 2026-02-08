@@ -879,7 +879,7 @@ class PreTrainDataMaker(_AbstractConverter):
         if rule is None:
             raise ValueError(f"Undefined instrument rule: {program_name}")
 
-        max_notes_per_measure = 36 if rule.is_polyphonic else 24
+        max_notes_per_measure = 45 if rule.is_polyphonic else 24
 
         # 2. 小節ごとの分割 (SMEトークンで分割)
         sme_id = self.tokenizer.get("<SME>")

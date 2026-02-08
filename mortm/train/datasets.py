@@ -1,6 +1,7 @@
 '''
 Tokenizerで変換したシーケンスを全て保管します。
 '''
+import json
 import os.path
 import random
 from typing import List, Optional, Tuple
@@ -273,6 +274,12 @@ class PreLoadingDatasets(Dataset):
     def add_data(self, directory: List[str], filename: List[str]):
         for i in range(len(directory)):
             self.src_list.append(os.path.join(directory[i], filename[i]))
+
+    def add_data_json(self, json_data: str):
+        with open(json_data, 'r') as f:
+            data = json.load(f)
+            for item in data:
+                self.src_list.append(item)
 
 
 
