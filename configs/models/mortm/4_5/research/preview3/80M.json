@@ -6,7 +6,7 @@
   "d_layer": 14,
   "dropout": 0.2,
   "position_length": 5000,
-  "min_length": 180,
+  "min_length": 40,
   "num_experts": 8,
   "topk_experts": 2,
   "num_groups": 1,

@@ -205,16 +205,23 @@ def _set_train_data_preloading(directory, datasets, mortm_datasets, *args):
     print("load Successful!!")
     return mortm_datasets
 
-def find_files_with_json(path:str, min=0):
+def find_files_with_json(path: str, min_idx=0):
     with open(path, "r") as f:
         json_data = json.load(f)
-    data = np.array([])
-    json_data = json_data[min:]
-    for l in json_data:
-        data = np.concatenate([data, l])
-    directory = [os.path.dirname(d) for d in data]
-    file_name = [os.path.basename(d) for d in data]
-    return directory, file_name
+
+    path_list = []
+    selected_data = json_data[min_idx:]
+
+    for item in selected_data:
+        if isinstance(item, list):
+            path_list.extend(item)
+        else:
+            path_list.append(item)
+
+    directories = [os.path.dirname(p) for p in path_list]
+    file_names = [os.path.basename(p) for p in path_list]
+
+    return directories, file_names
 
 def collate_fn(batch):
     # バッチ内のテンソルの長さを揃える（パディングする）
