@@ -77,7 +77,7 @@ class MORTM_SEQDataset(Dataset):
 
         if not apply_augmentation:
             # 条件を満たさない場合は、オリジナルのシーケンスを返す
-            return torch.tensor(sequence_array, dtype=torch.long, device=self.progress.get_device())
+            return torch.tensor(sequence_array, dtype=torch.long)
 
         try:
             begin_tag_id, end_tag_id = self.system_tag
@@ -110,14 +110,14 @@ class MORTM_SEQDataset(Dataset):
 
             # (楽器が1つ、またはサンプリング不要なケース)
             if inst_count <= 1:
-                return torch.tensor(sequence_array, dtype=torch.long, device=self.progress.get_device())
+                return torch.tensor(sequence_array, dtype=torch.long)
 
             max_k = min(self.sampling_inst_max, inst_count)
             k = random.randint(1, max_k)
             kept_inst_tokens = set(random.sample(present_inst_tokens, k))
 
             if len(kept_inst_tokens) == inst_count:
-                return torch.tensor(sequence_array, dtype=torch.long, device=self.progress.get_device())
+                return torch.tensor(sequence_array, dtype=torch.long)
 
             # 保持する楽器だけで新しいシステムタグを構築
             new_system_seq = [
@@ -190,12 +190,12 @@ class MORTM_SEQDataset(Dataset):
             final_sequence_list = prefix_part + new_system_seq + new_music_events
 
             #print(final_sequence_list) # デバッグ用
-            return torch.tensor(final_sequence_list, dtype=torch.long, device=self.progress.get_device())
+            return torch.tensor(final_sequence_list, dtype=torch.long)
 
         except Exception as e:
             # ログを拡張
             print(f"Warning: Augmentation failed for item {item}, returning original. Error: {e}  {sequence_array}")
-            return torch.tensor(sequence_array, dtype=torch.long, device=self.progress.get_device())
+            return torch.tensor(sequence_array, dtype=torch.long)
 
 
 class ClassDataSets(Dataset):
@@ -219,8 +219,8 @@ class ClassDataSets(Dataset):
                 v = self.key[item]
         else:
             v = self.key[item]
-        return (torch.tensor(v, dtype=torch.long, device=self.progress.get_device()),
-                torch.tensor(self.value[item], dtype=torch.long, device=self.progress.get_device()))
+        return (torch.tensor(v, dtype=torch.long),
+                torch.tensor(self.value[item], dtype=torch.long))
 
     def add_data(self, music_seq: np.ndarray, value):
         suc_count = 0
@@ -243,7 +243,7 @@ class PianoRollDataset(Dataset):
         return len(self.src_list)
 
     def __getitem__(self, item: int) :
-        return torch.tensor(self.src_list[item], device=self.progress.get_device())
+        return torch.tensor(self.src_list[item])
 
     def add_data(self, piano_roll: np.ndarray, *args):
         self.src_list.append(piano_roll)

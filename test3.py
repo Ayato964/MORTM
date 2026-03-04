@@ -9,7 +9,6 @@ import os
 import sys
 from typing import List, Tuple
 from torch.nn.utils.rnn import pad_sequence
-from tqdm import tqdm
 
 from mortm.train.datasets import MORTM_SEQDataset, PreLoadingDatasets
 from mortm.models.modules.progress import _DefaultLearningProgress

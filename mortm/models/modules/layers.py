@@ -16,8 +16,6 @@ import numpy as np
 from .attention import FlashSelfAttentionM, FlashCrossAttentionM, linear
 from .config import MORTMArgs, MORTM_LIVE_Args
 
-world_size = 1
-rank = 0
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
 
@@ -152,9 +150,10 @@ class MORTMDecoder(nn.Module):
         if args.normalize_type == "tanh":
             self.norm = NormTanh(args.d_model)
         elif args.normalize_type == "layernorm":
-            self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
+            self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True)
         elif args.normalize_type == "rmsnorm":
-            self.norm = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.float32)
+            # 演算効率と警告解消のためdtypeを明示
+            self.norm = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.bfloat16)
 
     def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False,
                 encoder_x: Tensor = None, cu_seqlens_k=None, max_seqlen_k=None) -> Tensor:
@@ -201,18 +200,21 @@ class MORTMDecoderLayer(nn.Module):
         if args.normalize_type == "tanh":
             print("NORM TYPE: NormTanh")
             self.norm1 = NormTanh(args.d_model)
-            self.norm2 = NormTanh(args.d_model)
+            if args.use_cross_attention:
+                self.norm2 = NormTanh(args.d_model)
             self.norm3 = NormTanh(args.d_model)
         elif args.normalize_type == "layernorm":
             print("NORM TYPE: LayerNorm")
-            self.norm1 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
-            self.norm2 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
-            self.norm3 = LayerNorm(args.d_model, eps=1e-5, bias=True, dtype=torch.float32)
+            self.norm1 = LayerNorm(args.d_model, eps=1e-5, bias=True)
+            if args.use_cross_attention:
+                self.norm2 = LayerNorm(args.d_model, eps=1e-5, bias=True)
+            self.norm3 = LayerNorm(args.d_model, eps=1e-5, bias=True)
         elif args.normalize_type == "rmsnorm":
             print("NORM TYPE: RMSNorm")
-            self.norm1 = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.float32)
-            self.norm2 = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.float32)
-            self.norm3 = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.float32)
+            self.norm1 = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.bfloat16)
+            if args.use_cross_attention:
+                self.norm2 = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.bfloat16)
+            self.norm3 = nn.RMSNorm(args.d_model, eps=1e-5, dtype=torch.bfloat16)
 
         self.dropout1 = nn.Dropout(args.dropout)
         self.dropout2 = nn.Dropout(args.dropout)
@@ -357,9 +359,14 @@ class MoE(nn.Module):
         super().__init__()
         self.dim = args.d_model
         self.n_routed_experts = args.num_experts
-        self.n_local_experts = self.n_routed_experts // world_size
+        
+        # モジュールレベルではなく、初期化時に動的に取得することでインポート順の影響を排除
+        curr_world_size = dist.get_world_size() if dist.is_initialized() else 1
+        curr_rank = dist.get_rank() if dist.is_initialized() else 0
+        
+        self.n_local_experts = self.n_routed_experts // curr_world_size
         self.n_activated_experts = args.topk_experts
-        self.experts_start_idx = 0
+        self.experts_start_idx = curr_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(args, route_scale=route_scale)
 
@@ -387,7 +394,7 @@ class MoE(nn.Module):
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx]) * weights[idx, top, None]
         z = self.shared_experts(x)
-        if world_size > 1:
+        if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(y)
         return (y + z)
 

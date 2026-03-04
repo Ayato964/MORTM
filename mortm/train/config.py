@@ -60,17 +60,25 @@ class AbstractTrainSet:
         pass
 
     def is_need_calc_val(self):
-        if self.all_tokens == 0:
+        # DDP環境では、各GPUが異なるデータ増強などにより処理トークン数に僅かな差が生じます。
+        # ここで全GPUの合計トークン数を同期して確認しないと、検証に入るタイミングがズレてデッドロック（タイムアウト）の原因になります。
+        if dist.is_initialized():
+            sync_tokens = self.all_tokens.clone().detach()
+            dist.all_reduce(sync_tokens, op=dist.ReduceOp.SUM)
+            current_tokens = sync_tokens.item()
+        else:
+            current_tokens = self.all_tokens.item()
+
+        if current_tokens == 0:
             return False
 
-        if self.all_tokens >= self.last_val_calc_tokens + self.calc_val_loss_tokens:
-            self.last_val_calc_tokens = self.all_tokens.item() # 実行タイミングを更新
+        if current_tokens >= self.last_val_calc_tokens + self.calc_val_loss_tokens:
+            self.last_val_calc_tokens = current_tokens # 同期したトークン数で更新
             return True
         return False
 
     def backward(self, accumulation_steps, is_step, progress, lr_param, *args):
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            loss: Tensor = self.criterion(*args)
+        loss: Tensor = self.criterion(*args)
         return_loss = loss.clone()
         loss = loss / accumulation_steps
         loss.backward()  # 逆伝播
