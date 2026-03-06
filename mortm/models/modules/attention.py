@@ -177,6 +177,7 @@ class FlashSelfAttentionM(nn.Module):
         )
         self.cache_seqlens = torch.zeros(batch_size, device=device, dtype=torch.int32)
 
+    @torch._dynamo.disable
     def forward(self, x: Tensor, is_causal=True, cu_seqlens=None, max_seqlen=None,
                 batch_size=None, indices=None, is_save_cache=False):
 

@@ -1,16 +1,16 @@
 {
   "big_batch_size": 3072,
-  "batch_size": 128,
+  "batch_size": 48,
   "accumulation_steps":1,
   "num_epochs": 1,
   "is_save_training_progress": true,
-  "val_total_tokens": 100000000,
+  "val_total_tokens": 1000000000,
   "train_dataset_split": 0.99,
   "shuffle": true,
-  "lr_param": 8e-4,
+  "lr_param": 4e-4,
   "scheduler": {
     "type": "cos",
     "warmup_ratio": 0.1,
-    "total_steps":680666
+    "total_steps":1020999
   }
 }

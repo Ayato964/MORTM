@@ -146,7 +146,7 @@ class MORTMDecoder(nn.Module):
     def __init__(self, args: MORTMArgs, progress):
         super(MORTMDecoder, self).__init__()
         self.num_layer = args.d_layer
-        self.layers = _get_clones(MORTMDecoderLayer(args, progress=progress), self.num_layer)
+        self.layers = nn.ModuleList([MORTMDecoderLayer(args, i, progress) for i in range(self.num_layer)])
         if args.normalize_type == "tanh":
             self.norm = NormTanh(args.d_model)
         elif args.normalize_type == "layernorm":
@@ -176,11 +176,12 @@ class MORTMDecoder(nn.Module):
 
 class MORTMDecoderLayer(nn.Module):
 
-    def __init__(self, args: MORTMArgs, progress):
+    def __init__(self, args: MORTMArgs, layer_id, progress):
         super(MORTMDecoderLayer, self).__init__()
         self.n_head = args.num_heads
         self.args = args
         self.d_model = args.d_model
+        self.layer_id = layer_id
         self.self_attention: FlashSelfAttentionM =FlashSelfAttentionM(args, progress=progress)
 
         if args.use_cross_attention:
@@ -188,7 +189,7 @@ class MORTMDecoderLayer(nn.Module):
 
         if args.use_moe_decoder:
             print("FFN TYPE: Gate Network")
-            self.ffn = MoE(args)
+            self.ffn = MoE(args, layer_id)
         else:
             if args.use_silu:
                 print("FFN TYPE: MLP with SiLU")
@@ -288,53 +289,70 @@ class MLP(nn.Module):
 
 
 class Gate(nn.Module):
-
-    def __init__(self, args: MORTMArgs, route_scale=1, score_type="softmax"):
-        """
-
-        :param d_model: 埋め込み次元数
-        :param num_experts: 専門家の数
-        :param activated_experts: 選ばれる専門家の数(top_k)
-        :param num_groups:　専門家のグループ数
-        :param top_k_groups:　選ばれるグループの数(top_k)
-        :param route_scale: スケーリング係数
-        :param score_type:　スケールのタイプ
-        """
+    def __init__(self, args: MORTMArgs, layer_id, route_scale=1, score_type="softmax"):
         super().__init__()
-        self.dim = args.d_model
         self.topk = args.topk_experts
-        self.n_groups = args.num_groups
-        self.topk_groups = args.topk_groups
         self.score_func = score_type
+        self.gate_bias = args.use_gate_bias
+        self.layer_id = layer_id
+        if self.gate_bias:
+            print("Using gate bias")
+
         self.route_scale = route_scale
-        #self.weight = nn.Parameter(torch.empty(num_experts, d_model))
-        #self.bias = nn.Parameter(torch.empty(num_experts)) if self.dim == 7168 else None
-        if args.use_gate_lora:
+        self.gamma = getattr(args, "bias_update_rate", 0.001)
+
+        if getattr(args, "use_gate_lora", False):
             self.gate_proj = lora.Linear(args.d_model, args.num_experts, r=args.lora_r, lora_alpha=args.lora_alpha, bias=False)
         else:
             self.gate_proj = nn.Linear(args.d_model, args.num_experts, bias=False)
 
+        self.register_buffer("routing_bias", torch.zeros(args.num_experts))
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.autocast(device_type=x.device.type):
-            scores = self.gate_proj(x)
-            if self.score_func == "softmax":
-                scores = scores.softmax(dim=-1)
-            else:
-                scores = scores.sigmoid()
-            original_scores = scores
+            logits = self.gate_proj(x)
+            scores = logits.softmax(dim=-1) if self.score_func == "softmax" else logits.sigmoid()
 
-            if self.n_groups > 1:
-                scores = scores.view(x.size(0), self.n_groups, -1)
-                group_scores = scores.amax(dim=-1)
-                indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-                mask = scores.new_ones(x.size(0), self.n_groups, dtype=torch.bool).scatter_(1, indices, False)
-                scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
-            indices = torch.topk(scores, self.topk, dim=-1)[1]
-            weights = original_scores.gather(1, indices)
-            if self.score_func == "sigmoid":
-                weights /= weights.sum(dim=-1, keepdim=True)
+            routing_scores = scores + self.routing_bias if self.training else scores
+            _, indices = torch.topk(routing_scores, self.topk, dim=-1)
+
+            weights = scores.gather(dim=-1, index=indices)
+
+            if self.training:
+                # Always monitor and log, but update bias conditionally
+                self._monitor_load_balance(indices, update_bias=self.gate_bias)
+
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
             weights *= self.route_scale
+
         return weights.type_as(x).to(dtype=x.dtype), indices
+
+    @torch.no_grad()
+    def _monitor_load_balance(self, indices: torch.Tensor, update_bias: bool):
+        counts = torch.bincount(indices.flatten(), minlength=self.routing_bias.size(0)).float()
+
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(counts)
+
+        num_total_samples = counts.sum()
+        if num_total_samples == 0:
+            return
+
+        n_exp = self.routing_bias.size(0)
+        mean = counts.mean()
+        std = counts.std()
+        cv = std / (mean + 1e-6)
+
+        # Monitoring and Logging (Always active during training)
+        if cv > 1.0:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {counts.long().tolist()}")
+
+        # Conditional Bias Update
+        if update_bias:
+            target = num_total_samples / n_exp
+            self.routing_bias -= self.gamma * torch.sign(counts - target)
 
 
 class Expert(nn.Module):
@@ -355,48 +373,56 @@ class Expert(nn.Module):
 
 
 class MoE(nn.Module):
-    def __init__(self, args: MORTMArgs, route_scale=1):
+
+    def __init__(self, args: MORTMArgs, layer_id, route_scale=1):
         super().__init__()
         self.dim = args.d_model
         self.n_routed_experts = args.num_experts
-        
-        # モジュールレベルではなく、初期化時に動的に取得することでインポート順の影響を排除
-        curr_world_size = dist.get_world_size() if dist.is_initialized() else 1
-        curr_rank = dist.get_rank() if dist.is_initialized() else 0
-        
-        self.n_local_experts = self.n_routed_experts // curr_world_size
         self.n_activated_experts = args.topk_experts
-        self.experts_start_idx = curr_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = Gate(args, route_scale=route_scale)
-
-        self.experts = nn.ModuleList([Expert(args) if self.experts_start_idx <= i < self.experts_end_idx else None
-                                      for i in range(self.n_routed_experts)])
+        self.gate = Gate(args, layer_id, route_scale=route_scale)
+        self.experts = nn.ModuleList([Expert(args) for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args)
 
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+
         """
         Forward pass for the MoE module.
-
         Args:
-            x (torch.Tensor): Input tensor.
-
+        x (torch.Tensor): Input tensor.
         Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
+        torch.Tensor: Output tensor after expert routing and computation.
         """
         weights, indices = self.gate(x)
-        y = torch.zeros_like(x)
+        orig_shape = x.shape
+        # 効率化とバグ回避のため、(Batch, Seq, Dim) を (Tokens, Dim) に平坦化
+        x_flat = x.view(-1, x.size(-1))
+        # indices と weights も (Tokens, TopK) に平坦化
+        indices_flat = indices.view(-1, self.n_activated_experts)
+        weights_flat = weights.view(-1, self.n_activated_experts)
+        y_flat = torch.zeros_like(x_flat)
+
+
+        # エキスパートごとの使用状況を確認 (全トークン x TopK)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
+
+
+        for i in range(self.n_routed_experts):
+
             if counts[i] == 0:
                 continue
+            # トークンインデックス(t_idx)と、そのトークン内でのTopK順位(k_idx)を取得
+            t_idx, k_idx = torch.where(indices_flat == i)
             expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx]) * weights[idx, top, None]
+            # 各エキスパートをまとめて1回だけ実行
+            expert_out = expert(x_flat[t_idx])
+            y_flat[t_idx] += expert_out * weights_flat[t_idx, k_idx, None]
+
+
         z = self.shared_experts(x)
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(y)
-        return (y + z)
+        y = y_flat.view(orig_shape)
+        return y + z
 
 
 class NormTanh(nn.Module):

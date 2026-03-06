@@ -10,7 +10,10 @@ from einops import rearrange
 import numpy as np
 
 import torch
+torch.set_float32_matmul_precision('high')
 import torch.distributed as dist
+import torch._dynamo
+torch._dynamo.config.capture_scalar_outputs = True
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch import Tensor
@@ -51,16 +54,17 @@ class MORTMTrainSet(AbstractTrainSet):
         if load_directory is not None:
             self.model.load_state_dict(torch.load(load_directory, map_location=device))
 
-        # MoEのようにバッチによって特定のExpert（パラメータ）が全く使われないことがある構造では、
-        # find_unused_parameters=Trueが「必須」です（FalseだとDDPが永遠に勾配を待ち続けてデッドロック・タイムアウトします）
-        self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
+        # torch.compile は DDP でラップするより「前」に適用するのがベストプラクティスです。
+        # これにより、通信部分を除いた純粋な計算グラフを最適化できます。
+        self.model = torch.compile(
+             self.model,
+             fullgraph=False,
+             dynamic=True 
+        )
 
-        # self.model = torch.compile(
-        #     self.model,
-        #     # mode="max-autotune", # 処理が重すぎるため無効化
-        #     fullgraph=False,
-        #     dynamic=True # バッチサイズやシーケンス長の変動による再コンパイルを抑制
-        # )
+        # MoEのようにバッチによって特定のExpert（パラメータ）が全く使われないことがある構造では、
+        # find_unused_parameters=True が必須です。
+        self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
 
         total_param, self.active_params = self.model.module.get_param()
         adam = torch.optim.Adam(self.model.parameters(), lr=t_args.lr_param)

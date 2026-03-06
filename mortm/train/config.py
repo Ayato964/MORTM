@@ -3,6 +3,7 @@ from abc import abstractmethod
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 from torch import nn, Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
