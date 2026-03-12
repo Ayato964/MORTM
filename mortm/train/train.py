@@ -56,11 +56,11 @@ class MORTMTrainSet(AbstractTrainSet):
 
         # torch.compile は DDP でラップするより「前」に適用するのがベストプラクティスです。
         # これにより、通信部分を除いた純粋な計算グラフを最適化できます。
-        self.model = torch.compile(
-             self.model,
-             fullgraph=False,
-             dynamic=True 
-        )
+        #self.model = torch.compile(
+        #     self.model,
+        #     fullgraph=False,
+        #     dynamic=True
+        #)
 
         # MoEのようにバッチによって特定のExpert（パラメータ）が全く使われないことがある構造では、
         # find_unused_parameters=True が必須です。
@@ -462,7 +462,7 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:Abstr
 
         except torch.cuda.OutOfMemoryError:
             if local_rank == 0:
-                message.send_message("エラーが発生し、処理を中断しました",
+                print("エラーが発生し、処理を中断しました",
                                      "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
 
     return model, verification_loss

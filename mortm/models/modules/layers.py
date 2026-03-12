@@ -288,25 +288,32 @@ class MLP(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+
+
+
 class Gate(nn.Module):
-    def __init__(self, args: MORTMArgs, layer_id, route_scale=1, score_type="softmax"):
+    def __init__(self, args, layer_id, route_scale=1, score_type="softmax"):
         super().__init__()
         self.topk = args.topk_experts
         self.score_func = score_type
-        self.gate_bias = args.use_gate_bias
+        self.gate_bias: bool = args.use_gate_bias
         self.layer_id = layer_id
+
         if self.gate_bias:
             print("Using gate bias")
 
         self.route_scale = route_scale
         self.gamma = getattr(args, "bias_update_rate", 0.001)
+        self.ema_decay = getattr(args, "ema_decay", 0.9)
 
         if getattr(args, "use_gate_lora", False):
-            self.gate_proj = lora.Linear(args.d_model, args.num_experts, r=args.lora_r, lora_alpha=args.lora_alpha, bias=False)
+            self.gate_proj = lora.Linear(args.d_model, args.num_experts, r=args.lora_r, lora_alpha=args.lora_alpha,
+                                         bias=False)
         else:
             self.gate_proj = nn.Linear(args.d_model, args.num_experts, bias=False)
 
         self.register_buffer("routing_bias", torch.zeros(args.num_experts))
+        self.register_buffer("ema_counts", torch.zeros(args.num_experts))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.autocast(device_type=x.device.type):
@@ -319,7 +326,6 @@ class Gate(nn.Module):
             weights = scores.gather(dim=-1, index=indices)
 
             if self.training:
-                # Always monitor and log, but update bias conditionally
                 self._monitor_load_balance(indices, update_bias=self.gate_bias)
 
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
@@ -334,26 +340,28 @@ class Gate(nn.Module):
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(counts)
 
-        num_total_samples = counts.sum()
-        if num_total_samples == 0:
+        if counts.sum() == 0:
             return
 
+        if self.ema_counts.sum() == 0:
+            self.ema_counts.copy_(counts)
+        else:
+            self.ema_counts.mul_(self.ema_decay).add_(counts, alpha=1 - self.ema_decay)
+
         n_exp = self.routing_bias.size(0)
-        mean = counts.mean()
-        std = counts.std()
+        mean = self.ema_counts.mean()
+        std = self.ema_counts.std(unbiased=False)
         cv = std / (mean + 1e-6)
 
-        # Monitoring and Logging (Always active during training)
         if cv > 1.0:
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             if rank == 0:
-                print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {counts.long().tolist()}")
+                print(
+                    f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {self.ema_counts.long().tolist()}")
 
-        # Conditional Bias Update
         if update_bias:
-            target = num_total_samples / n_exp
-            self.routing_bias -= self.gamma * torch.sign(counts - target)
-
+            target = self.ema_counts.sum() / n_exp
+            self.routing_bias -= self.gamma * torch.sign(self.ema_counts - target)
 
 class Expert(nn.Module):
 

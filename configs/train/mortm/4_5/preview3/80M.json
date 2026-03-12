@@ -1,6 +1,6 @@
 {
   "big_batch_size": 3072,
-  "batch_size": 48,
+  "batch_size": 32,
   "accumulation_steps":1,
   "num_epochs": 1,
   "is_save_training_progress": true,
@@ -10,7 +10,7 @@
   "lr_param": 4e-4,
   "scheduler": {
     "type": "cos",
-    "warmup_ratio": 0.1,
-    "total_steps":1020999
+    "warmup_steps": 1000,
+    "total_steps":1038040
   }
 }
