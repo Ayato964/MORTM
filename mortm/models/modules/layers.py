@@ -304,7 +304,7 @@ class Gate(nn.Module):
 
         self.route_scale = route_scale
         self.gamma = getattr(args, "bias_update_rate", 0.001)
-        self.ema_decay = getattr(args, "ema_decay", 0.9)
+        self.ema_decay = getattr(args, "ema_decay", 0.97)
 
         if getattr(args, "use_gate_lora", False):
             self.gate_proj = lora.Linear(args.d_model, args.num_experts, r=args.lora_r, lora_alpha=args.lora_alpha,
@@ -316,22 +316,19 @@ class Gate(nn.Module):
         self.register_buffer("ema_counts", torch.zeros(args.num_experts))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        with torch.autocast(device_type=x.device.type):
-            logits = self.gate_proj(x)
-            scores = logits.softmax(dim=-1) if self.score_func == "softmax" else logits.sigmoid()
+        logits = self.gate_proj(x)
+        scores = logits.softmax(dim=-1) if self.score_func == "softmax" else logits.sigmoid()
 
-            routing_scores = scores + self.routing_bias if self.training else scores
-            _, indices = torch.topk(routing_scores, self.topk, dim=-1)
+        routing_scores = scores + self.routing_bias if (self.training and self.gate_bias) else scores
+        _, indices = torch.topk(routing_scores, self.topk, dim=-1)
+        weights = scores.gather(dim=-1, index=indices)
 
-            weights = scores.gather(dim=-1, index=indices)
+        if self.training:
+            self._monitor_load_balance(indices, update_bias=self.gate_bias)
 
-            if self.training:
-                self._monitor_load_balance(indices, update_bias=self.gate_bias)
-
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
-            weights *= self.route_scale
-
-        return weights.type_as(x).to(dtype=x.dtype), indices
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
+        weights = weights * self.route_scale
+        return weights.to(dtype=x.dtype), indices
 
     @torch.no_grad()
     def _monitor_load_balance(self, indices: torch.Tensor, update_bias: bool):
@@ -361,7 +358,17 @@ class Gate(nn.Module):
 
         if update_bias:
             target = self.ema_counts.sum() / n_exp
-            self.routing_bias -= self.gamma * torch.sign(self.ema_counts - target)
+
+            if self.score_func == "sigmoid":
+                delta = torch.sign(self.ema_counts - target)
+                self.routing_bias -= self.gamma * delta
+                self.routing_bias.clamp_(-0.5, 0.5)
+
+            elif self.score_func == "softmax":
+                err = (self.ema_counts - target) / (target + 1e-6)
+                delta = err.clamp(-1.0, 1.0)
+                self.routing_bias -= self.gamma * delta
+                self.routing_bias.clamp_(-0.5, 0.5)
 
 class Expert(nn.Module):
 
@@ -391,44 +398,44 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([Expert(args) for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args)
 
-
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
-        """
-        Forward pass for the MoE module.
-        Args:
-        x (torch.Tensor): Input tensor.
-        Returns:
-        torch.Tensor: Output tensor after expert routing and computation.
-        """
         weights, indices = self.gate(x)
+
         orig_shape = x.shape
-        # 効率化とバグ回避のため、(Batch, Seq, Dim) を (Tokens, Dim) に平坦化
-        x_flat = x.view(-1, x.size(-1))
-        # indices と weights も (Tokens, TopK) に平坦化
-        indices_flat = indices.view(-1, self.n_activated_experts)
-        weights_flat = weights.view(-1, self.n_activated_experts)
+        x_flat = x.reshape(-1, x.size(-1))  # [T, D]
+        k = self.n_activated_experts
+
+        assign_expert = indices.reshape(-1)  # [T*K]
+        assign_weight = weights.reshape(-1)  # [T*K]
+
+        token_ids = torch.arange(x_flat.size(0), device=x.device)
+        token_ids = token_ids.repeat_interleave(k)  # [T*K]
+
+        order = torch.argsort(assign_expert)
+        assign_expert = assign_expert[order]
+        assign_weight = assign_weight[order]
+        token_ids = token_ids[order]
+
+        counts = torch.bincount(assign_expert, minlength=self.n_routed_experts)
+        boundaries = counts.cumsum(0).cpu().tolist()
+
         y_flat = torch.zeros_like(x_flat)
 
-
-        # エキスパートごとの使用状況を確認 (全トークン x TopK)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-
-
-        for i in range(self.n_routed_experts):
-
-            if counts[i] == 0:
+        start = 0
+        for expert_id, end in enumerate(boundaries):
+            if end == start:
                 continue
-            # トークンインデックス(t_idx)と、そのトークン内でのTopK順位(k_idx)を取得
-            t_idx, k_idx = torch.where(indices_flat == i)
-            expert = self.experts[i]
-            # 各エキスパートをまとめて1回だけ実行
-            expert_out = expert(x_flat[t_idx])
-            y_flat[t_idx] += expert_out * weights_flat[t_idx, k_idx, None]
 
+            cur_token_ids = token_ids[start:end]
+            cur_weights = assign_weight[start:end].unsqueeze(-1)
 
-        z = self.shared_experts(x)
+            expert_in = x_flat.index_select(0, cur_token_ids)
+            expert_out = self.experts[expert_id](expert_in)
+
+            y_flat.index_add_(0, cur_token_ids, expert_out * cur_weights)
+            start = end
+
+        z = self.shared_experts(x_flat).view(orig_shape)
         y = y_flat.view(orig_shape)
         return y + z
 

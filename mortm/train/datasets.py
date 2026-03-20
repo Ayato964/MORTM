@@ -55,125 +55,117 @@ class MORTM_SEQDataset(Dataset):
 
     def add_data(self, music_seq: np.ndarray, *args):
         suc_count = 0
-        for i in range(len(music_seq) - 1):
-            seq = music_seq[f'array{i + 1}'].tolist()
+
+        i = 1
+        while True:
+            key = f"array{i}"
+            if key not in music_seq.files:
+                break
+
+            arr = music_seq[key]
+            seq = np.asarray(arr)
+
+            if seq.ndim == 0:
+                i += 1
+                continue
+
+            seq = seq.astype(np.int64, copy=False)
+
             if self.min_length < len(seq) < self.positional_length:
-                self.seq.append(seq)
+                self.seq.append(np.ascontiguousarray(seq.copy()))
                 suc_count += 1
+
+            i += 1
+
         return suc_count
+
     def __getitem__(self, item):
+        sequence_array = self.seq[item]
 
-        # 1. Pythonリスト(self.seq[item])を numpy.ndarray に変換
-        sequence_array = np.array(self.seq[item])
+        has_mask_task = any(
+            int(token) in self.mask_sample_task for token in sequence_array) if self.mask_sample_task else False
 
-        # AUGMENTATIONの適用条件
         apply_augmentation = (
-                self.is_random_delete_key and
-                self.system_tag is not None and
-                self.program_token_id and
-                self.sampling_inst_max > 0 and
-                not self.mask_sample_task.isdisjoint(sequence_array)
+                self.is_random_delete_key
+                and self.system_tag is not None
+                and self.program_token_id
+                and self.sampling_inst_max > 0
+                and has_mask_task
         )
 
         if not apply_augmentation:
-            # 条件を満たさない場合は、オリジナルのシーケンスを返す
-            return torch.tensor(sequence_array, dtype=torch.long)
+            return torch.from_numpy(sequence_array.astype(np.int64, copy=False))
 
         try:
             begin_tag_id, end_tag_id = self.system_tag
-
             footer_tokens = {626, 627}
 
-            # --- 1. <SYSTEM> タグの開始インデックスを特定 ---
-            # (get_tag内部でエラーチェックされるが、プレフィックス抽出のために先に見つける)
             ind_begin_tag_search = np.where(sequence_array == begin_tag_id)[0]
             if len(ind_begin_tag_search) == 0:
-                # get_tag 同様のエラーを発生させる
                 raise IndexError("Begin tag token not found in sequence.")
             ind_begin_tag = ind_begin_tag_search[0]
 
-            # --- 2. プレフィックス (<EOS>など) を抽出 ---
-            # <SYSTEM> よりも前の部分
             prefix_part = sequence_array[:ind_begin_tag].tolist()
 
-            # --- 3. システムタグをフィルタリング ---
-            # (get_tagは堅牢化されたものを使用)
-            # system_seq_list = [8, 10, 9, ...]
-            # ind_end_tag = (2 のインデックス)
             system_seq_list, ind_end_tag = get_tag(sequence_array, begin_tag_id, end_tag_id)
 
             present_inst_tokens = [
-                token for token in system_seq_list
-                if token in self.program_token_id
+                token for token in system_seq_list if token in self.program_token_id
             ]
             inst_count = len(present_inst_tokens)
 
-            # (楽器が1つ、またはサンプリング不要なケース)
             if inst_count <= 1:
-                return torch.tensor(sequence_array, dtype=torch.long)
+                return torch.from_numpy(sequence_array.astype(np.int64, copy=False))
 
             max_k = min(self.sampling_inst_max, inst_count)
             k = random.randint(1, max_k)
             kept_inst_tokens = set(random.sample(present_inst_tokens, k))
 
             if len(kept_inst_tokens) == inst_count:
-                return torch.tensor(sequence_array, dtype=torch.long)
+                return torch.from_numpy(sequence_array.astype(np.int64, copy=False))
 
-            # 保持する楽器だけで新しいシステムタグを構築
             new_system_seq = [
                 token for token in system_seq_list
-                # 楽器トークンではない OR 保持する楽器トークンである
                 if (token not in self.program_token_id) or (token in kept_inst_tokens)
             ]
 
-            # --- 4. 音楽イベントをフィルタリング ---
             music_events_part = sequence_array[ind_end_tag + 1:]
-
             inst_token_indices = []
+
             for i, token in enumerate(music_events_part):
                 if token in self.program_token_id:
-                    inst_token_indices.append((i, token)) # (相対インデックス, トークンID)
+                    inst_token_indices.append((i, token))
 
             new_music_events = []
 
             if not inst_token_indices:
-                # 楽器トークンがなければ、そのまま（<CGEN>タスクなど）
                 new_music_events.extend(music_events_part.tolist())
             else:
-                # 4a. 音楽プレフィックス (e.g., <MGEN>) を追加
                 first_inst_idx = inst_token_indices[0][0]
                 new_music_events.extend(music_events_part[:first_inst_idx].tolist())
 
-                # 4b. 保持する楽器チャンクを追加
                 for i, (chunk_start_idx, inst_token_id) in enumerate(inst_token_indices):
                     if inst_token_id not in kept_inst_tokens:
                         continue
 
-                    # チャンクの終了位置を特定
                     if i + 1 < len(inst_token_indices):
-                        # 次の楽器トークンの手前まで
-                        next_chunk_start_idx = inst_token_indices[i+1][0]
+                        next_chunk_start_idx = inst_token_indices[i + 1][0]
                         chunk_end_idx = next_chunk_start_idx
                     else:
-                        # 最後の楽器チャンク。フッターを探す
                         footer_start_idx = -1
-                        # 最後のチャンク開始位置からフッターを探す
                         for j, tok in enumerate(music_events_part[chunk_start_idx:]):
                             if tok in footer_tokens:
-                                # フッターの相対インデックスを発見
                                 footer_start_idx = chunk_start_idx + j
                                 break
 
                         if footer_start_idx != -1:
-                            chunk_end_idx = footer_start_idx # フッターの手前まで
+                            chunk_end_idx = footer_start_idx
                         else:
-                            chunk_end_idx = len(music_events_part) # フッターがなければ最後まで
+                            chunk_end_idx = len(music_events_part)
 
-                    chunk = music_events_part[chunk_start_idx : chunk_end_idx]
+                    chunk = music_events_part[chunk_start_idx:chunk_end_idx]
                     new_music_events.extend(chunk.tolist())
 
-                # 4c. 音楽サフィックス (e.g., <TE>) を追加
-                # 最後の楽器チャンクの開始位置からフッターを探す
                 last_inst_start_idx = inst_token_indices[-1][0]
                 footer_start_idx = -1
                 for j, tok in enumerate(music_events_part[last_inst_start_idx:]):
@@ -181,21 +173,15 @@ class MORTM_SEQDataset(Dataset):
                         footer_start_idx = last_inst_start_idx + j
                         break
 
-                # フッターが見つかった場合、その位置から最後までを追加
                 if footer_start_idx != -1:
                     new_music_events.extend(music_events_part[footer_start_idx:].tolist())
 
-            # --- 5. 最終シーケンスの結合 ---
-            # [プレフィックス] + [システムタグ] + [音楽イベント]
             final_sequence_list = prefix_part + new_system_seq + new_music_events
-
-            #print(final_sequence_list) # デバッグ用
             return torch.tensor(final_sequence_list, dtype=torch.long)
 
         except Exception as e:
-            # ログを拡張
-            print(f"Warning: Augmentation failed for item {item}, returning original. Error: {e}  {sequence_array}")
-            return torch.tensor(sequence_array, dtype=torch.long)
+            print(f"Warning: Augmentation failed for item {item}, returning original. Error: {e} {sequence_array}")
+            return torch.from_numpy(sequence_array.astype(np.int64, copy=False))
 
 
 class ClassDataSets(Dataset):

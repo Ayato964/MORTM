@@ -8,6 +8,7 @@
   "train_dataset_split": 0.99,
   "shuffle": true,
   "lr_param": 4e-4,
+  "score_type": "sigmoid",
   "scheduler": {
     "type": "cos",
     "warmup_steps": 1000,

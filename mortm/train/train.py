@@ -8,6 +8,7 @@ import torchaudio
 import wandb
 from einops import rearrange
 import numpy as np
+import gc
 
 import torch
 torch.set_float32_matmul_precision('high')
@@ -41,6 +42,58 @@ def reduce_tensor(tensor: Tensor, op=dist.ReduceOp.SUM) -> Tensor:
     dist.all_reduce(rt, op=op)
     return rt
 
+def _is_dist_ready() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _build_distributed_sampler(dataset: Dataset, shuffle: bool):
+    if _is_dist_ready():
+        return DistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=shuffle,
+            drop_last=False,
+        )
+    return None
+
+
+def _sync_min_loader_length(local_len: int, device: torch.device) -> int:
+    if not _is_dist_ready():
+        return local_len
+
+    len_tensor = torch.tensor([local_len], device=device, dtype=torch.long)
+    dist.all_reduce(len_tensor, op=dist.ReduceOp.MIN)
+    return int(len_tensor.item())
+
+
+def _extract_paths_from_pack(pack) -> list[str]:
+    if isinstance(pack, str):
+        return [pack]
+
+    if isinstance(pack, np.ndarray):
+        return [str(x) for x in pack.reshape(-1).tolist()]
+
+    if isinstance(pack, (list, tuple)):
+        out = []
+        for x in pack:
+            out.extend(_extract_paths_from_pack(x))
+        return out
+
+    return [str(pack)]
+
+
+def _extract_all_paths_from_dataset(dataset) -> list[str]:
+    # PreLoadingDatasets
+    if hasattr(dataset, "src_list"):
+        return list(dataset.src_list)
+
+    # random_split() が返す Subset
+    if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+        base_paths = _extract_all_paths_from_dataset(dataset.dataset)
+        return [base_paths[i] for i in dataset.indices]
+
+    raise TypeError(f"Unsupported dataset type for path export: {type(dataset)}")
 
 class MORTMTrainSet(AbstractTrainSet):
     def __init__(self, args: MORTMArgs, t_args: TrainArgs, tokenizer: Tokenizer, calc_val_loss_tokens, progress: LearningProgress, log_scale=False, project_name="", config=None,  load_directory=None, model_name=None):
@@ -91,14 +144,21 @@ class MORTMTrainSet(AbstractTrainSet):
         self.all_tokens = torch.tensor(0, device=device, dtype=torch.long)
 
     def pre_processing(self, pack, progress):
-        dt: DataLoader = pack
-        mini_dataset = MORTM_SEQDataset(progress, self.args.position_length, self.args.min_length,
-                                        is_random_delete_key=False, mask_sample_task=[self.tokenizer.get("<MGEN>")],
-                                        program_token_id=[self.tokenizer.get("<INST_PIANO>"), self.tokenizer.get("<INST_SAX>")],
-                                        system_tag=(self.tokenizer.get("<SYSTEM>"), self.tokenizer.get("<TAG_END>")), sampling_inst_max=2)
-        for d in dt:
-            np_load_data = np.load(d, allow_pickle=True)
-            mini_dataset.add_data(np_load_data)
+        mini_dataset = MORTM_SEQDataset(
+            progress,
+            self.args.position_length,
+            self.args.min_length,
+            is_random_delete_key=False,
+            mask_sample_task=[self.tokenizer.get("<MGEN>")],
+            program_token_id=[self.tokenizer.get("<INST_PIANO>"), self.tokenizer.get("<INST_SAX>")],
+            system_tag=(self.tokenizer.get("<SYSTEM>"), self.tokenizer.get("<TAG_END>")),
+            sampling_inst_max=2,
+        )
+
+        paths = _extract_paths_from_pack(pack)
+        for path in paths:
+            with np.load(path, allow_pickle=True) as np_load_data:
+                mini_dataset.add_data(np_load_data)
 
         return mini_dataset
 
@@ -241,11 +301,9 @@ def collate_fn_with_tgt(batch):
     return src, tgt
 
 def save_path_json(name, val_loader: DataLoader, save_directory, version):
-    val_paths = []
-    for v in val_loader:
-        val_paths.append(v)
-    with open(f"{save_directory}/{name}_paths_{version}.json", 'w') as f:
-        json.dump(val_paths, f, indent=4)
+    paths = _extract_all_paths_from_dataset(val_loader.dataset)
+    with open(f"{save_directory}/{name}_paths_{version}.json", "w") as f:
+        json.dump(paths, f, indent=4)
 
 def update_log(model, writer, global_step):
     for name, param in model.named_parameters():
@@ -275,13 +333,16 @@ def progress_bar_with_minibatch(rank, epoch, sum_epoch, seq_count, all_pac, mini
 
 
 def get_inner_loader(dataset: Dataset, batch_size: int, collate_fn=None):
-    sampler = DistributedSampler(dataset, shuffle=True)
+    sampler = _build_distributed_sampler(dataset, shuffle=True)
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=sampler,
+        shuffle=(sampler is None),
         collate_fn=collate_fn,
-        drop_last=True
+        drop_last=True,
+        num_workers=0,
     )
     return loader, sampler
 
@@ -289,59 +350,94 @@ def get_data_loader(t_args: TrainArgs, mortm_dataset: tuple | Dataset, shuffle=T
     if isinstance(mortm_dataset, Dataset):
         train_size = int(t_args.train_dataset_split * len(mortm_dataset))
         val_size = len(mortm_dataset) - train_size
-        # DDP環境では全プロセスで同じ分割になるように乱数シードを固定
+
+        # 全 rank で同じ split になるよう固定シード
         generator = torch.Generator().manual_seed(42)
-        train_dataset, val_dataset = random_split(mortm_dataset, [train_size, val_size], generator=generator)
-
-        train_sampler = DistributedSampler(train_dataset, num_replicas=1, rank=0, shuffle=shuffle)
-        val_sampler = DistributedSampler(val_dataset, num_replicas=1, rank=0, shuffle=False)
-
-        train_loader = DataLoader(train_dataset, batch_size=t_args.big_batch_size, sampler=train_sampler,
-                                  num_workers=0, collate_fn=collate_fn)
-        val_loader = DataLoader(val_dataset, batch_size=t_args.big_batch_size, sampler=val_sampler,
-                                num_workers=0, collate_fn=collate_fn)
+        train_dataset, val_dataset = random_split(
+            mortm_dataset,
+            [train_size, val_size],
+            generator=generator
+        )
     else:
-        train_sampler = DistributedSampler(mortm_dataset[0], num_replicas=1, rank=0, shuffle=shuffle)
-        val_sampler = DistributedSampler(mortm_dataset[1], num_replicas=1, rank=0, shuffle=False)
+        train_dataset, val_dataset = mortm_dataset
 
-        train_loader = DataLoader(mortm_dataset[0], batch_size=t_args.big_batch_size, sampler=train_sampler, collate_fn=collate_fn, num_workers=0)
-        val_loader = DataLoader(mortm_dataset[1], batch_size=t_args.big_batch_size, sampler=val_sampler, collate_fn=collate_fn, num_workers=0)
+    train_sampler = _build_distributed_sampler(train_dataset, shuffle=shuffle)
+    val_sampler = _build_distributed_sampler(val_dataset, shuffle=False)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=t_args.big_batch_size,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None and shuffle),
+        num_workers=0,
+        collate_fn=collate_fn,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=t_args.big_batch_size,
+        sampler=val_sampler,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn,
+    )
 
     return train_loader, val_loader
 
 def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: nn.Module, progress: LearningProgress,
-                          trainer, train_args: TrainArgs,
-                          coll_fn=None):
+                          trainer, train_args: TrainArgs, coll_fn=None):
     model.eval()
-    val_loss = torch.tensor(0.0, device=torch.device(f"cuda:{trainer.local_rank}"))
-    all_count = torch.tensor(0.0, device=torch.device(f"cuda:{trainer.local_rank}"))
+
+    device = torch.device(f"cuda:{trainer.local_rank}")
+    val_loss = torch.tensor(0.0, device=device)
+    all_count = torch.tensor(0.0, device=device)
 
     with torch.no_grad():
         for pack in val_loader:
-            pre_processing: Dataset = trainer.pre_processing(pack, progress)
-            if len(pre_processing) == 0:
+            pre_processing_dataset: Dataset = trainer.pre_processing(pack, progress)
+
+            if len(pre_processing_dataset) == 0:
+                del pre_processing_dataset, pack
+                gc.collect()
                 continue
-            inner_sampler = DistributedSampler(pre_processing, shuffle=False)
-            loader = DataLoader(pre_processing, batch_size=train_args.batch_size, sampler=inner_sampler, shuffle=False, collate_fn=coll_fn)
-            for pack2 in loader:
+
+            inner_loader, inner_sampler = get_inner_loader(
+                pre_processing_dataset,
+                train_args.batch_size,
+                coll_fn
+            )
+
+            if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
+                inner_sampler.set_epoch(0)
+
+            for pack2 in inner_loader:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     r_pack = trainer.epoch_fc(model, pack2, progress)
                     loss = trainer.get_eval_loss(*r_pack)
-                val_loss += loss
+
+                val_loss += loss.detach()
                 all_count += 1
 
-    dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
-    dist.all_reduce(all_count, op=dist.ReduceOp.SUM)
+                del pack2, r_pack, loss
+
+            del inner_loader, inner_sampler, pre_processing_dataset, pack
+            gc.collect()
+
+    if _is_dist_ready():
+        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(all_count, op=dist.ReduceOp.SUM)
 
     model.train()
+
     if all_count.item() == 0:
         return 0.0
+
     return (val_loss / all_count).item()
 
-def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:AbstractTrainSet,
+def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: AbstractTrainSet,
                 train_loader: DataLoader, val_loader: DataLoader,
                 message: Messenger, progress: LearningProgress,
-                writer,  coll_fn=None):
+                writer, coll_fn=None):
 
     model = trainer.model
     criterion = trainer.criterion
@@ -356,9 +452,14 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:Abstr
     all_count = 1
     verification_loss = 0.0
 
+    device = torch.device(f"cuda:{local_rank}")
+
     for epoch in range(train_args.num_epochs):
-        if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
+        if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
+
+        if hasattr(val_loader, "sampler") and hasattr(val_loader.sampler, "set_epoch"):
+            val_loader.sampler.set_epoch(epoch)
 
         try:
             count = 1
@@ -370,52 +471,73 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:Abstr
 
             for pack in train_loader:
                 begin_time = time.time()
+
                 pre_processing_dataset = trainer.pre_processing(pack, progress)
+
+                if len(pre_processing_dataset) == 0:
+                    del pre_processing_dataset, pack
+                    gc.collect()
+                    continue
+
                 inner_loader, inner_sampler = get_inner_loader(
                     pre_processing_dataset,
                     train_args.batch_size,
                     coll_fn
                 )
-                inner_sampler.set_epoch(epoch)
-                
-                # DDP環境では、データの偏りや型番違いによる速度差でバッチ数がズレてデッドロックすることがあります。
-                # 全Rankのバッチ数を同期し、最小数に合わせて打ち切ることでこれを完全に防ぎます。
+
+                if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
+                    inner_sampler.set_epoch(epoch)
+
                 local_len = len(inner_loader)
-                if dist.is_initialized():
-                    device = torch.device(f"cuda:{local_rank}")
-                    len_tensor = torch.tensor([local_len], device=device)
-                    dist.all_reduce(len_tensor, op=dist.ReduceOp.MIN)
-                    synced_len = len_tensor.item()
-                else:
-                    synced_len = local_len
+                synced_len = _sync_min_loader_length(local_len, device)
 
                 mini_c = 0
                 count += 1
+
                 for pack2 in inner_loader:
-                    # 同期されたバッチ数を超えたら終了（デッドロック防止）
                     if mini_c >= synced_len:
                         break
-                    
+
                     mini_c += 1
                     all_count += 1
 
-                    is_step_optimizer = mini_c % train_args.accumulation_steps == 0
+                    is_step_optimizer = (mini_c % train_args.accumulation_steps == 0)
+
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         r_pack = trainer.epoch_fc(model, pack2, progress)
+                        loss = trainer.backward(
+                            train_args.accumulation_steps,
+                            is_step_optimizer,
+                            progress,
+                            train_args.lr_param,
+                            *r_pack
+                        )
 
-                    loss = trainer.backward(train_args.accumulation_steps, is_step_optimizer, progress, train_args.lr_param, *r_pack)
-
-                    reduced_loss = reduce_tensor(loss, op=dist.ReduceOp.SUM)
-                    avg_loss = (reduced_loss / world_size).item()
+                    reduced_loss = reduce_tensor(loss, op=dist.ReduceOp.SUM) if _is_dist_ready() else loss.detach()
+                    avg_loss = (reduced_loss / world_size).item() if _is_dist_ready() else reduced_loss.item()
 
                     epoch_loss.add(avg_loss)
 
-                    # 毎バッチのトークン数同期 (reduce_tensor) はフリーズの原因になるため、
-                    # 表示用にはローカルの値を使い、同期は検証前などにまとめて行います。
                     current_tokens = trainer.all_tokens.item()
                     current_lr = scheduler.get_last_lr()[0] if scheduler is not None else train_args.lr_param
 
-                    trainer.view_logs(epoch, train_args.num_epochs, count, len(train_loader), mini_c, len(inner_loader), epoch_loss.get(), current_lr, verification_loss, current_tokens)
+                    trainer.view_logs(
+                        epoch,
+                        train_args.num_epochs,
+                        count,
+                        len(train_loader),
+                        mini_c,
+                        len(inner_loader),
+                        epoch_loss.get(),
+                        current_lr,
+                        verification_loss,
+                        current_tokens
+                    )
+
+                    del pack2, r_pack, loss, reduced_loss
+
+                del inner_loader, inner_sampler, pre_processing_dataset, pack
+                gc.collect()
 
                 end_time = time.time()
 
@@ -426,10 +548,11 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:Abstr
                         message.send_message(
                             "学習開始のお知らせ",
                             f"{model_name}の学習が開始されました。"
-                                f"\n\n シーケンスの1回目の処理が終了しました。かかった時間は{t:.1f}秒でした。\n"
-                                f"終了見込み時間は{end_time_progress:.2f}時間です"
+                            f"\n\n シーケンスの1回目の処理が終了しました。かかった時間は{t:.1f}秒でした。\n"
+                            f"終了見込み時間は{end_time_progress:.2f}時間です"
                         )
                         mail_bool = False
+
                     if writer is not None:
                         writer.flush()
 
@@ -438,32 +561,48 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer:Abstr
                         update_log(model, writer, all_count)
 
                     torch.cuda.empty_cache()
-                    verification_loss = get_verification_loss(model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn)
+                    verification_loss = get_verification_loss(
+                        model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn
+                    )
 
                     if local_rank == 0 and writer is not None:
-                        writer.add_scalars("Train/Verification Loss", {"Train": epoch_loss.get(), "Verification": verification_loss}, all_count)
+                        writer.add_scalars(
+                            "Train/Verification Loss",
+                            {"Train": epoch_loss.get(), "Verification": verification_loss},
+                            all_count
+                        )
 
                     trainer.optional_logging(verification_loss, all_count)
 
             if not epoch1_end:
                 epoch1_end = True
-                verification_loss = get_verification_loss(model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn)
+                verification_loss = get_verification_loss(
+                    model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn
+                )
                 trainer.optional_logging(verification_loss, all_count)
 
-            sync_tokens = reduce_tensor(trainer.all_tokens, op=dist.ReduceOp.SUM).item()
+            sync_tokens = reduce_tensor(trainer.all_tokens, op=dist.ReduceOp.SUM).item() if _is_dist_ready() else trainer.all_tokens.item()
+
             if local_rank == 0:
-                message.send_message(f"{model_name}の途中経過について",
-                                     f"Epoch {epoch + 1}/{train_args.num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
-                                     f"また、検証データの損失は{verification_loss:.4f}となっています。\n　"
-                                     f"また現在学習中のトークン数は{sync_tokens}です。\n 以上です。")
+                message.send_message(
+                    f"{model_name}の途中経過について",
+                    f"Epoch {epoch + 1}/{train_args.num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
+                    f"また、検証データの損失は{verification_loss:.4f}となっています。\n "
+                    f"また現在学習中のトークン数は{sync_tokens}です。\n 以上です。"
+                )
 
                 if train_args.is_save_training_progress:
-                    torch.save(model.module.state_dict(), f"{save_directory}/{model_name}.train.{epoch}.{verification_loss:.4f}.pth")
+                    torch.save(
+                        model.module.state_dict(),
+                        f"{save_directory}/{model_name}.train.{epoch}.{verification_loss:.4f}.pth"
+                    )
 
         except torch.cuda.OutOfMemoryError:
             if local_rank == 0:
-                print("エラーが発生し、処理を中断しました",
-                                     "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください")
+                print(
+                    "エラーが発生し、処理を中断しました",
+                    "学習中にモデルがこのPCのメモリーの理論値を超えました。\nバッチサイズを調整してください"
+                )
 
     return model, verification_loss
 
