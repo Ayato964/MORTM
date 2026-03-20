@@ -142,6 +142,7 @@ class MORTMTrainSet(AbstractTrainSet):
                          calc_val_loss_tokens=calc_val_loss_tokens)
 
         self.all_tokens = torch.tensor(0, device=device, dtype=torch.long)
+        self.optimizer_steps = 0
 
     def pre_processing(self, pack, progress):
         mini_dataset = MORTM_SEQDataset(
@@ -185,14 +186,13 @@ class MORTMTrainSet(AbstractTrainSet):
         progress_bar_with_minibatch(self.local_rank, epoch, sum_epoch, seq_count, all_pac, mini_seq_count, mini_seq_pac, loss, lr, verif_loss, tokens)
 
     def optional_logging(self, val_loss, step):
-        # 頻繁な通信を避けるため、ログ出力が必要な Rank 0 でのみ動作させるか、
-        # あるいはここで明示的な同期が必要な場合のみ全員で入るようにします。
-        # (学習を止めないよう、ここでは同期なしで Rank 0 のローカル値を暫定表示する形にします)
+        global_tokens = self.get_synced_tokens()
+
         if self.local_rank == 0:
             wandb.log({
                 "axis/val_loss": val_loss,
-                "axis/tokens": self.all_tokens.item(), # 同期なしのローカル値
-                "axis/flops": 6 * self.active_params * self.all_tokens.item(),
+                "axis/tokens": global_tokens,
+                "axis/flops": 6 * self.active_params * global_tokens,
                 "trainer/global_step": step
             })
 
@@ -433,7 +433,6 @@ def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: n
         return 0.0
 
     return (val_loss / all_count).item()
-
 def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: AbstractTrainSet,
                 train_loader: DataLoader, val_loader: DataLoader,
                 message: Messenger, progress: LearningProgress,
@@ -450,6 +449,7 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
     mail_bool = True
     epoch1_end = False
     all_count = 1
+    optimizer_step = 0
     verification_loss = 0.0
 
     device = torch.device(f"cuda:{local_rank}")
@@ -513,6 +513,10 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                             *r_pack
                         )
 
+                    if is_step_optimizer:
+                        optimizer_step += 1
+                        trainer.optimizer_steps = optimizer_step
+
                     reduced_loss = reduce_tensor(loss, op=dist.ReduceOp.SUM) if _is_dist_ready() else loss.detach()
                     avg_loss = (reduced_loss / world_size).item() if _is_dist_ready() else reduced_loss.item()
 
@@ -558,7 +562,7 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
 
                 if trainer.is_need_calc_val():
                     if local_rank == 0 and writer is not None:
-                        update_log(model, writer, all_count)
+                        update_log(model, writer, optimizer_step)
 
                     torch.cuda.empty_cache()
                     verification_loss = get_verification_loss(
@@ -569,17 +573,17 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                         writer.add_scalars(
                             "Train/Verification Loss",
                             {"Train": epoch_loss.get(), "Verification": verification_loss},
-                            all_count
+                            optimizer_step
                         )
 
-                    trainer.optional_logging(verification_loss, all_count)
+                    trainer.optional_logging(verification_loss, optimizer_step)
 
             if not epoch1_end:
                 epoch1_end = True
                 verification_loss = get_verification_loss(
                     model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn
                 )
-                trainer.optional_logging(verification_loss, all_count)
+                trainer.optional_logging(verification_loss, optimizer_step)
 
             sync_tokens = reduce_tensor(trainer.all_tokens, op=dist.ReduceOp.SUM).item() if _is_dist_ready() else trainer.all_tokens.item()
 

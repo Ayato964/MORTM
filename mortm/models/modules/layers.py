@@ -290,7 +290,6 @@ class MLP(nn.Module):
 
 
 
-
 class Gate(nn.Module):
     def __init__(self, args, layer_id, route_scale=1, score_type="softmax"):
         super().__init__()
@@ -303,28 +302,37 @@ class Gate(nn.Module):
             print("Using gate bias")
 
         self.route_scale = route_scale
-        self.gamma = getattr(args, "bias_update_rate", 0.001)
-        self.ema_decay = getattr(args, "ema_decay", 0.97)
+        self.gamma = getattr(args, "bias_update_rate", 0.5)
+        self.ema_decay = getattr(args, "ema_decay", 0.99)
 
         if getattr(args, "use_gate_lora", False):
-            self.gate_proj = lora.Linear(args.d_model, args.num_experts, r=args.lora_r, lora_alpha=args.lora_alpha,
-                                         bias=False)
+            self.gate_proj = lora.Linear(
+                args.d_model, args.num_experts,
+                r=args.lora_r, lora_alpha=args.lora_alpha, bias=False
+            )
         else:
             self.gate_proj = nn.Linear(args.d_model, args.num_experts, bias=False)
 
         self.register_buffer("routing_bias", torch.zeros(args.num_experts))
         self.register_buffer("ema_counts", torch.zeros(args.num_experts))
+        self.bias_cv_threshold = getattr(args, "bias_cv_threshold", 0.75)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.gate_proj(x)
         scores = logits.softmax(dim=-1) if self.score_func == "softmax" else logits.sigmoid()
 
+        # 監視用: bias なしの純粋な Gate の選好
+        _, monitor_indices = torch.topk(scores, self.topk, dim=-1)
+
+        # 実 routing 用: bias あり
         routing_scores = scores + self.routing_bias if (self.training and self.gate_bias) else scores
         _, indices = torch.topk(routing_scores, self.topk, dim=-1)
+
+        # expert 重みは bias なしの元スコアから取る
         weights = scores.gather(dim=-1, index=indices)
 
         if self.training:
-            self._monitor_load_balance(indices, update_bias=self.gate_bias)
+            self._monitor_load_balance(monitor_indices, update_bias=self.gate_bias)
 
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
         weights = weights * self.route_scale
@@ -334,8 +342,8 @@ class Gate(nn.Module):
     def _monitor_load_balance(self, indices: torch.Tensor, update_bias: bool):
         counts = torch.bincount(indices.flatten(), minlength=self.routing_bias.size(0)).float()
 
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(counts)
+        if dist.is_initialized():
+            dist.all_reduce(counts)
 
         if counts.sum() == 0:
             return
@@ -346,29 +354,37 @@ class Gate(nn.Module):
             self.ema_counts.mul_(self.ema_decay).add_(counts, alpha=1 - self.ema_decay)
 
         n_exp = self.routing_bias.size(0)
+        target = self.ema_counts.sum() / n_exp
+
         mean = self.ema_counts.mean()
         std = self.ema_counts.std(unbiased=False)
         cv = std / (mean + 1e-6)
 
-        if cv > 1.0:
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            if rank == 0:
-                print(
-                    f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {self.ema_counts.long().tolist()}")
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if cv > 0.5 and rank == 0:
+            print(
+                f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {self.ema_counts.long().tolist()}"
+            )
 
-        if update_bias:
-            target = self.ema_counts.sum() / n_exp
+        if not update_bias:
+            return
 
-            if self.score_func == "sigmoid":
-                delta = torch.sign(self.ema_counts - target)
-                self.routing_bias -= self.gamma * delta
-                self.routing_bias.clamp_(-0.5, 0.5)
+        # CVが閾値以下なら bias は無効化
+        if cv <= self.bias_cv_threshold:
+            self.routing_bias.zero_()
+            return
 
-            elif self.score_func == "softmax":
-                err = (self.ema_counts - target) / (target + 1e-6)
-                delta = err.clamp(-1.0, 1.0)
-                self.routing_bias -= self.gamma * delta
-                self.routing_bias.clamp_(-0.5, 0.5)
+        # CVが閾値を超えたときのみ bias を再計算して置換
+        if self.score_func == "sigmoid":
+            delta = torch.sign(self.ema_counts - target)
+        elif self.score_func == "softmax":
+            err = (self.ema_counts - target) / (target + 1e-6)
+            delta = err.clamp(-1.0, 1.0)
+        else:
+            delta = torch.zeros_like(self.routing_bias)
+
+        new_bias = (-self.gamma * delta).clamp(-0.5, 0.5)
+        self.routing_bias.copy_(new_bias)
 
 class Expert(nn.Module):
 
