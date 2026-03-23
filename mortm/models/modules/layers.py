@@ -353,7 +353,7 @@ class Gate(nn.Module):
         n_exp = self.routing_bias.size(0)
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # --- 追加: このstepで一度も選ばれなかった expert を監視 ---
+        # --- このstepで一度も選ばれなかった expert を監視 ---
         zero_mask = (counts == 0)
         zero_count = int(zero_mask.sum().item())
 
@@ -376,8 +376,6 @@ class Gate(nn.Module):
         else:
             self.ema_counts.mul_(self.ema_decay).add_(counts, alpha=1 - self.ema_decay)
 
-        target = self.ema_counts.sum() / n_exp
-
         mean = self.ema_counts.mean()
         std = self.ema_counts.std(unbiased=False)
         cv = std / (mean + 1e-6)
@@ -395,19 +393,30 @@ class Gate(nn.Module):
         if not update_bias:
             return
 
-        if cv <= self.bias_cv_threshold:
-            self.routing_bias.zero_()
-            return
-
         if self.score_func == "sigmoid":
-            delta = torch.sign(self.ema_counts - target)
+            x = self.ema_counts
+            x_min = x.min()
+            x_max = x.max()
+
+            if (x_max - x_min) < 1e-6:
+                delta = torch.zeros_like(x)
+            else:
+                # min expert -> -1, max expert -> +1
+                delta = 2.0 * (x - x_min) / (x_max - x_min) - 1.0
+
         elif self.score_func == "softmax":
+            target = self.ema_counts.sum() / n_exp
             err = (self.ema_counts - target) / (target + 1e-6)
             delta = err.clamp(-1.0, 1.0)
+
         else:
             delta = torch.zeros_like(self.routing_bias)
 
-        new_bias = (-self.gamma * delta).clamp(-0.5, 0.5)
+        # gamma を CV から動的決定
+        gamma_eff = torch.clamp(cv / 2.0, max=1.0)
+
+        # clamp は廃止
+        new_bias = -gamma_eff * delta
         self.routing_bias.copy_(new_bias)
 
 class Expert(nn.Module):
