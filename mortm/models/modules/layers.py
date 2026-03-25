@@ -374,7 +374,7 @@ class Gate(nn.Module):
             print(f"[MOE_DEAD] LAYER ID: {self.layer_id} CLEAR!")
             self.dead_expert_alert = False
 
-        if (not update_bias) or (cv <= self.bias_cv_threshold):
+        if not update_bias:
             return
 
         if self.score_func == "sigmoid":
