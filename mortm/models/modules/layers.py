@@ -288,22 +288,18 @@ class MLP(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-
-
 class Gate(nn.Module):
-    def __init__(self, args, layer_id, route_scale=1, score_type="softmax"):
+    def __init__(self, args, layer_id, route_scale=1.0, score_type="softmax"):
         super().__init__()
         self.topk = args.topk_experts
         self.score_func = score_type
         self.gate_bias: bool = args.use_gate_bias
         self.layer_id = layer_id
-
-        if self.gate_bias:
-            print("Using gate bias")
-
         self.route_scale = route_scale
-        self.gamma = getattr(args, "bias_update_rate", 0.1)
-        self.ema_decay = getattr(args, "ema_decay", 0.99)
+
+        #self.gamma = getattr(args, "bias_update_rate", 1e-3)
+        self.ema_decay = getattr(args, "ema_decay", 0.97)
+        self.bias_cv_threshold = getattr(args, "bias_cv_threshold", 0.70)
 
         if getattr(args, "use_gate_lora", False):
             self.gate_proj = lora.Linear(
@@ -315,34 +311,32 @@ class Gate(nn.Module):
 
         self.register_buffer("routing_bias", torch.zeros(args.num_experts))
         self.register_buffer("ema_counts", torch.zeros(args.num_experts))
-        self.bias_cv_threshold = getattr(args, "bias_cv_threshold", 0.75)
+
         self.is_update = False
         self.dead_expert_alert = False
+
+        if self.gate_bias:
+            print("Using gate bias")
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.gate_proj(x)
         scores = logits.softmax(dim=-1) if self.score_func == "softmax" else logits.sigmoid()
 
-        # 監視用: bias なしの純粋な Gate の選好
-        _, monitor_indices = torch.topk(scores, self.topk, dim=-1)
-
-        # 実 routing 用: bias あり
         routing_scores = scores + self.routing_bias if (self.training and self.gate_bias) else scores
         _, indices = torch.topk(routing_scores, self.topk, dim=-1)
 
-        # expert 重みは bias なしの元スコアから取る
         weights = scores.gather(dim=-1, index=indices)
-
-        if self.training:
-            self._monitor_load_balance(monitor_indices, update_bias=self.gate_bias)
-
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
         weights = weights * self.route_scale
+
+        if self.training:
+            self._monitor_load_balance(indices, update_bias=self.gate_bias)
+
         return weights.to(dtype=x.dtype), indices
 
     @torch.no_grad()
     def _monitor_load_balance(self, indices: torch.Tensor, update_bias: bool):
-        counts = torch.bincount(indices.flatten(), minlength=self.routing_bias.size(0)).float()
+        counts = torch.bincount(indices.flatten(), minlength=self.routing_bias.numel()).float()
 
         if dist.is_initialized():
             dist.all_reduce(counts)
@@ -350,58 +344,46 @@ class Gate(nn.Module):
         if counts.sum() == 0:
             return
 
-        n_exp = self.routing_bias.size(0)
+        n_exp = self.routing_bias.numel()
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # --- このstepで一度も選ばれなかった expert を監視 ---
-        zero_mask = (counts == 0)
-        zero_count = int(zero_mask.sum().item())
-
-        if zero_count > 0:
-            if rank == 0 and not self.dead_expert_alert:
-                zero_ids = torch.nonzero(zero_mask, as_tuple=False).flatten().tolist()
-                print(
-                    f"[MOE_DEAD] LAYER ID: {self.layer_id} | "
-                    f"dead experts: {zero_count}/{n_exp} | ids: {zero_ids}"
-                )
-                self.dead_expert_alert = True
-        else:
-            if rank == 0 and self.dead_expert_alert:
-                print(f"[MOE_DEAD] LAYER ID: {self.layer_id} CLEAR!")
-                self.dead_expert_alert = False
-
-        # --- EMA更新 ---
         if self.ema_counts.sum() == 0:
             self.ema_counts.copy_(counts)
         else:
-            self.ema_counts.mul_(self.ema_decay).add_(counts, alpha=1 - self.ema_decay)
+            self.ema_counts.mul_(self.ema_decay).add_(counts, alpha=1.0 - self.ema_decay)
 
         mean = self.ema_counts.mean()
         std = self.ema_counts.std(unbiased=False)
         cv = std / (mean + 1e-6)
 
-        if cv > 0.7 and rank == 0 and self.is_update:
+        if cv > self.bias_cv_threshold and rank == 0 and not self.is_update:
+            print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {self.ema_counts.long().tolist()}")
+            self.is_update = True
+        elif cv <= self.bias_cv_threshold and rank == 0 and self.is_update:
+            print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} CLEAR!")
             self.is_update = False
-            print(
-                f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {self.ema_counts.long().tolist()}"
-            )
-        else:
-            if cv < 0.7 and not self.is_update and rank == 0:
-                print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} CLEAR!")
-                self.is_update = True
 
-        if not update_bias:
+        zero_mask = (counts == 0)
+        zero_count = int(zero_mask.sum().item())
+
+        if zero_count > 3 and rank == 0 and not self.dead_expert_alert:
+            zero_ids = torch.nonzero(zero_mask, as_tuple=False).flatten().tolist()
+            print(f"[MOE_DEAD] LAYER ID: {self.layer_id} | dead experts: {zero_count}/{n_exp} | ids: {zero_ids} | CV: {cv:.4f}")
+            self.dead_expert_alert = True
+        elif zero_count <= 3 and rank == 0 and self.dead_expert_alert:
+            print(f"[MOE_DEAD] LAYER ID: {self.layer_id} CLEAR!")
+            self.dead_expert_alert = False
+
+        if (not update_bias) or (cv <= self.bias_cv_threshold):
             return
 
         if self.score_func == "sigmoid":
             x = self.ema_counts
             x_min = x.min()
             x_max = x.max()
-
             if (x_max - x_min) < 1e-6:
                 delta = torch.zeros_like(x)
             else:
-                # min expert -> -1, max expert -> +1
                 delta = 2.0 * (x - x_min) / (x_max - x_min) - 1.0
 
         elif self.score_func == "softmax":
@@ -412,10 +394,7 @@ class Gate(nn.Module):
         else:
             delta = torch.zeros_like(self.routing_bias)
 
-        # gamma を CV から動的決定
         gamma_eff = torch.clamp(cv / 2.0, max=1.0)
-
-        # clamp は廃止
         new_bias = -gamma_eff * delta
         self.routing_bias.copy_(new_bias)
 
