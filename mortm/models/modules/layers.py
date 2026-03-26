@@ -287,17 +287,17 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
-
 class Gate(nn.Module):
     def __init__(self, args, layer_id, route_scale=1.0, score_type="softmax"):
         super().__init__()
+
         self.topk = args.topk_experts
         self.score_func = score_type
         self.gate_bias: bool = args.use_gate_bias
         self.layer_id = layer_id
         self.route_scale = route_scale
 
-        #self.gamma = getattr(args, "bias_update_rate", 1e-3)
+        # self.gamma = getattr(args, "bias_update_rate", 1e-3)
         self.ema_decay = getattr(args, "ema_decay", 0.97)
         self.bias_cv_threshold = getattr(args, "bias_cv_threshold", 0.70)
 
@@ -312,6 +312,13 @@ class Gate(nn.Module):
         self.register_buffer("routing_bias", torch.zeros(args.num_experts))
         self.register_buffer("ema_counts", torch.zeros(args.num_experts))
 
+        # ===== DEAD EXPERT logging only =====
+        self.register_buffer("zero_streak", torch.zeros(args.num_experts, dtype=torch.long))
+        self.dead_steps_threshold = getattr(args, "dead_steps_threshold", 16)
+        self.dead_clear_patience = getattr(args, "dead_clear_patience", 16)
+        self.dead_clear_streak = 0
+        # ====================================
+
         self.is_update = False
         self.dead_expert_alert = False
 
@@ -321,10 +328,9 @@ class Gate(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.gate_proj(x)
         scores = logits.softmax(dim=-1) if self.score_func == "softmax" else logits.sigmoid()
-
         routing_scores = scores + self.routing_bias if (self.training and self.gate_bias) else scores
-        _, indices = torch.topk(routing_scores, self.topk, dim=-1)
 
+        _, indices = torch.topk(routing_scores, self.topk, dim=-1)
         weights = scores.gather(dim=-1, index=indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
         weights = weights * self.route_scale
@@ -364,15 +370,30 @@ class Gate(nn.Module):
             self.is_update = False
 
         zero_mask = (counts == 0)
-        zero_count = int(zero_mask.sum().item())
 
-        if zero_count > 3 and rank == 0 and not self.dead_expert_alert:
-            zero_ids = torch.nonzero(zero_mask, as_tuple=False).flatten().tolist()
-            print(f"[MOE_DEAD] LAYER ID: {self.layer_id} | dead experts: {zero_count}/{n_exp} | ids: {zero_ids} | CV: {cv:.4f}")
+        self.zero_streak[zero_mask] += 1
+        self.zero_streak[~zero_mask] = 0
+
+        persistent_dead_mask = (self.zero_streak >= self.dead_steps_threshold)
+        persistent_dead_ids = torch.nonzero(persistent_dead_mask, as_tuple=False).flatten().tolist()
+        persistent_dead_count = len(persistent_dead_ids)
+
+        if persistent_dead_count > 0 and rank == 0 and not self.dead_expert_alert:
+            print(
+                f"[MOE_DEAD] LAYER ID: {self.layer_id} | "
+                f"persistent dead experts: {persistent_dead_count}/{n_exp} | "
+                f"ids: {persistent_dead_ids} | CV: {cv:.4f}"
+            )
             self.dead_expert_alert = True
-        elif zero_count <= 3 and rank == 0 and self.dead_expert_alert:
-            print(f"[MOE_DEAD] LAYER ID: {self.layer_id} CLEAR!")
-            self.dead_expert_alert = False
+            self.dead_clear_streak = 0
+
+        elif persistent_dead_count == 0 and rank == 0 and self.dead_expert_alert:
+            self.dead_clear_streak += 1
+            if self.dead_clear_streak >= self.dead_clear_patience:
+                print(f"[MOE_DEAD] LAYER ID: {self.layer_id} CLEAR!")
+                self.dead_expert_alert = False
+                self.dead_clear_streak = 0
+        # ==========================================================
 
         if not update_bias:
             return
