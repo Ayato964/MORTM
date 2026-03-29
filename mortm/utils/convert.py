@@ -3104,7 +3104,7 @@ class MetaData2Chord(_AbstractConverter):
 
     def convert(self, *args, **kwargs):
         token_converter: List[Token] = self.tokenizer.music_token_list
-        shift_time_container = ShiftTimeContainer(0, self.tempo)
+        shift_time_container = ShiftTimeContainer(0, self.tempo, True)
         shift_time_container.is_code_mode = True
         back_chord: Optional[Chord] = None
         aya_node_split = []
@@ -3113,7 +3113,10 @@ class MetaData2Chord(_AbstractConverter):
             clip = self.make_system_prompt(clip, self.key)
         clip_count = 0
 
-        self.chords.sort(self.chords[0].time_stamp)
+        if len(self.chords) > 0:
+            self.chords.sort(self.chords[0].time_stamp)
+        else:
+            return
         chord_count = 0
 
         while chord_count < len(self.chords):
@@ -3172,10 +3175,13 @@ class MetaData2Chord(_AbstractConverter):
         self.split_measure = split_measure
         self.chords = ChordMidi(all_chords, all_chord_timestamps)
 
-        if "major" in key:
-            self.key = f"{key.split(' major')[0]}M"
-        elif "minor" in key:
-            self.key = f"{key.split(' minor')[0]}m"
+        if key is not None:
+            if "major" in key:
+                self.key = f"{key.split(' major')[0]}M"
+            elif "minor" in key:
+                self.key = f"{key.split(' minor')[0]}m"
+            else:
+                self.key = key
         else:
             self.key = None
 
