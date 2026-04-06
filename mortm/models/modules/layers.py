@@ -288,11 +288,11 @@ class MLP(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class Gate(nn.Module):
-    def __init__(self, args, layer_id, route_scale=1.0, score_type="softmax"):
+    def __init__(self, args, layer_id, route_scale=1.0):
         super().__init__()
 
         self.topk = args.topk_experts
-        self.score_func = score_type
+        self.score_func = args.score_type
         self.gate_bias: bool = args.use_gate_bias
         self.layer_id = layer_id
         self.route_scale = route_scale
@@ -300,6 +300,8 @@ class Gate(nn.Module):
         # self.gamma = getattr(args, "bias_update_rate", 1e-3)
         self.ema_decay = getattr(args, "ema_decay", 0.97)
         self.bias_cv_threshold = getattr(args, "bias_cv_threshold", 0.70)
+        self.bias_threshold = getattr(args, "bias_threshold", 1500000)
+        self._bias_step = torch.zeros(1)
 
         if getattr(args, "use_gate_lora", False):
             self.gate_proj = lora.Linear(
@@ -324,6 +326,7 @@ class Gate(nn.Module):
 
         if self.gate_bias:
             print("Using gate bias")
+        print(f"Gate Type:{self.score_func}")
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.gate_proj(x)
@@ -364,7 +367,9 @@ class Gate(nn.Module):
 
         if cv > self.bias_cv_threshold and rank == 0 and not self.is_update:
             print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {self.ema_counts.long().tolist()}")
+            print(f"[MOE_{self.layer_id}] BIAS: ON!!")
             self.is_update = True
+            self.gate_bias = True
         elif cv <= self.bias_cv_threshold and rank == 0 and self.is_update:
             print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} CLEAR!")
             self.is_update = False
@@ -384,8 +389,11 @@ class Gate(nn.Module):
                 f"persistent dead experts: {persistent_dead_count}/{n_exp} | "
                 f"ids: {persistent_dead_ids} | CV: {cv:.4f}"
             )
+            print(f"[MOE_{self.layer_id}] BIAS: ON!!")
+
             self.dead_expert_alert = True
             self.dead_clear_streak = 0
+            self.gate_bias = True
 
         elif persistent_dead_count == 0 and rank == 0 and self.dead_expert_alert:
             self.dead_clear_streak += 1
@@ -397,6 +405,14 @@ class Gate(nn.Module):
 
         if not update_bias:
             return
+
+        if cv < 2.0:
+            self._bias_step += 1
+
+        if self._bias_step >= self.bias_threshold:
+            self._bias_step = 0
+            self.gate_bias = False
+            print(f"[MOE_{self.layer_id}] BIAS: OFF!!")
 
         if self.score_func == "sigmoid":
             x = self.ema_counts
