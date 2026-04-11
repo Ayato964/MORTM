@@ -271,21 +271,6 @@ class FFN(nn.Module):
         return y
 
 
-class MLP(nn.Module):
-
-    def __init__(self, args: MORTMArgs):
-        super().__init__()
-        if not args.use_ffn_lora:
-            self.w1 = nn.Linear(args.d_model, args.dim_feedforward, bias=args.use_bias)
-            self.w2 = nn.Linear(args.dim_feedforward, args.d_model, bias=args.use_bias)
-            self.w3 = nn.Linear(args.d_model, args.dim_feedforward, bias=args.use_bias)
-        else:
-            self.w1 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
-            self.w2 = lora.Linear(args.dim_feedforward, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
-            self.w3 = lora.Linear(args.d_model, args.dim_feedforward, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class Gate(nn.Module):
     def __init__(self, args, layer_id, route_scale=1.0):
@@ -300,7 +285,7 @@ class Gate(nn.Module):
         # self.gamma = getattr(args, "bias_update_rate", 1e-3)
         self.ema_decay = getattr(args, "ema_decay", 0.97)
         self.bias_cv_threshold = getattr(args, "bias_cv_threshold", 0.70)
-        self.bias_threshold = getattr(args, "bias_threshold", 1500000)
+        self.bias_threshold = getattr(args, "bias_threshold", 20000)
         self._bias_step = torch.zeros(1)
 
         if getattr(args, "use_gate_lora", False):
@@ -335,7 +320,8 @@ class Gate(nn.Module):
 
         _, indices = torch.topk(routing_scores, self.topk, dim=-1)
         weights = scores.gather(dim=-1, index=indices)
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
+        if self.score_func == "softmax":
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
         weights = weights * self.route_scale
 
         if self.training:
@@ -383,22 +369,24 @@ class Gate(nn.Module):
         persistent_dead_ids = torch.nonzero(persistent_dead_mask, as_tuple=False).flatten().tolist()
         persistent_dead_count = len(persistent_dead_ids)
 
-        if persistent_dead_count > 0 and rank == 0 and not self.dead_expert_alert:
-            print(
-                f"[MOE_DEAD] LAYER ID: {self.layer_id} | "
-                f"persistent dead experts: {persistent_dead_count}/{n_exp} | "
-                f"ids: {persistent_dead_ids} | CV: {cv:.4f}"
-            )
+        if persistent_dead_count > 0 and not self.dead_expert_alert:
+            if rank == 0:
+                print(
+                    f"[MOE_DEAD] LAYER ID: {self.layer_id} | "
+                    f"persistent dead experts: {persistent_dead_count}/{n_exp} | "
+                    f"ids: {persistent_dead_ids} | CV: {cv:.4f}"
+                )
             print(f"[MOE_{self.layer_id}] BIAS: ON!!")
 
             self.dead_expert_alert = True
             self.dead_clear_streak = 0
             self.gate_bias = True
 
-        elif persistent_dead_count == 0 and rank == 0 and self.dead_expert_alert:
+        elif persistent_dead_count == 0  and self.dead_expert_alert:
             self.dead_clear_streak += 1
             if self.dead_clear_streak >= self.dead_clear_patience:
-                print(f"[MOE_DEAD] LAYER ID: {self.layer_id} CLEAR!")
+                if rank == 0:
+                    print(f"[MOE_DEAD] LAYER ID: {self.layer_id} CLEAR!")
                 self.dead_expert_alert = False
                 self.dead_clear_streak = 0
         # ==========================================================
@@ -406,7 +394,7 @@ class Gate(nn.Module):
         if not update_bias:
             return
 
-        if cv < 2.0:
+        if cv < 0.2:
             self._bias_step += 1
 
         if self._bias_step >= self.bias_threshold:
@@ -416,12 +404,9 @@ class Gate(nn.Module):
 
         if self.score_func == "sigmoid":
             x = self.ema_counts
-            x_min = x.min()
-            x_max = x.max()
-            if (x_max - x_min) < 1e-6:
-                delta = torch.zeros_like(x)
-            else:
-                delta = 2.0 * (x - x_min) / (x_max - x_min) - 1.0
+            mu = x.mean()
+            delta = (x - mu) / (mu + 1e-6)
+            delta = delta.clamp(-1.0, 1.0)
 
         elif self.score_func == "softmax":
             target = self.ema_counts.sum() / n_exp
@@ -431,7 +416,7 @@ class Gate(nn.Module):
         else:
             delta = torch.zeros_like(self.routing_bias)
 
-        gamma_eff = torch.clamp(cv / 2.0, max=1.0)
+        gamma_eff = torch.clamp(cv / 1.2, max=1.0)
         new_bias = -gamma_eff * delta
         self.routing_bias.copy_(new_bias)
 
@@ -451,6 +436,21 @@ class Expert(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+class SharedExpert(nn.Module):
+
+    def __init__(self, args: MORTMArgs):
+        super().__init__()
+        if not args.use_ffn_lora:
+            self.w1 = nn.Linear(args.d_model, args.d_model, bias=args.use_bias)
+            self.w2 = nn.Linear(args.d_model, args.d_model, bias=args.use_bias)
+            self.w3 = nn.Linear(args.d_model, args.d_model, bias=args.use_bias)
+        else:
+            self.w1 = lora.Linear(args.d_model, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
+            self.w2 = lora.Linear(args.d_model, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
+            self.w3 = lora.Linear(args.d_model, args.d_model, r=args.lora_r, lora_alpha=args.lora_alpha, bias=args.use_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class MoE(nn.Module):
 
@@ -461,7 +461,7 @@ class MoE(nn.Module):
         self.n_activated_experts = args.topk_experts
         self.gate = Gate(args, layer_id, route_scale=route_scale)
         self.experts = nn.ModuleList([Expert(args) for i in range(self.n_routed_experts)])
-        self.shared_experts = MLP(args)
+        self.shared_experts = SharedExpert(args)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weights, indices = self.gate(x)
