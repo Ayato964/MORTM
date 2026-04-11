@@ -351,13 +351,15 @@ class Gate(nn.Module):
         std = self.ema_counts.std(unbiased=False)
         cv = std / (mean + 1e-6)
 
-        if cv > self.bias_cv_threshold and rank == 0 and not self.is_update:
-            print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {self.ema_counts.long().tolist()}")
-            print(f"[MOE_{self.layer_id}] BIAS: ON!!")
+        if cv > self.bias_cv_threshold and not self.is_update:
+            if rank == 0:
+                print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {self.ema_counts.long().tolist()}")
+                print(f"[MOE_{self.layer_id}] BIAS: ON!!")
             self.is_update = True
             self.gate_bias = True
-        elif cv <= self.bias_cv_threshold and rank == 0 and self.is_update:
-            print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} CLEAR!")
+        elif cv <= self.bias_cv_threshold and self.is_update:
+            if rank == 0:
+                print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} CLEAR!")
             self.is_update = False
 
         zero_mask = (counts == 0)
