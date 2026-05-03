@@ -285,7 +285,7 @@ class Gate(nn.Module):
         # self.gamma = getattr(args, "bias_update_rate", 1e-3)
         self.ema_decay = getattr(args, "ema_decay", 0.97)
         self.bias_cv_threshold = getattr(args, "bias_cv_threshold", 0.70)
-        self.bias_threshold = getattr(args, "bias_threshold", 20000)
+        self.bias_threshold = getattr(args, "bias_threshold", 1500000)
         self._bias_step = torch.zeros(1)
 
         if getattr(args, "use_gate_lora", False):

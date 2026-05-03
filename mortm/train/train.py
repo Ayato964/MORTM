@@ -333,18 +333,15 @@ def progress_bar_with_minibatch(rank, epoch, sum_epoch, seq_count, all_pac, mini
 
 
 def get_inner_loader(dataset: Dataset, batch_size: int, collate_fn=None):
-    sampler = _build_distributed_sampler(dataset, shuffle=True)
-
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        sampler=sampler,
-        shuffle=(sampler is None),
+        shuffle=True,
         collate_fn=collate_fn,
         drop_last=True,
         num_workers=0,
     )
-    return loader, sampler
+    return loader, None
 
 def get_data_loader(t_args: TrainArgs, mortm_dataset: tuple | Dataset, shuffle=True, collate_fn=None):
     if isinstance(mortm_dataset, Dataset):
@@ -522,7 +519,7 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
 
                     epoch_loss.add(avg_loss)
 
-                    current_tokens = trainer.all_tokens.item()
+                    current_tokens = trainer.get_synced_tokens()
                     current_lr = scheduler.get_last_lr()[0] if scheduler is not None else train_args.lr_param
 
                     trainer.view_logs(
