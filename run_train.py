@@ -13,11 +13,11 @@ model = train_mortm(
     tokenizer,
     "configs/models/mortm/4_5/research/preview3/160M.json",
     "configs/train/mortm/4_5/preview3/80M.json",
-    "out/models/mortm/4_5/preview3/train_updated.json",
+    ("out/models/mortm/4_5/preview3/train_music.json", "out/models/mortm/4_5/preview3/train_cm.json"),
     "out/models/mortm/4_5/preview3/",
     "4.5D",
     log_scale=True,
     project_name="MORTM4.5_Scale2",
-    eval_list_json="out/models/mortm/4_5/preview3/eval_updated.json",
+    eval_list_json=("out/models/mortm/4_5/preview3/eval_music.json", "out/models/mortm/4_5/preview3/eval_cm.json"),
     message=message
 )

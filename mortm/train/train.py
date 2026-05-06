@@ -1,8 +1,10 @@
 import datetime
 import json
+import math
 import os
 import random
 import time
+from typing import Optional
 
 import torchaudio
 import wandb
@@ -18,7 +20,7 @@ torch._dynamo.config.capture_scalar_outputs = True
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch import Tensor
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
@@ -67,20 +69,58 @@ def _sync_min_loader_length(local_len: int, device: torch.device) -> int:
     return int(len_tensor.item())
 
 
-def _extract_paths_from_pack(pack) -> list[str]:
+def _allocate_counts(total_size: int, weights: list[int]) -> list[int]:
+    if total_size <= 0:
+        raise ValueError("total_size must be positive.")
+
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        raise ValueError("weights must contain at least one positive value.")
+
+    raw_counts = [(total_size * weight / total_weight) if weight > 0 else 0.0 for weight in weights]
+    counts = [math.floor(value) for value in raw_counts]
+    remain = total_size - sum(counts)
+
+    if remain > 0:
+        order = sorted(
+            range(len(raw_counts)),
+            key=lambda idx: (raw_counts[idx] - counts[idx], weights[idx]),
+            reverse=True,
+        )
+        for idx in order[:remain]:
+            counts[idx] += 1
+
+    return counts
+
+
+def _set_loader_epoch(loader: DataLoader, epoch: int):
+    if hasattr(loader, "sampler") and hasattr(loader.sampler, "set_epoch"):
+        loader.sampler.set_epoch(epoch)
+
+    if hasattr(loader, "batch_sampler") and hasattr(loader.batch_sampler, "set_epoch"):
+        loader.batch_sampler.set_epoch(epoch)
+
+
+def _extract_paths_and_dataset_ids_from_pack(pack) -> tuple[list[str], list[int]]:
+    if (
+        isinstance(pack, (list, tuple))
+        and len(pack) == 2
+        and isinstance(pack[0], (list, tuple))
+    ):
+        paths = [str(path) for path in pack[0]]
+        dataset_ids_raw = pack[1]
+
+        if isinstance(dataset_ids_raw, torch.Tensor):
+            dataset_ids = [int(v) for v in dataset_ids_raw.tolist()]
+        else:
+            dataset_ids = [int(v) for v in dataset_ids_raw]
+
+        return paths, dataset_ids
+
     if isinstance(pack, str):
-        return [pack]
+        return [pack], [0]
 
-    if isinstance(pack, np.ndarray):
-        return [str(x) for x in pack.reshape(-1).tolist()]
-
-    if isinstance(pack, (list, tuple)):
-        out = []
-        for x in pack:
-            out.extend(_extract_paths_from_pack(x))
-        return out
-
-    return [str(pack)]
+    raise TypeError(f"Unsupported pack type: {type(pack)}")
 
 
 def _extract_all_paths_from_dataset(dataset) -> list[str]:
@@ -94,6 +134,299 @@ def _extract_all_paths_from_dataset(dataset) -> list[str]:
         return [base_paths[i] for i in dataset.indices]
 
     raise TypeError(f"Unsupported dataset type for path export: {type(dataset)}")
+
+
+def _extract_all_dataset_ids_from_dataset(dataset) -> list[int]:
+    if hasattr(dataset, "dataset_ids"):
+        return list(dataset.dataset_ids)
+
+    if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+        base_ids = _extract_all_dataset_ids_from_dataset(dataset.dataset)
+        return [base_ids[i] for i in dataset.indices]
+
+    raise TypeError(f"Unsupported dataset type for dataset id export: {type(dataset)}")
+
+
+def _extract_all_dataset_names_from_dataset(dataset) -> list[str]:
+    if hasattr(dataset, "dataset_names"):
+        return list(dataset.dataset_names)
+
+    if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+        base_names = _extract_all_dataset_names_from_dataset(dataset.dataset)
+        return [base_names[i] for i in dataset.indices]
+
+    raise TypeError(f"Unsupported dataset type for dataset name export: {type(dataset)}")
+
+
+def _supports_dataset_ids(dataset) -> bool:
+    try:
+        _extract_all_dataset_ids_from_dataset(dataset)
+        return True
+    except TypeError:
+        return False
+
+
+def _group_local_indices_by_dataset_id(dataset) -> dict[int, list[int]]:
+    grouped_indices: dict[int, list[int]] = {}
+    for local_idx, dataset_id in enumerate(_extract_all_dataset_ids_from_dataset(dataset)):
+        grouped_indices.setdefault(int(dataset_id), []).append(local_idx)
+    return grouped_indices
+
+
+def _compute_split_sizes(total_size: int, train_ratio: float) -> tuple[int, int]:
+    train_size = int(train_ratio * total_size)
+
+    if total_size > 0 and train_ratio > 0.0 and train_size == 0:
+        train_size = 1
+    if total_size > 1 and train_ratio < 1.0 and train_size >= total_size:
+        train_size = total_size - 1
+
+    val_size = total_size - train_size
+    return train_size, val_size
+
+
+def _split_dataset_by_dataset_id(dataset: Dataset, train_ratio: float) -> tuple[Subset, Subset]:
+    grouped_indices = _group_local_indices_by_dataset_id(dataset)
+    generator = torch.Generator().manual_seed(42)
+
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+
+    for dataset_id in sorted(grouped_indices):
+        indices = grouped_indices[dataset_id]
+        shuffled_positions = torch.randperm(len(indices), generator=generator).tolist()
+        shuffled_indices = [indices[pos] for pos in shuffled_positions]
+        train_size, _ = _compute_split_sizes(len(shuffled_indices), train_ratio)
+        train_indices.extend(shuffled_indices[:train_size])
+        val_indices.extend(shuffled_indices[train_size:])
+
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
+class DatasetBatchAllocationDistributedBatchSampler:
+    def __init__(self, dataset: Dataset, batch_size: int, dataset_batch_allocation: list[int], shuffle: bool):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer.")
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.dataset_batch_allocation = [int(v) for v in dataset_batch_allocation]
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.num_replicas = dist.get_world_size() if _is_dist_ready() else 1
+        self.rank = dist.get_rank() if _is_dist_ready() else 0
+        self.grouped_indices = _group_local_indices_by_dataset_id(dataset)
+        self.per_rank_batch_counts = _allocate_counts(self.batch_size, self.dataset_batch_allocation)
+        self.global_batch_counts = [count * self.num_replicas for count in self.per_rank_batch_counts]
+
+        max_dataset_id = max(self.grouped_indices.keys(), default=-1)
+        if len(self.dataset_batch_allocation) <= max_dataset_id:
+            raise ValueError(
+                f"dataset_batch_allocation length ({len(self.dataset_batch_allocation)}) "
+                f"does not match available datasets ({max_dataset_id + 1})."
+            )
+
+        for dataset_id, batch_count in enumerate(self.dataset_batch_allocation):
+            if batch_count > 0 and len(self.grouped_indices.get(dataset_id, [])) == 0:
+                raise ValueError(
+                    f"dataset_batch_allocation[{dataset_id}]={batch_count} was requested, "
+                    f"but the corresponding train split is empty."
+                )
+
+        for dataset_id, weight in enumerate(self.dataset_batch_allocation):
+            if weight > 0 and self.per_rank_batch_counts[dataset_id] == 0:
+                raise ValueError(
+                    f"dataset_batch_allocation[{dataset_id}]={weight} is too small for batch_size={self.batch_size}. "
+                    f"Increase batch_size or reduce the number of active datasets."
+                )
+
+        self.required_batches_per_dataset = [
+            math.ceil(len(self.grouped_indices.get(dataset_id, [])) / self.global_batch_counts[dataset_id])
+            if self.global_batch_counts[dataset_id] > 0 else 0
+            for dataset_id in range(len(self.dataset_batch_allocation))
+        ]
+        self.total_batches = max(self.required_batches_per_dataset, default=0)
+
+    def __len__(self) -> int:
+        return self.total_batches
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def _shuffle_indices(self, indices: list[int], generator: torch.Generator) -> list[int]:
+        if not self.shuffle or len(indices) <= 1:
+            return list(indices)
+
+        perm = torch.randperm(len(indices), generator=generator).tolist()
+        return [indices[i] for i in perm]
+
+    def _draw_indices(
+        self,
+        dataset_id: int,
+        count: int,
+        generator: torch.Generator,
+        dataset_state: dict[int, dict[str, object]],
+    ) -> list[int]:
+        state = dataset_state[dataset_id]
+        base_indices = state["base_indices"]
+        order = state["order"]
+        offset = state["offset"]
+        drawn: list[int] = []
+
+        while len(drawn) < count:
+            if len(base_indices) == 0:
+                raise ValueError(f"Dataset {dataset_id} has no samples to draw from.")
+
+            remaining = len(order) - offset
+            take = min(count - len(drawn), remaining)
+            drawn.extend(order[offset:offset + take])
+            offset += take
+
+            if offset >= len(order):
+                order = self._shuffle_indices(base_indices, generator)
+                offset = 0
+
+        state["order"] = order
+        state["offset"] = offset
+        return drawn
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(42 + self.epoch)
+        dataset_state: dict[int, dict[str, object]] = {}
+        for dataset_id, indices in self.grouped_indices.items():
+            dataset_state[dataset_id] = {
+                "base_indices": list(indices),
+                "order": self._shuffle_indices(indices, generator),
+                "offset": 0,
+            }
+
+        for _ in range(self.total_batches):
+            rank_batches = [[] for _ in range(self.num_replicas)]
+
+            for dataset_id, per_rank_count in enumerate(self.per_rank_batch_counts):
+                if per_rank_count <= 0:
+                    continue
+
+                global_indices = self._draw_indices(
+                    dataset_id,
+                    per_rank_count * self.num_replicas,
+                    generator,
+                    dataset_state,
+                )
+
+                for replica_rank in range(self.num_replicas):
+                    begin = replica_rank * per_rank_count
+                    end = begin + per_rank_count
+                    rank_batches[replica_rank].extend(global_indices[begin:end])
+
+            for replica_rank in range(self.num_replicas):
+                if self.shuffle and len(rank_batches[replica_rank]) > 1:
+                    perm = torch.randperm(len(rank_batches[replica_rank]), generator=generator).tolist()
+                    rank_batches[replica_rank] = [rank_batches[replica_rank][idx] for idx in perm]
+
+            yield rank_batches[self.rank]
+
+
+class MixedSequenceBatchSampler:
+    def __init__(self, dataset: Dataset, batch_size: int, dataset_batch_allocation: list[int], shuffle: bool):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer.")
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.dataset_batch_allocation = [int(v) for v in dataset_batch_allocation]
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.grouped_indices: dict[int, list[int]] = {}
+
+        if not hasattr(dataset, "seq_dataset_ids"):
+            raise TypeError(f"MixedSequenceBatchSampler requires seq_dataset_ids, got {type(dataset)}")
+
+        for local_idx, dataset_id in enumerate(dataset.seq_dataset_ids):
+            self.grouped_indices.setdefault(int(dataset_id), []).append(local_idx)
+
+        max_dataset_id = max(self.grouped_indices.keys(), default=-1)
+        if len(self.dataset_batch_allocation) <= max_dataset_id:
+            raise ValueError(
+                f"dataset_batch_allocation length ({len(self.dataset_batch_allocation)}) "
+                f"does not match available sequence datasets ({max_dataset_id + 1})."
+            )
+
+        active_weights = [
+            weight if len(self.grouped_indices.get(dataset_id, [])) > 0 else 0
+            for dataset_id, weight in enumerate(self.dataset_batch_allocation)
+        ]
+        self.per_batch_counts = _allocate_counts(self.batch_size, active_weights)
+
+        for dataset_id, weight in enumerate(active_weights):
+            if weight > 0 and self.per_batch_counts[dataset_id] == 0:
+                raise ValueError(
+                    f"dataset_batch_allocation[{dataset_id}]={weight} is too small for inner batch_size={self.batch_size}."
+                )
+
+        self.required_batches_per_dataset = [
+            math.ceil(len(self.grouped_indices.get(dataset_id, [])) / self.per_batch_counts[dataset_id])
+            if self.per_batch_counts[dataset_id] > 0 else 0
+            for dataset_id in range(len(self.dataset_batch_allocation))
+        ]
+        self.total_batches = max(self.required_batches_per_dataset, default=0)
+
+    def __len__(self) -> int:
+        return self.total_batches
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def _shuffle_indices(self, indices: list[int], generator: torch.Generator) -> list[int]:
+        if not self.shuffle or len(indices) <= 1:
+            return list(indices)
+
+        perm = torch.randperm(len(indices), generator=generator).tolist()
+        return [indices[i] for i in perm]
+
+    def _draw_indices(self, dataset_id: int, count: int, generator: torch.Generator, state: dict[int, dict[str, object]]) -> list[int]:
+        dataset_state = state[dataset_id]
+        base_indices = dataset_state["base_indices"]
+        order = dataset_state["order"]
+        offset = dataset_state["offset"]
+        drawn: list[int] = []
+
+        while len(drawn) < count:
+            remaining = len(order) - offset
+            take = min(count - len(drawn), remaining)
+            drawn.extend(order[offset:offset + take])
+            offset += take
+
+            if offset >= len(order):
+                order = self._shuffle_indices(base_indices, generator)
+                offset = 0
+
+        dataset_state["order"] = order
+        dataset_state["offset"] = offset
+        return drawn
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(42 + self.epoch)
+        state: dict[int, dict[str, object]] = {}
+        for dataset_id, indices in self.grouped_indices.items():
+            state[dataset_id] = {
+                "base_indices": list(indices),
+                "order": self._shuffle_indices(indices, generator),
+                "offset": 0,
+            }
+
+        for _ in range(self.total_batches):
+            batch_indices: list[int] = []
+            for dataset_id, count in enumerate(self.per_batch_counts):
+                if count <= 0:
+                    continue
+                batch_indices.extend(self._draw_indices(dataset_id, count, generator, state))
+
+            if self.shuffle and len(batch_indices) > 1:
+                perm = torch.randperm(len(batch_indices), generator=generator).tolist()
+                batch_indices = [batch_indices[idx] for idx in perm]
+
+            yield batch_indices
 
 class MORTMTrainSet(AbstractTrainSet):
     def __init__(self, args: MORTMArgs, t_args: TrainArgs, tokenizer: Tokenizer, calc_val_loss_tokens, progress: LearningProgress, log_scale=False, project_name="", config=None,  load_directory=None, model_name=None):
@@ -120,7 +453,7 @@ class MORTMTrainSet(AbstractTrainSet):
         self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
 
         total_param, self.active_params = self.model.module.get_param()
-        adam = torch.optim.Adam(self.model.parameters(), lr=t_args.lr_param)
+        adam = torch.optim.AdamW(self.model.parameters(), lr=t_args.lr_param)
 
         if self.local_rank == 0:
             with open(config, 'r') as f:
@@ -156,10 +489,10 @@ class MORTMTrainSet(AbstractTrainSet):
             sampling_inst_max=2,
         )
 
-        paths = _extract_paths_from_pack(pack)
-        for path in paths:
+        paths, dataset_ids = _extract_paths_and_dataset_ids_from_pack(pack)
+        for path, dataset_id in zip(paths, dataset_ids):
             with np.load(path, allow_pickle=True) as np_load_data:
-                mini_dataset.add_data(np_load_data)
+                mini_dataset.add_data(np_load_data, dataset_id=dataset_id)
 
         return mini_dataset
 
@@ -290,6 +623,68 @@ def find_files_with_json(path: str, min_idx=0):
     directories, file_names = zip(*combined)
     return list(directories), list(file_names)
 
+
+def _paths_from_directory_and_filename(directory: list[str], filename: list[str]) -> list[str]:
+    return [os.path.join(directory[i], filename[i]) for i in range(len(directory))]
+
+
+def _collect_grouped_paths(root_directory) -> tuple[list[list[str]], list[str]]:
+    if isinstance(root_directory, str):
+        if root_directory.endswith(".json"):
+            directory, filename = find_files_with_json(root_directory)
+        else:
+            directory, filename = find_files(root_directory, '.npz')
+        return [_paths_from_directory_and_filename(directory, filename)], [root_directory]
+
+    if isinstance(root_directory, (tuple, list)):
+        grouped_paths: list[list[str]] = []
+        dataset_names: list[str] = []
+        for root in root_directory:
+            if root.endswith(".json"):
+                directory, filename = find_files_with_json(root)
+            else:
+                directory, filename = find_files(root, '.npz')
+            grouped_paths.append(_paths_from_directory_and_filename(directory, filename))
+            dataset_names.append(root)
+        return grouped_paths, dataset_names
+
+    directory, filename = root_directory
+    return [_paths_from_directory_and_filename(directory, filename)], ["provided_paths"]
+
+
+def _build_preloading_dataset(grouped_paths: list[list[str]], progress: LearningProgress, dataset_names: Optional[list[str]] = None):
+    mortm_dataset = PreLoadingDatasets(progress)
+
+    for dataset_id, paths in enumerate(grouped_paths):
+        dataset_name = dataset_names[dataset_id] if dataset_names is not None and dataset_id < len(dataset_names) else None
+        mortm_dataset.add_paths(paths, dataset_id=dataset_id, dataset_name=dataset_name)
+
+    return mortm_dataset
+
+
+def _validate_grouped_paths_exist(grouped_paths: list[list[str]], dataset_names: Optional[list[str]] = None, preview_limit: int = 3):
+    missing_reports: list[str] = []
+
+    for dataset_id, paths in enumerate(grouped_paths):
+        dataset_name = dataset_names[dataset_id] if dataset_names is not None and dataset_id < len(dataset_names) else f"dataset_{dataset_id}"
+        missing_paths = [path for path in paths if not os.path.exists(path)]
+
+        if not missing_paths:
+            continue
+
+        preview = "\n".join(f"  - {path}" for path in missing_paths[:preview_limit])
+        remain = len(missing_paths) - min(len(missing_paths), preview_limit)
+        remain_text = f"\n  ... and {remain} more" if remain > 0 else ""
+        missing_reports.append(
+            f"[{dataset_name}] missing {len(missing_paths)} / {len(paths)} files:\n{preview}{remain_text}"
+        )
+
+    if missing_reports:
+        raise FileNotFoundError(
+            "Dataset JSON contains paths that do not exist on this machine.\n"
+            + "\n".join(missing_reports)
+        )
+
 def collate_fn(batch):
     src = pad_sequence(batch, batch_first=True, padding_value=0)
     return src
@@ -304,6 +699,72 @@ def save_path_json(name, val_loader: DataLoader, save_directory, version):
     paths = _extract_all_paths_from_dataset(val_loader.dataset)
     with open(f"{save_directory}/{name}_paths_{version}.json", "w") as f:
         json.dump(paths, f, indent=4)
+
+
+def _format_large_count(value: int) -> str:
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.2f}K"
+    return str(value)
+
+
+def _dataset_label(name: str) -> str:
+    return os.path.basename(name.rstrip("/")) or name
+
+
+def _print_loader_summary(train_loader: DataLoader, val_loader: DataLoader, train_args: TrainArgs, world_size: int):
+    train_dataset = train_loader.dataset
+    val_dataset = val_loader.dataset
+    global_outer_batch = train_args.big_batch_size * world_size
+
+    print(
+        f"[Train Setup] world_size={world_size} outer_batch/rank={train_args.big_batch_size} "
+        f"global_outer_batch={global_outer_batch} inner_batch={train_args.batch_size} "
+        f"accumulation={train_args.accumulation_steps} epochs={train_args.num_epochs}"
+    )
+    print(
+        f"[Train Setup] train_outer_batches={len(train_loader)} val_outer_batches={len(val_loader)} "
+        f"train_samples={_format_large_count(len(train_dataset))} val_samples={_format_large_count(len(val_dataset))}"
+    )
+
+    batch_sampler = getattr(train_loader, "batch_sampler", None)
+    if not isinstance(batch_sampler, DatasetBatchAllocationDistributedBatchSampler):
+        return
+
+    dataset_names = _extract_all_dataset_names_from_dataset(train_dataset)
+    inner_counts = _allocate_counts(train_args.batch_size, train_args.dataset_batch_allocation)
+    print(
+        f"[Train Setup] inner_mix="
+        + ", ".join(
+            f"{dataset_id}:{count}" for dataset_id, count in enumerate(inner_counts) if count > 0
+        )
+    )
+    for dataset_id, train_indices in sorted(batch_sampler.grouped_indices.items()):
+        name = _dataset_label(dataset_names[train_indices[0]]) if train_indices else f"dataset_{dataset_id}"
+        sample_count = len(train_indices)
+        pack_count_per_rank = batch_sampler.per_rank_batch_counts[dataset_id]
+        global_pack_count = batch_sampler.global_batch_counts[dataset_id]
+        required = batch_sampler.required_batches_per_dataset[dataset_id]
+        weight = batch_sampler.dataset_batch_allocation[dataset_id]
+        seen_global_samples = batch_sampler.total_batches * global_pack_count
+        repeat_factor = seen_global_samples / sample_count if sample_count > 0 else 0.0
+        print(
+            f"[Train Setup] dataset[{dataset_id}] {name}: weight={weight} "
+            f"train_npz={_format_large_count(sample_count)} npz/rank/big_batch={pack_count_per_rank} "
+            f"big_batches/epoch={batch_sampler.total_batches} min_big_batches_to_cover={required} "
+            f"repeat_factor={repeat_factor:.2f}x"
+        )
+
+
+def _print_epoch_summary(epoch: int, train_args: TrainArgs, train_loader: DataLoader, optimizer_step: int):
+    print(
+        f"\n[Epoch {epoch + 1}/{train_args.num_epochs}] "
+        f"outer_batches={len(train_loader)} optimizer_steps_so_far={optimizer_step}"
+    )
+
 
 def update_log(model, writer, global_step):
     for name, param in model.named_parameters():
@@ -328,11 +789,39 @@ def progress_bar_with_minibatch(rank, epoch, sum_epoch, seq_count, all_pac, mini
     mini_per = mini_seq_count / mini_seq_pac * 100
     mini_block = int(mini_per / 100 * 20)
     mini_bar = f"{color_bar}{'#' * mini_block}\033[31m{'-' * (20 - mini_block)} \033[0m"
+    lr_text = f"{lr:.3e}" if isinstance(lr, (int, float)) else str(lr)
 
-    print(f"\r [Rank{rank}] learning Epoch {epoch + 1}/{sum_epoch} Package [{big_bar}] {big_per:.2f}%  Mini Package [{mini_bar}]  {mini_per:.2f}%  loss:{loss:.4f} Lr:{lr}  verification loss:{verif_loss: .4f}  Learning tokens:{tokens}", end="")
+    print(
+        f"\r [Rank{rank}] Epoch {epoch + 1}/{sum_epoch} "
+        f"Outer {seq_count}/{all_pac} [{big_bar}] {big_per:.2f}%  "
+        f"Inner {mini_seq_count}/{mini_seq_pac} [{mini_bar}] {mini_per:.2f}%  "
+        f"loss:{loss:.4f} lr:{lr_text} val:{verif_loss:.4f} tokens:{_format_large_count(tokens)}",
+        end=""
+    )
 
 
-def get_inner_loader(dataset: Dataset, batch_size: int, collate_fn=None):
+def path_pack_collate_fn(batch):
+    paths = [item[0] for item in batch]
+    dataset_ids = [int(item[1]) for item in batch]
+    return paths, dataset_ids
+
+
+def get_inner_loader(dataset: Dataset, batch_size: int, collate_fn=None, dataset_batch_allocation: Optional[list[int]] = None):
+    if dataset_batch_allocation is not None:
+        batch_sampler = MixedSequenceBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            dataset_batch_allocation=dataset_batch_allocation,
+            shuffle=True,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_fn,
+            num_workers=0,
+        )
+        return loader, batch_sampler
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -345,30 +834,53 @@ def get_inner_loader(dataset: Dataset, batch_size: int, collate_fn=None):
 
 def get_data_loader(t_args: TrainArgs, mortm_dataset: tuple | Dataset, shuffle=True, collate_fn=None):
     if isinstance(mortm_dataset, Dataset):
-        train_size = int(t_args.train_dataset_split * len(mortm_dataset))
-        val_size = len(mortm_dataset) - train_size
+        if t_args.dataset_batch_allocation is not None:
+            train_dataset, val_dataset = _split_dataset_by_dataset_id(mortm_dataset, t_args.train_dataset_split)
+        else:
+            train_size, val_size = _compute_split_sizes(len(mortm_dataset), t_args.train_dataset_split)
 
-        # 全 rank で同じ split になるよう固定シード
-        generator = torch.Generator().manual_seed(42)
-        train_dataset, val_dataset = random_split(
-            mortm_dataset,
-            [train_size, val_size],
-            generator=generator
-        )
+            # 全 rank で同じ split になるよう固定シード
+            generator = torch.Generator().manual_seed(42)
+            train_dataset, val_dataset = random_split(
+                mortm_dataset,
+                [train_size, val_size],
+                generator=generator
+            )
     else:
         train_dataset, val_dataset = mortm_dataset
 
-    train_sampler = _build_distributed_sampler(train_dataset, shuffle=shuffle)
+    train_sampler = None
+    train_batch_sampler = None
+    if t_args.dataset_batch_allocation is not None:
+        train_batch_sampler = DatasetBatchAllocationDistributedBatchSampler(
+            train_dataset,
+            batch_size=t_args.big_batch_size,
+            dataset_batch_allocation=t_args.dataset_batch_allocation,
+            shuffle=shuffle,
+        )
+    else:
+        train_sampler = _build_distributed_sampler(train_dataset, shuffle=shuffle)
+
     val_sampler = _build_distributed_sampler(val_dataset, shuffle=False)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=t_args.big_batch_size,
-        sampler=train_sampler,
-        shuffle=(train_sampler is None and shuffle),
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
+    outer_collate_fn = path_pack_collate_fn if _supports_dataset_ids(train_dataset) else collate_fn
+
+    if train_batch_sampler is not None:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            num_workers=0,
+            collate_fn=outer_collate_fn,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=t_args.big_batch_size,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None and shuffle),
+            num_workers=0,
+            collate_fn=outer_collate_fn,
+        )
 
     val_loader = DataLoader(
         val_dataset,
@@ -376,7 +888,7 @@ def get_data_loader(t_args: TrainArgs, mortm_dataset: tuple | Dataset, shuffle=T
         sampler=val_sampler,
         shuffle=False,
         num_workers=0,
-        collate_fn=collate_fn,
+        collate_fn=outer_collate_fn,
     )
 
     return train_loader, val_loader
@@ -401,7 +913,8 @@ def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: n
             inner_loader, inner_sampler = get_inner_loader(
                 pre_processing_dataset,
                 train_args.batch_size,
-                coll_fn
+                coll_fn,
+                dataset_batch_allocation=train_args.dataset_batch_allocation,
             )
 
             if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
@@ -452,11 +965,8 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
     device = torch.device(f"cuda:{local_rank}")
 
     for epoch in range(train_args.num_epochs):
-        if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
-            train_loader.sampler.set_epoch(epoch)
-
-        if hasattr(val_loader, "sampler") and hasattr(val_loader.sampler, "set_epoch"):
-            val_loader.sampler.set_epoch(epoch)
+        _set_loader_epoch(train_loader, epoch)
+        _set_loader_epoch(val_loader, epoch)
 
         try:
             count = 1
@@ -465,6 +975,9 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
 
             model.train()
             optimizer.zero_grad()
+
+            if local_rank == 0:
+                _print_epoch_summary(epoch, train_args, train_loader, optimizer_step)
 
             for pack in train_loader:
                 begin_time = time.time()
@@ -479,7 +992,8 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                 inner_loader, inner_sampler = get_inner_loader(
                     pre_processing_dataset,
                     train_args.batch_size,
-                    coll_fn
+                    coll_fn,
+                    dataset_batch_allocation=train_args.dataset_batch_allocation,
                 )
 
                 if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
@@ -619,6 +1133,7 @@ def _train(args, t_args, save_directory, trainer, version, today_date,
         save_path_json("eval", val_loader, save_directory, version)
         save_path_json("train", train_loader, save_directory, version)
         writer = SummaryWriter(save_directory + f"/runs/{version}_{today_date}/")
+        _print_loader_summary(train_loader, val_loader, t_args, trainer.world_size)
 
     try:
         model, loss = self_turing(f"{args.name}.{version}", t_args, save_directory, trainer,
@@ -668,30 +1183,15 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
     # os.environ['CUDA_LAUNCH_BLOCKING'] = '1' # デバッグ終了につき無効化
     today_date = datetime.date.today().strftime('%Y%m%d')
 
-    if isinstance(root_directory, str):
-        if root_directory.endswith(".json"):
-            directory, filename = find_files_with_json(root_directory)
-        else:
-            directory, filename = find_files(root_directory, '.npz')
-    elif isinstance(root_directory, tuple):
-        directory = []
-        filename = []
-        for r in root_directory:
-            if r.endswith(".json"):
-                d, f = find_files_with_json(r)
-            else:
-                d, f = find_files(r, '.npz')
-            directory.extend(d)
-            filename.extend(f)
-    else:
-        directory, filename = root_directory
-
-    mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
+    grouped_paths, dataset_names = _collect_grouped_paths(root_directory)
+    _validate_grouped_paths_exist(grouped_paths, dataset_names)
+    mortm_dataset = _build_preloading_dataset(grouped_paths, progress, dataset_names)
     if eval_list_json is None:
         train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=t_args.shuffle)
     else:
-        directory, filename = find_files_with_json(eval_list_json)
-        val_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
+        eval_grouped_paths, eval_dataset_names = _collect_grouped_paths(eval_list_json)
+        _validate_grouped_paths_exist(eval_grouped_paths, eval_dataset_names)
+        val_dataset = _build_preloading_dataset(eval_grouped_paths, progress, eval_dataset_names)
         train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=t_args.shuffle)
 
     _train(args, t_args, save_directory, trainer,message=message, version=version, today_date=today_date,
@@ -714,30 +1214,15 @@ def train_custom(trainer: AbstractTrainSet, t_args, root_directory, save_directo
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
 
-    if isinstance(root_directory, str):
-        if root_directory.endswith(".json"):
-            directory, filename = find_files_with_json(root_directory)
-        else:
-            directory, filename = find_files(root_directory, '.npz')
-    elif isinstance(root_directory, tuple):
-        directory = []
-        filename = []
-        for r in root_directory:
-            if r.endswith(".json"):
-                d, f = find_files_with_json(r)
-            else:
-                d, f = find_files(r, '.npz')
-            directory.extend(d)
-            filename.extend(f)
-    else:
-        directory, filename = root_directory
-
-    mortm_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
+    grouped_paths, dataset_names = _collect_grouped_paths(root_directory)
+    _validate_grouped_paths_exist(grouped_paths, dataset_names)
+    mortm_dataset = _build_preloading_dataset(grouped_paths, progress, dataset_names)
     if eval_list_json is None:
         train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
     else:
-        directory, filename = find_files_with_json(eval_list_json)
-        val_dataset = _set_train_data_preloading(directory, filename, PreLoadingDatasets(progress))
+        eval_grouped_paths, eval_dataset_names = _collect_grouped_paths(eval_list_json)
+        _validate_grouped_paths_exist(eval_grouped_paths, eval_dataset_names)
+        val_dataset = _build_preloading_dataset(eval_grouped_paths, progress, eval_dataset_names)
         train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=True)
 
     _train(trainer.args, t_args, save_directory, trainer, message=message, version=version, today_date=today_date,

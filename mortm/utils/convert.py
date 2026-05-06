@@ -345,6 +345,77 @@ class _AbstractAudioConverter(_AbstractConverter):
             self.error_reason = "このwavは読み込むことができない。"
 
 
+def apply_sustain_pedal(inst: Instrument) -> List[Note]:
+    """
+    CC64(サステインペダル)を考慮してノートのend時刻を修正したノートリストを返す。
+
+    - サステインON中に到来したNote Offは無視し、サステインOFF時までノートを延長する。
+    - 延長中に同じピッチが再発音(retrigger)された場合、前のノートをその時点でカットし
+      新しいノートとして開始する。
+    - CC64 イベントが存在しない楽器はそのまま返す。
+    """
+    cc64 = sorted(
+        [cc for cc in inst.control_changes if cc.number == 64],
+        key=lambda c: c.time,
+    )
+    if not cc64:
+        return list(inst.notes)
+
+    # サステインON/OFF区間を構築
+    sustain_periods: List[Tuple[float, float]] = []
+    sus_on: Optional[float] = None
+    for cc in cc64:
+        if cc.value >= 64 and sus_on is None:
+            sus_on = cc.time
+        elif cc.value < 64 and sus_on is not None:
+            sustain_periods.append((sus_on, cc.time))
+            sus_on = None
+
+    if not sustain_periods:
+        return list(inst.notes)
+
+    def _get_sustain_off(t: float) -> Optional[float]:
+        for on, off in sustain_periods:
+            if on <= t < off:
+                return off
+        return None
+
+    notes = sorted(inst.notes, key=lambda n: n.start)
+    result: List[Note] = []
+    # pitch -> result内のインデックス (サステイン延長中のノート)
+    active_sustained: Dict[int, int] = {}
+
+    for note in notes:
+        p = note.pitch
+
+        # 同ピッチがサステイン延長中 → retrigger: 旧ノートをこの時点でカット
+        if p in active_sustained:
+            idx = active_sustained.pop(p)
+            old = result[idx]
+            if old.end > note.start:
+                result[idx] = Note(
+                    velocity=old.velocity, pitch=old.pitch,
+                    start=old.start, end=note.start,
+                )
+
+        sus_off = _get_sustain_off(note.end)
+        if sus_off is not None:
+            new_note = Note(
+                velocity=note.velocity, pitch=note.pitch,
+                start=note.start, end=sus_off,
+            )
+            result.append(new_note)
+            active_sustained[p] = len(result) - 1
+        else:
+            result.append(Note(
+                velocity=note.velocity, pitch=note.pitch,
+                start=note.start, end=note.end,
+            ))
+
+    result.sort(key=lambda n: n.start)
+    return result
+
+
 class MIDI2Seq(_AbstractMidiConverter):
     '''
     MIDIをトークンのシーケンスに変換するクラス
@@ -370,8 +441,13 @@ class MIDI2Seq(_AbstractMidiConverter):
             note_counts = [0 for _ in self.inst_list]
 
             for i, (inst, program) in enumerate(self.inst_list_with_name):
+                # サステインペダルを適用した一時的なノートリストで変換
+                original_notes = inst.notes
+                inst.notes = apply_sustain_pedal(inst)
 
                 inst_clip, note_count, is_finish = self.convert_inst(program, inst, container[i], note_counts[i])
+
+                inst.notes = original_notes  # 他クラスが同じ inst を参照しているため復元
                 note_counts[i] = note_count
                 s_e = self.tokenizer.get_length_tuple("s")
 

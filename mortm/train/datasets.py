@@ -41,6 +41,7 @@ class MORTM_SEQDataset(Dataset):
     def __init__(self, progress: LearningProgress, positional_length, min_length, is_random_delete_key = False,
                  mask_sample_task: Optional[List[int]]=None, program_token_id: Optional[List[int]]=None, system_tag: Optional[Tuple[int, int]]=None, sampling_inst_max=1):
         self.seq: list = list()
+        self.seq_dataset_ids: List[int] = list()
         self.progress = progress
         self.positional_length = positional_length
         self.min_length = min_length
@@ -53,7 +54,7 @@ class MORTM_SEQDataset(Dataset):
     def __len__(self):
         return len(self.seq)
 
-    def add_data(self, music_seq: np.ndarray, *args):
+    def add_data(self, music_seq: np.ndarray, dataset_id: int = 0, *args):
         suc_count = 0
 
         i = 1
@@ -73,6 +74,7 @@ class MORTM_SEQDataset(Dataset):
 
             if self.min_length < len(seq) < self.positional_length:
                 self.seq.append(np.ascontiguousarray(seq.copy()))
+                self.seq_dataset_ids.append(int(dataset_id))
                 suc_count += 1
 
             i += 1
@@ -249,23 +251,35 @@ class PreLoadingDatasets(Dataset):
     def __init__(self, progress: LearningProgress):
         self.progress = progress
         self.src_list: List[str] = list()
+        self.dataset_ids: List[int] = list()
+        self.dataset_names: List[str] = list()
 
     def __len__(self):
         return len(self.src_list)
 
     def __getitem__(self, item: int) :
-        return self.src_list[item]
+        return self.src_list[item], self.dataset_ids[item]
 
 
-    def add_data(self, directory: List[str], filename: List[str]):
+    def add_data(self, directory: List[str], filename: List[str], dataset_id: int = 0, dataset_name: Optional[str] = None):
         for i in range(len(directory)):
             self.src_list.append(os.path.join(directory[i], filename[i]))
+            self.dataset_ids.append(dataset_id)
+            self.dataset_names.append(dataset_name or f"dataset_{dataset_id}")
 
-    def add_data_json(self, json_data: str):
+    def add_paths(self, paths: List[str], dataset_id: int = 0, dataset_name: Optional[str] = None):
+        for path in paths:
+            self.src_list.append(path)
+            self.dataset_ids.append(dataset_id)
+            self.dataset_names.append(dataset_name or f"dataset_{dataset_id}")
+
+    def add_data_json(self, json_data: str, dataset_id: int = 0, dataset_name: Optional[str] = None):
         with open(json_data, 'r') as f:
             data = json.load(f)
             for item in data:
                 self.src_list.append(item)
+                self.dataset_ids.append(dataset_id)
+                self.dataset_names.append(dataset_name or f"dataset_{dataset_id}")
 
 
 

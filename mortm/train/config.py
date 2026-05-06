@@ -23,6 +23,20 @@ class TrainArgs:
             self.big_batch_size = data['big_batch_size'] if data.get('big_batch_size') else 16
             self.val_total_tokens = data['val_total_tokens'] if data.get('val_total_tokens') else 50000000
             self.shuffle = data['shuffle'] if data.get('shuffle') else True
+            dataset_batch_allocation = data.get('dataset_batch_allocation')
+            self.dataset_batch_allocation: Optional[list[int]] = None
+
+            if dataset_batch_allocation is not None:
+                if not isinstance(dataset_batch_allocation, list) or len(dataset_batch_allocation) == 0:
+                    raise ValueError("dataset_batch_allocation must be a non-empty list of integers.")
+
+                parsed_allocation = [int(v) for v in dataset_batch_allocation]
+                if any(v < 0 for v in parsed_allocation):
+                    raise ValueError("dataset_batch_allocation must contain only non-negative integers.")
+                if sum(parsed_allocation) <= 0:
+                    raise ValueError("dataset_batch_allocation must contain at least one positive integer.")
+
+                self.dataset_batch_allocation = parsed_allocation
 
 class AbstractTrainSet:
     model: nn.Module
