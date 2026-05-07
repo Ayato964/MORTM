@@ -80,8 +80,8 @@ if __name__ == "__main__":
     MIN_MEASURE = 1
     MAX_MEASURE = 8
     PROGRAM = ['PIANO', 'SAX']
-    DATASETS = "C:/Users/Nagoshi Takaaki.KTHRLab/MIDIdatasets/GMD/training/"
-    SAVE_PATH = "C:/Users/Nagoshi Takaaki.KTHRLab/MORTM/pre_train/foundation/"
+    DATASETS = "/home/ubuntu/nagoshi/music_generation/data/GMD/training"
+    SAVE_PATH = "/home/ubuntu/nagoshi/music_generation/dataset/music"
 
     tokenizer = Tokenizer(get_token_converter_pro(TO_TOKEN))
 

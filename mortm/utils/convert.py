@@ -185,6 +185,7 @@ class _AbstractMidiConverter(_AbstractConverter):
         super().__init__(instance, directory, file_name)
         self.token_converter: List[Token] = tokenizer.music_token_list
         self.tokenizer = tokenizer
+        self.key_dict = None
         if midi_data is not None:
             self.midi_data: PrettyMIDI = midi_data
         else:
@@ -633,7 +634,13 @@ class MIDIConverter(_AbstractMidiConverter):
         if call_function is not None:
             call_function(prompt)
 
-        prompt.append(self.tokenizer.get(f"k_{self.get_key(time) if isinstance(self.key, dict) else self.key}"))
+        if self.key_dict:
+            key_str = self.get_key(time)
+        elif isinstance(self.key, dict):
+            key_str = self.get_key(time)
+        else:
+            key_str = self.key
+        prompt.append(self.tokenizer.get(f"k_{key_str}"))
         prompt.append(self.tokenizer.get("<TAG_END>"))
         return prompt
 
