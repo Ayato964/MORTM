@@ -1,5 +1,7 @@
+import hashlib
 import json
 import math
+import os
 import random
 from typing import List, Optional, Tuple
 
@@ -61,27 +63,59 @@ class FoundationDataMaker(_AbstractConverter):
     # 保存
     # ---------------------------------------------------------
 
-    def save(self, save_directory: str) -> Tuple[bool, str]:
+    def _get_out_dir(self, save_directory: str) -> str:
+        subdir = hashlib.md5(self.converter.file_name.encode()).hexdigest()[0]
+        return os.path.join(save_directory, subdir)
+
+    def save(self, save_directory: str, save_stats: bool = False) -> Tuple[bool, str]:
         if not self.is_error:
             array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
             if len(array_dict) > 1:
-                np.savez(save_directory + "/" + self.converter.file_name, **array_dict)
-                # JSON は整数キーを文字列に変換して保存
-                stats_serializable = {
-                    "total_samples": self.stats["total_samples"],
-                    "deletion_count": {str(k): v for k, v in self.stats["deletion_count"].items()},
-                    "block_presence": self.stats["block_presence"],
-                    "permutation_patterns": self.stats["permutation_patterns"],
-                    "skipped_windows": self.stats["skipped_windows"],
-                    "instrument_finish_reasons": self.stats["instrument_finish_reasons"],
-                }
-                with open(save_directory + "/" + self.converter.file_name + "_stats.json", "w") as f:
-                    json.dump(stats_serializable, f, indent=2)
+                out_dir = self._get_out_dir(save_directory)
+                np.savez(os.path.join(out_dir, self.converter.file_name), **array_dict)
+                if save_stats:
+                    stats_serializable = {
+                        "total_samples": self.stats["total_samples"],
+                        "deletion_count": {str(k): v for k, v in self.stats["deletion_count"].items()},
+                        "block_presence": self.stats["block_presence"],
+                        "permutation_patterns": self.stats["permutation_patterns"],
+                        "skipped_windows": self.stats["skipped_windows"],
+                        "instrument_finish_reasons": self.stats["instrument_finish_reasons"],
+                    }
+                    with open(os.path.join(out_dir, self.converter.file_name + "_stats.json"), "w") as f:
+                        json.dump(stats_serializable, f, indent=2)
                 return True, "処理が正常に終了しました。"
             else:
                 return False, "オブジェクトが何らかの理由で見つかりませんでした。"
         else:
             return False, self.error_reason
+
+    def prepare_write_task(
+        self, save_directory: str, save_stats: bool = False
+    ) -> Optional[Tuple[str, str, dict, Optional[dict]]]:
+        """
+        書き込みに必要なデータを返す（実際の I/O は行わない）。
+        単一ライタープロセスへのキュー投入用。
+        戻り値: (out_dir, filename, array_dict, stats_dict_or_None)
+                何も保存するものがなければ None。
+        """
+        if self.is_error:
+            return None
+        array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
+        if len(array_dict) <= 1:
+            return None
+        out_dir = self._get_out_dir(save_directory)
+        stats_data = None
+        if save_stats and self.stats:
+            stats_data = {
+                "total_samples": self.stats["total_samples"],
+                "deletion_count": {str(k): v for k, v in self.stats["deletion_count"].items()},
+                "block_presence": self.stats["block_presence"],
+                "permutation_patterns": self.stats["permutation_patterns"],
+                "skipped_windows": self.stats["skipped_windows"],
+                "instrument_finish_reasons": self.stats["instrument_finish_reasons"],
+            }
+        return out_dir, self.converter.file_name, array_dict, stats_data
 
     # ---------------------------------------------------------
     # ヘルパー: 制約チェック & 密度計算 (PreTrainDataMaker から流用)

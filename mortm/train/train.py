@@ -468,7 +468,7 @@ class MORTMTrainSet(AbstractTrainSet):
                         reinit=True
                     )
 
-        super().__init__(criterion=MaskedCrossEntropyLoss(ignore_index=0).to(device),
+        super().__init__(criterion=nn.CrossEntropyLoss(ignore_index=0).to(device),
                          optimizer=adam,
                          t_args=t_args,
                          m_args=args,
@@ -500,9 +500,7 @@ class MORTMTrainSet(AbstractTrainSet):
         src = pack
         device = torch.device(f"cuda:{self.local_rank}")
         target: Tensor = src[:, 1:].to(device)
-        mask = self.loss_mask(target)
         target = target.reshape(-1).long()
-        mask = mask.reshape(-1).long()
 
         src = src[:, :-1].to(device)
         padding_mask_in: Tensor = _get_padding_mask(src, progress, device)
@@ -512,7 +510,7 @@ class MORTMTrainSet(AbstractTrainSet):
 
         input: Tensor = model(x=src, padding_mask=padding_mask_in, is_causal=True)
         input = input.view(-1, input.size(-1)).to(device)
-        return input.to(device=device, dtype=torch.float32), target, mask
+        return input.to(device=device, dtype=torch.float32), target
 
     def view_logs(self, epoch, sum_epoch, seq_count, all_pac, mini_seq_count, mini_seq_pac, loss, lr, verif_loss, tokens):
         # 全プロセスで進捗を確認できるように、Rank 0 以外のログも抑制を外します (デバッグ用)
@@ -984,22 +982,24 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
 
                 pre_processing_dataset = trainer.pre_processing(pack, progress)
 
-                if len(pre_processing_dataset) == 0:
-                    del pre_processing_dataset, pack
-                    gc.collect()
-                    continue
-
-                inner_loader, inner_sampler = get_inner_loader(
-                    pre_processing_dataset,
-                    train_args.batch_size,
-                    coll_fn,
-                    dataset_batch_allocation=train_args.dataset_batch_allocation,
-                )
+                # 空でも continue せず _sync_min_loader_length に必ず参加する。
+                # 一方のランクだけが continue すると dist.all_reduce がズレて NCCL デッドロックになる。
+                if len(pre_processing_dataset) > 0:
+                    inner_loader, inner_sampler = get_inner_loader(
+                        pre_processing_dataset,
+                        train_args.batch_size,
+                        coll_fn,
+                        dataset_batch_allocation=train_args.dataset_batch_allocation,
+                    )
+                    local_len = len(inner_loader)
+                else:
+                    inner_loader = iter([])
+                    inner_sampler = None
+                    local_len = 0
 
                 if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
                     inner_sampler.set_epoch(epoch)
 
-                local_len = len(inner_loader)
                 synced_len = _sync_min_loader_length(local_len, device)
 
                 mini_c = 0
@@ -1183,14 +1183,34 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
     # os.environ['CUDA_LAUNCH_BLOCKING'] = '1' # デバッグ終了につき無効化
     today_date = datetime.date.today().strftime('%Y%m%d')
 
-    grouped_paths, dataset_names = _collect_grouped_paths(root_directory)
-    _validate_grouped_paths_exist(grouped_paths, dataset_names)
+    # rank 0 だけ NTFS をスキャンしてブロードキャスト。
+    # ntfs-3g (FUSE) への並列 readdir は D クラスデッドロックを引き起こすため、
+    # 全ランクが同時に os.walk するのを避ける。
+    if local_rank == 0:
+        grouped_paths, dataset_names = _collect_grouped_paths(root_directory)
+    else:
+        grouped_paths, dataset_names = None, None
+
+    if dist.is_initialized():
+        obj = [grouped_paths, dataset_names]
+        dist.broadcast_object_list(obj, src=0)
+        grouped_paths, dataset_names = obj[0], obj[1]
+
     mortm_dataset = _build_preloading_dataset(grouped_paths, progress, dataset_names)
+
     if eval_list_json is None:
         train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=t_args.shuffle)
     else:
-        eval_grouped_paths, eval_dataset_names = _collect_grouped_paths(eval_list_json)
-        _validate_grouped_paths_exist(eval_grouped_paths, eval_dataset_names)
+        if local_rank == 0:
+            eval_grouped_paths, eval_dataset_names = _collect_grouped_paths(eval_list_json)
+        else:
+            eval_grouped_paths, eval_dataset_names = None, None
+
+        if dist.is_initialized():
+            obj = [eval_grouped_paths, eval_dataset_names]
+            dist.broadcast_object_list(obj, src=0)
+            eval_grouped_paths, eval_dataset_names = obj[0], obj[1]
+
         val_dataset = _build_preloading_dataset(eval_grouped_paths, progress, eval_dataset_names)
         train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=t_args.shuffle)
 
@@ -1215,13 +1235,11 @@ def train_custom(trainer: AbstractTrainSet, t_args, root_directory, save_directo
     today_date = datetime.date.today().strftime('%Y%m%d')
 
     grouped_paths, dataset_names = _collect_grouped_paths(root_directory)
-    _validate_grouped_paths_exist(grouped_paths, dataset_names)
     mortm_dataset = _build_preloading_dataset(grouped_paths, progress, dataset_names)
     if eval_list_json is None:
         train_loader, val_loader = get_data_loader(t_args, mortm_dataset, shuffle=True)
     else:
         eval_grouped_paths, eval_dataset_names = _collect_grouped_paths(eval_list_json)
-        _validate_grouped_paths_exist(eval_grouped_paths, eval_dataset_names)
         val_dataset = _build_preloading_dataset(eval_grouped_paths, progress, eval_dataset_names)
         train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=True)
 
