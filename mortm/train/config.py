@@ -52,17 +52,23 @@ class AbstractTrainSet:
 
         if t_args.scheduler['type'] == "noam":
             print("Using Noam Scheduler")
+            _warmup = t_args.scheduler.get('warmup_steps', 4000)
             self.scheduler = LambdaLR(
                 optimizer=optimizer,
-                lr_lambda=noam_lr(m_args.d_model, warmup_steps=t_args.scheduler['warmup_steps'])
+                lr_lambda=noam_lr(m_args.d_model, warmup_steps=_warmup)
             )
         elif t_args.scheduler['type'] == "cos":
             print("Using Cosine Annealing Scheduler")
+            _total = t_args.scheduler['total_steps']
+            if 'warmup_steps' in t_args.scheduler:
+                _warmup = t_args.scheduler['warmup_steps']
+            else:
+                _warmup = max(1, int(t_args.scheduler.get('warmup_ratio', 0.05) * _total))
             self.scheduler = LambdaLR(
                 optimizer=optimizer,
                 lr_lambda=get_cosine_schedule_with_warmup(
-                    warmup_steps=t_args.scheduler['warmup_steps'],
-                    total_steps=t_args.scheduler['total_steps']
+                    warmup_steps=_warmup,
+                    total_steps=_total
                 )
             )
         else:

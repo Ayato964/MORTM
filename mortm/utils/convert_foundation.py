@@ -24,7 +24,8 @@ class FoundationDataMaker(_AbstractConverter):
     能力を獲得させる。
     """
 
-    def __init__(self, converter: MIDIConverter, min_measure=1, max_measure=8, additional_prompt=None):
+    def __init__(self, converter: MIDIConverter, min_measure=1, max_measure=8, additional_prompt=None,
+                 disable_block_augment: bool = False):
         super().__init__(FoundationDataMaker, None, None)
         self.converter = converter
         self.tokenizer = converter.tokenizer
@@ -32,6 +33,10 @@ class FoundationDataMaker(_AbstractConverter):
         self.min_measure = min_measure
         self.max_measure = max_measure
         self.additional_prompt = additional_prompt
+        # True のとき、シーケンスブロックの入れ替え（並び替え）と削除を一切行わない。
+        # ブロックは固定順 [SYSTEM, PAST_M, CONST_M, FUTURE_M] で 3 ブロック全て残す（決定的）。
+        # ※ _build_melody_block 内の楽器順シャッフルはブロック内の別レイヤーなので影響しない。
+        self.disable_block_augment = disable_block_augment
         self.stats = {
             "total_samples": 0,
             "deletion_count": {0: 0, 1: 0, 2: 0},
@@ -360,37 +365,49 @@ class FoundationDataMaker(_AbstractConverter):
             eos_token = np.array([system_prompt[0]], dtype=int)
             system_block = np.array(system_prompt[1:], dtype=int)
 
-            # --- 削除処理: k ∈ {0, 1, 2} 個のブロックを一様にランダム削除 ---
-            k = random.choice([0, 1, 2])
             music_block_names = ["PAST_M", "CONST_M", "FUTURE_M"]
             music_blocks_map = {
                 "PAST_M": past_block,
                 "CONST_M": const_block,
                 "FUTURE_M": future_block,
             }
-            delete_names = random.sample(music_block_names, k)
-            remaining_music = {
-                name: blk for name, blk in music_blocks_map.items()
-                if name not in delete_names
-            }
 
-            # --- 並び替え ---
-            # PAST → FUTURE の時系列順を固定し、CONST だけ 3 択でランダム挿入する。
-            # 3 択: PASTより前 / PASTとFUTUREの間 / FUTUREより後
-            ordered_music = []
-            if "PAST_M" in remaining_music:
-                ordered_music.append(("PAST_M", remaining_music["PAST_M"]))
-            if "FUTURE_M" in remaining_music:
-                ordered_music.append(("FUTURE_M", remaining_music["FUTURE_M"]))
-            if "CONST_M" in remaining_music:
-                # 0 〜 len(ordered_music) のいずれかに挿入
-                pos = random.randint(0, len(ordered_music))
-                ordered_music.insert(pos, ("CONST_M", remaining_music["CONST_M"]))
+            if self.disable_block_augment:
+                # --- 入れ替え・削除なしモード（決定的）---
+                # 全ブロックを残し、固定順 [SYSTEM, PAST_M, CONST_M, FUTURE_M] で並べる。
+                k = 0
+                remaining_blocks = [
+                    ("SYSTEM", system_block),
+                    ("PAST_M", music_blocks_map["PAST_M"]),
+                    ("CONST_M", music_blocks_map["CONST_M"]),
+                    ("FUTURE_M", music_blocks_map["FUTURE_M"]),
+                ]
+            else:
+                # --- 削除処理: k ∈ {0, 1, 2} 個のブロックを一様にランダム削除 ---
+                k = random.choice([0, 1, 2])
+                delete_names = random.sample(music_block_names, k)
+                remaining_music = {
+                    name: blk for name, blk in music_blocks_map.items()
+                    if name not in delete_names
+                }
 
-            # SYSTEM は全ブロックの中でランダムな位置に挿入
-            system_pos = random.randint(0, len(ordered_music))
-            remaining_blocks = ordered_music.copy()
-            remaining_blocks.insert(system_pos, ("SYSTEM", system_block))
+                # --- 並び替え ---
+                # PAST → FUTURE の時系列順を固定し、CONST だけ 3 択でランダム挿入する。
+                # 3 択: PASTより前 / PASTとFUTUREの間 / FUTUREより後
+                ordered_music = []
+                if "PAST_M" in remaining_music:
+                    ordered_music.append(("PAST_M", remaining_music["PAST_M"]))
+                if "FUTURE_M" in remaining_music:
+                    ordered_music.append(("FUTURE_M", remaining_music["FUTURE_M"]))
+                if "CONST_M" in remaining_music:
+                    # 0 〜 len(ordered_music) のいずれかに挿入
+                    pos = random.randint(0, len(ordered_music))
+                    ordered_music.insert(pos, ("CONST_M", remaining_music["CONST_M"]))
+
+                # SYSTEM は全ブロックの中でランダムな位置に挿入
+                system_pos = random.randint(0, len(ordered_music))
+                remaining_blocks = ordered_music.copy()
+                remaining_blocks.insert(system_pos, ("SYSTEM", system_block))
 
             # --- 統計更新 ---
             self.stats["total_samples"] += 1

@@ -41,6 +41,9 @@ class MORTMArgs:
             self.lora_r = data['lora_r'] if data.get('lora_r') else 8
             self.lora_alpha = data['lora_alpha'] if data.get('lora_alpha') else 16
 
+            # デバッグ用: Trueにすると観察用Attentionに切り替わりweightを保存する
+            self.debug_attention: bool = False
+
 
 class V_MORTMArgs(MORTMArgs):
     def __init__(self, json_directory: str):

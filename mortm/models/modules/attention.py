@@ -276,15 +276,62 @@ class FlashSelfAttentionM(nn.Module):
 
                     # RoPE適用 (q, k はここで新しく計算されるため安全)
                     q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+
+                if getattr(self.args, 'debug_attention', False):
+                    # ======================================================
+                    # 観察用Attention: Flash Attentionをバイパスし、
+                    # softmax(QK^T/√d)V を手動計算してweightを保存する
+                    # ======================================================
+                    B = q.shape[0]
+                    cur_lens = self.cache_seqlens  # [B]
+
+                    # 新しい k/v をキャッシュに書き込む
+                    for i in range(B):
+                        pos = cur_lens[i].item()
+                        self.kv_cache[0][i, pos] = k[i, 0]   # k: [B,1,H,D]
+                        self.kv_cache[1][i, pos] = v[i, 0]
+
+                    self.cache_seqlens += 1
+                    new_lens = self.cache_seqlens  # [B]
+
+                    # 各バッチで attention を計算 (B=1 前提で最適化)
+                    S = new_lens[0].item()
+                    k_ctx = self.kv_cache[0][0, :S]   # [S, H, D]
+                    v_ctx = self.kv_cache[1][0, :S]   # [S, H, D]
+
+                    # q[0,0]: [H, D]  →  [H, 1, D]
+                    q0 = q[0, 0].unsqueeze(1)          # [H, 1, D]
+                    k0 = k_ctx.permute(1, 0, 2)        # [H, S, D]
+                    v0 = v_ctx.permute(1, 0, 2)        # [H, S, D]
+
+                    scale = self.head_dim ** -0.5
+                    scores = torch.matmul(q0, k0.transpose(-2, -1)) * scale  # [H, 1, S]
+                    attn_w = torch.softmax(scores.float(), dim=-1).to(q.dtype)  # [H, 1, S]
+
+                    # weight を保存 [H, S] (head 次元を保持)
+                    self.last_attn_weights = attn_w[:, 0, :].detach().cpu()
+
+                    out_0 = torch.matmul(attn_w, v0)   # [H, 1, D]
+                    out_0 = out_0.squeeze(1)            # [H, D]
+                    out = out_0.unsqueeze(0)            # [1, H, D]  (batch=1)
+
+                    # [B, H, D] -> [B, H*D]
+                    out = rearrange(out, "b h d -> b (h d)")
+
+                elif self.args.use_rope:
                     out = flash_attn_with_kvcache(
                         q,
                         self.kv_cache[0],
                         self.kv_cache[1],
                         k=k,
-                        v=v, # ここで渡す v が完全に整列された状態になる
+                        v=v,
                         cache_seqlens=self.cache_seqlens,
                         causal=True
                     )
+                    self.cache_seqlens += 1
+                    # Decoding Output: [Batch, 1, Heads, Dim] -> [Batch, Heads*Dim]
+                    out = out.squeeze(1)
+                    out = rearrange(out, "b h d -> b (h d)")
                 else:
                     out = flash_attn_with_kvcache(
                         q,
@@ -296,15 +343,11 @@ class FlashSelfAttentionM(nn.Module):
                         alibi_slopes=self.alibi_slopes,
                         causal=True
                     )
-                self.cache_seqlens += 1
+                    self.cache_seqlens += 1
+                    out = out.squeeze(1)
+                    out = rearrange(out, "b h d -> b (h d)")
             else:
                 raise NotImplementedError("Decoding without cache is not implemented.")
-
-            # Decoding Output: [Batch, 1, Heads, Dim] -> [Batch, Heads, Dim]
-            out = out.squeeze(1)
-
-            # [Batch, Heads, Dim] -> [Batch, Heads*Dim]
-            out = rearrange(out, "b h d -> b (h d)")
 
         # 最終出力
         return self.qkv_block.comp(out)
