@@ -1,5 +1,5 @@
 """SFT生成タスク データ生成 (MIDICaps, ピアノ&サックスのみ, 転調なし)。
-FoundationDataMaker.convert_generation_sft() で 3タスク
+GenerationDataMaker.convert_generation_sft() で 3タスク
 (meta / meta_past / meta_future -> CONST) のシーケンスを作る。
 出力: ext4 (/home/.../data/sft/generation/music) 16シャード。NTFSは書込不安定のため避ける。
 """
@@ -11,7 +11,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_TOKEN
 from mortm.utils.convert import MIDIConverter
-from mortm.utils.convert_foundation import FoundationDataMaker, genre_names_to_ids
+from mortm.utils.convert_foundation import GenerationDataMaker, genre_names_to_ids
 from ConvertFoundation import writer_worker, _QUEUE_SENTINEL
 
 DATASETS = "/media/takaaki-nagoshi/MIDIdatasets/MIDI_Caps/lmd_full"
@@ -72,7 +72,7 @@ def convert_worker(pid, tokenizer, directory, md_file, program, min_m, max_m,
                 genres = genres[:1]          # 第2ジャンルを落とす
             genre_tokens = genre_names_to_ids(genres, tokenizer)
 
-            m = FoundationDataMaker(con, min_m, max_m)
+            m = GenerationDataMaker(con, min_m, max_m)
             stats = m.convert_generation_sft(tasks=SFT_TASKS, genre_tokens=genre_tokens)
             if len(m.aya_node) <= 1:
                 continue

@@ -454,9 +454,14 @@ class FoundationDataMaker(_AbstractConverter):
         print(f"  並び替えパターン数: {len(self.stats['permutation_patterns'])}")
         return self.stats
 
-    # ---------------------------------------------------------
-    # 生成 SFT タスク (Meta / Meta+PAST / Meta+FUTURE -> CONST)
-    # ---------------------------------------------------------
+
+
+class GenerationDataMaker(FoundationDataMaker):
+    """生成SFTタスク (meta / meta_past / meta_future -> CONST) のシーケンス生成器。
+
+    FoundationDataMaker(基盤事前学習用) の窓分割・ブロック構築ヘルパーを継承して使うが、
+    責務は SFT 用の生成タスク列生成であり、事前学習(convert)とは分離する。
+    """
 
     def _build_gen_field(self, seqs: dict, programs: List[str]) -> np.ndarray:
         """生成ターゲット: <MGEN> [<INST_X> seq <ESEQ>]* <TE> を構築する。
