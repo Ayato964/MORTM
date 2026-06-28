@@ -14,6 +14,19 @@ from mortm.utils.convert import (
     split_sequence_measure,
 )
 
+# --- ジャンルトークン (MIDICaps 用) ---------------------------------------
+# ジャンルトークンは custom_token.Genre として tokenizer 末尾に正式登録済み
+# (<GENRE_xxx>, ID 647.. 既存IDは不変)。ID は必ず tokenizer.get で解決する。
+def genre_names_to_ids(genres, tokenizer):
+    """ジャンル名リスト -> トークンIDリスト。tokenizer 経由で解決(未登録は無視)。"""
+    ids = []
+    for g in genres:
+        try:
+            ids.append(tokenizer.get(f"<GENRE_{g}>"))
+        except KeyError:
+            pass
+    return ids
+
 
 class FoundationDataMaker(_AbstractConverter):
     """
@@ -439,4 +452,151 @@ class FoundationDataMaker(_AbstractConverter):
         print(f"  ブロック存在数: {self.stats['block_presence']}")
         print(f"  スキップウィンドウ数: {self.stats['skipped_windows']}")
         print(f"  並び替えパターン数: {len(self.stats['permutation_patterns'])}")
+        return self.stats
+
+    # ---------------------------------------------------------
+    # 生成 SFT タスク (Meta / Meta+PAST / Meta+FUTURE -> CONST)
+    # ---------------------------------------------------------
+
+    def _build_gen_field(self, seqs: dict, programs: List[str]) -> np.ndarray:
+        """生成ターゲット: <MGEN> [<INST_X> seq <ESEQ>]* <TE> を構築する。
+        loss_mask が <MGEN> 以降のみ損失計算するため、生成対象(CONST)はここに置く。"""
+        s_range = self.tokenizer.get_length_tuple("s")
+        field = np.array([self.tokenizer.get("<MGEN>")], dtype=int)
+        for prog in programs:
+            seq = seqs[prog]
+            if not np.any(np.isin(seq, np.arange(s_range[0], s_range[1]))):
+                continue
+            framed = np.concatenate([
+                np.array([self.tokenizer.get(f"<INST_{prog}>")], dtype=int),
+                seq,
+                np.array([self.tokenizer.get("<ESEQ>")], dtype=int),
+            ])
+            field = np.concatenate([field, framed])
+        field = np.concatenate([field, np.array([self.tokenizer.get("<TE>")], dtype=int)])
+        return field
+
+    def convert_generation_sft(self, tasks=("meta", "meta_past", "meta_future"),
+                               genre_tokens=None, *args, **kwargs):
+        """生成 SFT タスクのシーケンスを作る。各窓で指定タスクを emit する。
+        genre_tokens: ジャンルのトークンIDリスト(任意)。メタの key トークンの直前に差し込む。
+
+        - "meta"        : [SYSTEM(meta)]            <MGEN> CONST <TE>   (メタのみ -> CONST)
+        - "meta_past"   : [SYSTEM] <PAST_M>..<TAG_END>   <MGEN> CONST <TE>
+        - "meta_future" : [SYSTEM] <FUTURE_M>..<TAG_END> <MGEN> CONST <TE>
+
+        EOS は系列先頭固定。CONST(=生成対象)は <MGEN> 以降に置く(loss_mask対応)。
+        ブロックの並び替え・削除は行わない(SFTは決定的)。
+        """
+        if self.is_error:
+            return self.stats
+
+        measure_token_id = self.tokenizer.get("<SME>")
+        s_e = self.tokenizer.get_length_tuple("s")
+
+        valid_programs = [p for p in self.converter.program_list if p in self.seq_dict]
+        if not valid_programs:
+            return self.stats
+
+        seq_inds = {}
+        for program in valid_programs:
+            seq_inds[program] = np.where(self.seq_dict[program] == measure_token_id)[0]
+
+        inst_finish_dict = {program: False for program in valid_programs}
+        counts = {t: 0 for t in tasks}
+        now_measure = 0
+
+        while not all(inst_finish_dict.values()):
+            # ★可変長: 過去/中央(生成対象)/未来 を各窓で独立にランダム化 (min..max 小節)。
+            #   これにより GEN_MEASURE_COUNT(出力長) と 入力長(PAST/FUTURE) が 1..max で多様化し、
+            #   「1小節だけ入力→N小節生成」のような可変入出力を学習できる。
+            past_len = random.randint(self.min_measure, self.max_measure)
+            const_len = random.randint(self.min_measure, self.max_measure)
+            future_len = random.randint(self.min_measure, self.max_measure)
+            past_seqs, const_seqs, future_seqs = {}, {}, {}
+            active_program_info = []
+            is_skip_window = False
+
+            for program in valid_programs:
+                if inst_finish_dict[program]:
+                    continue
+                inds = seq_inds[program]
+                if now_measure + past_len + const_len + future_len >= len(inds):
+                    inst_finish_dict[program] = True
+                    continue
+
+                past_start = inds[now_measure]
+                past_end = inds[now_measure + past_len]
+                const_end = inds[now_measure + past_len + const_len]
+                future_end = inds[now_measure + past_len + const_len + future_len]
+                past_seq = self.seq_dict[program][past_start:past_end]
+                const_seq = self.seq_dict[program][past_end:const_end]
+                future_seq = self.seq_dict[program][const_end:future_end]
+
+                # CONST は生成対象なので音符必須
+                if not np.any(np.isin(const_seq, np.arange(s_e[0], s_e[1]))):
+                    continue
+                if not (
+                    self._check_instrument_constraint(program, past_seq)
+                    and self._check_instrument_constraint(program, const_seq)
+                    and self._check_instrument_constraint(program, future_seq)
+                ):
+                    continue
+                if (self._calculate_density_token(past_seq, program) is None
+                        or self._calculate_density_token(future_seq, program) is None):
+                    is_skip_window = True
+                    break
+                density_token = self._calculate_density_token(const_seq, program)
+                if density_token is None:
+                    is_skip_window = True
+                    break
+
+                past_seqs[program] = past_seq
+                const_seqs[program] = const_seq
+                future_seqs[program] = future_seq
+                active_program_info.append((program, density_token))
+
+            if is_skip_window or len(active_program_info) == 0:
+                if all(inst_finish_dict.values()):
+                    break
+                now_measure += past_len
+                continue
+
+            active_programs = [prog for prog, _ in active_program_info]
+
+            # SYSTEM プロンプト(メタ)。生成小節数トークン + ジャンルを key の直前に付与。
+            # (make_system_prompt は call_function の追加分を k_<key> の直前に置く)
+            def _append_measure_count(p: list):
+                p.append(self.tokenizer.get(f"<GEN_MEASURE_COUNT_{const_len}>"))
+                if genre_tokens:
+                    p.extend(genre_tokens)  # ジャンルを key の直前に差し込む
+
+            system_prompt = self.converter.make_system_prompt(
+                0, active_program_info, call_function=_append_measure_count)
+            eos_token = np.array([system_prompt[0]], dtype=int)
+            system_block = np.array(system_prompt[1:], dtype=int)  # <SYSTEM>..<TAG_END>
+
+            gen_field = self._build_gen_field(const_seqs, active_programs)  # <MGEN>..<TE>
+
+            for task in tasks:
+                if task == "meta":
+                    cond = []
+                elif task == "meta_past":
+                    cond = [self._build_melody_block("<PAST_M>", past_seqs, active_programs)]
+                elif task == "meta_future":
+                    cond = [self._build_melody_block("<FUTURE_M>", future_seqs, active_programs)]
+                else:
+                    continue
+                sample = np.concatenate([eos_token, system_block, *cond, gen_field])
+                self.aya_node.append(sample)
+                counts[task] += 1
+
+            now_measure += past_len
+
+        self.stats["sft_generation_counts"] = counts
+        total = sum(counts.values())
+        total_tokens = int(sum(len(arr) for arr in self.aya_node[1:]))
+        self.stats["total_samples"] = total
+        self.stats["total_tokens"] = total_tokens
+        print(f"[FoundationDataMaker.SFT] 生成タスク完了: {total} サンプル ({counts})  総トークン {total_tokens}")
         return self.stats

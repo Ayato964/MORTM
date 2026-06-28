@@ -535,6 +535,10 @@ class MORTMTrainSet(AbstractTrainSet):
 
         cumulative_mask = torch.cumsum(is_start_token, dim=1)
         mask_x = (cumulative_mask > 0).long()
+        # foundation事前学習: <MGEN>/<CGEN>/<META>マーカーを含まない系列は
+        # 全トークンで損失を計算する(マスク全0→loss0→未学習 を回避)。
+        has_marker = is_start_token.any(dim=1, keepdim=True)
+        mask_x = torch.where(has_marker.bool(), mask_x, torch.ones_like(mask_x))
         return mask_x.to(x.device)
 
 

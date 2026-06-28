@@ -421,6 +421,35 @@ class NoteDense(SpecialToken):
         for i in range(1, 11):
             tokens[f'<NOTE_DENSE_{i}>'] = base + i - 1
 
+
+class Genre(SpecialToken):
+    """ジャンルトークン (MIDICaps 用)。<GENRE_xxx> を 42 種登録する。
+    get_token_converter_pro の末尾に追加されるため、既存トークンIDをずらさずに
+    末尾(現状 647 以降)へ採番される。embedding/Wout を SFT でフル学習して意味を獲得する。
+    """
+    # MIDICaps の 42 ジャンル (sorted 固定。この順序が ID 採番順)
+    GENRES = [
+        "80s", "90s", "alternative", "ambient", "blues", "celtic", "chillout",
+        "classical", "country", "dance", "drumnbass", "easylistening", "electronic",
+        "electropop", "experimental", "folk", "funk", "hiphop", "house", "indie",
+        "instrumentalpop", "instrumentalrock", "jazz", "jazzfusion", "latin", "lounge",
+        "metal", "newage", "orchestral", "pop", "popfolk", "poprock", "punkrock",
+        "reggae", "rock", "soundtrack", "swing", "symphonic", "synthpop", "techno",
+        "trance", "world",
+    ]
+
+    def __init__(self, convert_type: int):
+        super().__init__("<GENRE>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+    def _set_tokens(self, tokens: dict):
+        base = len(tokens)
+        for i, g in enumerate(self.GENRES):
+            tokens[f'<GENRE_{g}>'] = base + i
+
+
 class Key(MusicToken):
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int,
                   container: ShiftTimeContainer) -> int | str | None:
