@@ -450,6 +450,39 @@ class Genre(SpecialToken):
             tokens[f'<GENRE_{g}>'] = base + i
 
 
+class Thinking(SpecialToken):
+    """CoT(Chain-of-Thought)トリガー <thinking>。
+    条件付きsystemタグの末尾に置かれると、生成タスクで <MGEN> の後に
+    フルメタ(=systemタグ)を明示的に予測してから MIDI を生成する。
+    tokenizer 末尾追加(Genreの後)で既存IDをずらさない。
+    """
+    def __init__(self, convert_type: int):
+        super().__init__("<thinking>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+
+class AnalysisTrigger(SpecialToken):
+    """分析タスクのトリガー特殊トークン。MIDI→メタ予測(生成の逆)。
+    旋律の後にこれらを置き、以降に分析対象(答え)を予測させる。
+    <META> は既存。ここでは属性別の <KEY>/<DENCE>/<GENRE>/<LENGTH> を追加する。
+    tokenizer 末尾追加(<thinking>の後)で既存IDをずらさない。
+    """
+    TRIGGERS = ["<KEY>", "<DENCE>", "<GENRE>", "<LENGTH>"]
+
+    def __init__(self, convert_type: int):
+        super().__init__("<ANALYSIS>", convert_type)
+
+    def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int, container: ShiftTimeContainer) -> int | str | None:
+        pass
+
+    def _set_tokens(self, tokens: dict):
+        base = len(tokens)
+        for i, t in enumerate(self.TRIGGERS):
+            tokens[t] = base + i
+
+
 class Key(MusicToken):
     def get_token(self, inst: Instrument, back_notes: Note, note: Note, tempo: int,
                   container: ShiftTimeContainer) -> int | str | None:

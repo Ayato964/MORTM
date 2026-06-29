@@ -63,6 +63,8 @@ def get_token_converter_pro(convert: int, old_version=True) -> List[Token]:
     register.append(GenMeasureCount(convert))
     register.append(NoteDense(convert))
     register.append(Genre(convert))  # ★末尾追加: 42ジャンルを ID 647.. に採番(既存IDは不変)
+    register.append(Thinking(convert))  # ★末尾追加: CoTトリガー <thinking> (ID 689)
+    register.append(AnalysisTrigger(convert))  # ★末尾追加: 分析トリガー <KEY>/<DENCE>/<GENRE>/<LENGTH> (ID 690-693)
     return register
 
 

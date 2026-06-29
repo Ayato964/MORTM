@@ -463,23 +463,47 @@ class GenerationDataMaker(FoundationDataMaker):
     責務は SFT 用の生成タスク列生成であり、事前学習(convert)とは分離する。
     """
 
-    def _build_gen_field(self, seqs: dict, programs: List[str]) -> np.ndarray:
-        """生成ターゲット: <MGEN> [<INST_X> seq <ESEQ>]* <TE> を構築する。
-        loss_mask が <MGEN> 以降のみ損失計算するため、生成対象(CONST)はここに置く。"""
+    COT_PROB = 0.5  # meta_past/meta_future で CoT(<thinking>+フルmeta予測)を有効にする確率
+
+    def _build_gen_field(self, seqs: dict, programs: List[str], cot_meta=None) -> np.ndarray:
+        """生成ターゲット: <MGEN> [cot_meta] [<INST_X> seq <ESEQ>]* <TE> を構築する。
+        loss_mask が <MGEN> 以降のみ損失計算するため、生成対象(CONST)はここに置く。
+        cot_meta: CoT時、<MGEN>直後に予測させるフルmeta(<SYSTEM>..<TAG_END>)のトークン配列。"""
         s_range = self.tokenizer.get_length_tuple("s")
-        field = np.array([self.tokenizer.get("<MGEN>")], dtype=int)
+        parts = [np.array([self.tokenizer.get("<MGEN>")], dtype=int)]
+        if cot_meta is not None:
+            parts.append(np.asarray(cot_meta, dtype=int))  # CoT: フルmetaを先に予測してから生成
         for prog in programs:
             seq = seqs[prog]
             if not np.any(np.isin(seq, np.arange(s_range[0], s_range[1]))):
                 continue
-            framed = np.concatenate([
+            parts.append(np.concatenate([
                 np.array([self.tokenizer.get(f"<INST_{prog}>")], dtype=int),
                 seq,
                 np.array([self.tokenizer.get("<ESEQ>")], dtype=int),
-            ])
-            field = np.concatenate([field, framed])
-        field = np.concatenate([field, np.array([self.tokenizer.get("<TE>")], dtype=int)])
-        return field
+            ]))
+        parts.append(np.array([self.tokenizer.get("<TE>")], dtype=int))
+        return np.concatenate(parts)
+
+    def _build_partial_system(self, active_program_info, gmc_tok, genre_tokens, key_tok,
+                              inc_density, inc_length, inc_genre, inc_key, thinking):
+        """条件付きsystemタグ(部分meta)を構築。指定属性のみ含める。
+        順序は make_system_prompt 準拠: <SYSTEM> (<INST>[<DENSE>])* [GMC] [genre] [key] [<thinking>] <TAG_END>"""
+        blk = [self.tokenizer.get("<SYSTEM>")]
+        for prog, dens in active_program_info:
+            blk.append(self.tokenizer.get(f"<INST_{prog}>"))   # 楽器は構造上常に含める
+            if inc_density and dens is not None:
+                blk.append(int(dens))
+        if inc_length and gmc_tok is not None:
+            blk.append(int(gmc_tok))
+        if inc_genre and genre_tokens:
+            blk.extend(int(g) for g in genre_tokens)
+        if inc_key and key_tok is not None:
+            blk.append(int(key_tok))
+        if thinking:
+            blk.append(self.tokenizer.get("<thinking>"))       # systemタグ末尾にCoTトリガー
+        blk.append(self.tokenizer.get("<TAG_END>"))
+        return np.array(blk, dtype=int)
 
     def convert_generation_sft(self, tasks=("meta", "meta_past", "meta_future"),
                                genre_tokens=None, *args, **kwargs):
@@ -579,20 +603,44 @@ class GenerationDataMaker(FoundationDataMaker):
             system_prompt = self.converter.make_system_prompt(
                 0, active_program_info, call_function=_append_measure_count)
             eos_token = np.array([system_prompt[0]], dtype=int)
-            system_block = np.array(system_prompt[1:], dtype=int)  # <SYSTEM>..<TAG_END>
+            full_system_block = np.array(system_prompt[1:], dtype=int)  # フル <SYSTEM>..<TAG_END>
 
-            gen_field = self._build_gen_field(const_seqs, active_programs)  # <MGEN>..<TE>
+            # 部分meta構築用のパーツ(key/GMC)を抽出
+            gmc_tok = self.tokenizer.get(f"<GEN_MEASURE_COUNT_{const_len}>")
+            key_lo, key_hi = self.tokenizer.get_length_tuple("k")
+            key_cands = [int(t) for t in full_system_block if key_lo <= int(t) < key_hi]
+            key_tok = key_cands[0] if key_cands else None
 
             for task in tasks:
                 if task == "meta":
-                    cond = []
-                elif task == "meta_past":
-                    cond = [self._build_melody_block("<PAST_M>", past_seqs, active_programs)]
-                elif task == "meta_future":
-                    cond = [self._build_melody_block("<FUTURE_M>", future_seqs, active_programs)]
+                    # メタ→MIDI: フルmeta入力、CoTなし(従来通り)
+                    sample = np.concatenate([
+                        eos_token, full_system_block,
+                        self._build_gen_field(const_seqs, active_programs),
+                    ])
+                elif task in ("meta_past", "meta_future"):
+                    marker = "<PAST_M>" if task == "meta_past" else "<FUTURE_M>"
+                    seqs = past_seqs if task == "meta_past" else future_seqs
+                    cond_block = self._build_melody_block(marker, seqs, active_programs)
+                    # CoT有無をランダム決定
+                    cot = random.random() < self.COT_PROB
+                    # 部分meta: 各属性をランダムに含める(楽器は常に含む)
+                    partial_system = self._build_partial_system(
+                        active_program_info, gmc_tok, genre_tokens, key_tok,
+                        inc_density=random.random() < 0.5,
+                        inc_length=random.random() < 0.5,
+                        inc_genre=random.random() < 0.5,
+                        inc_key=random.random() < 0.5,
+                        thinking=cot,
+                    )
+                    # CoT時のみ <MGEN> 直後にフルmeta(=full_system_block)を予測させる
+                    cot_meta = full_system_block if cot else None
+                    gen_field = self._build_gen_field(const_seqs, active_programs, cot_meta=cot_meta)
+                    sample = np.concatenate([eos_token, partial_system, cond_block, gen_field])
+                    if cot:
+                        counts["_cot"] = counts.get("_cot", 0) + 1
                 else:
                     continue
-                sample = np.concatenate([eos_token, system_block, *cond, gen_field])
                 self.aya_node.append(sample)
                 counts[task] += 1
 
@@ -604,4 +652,113 @@ class GenerationDataMaker(FoundationDataMaker):
         self.stats["total_samples"] = total
         self.stats["total_tokens"] = total_tokens
         print(f"[FoundationDataMaker.SFT] 生成タスク完了: {total} サンプル ({counts})  総トークン {total_tokens}")
+        return self.stats
+
+
+class AnalysisDataMaker(FoundationDataMaker):
+    """分析SFTタスク (MIDI -> メタ予測。生成の逆) のシーケンス生成器。
+
+    構造: <EOS> <CONST_M>[旋律]<TAG_END> <TRIGGER> [予測対象(答え)] <TE>
+      <META>  : フルmeta(楽器別密度/長さ/ジャンル/キー)
+      <KEY>   : k_<key>
+      <DENCE> : <INST_x><NOTE_DENSE_x> (楽器別)
+      <GENRE> : <GENRE_xxx>
+      <LENGTH>: <GEN_MEASURE_COUNT_n>
+    loss_mask が <TRIGGER> 以降のみ損失計算するため、予測対象はトリガー後に置く。
+    """
+
+    def convert_analysis_sft(self, tasks=("meta", "key", "dence", "genre", "length"),
+                             genre_tokens=None, *args, **kwargs):
+        if self.is_error:
+            return self.stats
+        measure_token_id = self.tokenizer.get("<SME>")
+        s_e = self.tokenizer.get_length_tuple("s")
+        valid_programs = [p for p in self.converter.program_list if p in self.seq_dict]
+        if not valid_programs:
+            return self.stats
+        seq_inds = {p: np.where(self.seq_dict[p] == measure_token_id)[0] for p in valid_programs}
+        inst_finish_dict = {p: False for p in valid_programs}
+        counts = {t: 0 for t in tasks}
+        now_measure = 0
+
+        while not all(inst_finish_dict.values()):
+            const_len = random.randint(self.min_measure, self.max_measure)  # 分析対象の長さも可変
+            const_seqs = {}
+            active_program_info = []
+            is_skip = False
+            for program in valid_programs:
+                if inst_finish_dict[program]:
+                    continue
+                inds = seq_inds[program]
+                if now_measure + const_len >= len(inds):
+                    inst_finish_dict[program] = True
+                    continue
+                cs = self.seq_dict[program][inds[now_measure]:inds[now_measure + const_len]]
+                if not np.any(np.isin(cs, np.arange(s_e[0], s_e[1]))):
+                    continue
+                if not self._check_instrument_constraint(program, cs):
+                    continue
+                dt = self._calculate_density_token(cs, program)
+                if dt is None:
+                    is_skip = True
+                    break
+                const_seqs[program] = cs
+                active_program_info.append((program, dt))
+
+            if is_skip or len(active_program_info) == 0:
+                if all(inst_finish_dict.values()):
+                    break
+                now_measure += const_len
+                continue
+
+            active_programs = [p for p, _ in active_program_info]
+            eos = np.array([self.tokenizer.get("<EOS>")], dtype=int)
+            # 分析対象の旋律ブロック: <CONST_M>[<INST> seq <ESEQ>]*<TAG_END>
+            music_block = self._build_melody_block("<CONST_M>", const_seqs, active_programs)
+
+            # フルmeta(make_system_promptのSYSTEM..TAG_END中身)からkey/各トークンを取得
+            def _amc(p):
+                p.append(self.tokenizer.get(f"<GEN_MEASURE_COUNT_{const_len}>"))
+                if genre_tokens:
+                    p.extend(genre_tokens)
+            full_sys = self.converter.make_system_prompt(0, active_program_info, call_function=_amc)
+            full_meta = np.array(full_sys[1:], dtype=int)  # <SYSTEM>..<TAG_END>(=メタ分析の答え)
+            key_lo, key_hi = self.tokenizer.get_length_tuple("k")
+            key_toks = [int(t) for t in full_meta if key_lo <= int(t) < key_hi]
+
+            # 各分析タスクの (トリガー, 予測対象) を構築
+            def target_for(task):
+                if task == "meta":
+                    return self.tokenizer.get("<META>"), list(full_meta)
+                if task == "key":
+                    return self.tokenizer.get("<KEY>"), key_toks
+                if task == "dence":
+                    tgt = []
+                    for prog, dt in active_program_info:
+                        tgt += [self.tokenizer.get(f"<INST_{prog}>"), int(dt)]
+                    return self.tokenizer.get("<DENCE>"), tgt
+                if task == "genre":
+                    return self.tokenizer.get("<GENRE>"), list(genre_tokens or [])
+                if task == "length":
+                    return self.tokenizer.get("<LENGTH>"), [self.tokenizer.get(f"<GEN_MEASURE_COUNT_{const_len}>")]
+                return None, None
+
+            te = np.array([self.tokenizer.get("<TE>")], dtype=int)
+            for task in tasks:
+                trig, tgt = target_for(task)
+                if trig is None or not tgt:
+                    continue
+                sample = np.concatenate([eos, music_block,
+                                         np.array([trig] + list(tgt), dtype=int), te])
+                self.aya_node.append(sample)
+                counts[task] += 1
+
+            now_measure += const_len
+
+        self.stats["sft_analysis_counts"] = counts
+        total = sum(counts.values())
+        total_tokens = int(sum(len(arr) for arr in self.aya_node[1:]))
+        self.stats["total_samples"] = total
+        self.stats["total_tokens"] = total_tokens
+        print(f"[AnalysisDataMaker] 分析タスク完了: {total} サンプル ({counts})  総トークン {total_tokens}")
         return self.stats

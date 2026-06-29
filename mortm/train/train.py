@@ -528,10 +528,13 @@ class MORTMTrainSet(AbstractTrainSet):
             })
 
     def loss_mask(self, x: torch.Tensor) -> torch.Tensor:
-        mgen_id = self.tokenizer.get("<MGEN>")
-        cgen_id = self.tokenizer.get("<CGEN>")
-        meta_id = self.tokenizer.get("<META>")
-        is_start_token = ((x == mgen_id) | (x == cgen_id) | (x == meta_id)).long()
+        # 生成: <MGEN>/<CGEN>, メタ分析: <META>, 属性別分析: <KEY>/<DENCE>/<GENRE>/<LENGTH>
+        # これら(トリガー)以降=予測対象(答え)のみ損失。入力(旋律/条件)は損失しない。
+        start_ids = [self.tokenizer.get(t) for t in
+                     ("<MGEN>", "<CGEN>", "<META>", "<KEY>", "<DENCE>", "<GENRE>", "<LENGTH>")]
+        is_start_token = torch.zeros_like(x, dtype=torch.long)
+        for sid in start_ids:
+            is_start_token = is_start_token | (x == sid).long()
 
         cumulative_mask = torch.cumsum(is_start_token, dim=1)
         mask_x = (cumulative_mask > 0).long()
