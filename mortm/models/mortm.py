@@ -159,8 +159,8 @@ class MORTM(nn.Module):
                 eseq = eseq.item()
 
             if len(pad) != 0:
-                start = pad[0]
-                end = pad[-1]
+                start = pad[0].item()
+                end = pad[-1].item()
                 prompt.append(seq[:start].cpu().numpy())
                 np_seq = np.append(np_seq, seq[:start].cpu().numpy())
                 if eseq == len(seq):
@@ -171,12 +171,13 @@ class MORTM(nn.Module):
                     np_seq = np.append(np_seq, seq[end+1:eseq+1].cpu().numpy())
             else:
                 gen_id = ((seq == tokenizer.get("<MGEN>")) | (seq == tokenizer.get("<CGEN>"))).nonzero(as_tuple=True)[0]
+                gen_start = gen_id[0].item() if len(gen_id) > 0 else 0
                 if eseq == len(seq):
-                    generated.append(seq[gen_id+1:].cpu().numpy())
+                    generated.append(seq[gen_start+1:].cpu().numpy())
                     np_seq = np.append(np_seq, seq.cpu().numpy())
                 else:
-                    generated.append(seq[gen_id:eseq+1].cpu().numpy())
-                    np_seq = np.append(np_seq,seq[:eseq+1].cpu().numpy())
+                    generated.append(seq[gen_start:eseq+1].cpu().numpy())
+                    np_seq = np.append(np_seq, seq[:eseq+1].cpu().numpy())
             np_all_tokens.append(np_seq)
             if np_seq.max() > self.args.vocab_size:
                 raise ValueError(
