@@ -1,0 +1,201 @@
+song_hash	midi_relpath	pipeline_key(music21)	human_key(記入)	match(y/n)
+002918fd6f890918f50b8752665f94b4	GMD/training/no-drums/15/002918fd6f890918f50b8752665f94b4.mid	E minor	E minor	y
+017e52b4bfa48cac5fc2207c61352d4f	GMD/training/no-drums/38/017e52b4bfa48cac5fc2207c61352d4f.mid	G major	G major	y
+03238b661d42d3c2df2d5d1ad5093b3f	GMD/training/no-drums/23/03238b661d42d3c2df2d5d1ad5093b3f.mid	B minor	B minor	y
+03a7b8f60832ccbe8570915a69be239c	GMD/training/no-drums/41/03a7b8f60832ccbe8570915a69be239c.mid	B- major	A minor	n
+0558bbfad945477a196fdd8488c47064	GMD/training/no-drums/37/0558bbfad945477a196fdd8488c47064.mid	G major	A minor	n
+09e33f530ffa8c7676cd15436811fb88	GMD/training/no-drums/28/09e33f530ffa8c7676cd15436811fb88.mid	C minor	C minor	y
+0abc04d6846a3a315f9601cd004d7029	GMD/training/all-instruments-with-drums/12/0abc04d6846a3a315f9601cd004d7029.mid	C minor	C minor
+0c50904756a30e1d6c23b302b066faf2	GMD/training/all-instruments-with-drums/4/0c50904756a30e1d6c23b302b066faf2.mid	E- major	F major	n
+0d371c88698d37caf200c2d54f1de660	GMD/training/no-drums/24/0d371c88698d37caf200c2d54f1de660.mid	E- major	E- major
+0f447ecf9a811e79ee81a0ceb4a04002	GMD/training/all-instruments-with-drums/10/0f447ecf9a811e79ee81a0ceb4a04002.mid	C major	F major	n
+100dfdad55e3f27676a57a75db1de081	GMD/training/no-drums/10/100dfdad55e3f27676a57a75db1de081.mid	A major	G minor	n
+10505cb7bad53b33f5157b3629dba9a3	GMD/training/all-instruments-with-drums/9/10505cb7bad53b33f5157b3629dba9a3.mid	B major	B major	y
+105662d8eb4e16d98ee61719c239bab2	GMD/training/no-drums/22/105662d8eb4e16d98ee61719c239bab2.mid	D major	D minor	n
+15a88d9265d934387916587cb20df073	GMD/training/no-drums/16/15a88d9265d934387916587cb20df073.mid	A- major	A- major	y
+16a94b81fe890ead0cfac72d4a3bb2c0	GMD/training/all-instruments-with-drums/12/16a94b81fe890ead0cfac72d4a3bb2c0.mid	C major	C major	y
+1736460d90fde0c623e8d9cb893bae01	GMD/training/no-drums/39/1736460d90fde0c623e8d9cb893bae01.mid	E minor	E minor	y
+1a678660465a5a933506009094de2827	GMD/training/no-drums/1/1a678660465a5a933506009094de2827.mid	E minor	E minor	y
+1b1c682c01c8681592cb1aeff98413ab	GMD/training/no-drums/9/1b1c682c01c8681592cb1aeff98413ab.mid	G major	G major	y
+1c259671033249c25fe9526ba349828e	GMD/training/no-drums/51/1c259671033249c25fe9526ba349828e.mid	E- major	E- major	y
+1c9361bf86c62e3dd9b8063cdedc2466	GMD/training/no-drums/10/1c9361bf86c62e3dd9b8063cdedc2466.mid	G major	G major	y
+1d319be82d79da8732c0b86e3351b155	GMD/training/no-drums/12/1d319be82d79da8732c0b86e3351b155.mid	B minor	E minor	n
+1e6f28fea4cb53ad56093201332667fa	GMD/training/no-drums/41/1e6f28fea4cb53ad56093201332667fa.mid	B- major	B- major
+1e9384d76ac309e536e3b2d2a2eed180	GMD/training/all-instruments-with-drums/4/1e9384d76ac309e536e3b2d2a2eed180.mid	C major	C major	y
+1f702b860d00eab32574ed0a7d6ee187	GMD/training/no-drums/42/1f702b860d00eab32574ed0a7d6ee187.mid	E major	F major	n
+20a65eb162d04ba69d12d29848f57f54	GMD/training/all-instruments-with-drums/4/20a65eb162d04ba69d12d29848f57f54.mid	C major	C major	y
+218f2b2d5fb56edf9c6c977a30c79c66	GMD/training/no-drums/6/218f2b2d5fb56edf9c6c977a30c79c66.mid	B- major	B- major	y
+2196ba36643a874520658800c1051908	GMD/training/all-instruments-with-drums/5/2196ba36643a874520658800c1051908.mid	G major	G major	y
+228682c50ca17da2d731bc74232e8409	GMD/training/no-drums/20/228682c50ca17da2d731bc74232e8409.mid	D minor	D minor	y
+22da6d81cf6ee9166aacb5d32f7c61bd	GMD/training/no-drums/43/22da6d81cf6ee9166aacb5d32f7c61bd.mid	G major	C major	n
+256b441166636c5606a269c94b30a85d	GMD/training/all-instruments-with-drums/10/256b441166636c5606a269c94b30a85d.mid	B- major	B- major
+25f7bda39a2a5d7b9f876f8c8853fe3c	GMD/training/no-drums/26/25f7bda39a2a5d7b9f876f8c8853fe3c.mid	A- major	A- major	y
+28197a500de808bd0d2371497a572588	GMD/training/all-instruments-with-drums/9/28197a500de808bd0d2371497a572588.mid	D major	D major	y
+2909ffc32eb26e1d3a3fb78fadc361d5	GMD/training/no-drums/32/2909ffc32eb26e1d3a3fb78fadc361d5.mid	E- major	B major	n
+2ac27257f7cd4318326322e48a0d5bc8	GMD/training/no-drums/53/2ac27257f7cd4318326322e48a0d5bc8.mid	C# major	C# major	y
+2b74f2d5d72515e913c2ac49b183a63e	GMD/training/no-drums/47/2b74f2d5d72515e913c2ac49b183a63e.mid	F minor	F minor	y
+2be6dbe6e58a8cebf78d600d12110e38	GMD/training/all-instruments-with-drums/2/2be6dbe6e58a8cebf78d600d12110e38.mid	C# major	C# major	y
+2c9806979b5bf2cffc37c9b3c70731d5	GMD/training/all-instruments-with-drums/1/2c9806979b5bf2cffc37c9b3c70731d5.mid	F major	F major
+2d9fbcb7b23f60f643c6677b890500ed	GMD/training/no-drums/41/2d9fbcb7b23f60f643c6677b890500ed.mid	A major	C# minor	n
+2de5c6c878f69306a56285039927f2ad	GMD/training/all-instruments-with-drums/6/2de5c6c878f69306a56285039927f2ad.mid	A major	A major	y
+2e6586c5dd3a40c07827e32b0ebff812	GMD/training/no-drums/47/2e6586c5dd3a40c07827e32b0ebff812.mid	C# major	C# major	y
+2fde7d2ed8f3789f296d7a1a8433aec3	GMD/training/all-instruments-with-drums/11/2fde7d2ed8f3789f296d7a1a8433aec3.mid	C major	C major	y
+30db46541990d1dde9b1e210465cda2a	GMD/training/no-drums/45/30db46541990d1dde9b1e210465cda2a.mid	A major	A major	y
+30e6abe2e495072a08bb9627faa8cca3	GMD/training/no-drums/31/30e6abe2e495072a08bb9627faa8cca3.mid	C major	C major	y
+32b83747a09eca686d58859b5bf3dd1d	GMD/training/no-drums/53/32b83747a09eca686d58859b5bf3dd1d.mid	F minor	F minor	y
+34426912d66f76f813f2352ebb023e7c	GMD/training/all-instruments-with-drums/1/34426912d66f76f813f2352ebb023e7c.mid	F# major	F# major	y
+3469639ffe3e2a7eaf8e77724c96a504	GMD/training/no-drums/26/3469639ffe3e2a7eaf8e77724c96a504.mid	G major	G major	y
+34e3f1f906c418106160f752806975a9	GMD/training/no-drums/23/34e3f1f906c418106160f752806975a9.mid	A minor	A minor	y
+3512c3d67c6a588415053824315ab12a	GMD/training/all-instruments-with-drums/4/3512c3d67c6a588415053824315ab12a.mid	F major	F major	y
+36894f79c118dc8aca69c955f387dc3b	GMD/training/all-instruments-with-drums/2/36894f79c118dc8aca69c955f387dc3b.mid	C major	C major	y
+3947588b20b0650562a16b4b68b675cf	GMD/training/no-drums/47/3947588b20b0650562a16b4b68b675cf.mid	E- major	E minor	n
+3ac69cddd999017b3240beff62ce579b	GMD/training/no-drums/9/3ac69cddd999017b3240beff62ce579b.mid	D major	D major
+3b7e397a6bfa21f2e206158a00e39a40	GMD/training/no-drums/10/3b7e397a6bfa21f2e206158a00e39a40.mid	G major	G major
+3cc85bea2dd47197cb7b3e799c35617c	GMD/training/no-drums/32/3cc85bea2dd47197cb7b3e799c35617c.mid	G major	G major	y
+3ef035b9157facbc9f5ab62c49c3417f	GMD/training/no-drums/31/3ef035b9157facbc9f5ab62c49c3417f.mid	G major	G major	y
+4128a2c8cc18aa2edc8e2642b7d128b9	GMD/training/all-instruments-with-drums/6/4128a2c8cc18aa2edc8e2642b7d128b9.mid	F# minor	F# minor	y
+41ba88a414be8cb4d84452dcb0ab9779	GMD/training/no-drums/31/41ba88a414be8cb4d84452dcb0ab9779.mid	C major	C major	y
+431a7c8b372958f3f7cb7f895e5ad448	GMD/training/all-instruments-with-drums/13/431a7c8b372958f3f7cb7f895e5ad448.mid	A major	B minor	n
+475631b3e52a5f731d070bdfb0f9b2d5	GMD/training/all-instruments-with-drums/9/475631b3e52a5f731d070bdfb0f9b2d5.mid	B- major	A major	n
+48740ef5f43e5693b39b40ec5954e493	GMD/training/no-drums/42/48740ef5f43e5693b39b40ec5954e493.mid	F major	C major	n
+48d6e50d3d7c242d6753c7f42bbc5a95	GMD/training/all-instruments-with-drums/5/48d6e50d3d7c242d6753c7f42bbc5a95.mid	A major	D major	n
+49d0ad77494a9e9761005ccba7f9f19b	GMD/training/no-drums/48/49d0ad77494a9e9761005ccba7f9f19b.mid	E minor	E minor	y
+4a29ea75262aeeb2da499bfadd04ed05	GMD/training/no-drums/12/4a29ea75262aeeb2da499bfadd04ed05.mid	E minor	E minor
+4a6d8dc175f6b75b9fa9ad307b920f08	GMD/training/all-instruments-with-drums/6/4a6d8dc175f6b75b9fa9ad307b920f08.mid	B minor	B- major	n
+4aefd876eb40b907499224e50e980c61	GMD/training/all-instruments-with-drums/1/4aefd876eb40b907499224e50e980c61.mid	B- major	B- major	y
+4b2f5aa27d54a02942cdf52180c210c1	GMD/training/no-drums/50/4b2f5aa27d54a02942cdf52180c210c1.mid	C major	C major	y
+4c88fe0de9f1e7f74ab323251cd67c98	GMD/training/all-instruments-with-drums/13/4c88fe0de9f1e7f74ab323251cd67c98.mid	A major	A major	y
+503a65597ea9bd55ad37396847b33d5f	GMD/training/no-drums/53/503a65597ea9bd55ad37396847b33d5f.mid	G major	G major	y
+54828daf29347cf86077abf00ea52156	GMD/training/no-drums/2/54828daf29347cf86077abf00ea52156.mid	C minor	C minor	y
+599b39aff6b2b7e601ccd62a27cab940	GMD/training/no-drums/8/599b39aff6b2b7e601ccd62a27cab940.mid	B major	B major	y
+5aa9e11f2f8c35154d18b18adda88fbd	GMD/training/no-drums/13/5aa9e11f2f8c35154d18b18adda88fbd.mid	A major	C major	n
+5d3de7d103d7e7b015b47dbf78052803	GMD/training/all-instruments-with-drums/9/5d3de7d103d7e7b015b47dbf78052803.mid	B- major	B- major	y
+5e9b2f211e919f6e8bb9181e8c5fc13d	GMD/training/all-instruments-with-drums/13/5e9b2f211e919f6e8bb9181e8c5fc13d.mid	B- major	B- major	y
+6269e2f22a2825cf71773d071c3bfaa5	GMD/training/all-instruments-with-drums/14/6269e2f22a2825cf71773d071c3bfaa5.mid	F major	E major	n
+6316bef74bb42b8a5753bcbbae48efbb	GMD/training/no-drums/20/6316bef74bb42b8a5753bcbbae48efbb.mid	G major	G major	y
+63a6f4d99395c525595b09c9f549525b	GMD/training/all-instruments-with-drums/1/63a6f4d99395c525595b09c9f549525b.mid	C# major	C# major
+63dc9b17b50e1386b233269bfc29d590	GMD/training/all-instruments-with-drums/14/63dc9b17b50e1386b233269bfc29d590.mid	G major	G major	y
+64a2b72d15749812bed5c38f0e0b65c4	GMD/training/no-drums/42/64a2b72d15749812bed5c38f0e0b65c4.mid	E major	E major	y
+64bbd8d576a69bd8b5517401fbf1fa49	GMD/training/all-instruments-with-drums/13/64bbd8d576a69bd8b5517401fbf1fa49.mid	B- major	F major	n
+6597d75f3f86f9ba4e5b1c18dd39f066	GMD/training/all-instruments-with-drums/1/6597d75f3f86f9ba4e5b1c18dd39f066.mid	E- major	E- major	y
+65ddd4d1d960eda39d535edefb580b00	GMD/training/all-instruments-with-drums/1/65ddd4d1d960eda39d535edefb580b00.mid	G major	G major	y
+65e62d702274a14c6fde473b588671bb	GMD/training/no-drums/3/65e62d702274a14c6fde473b588671bb.mid	C minor	G minor	n
+661afb834cea28713b9b3eaa75f54d24	GMD/training/no-drums/26/661afb834cea28713b9b3eaa75f54d24.mid	C major	C major	y
+6773585f295f0000e0d2a32e983818b0	GMD/training/no-drums/9/6773585f295f0000e0d2a32e983818b0.mid	F major	F major	y
+67d533e1345cf678a58dd5042216f165	GMD/training/all-instruments-with-drums/14/67d533e1345cf678a58dd5042216f165.mid	A minor	D major	n
+694d69d2896497ec41b14b2f40404d8e	GMD/training/no-drums/43/694d69d2896497ec41b14b2f40404d8e.mid	D minor	D minor	y
+6a054501a3ceffa80e3cd054b341d851	GMD/training/no-drums/53/6a054501a3ceffa80e3cd054b341d851.mid	F major	F major	y
+6a088f50b517a68311323fffe0d56097	GMD/training/no-drums/44/6a088f50b517a68311323fffe0d56097.mid	G minor	G minor
+6a3d4acf1933a626cf0f87cfbc99d4dc	GMD/training/no-drums/53/6a3d4acf1933a626cf0f87cfbc99d4dc.mid	G minor	G minor	y
+6b98b4e9767efe50b29462e30e41ce41	GMD/training/no-drums/7/6b98b4e9767efe50b29462e30e41ce41.mid	F major	F major	y
+6b9d9fdfbd4d180e94bb5c3d65162df7	GMD/training/no-drums/4/6b9d9fdfbd4d180e94bb5c3d65162df7.mid	C major	A- major	n
+6d8b7d6a7e49640d51bc78c0f2ef7df2	GMD/training/no-drums/28/6d8b7d6a7e49640d51bc78c0f2ef7df2.mid	D minor	D minor	y
+6e0b33156bc06ea8fdebf9b715d46eea	GMD/training/all-instruments-with-drums/3/6e0b33156bc06ea8fdebf9b715d46eea.mid	G minor	G minor	y
+6efaac8e922bf7a65ee323ba6d5f0574	GMD/training/no-drums/31/6efaac8e922bf7a65ee323ba6d5f0574.mid	C major	C major	y
+70381f07e3c374922e58fdab8aa6d83e	GMD/training/all-instruments-with-drums/11/70381f07e3c374922e58fdab8aa6d83e.mid	B- minor	B- minor	y
+710bc1721b0f476a20f25630e56e587e	GMD/training/no-drums/31/710bc1721b0f476a20f25630e56e587e.mid	E- minor	E- minor
+711c688fd630a5b79910145dc21759de	GMD/training/all-instruments-with-drums/2/711c688fd630a5b79910145dc21759de.mid	G major	G major	y
+71c2ab7cb7cc139199fcc36ef6ae3b7b	GMD/training/no-drums/54/71c2ab7cb7cc139199fcc36ef6ae3b7b.mid	E major	E major	y
+723516e3bc3779f6b96e07b863747484	GMD/training/no-drums/31/723516e3bc3779f6b96e07b863747484.mid	Unknown	Unknown	y
+73a5d1a9edb6fde1dfb8aec38ee3c8ae	GMD/training/no-drums/47/73a5d1a9edb6fde1dfb8aec38ee3c8ae.mid	F major	F major	y
+78d4f383b6c2e85888c18fa2d1f5171f	GMD/training/no-drums/17/78d4f383b6c2e85888c18fa2d1f5171f.mid	C major	C major	y
+79178c8881c51a8ef894cb6cb371a358	GMD/training/all-instruments-with-drums/12/79178c8881c51a8ef894cb6cb371a358.mid	Unknown	C# major	n
+79882ca698a971391c43fd47f8f0017a	GMD/training/no-drums/39/79882ca698a971391c43fd47f8f0017a.mid	F# minor	F# minor	y
+798d81dc3006f2e6c621238b3d193f01	GMD/training/all-instruments-with-drums/3/798d81dc3006f2e6c621238b3d193f01.mid	F major	F major	y
+79bdedc7219bddd98f64b9e04ab01afe	GMD/training/all-instruments-with-drums/3/79bdedc7219bddd98f64b9e04ab01afe.mid	B- minor	B- minor	y
+7a9c9ccfe4624c1dc9bc08e2bb96711e	GMD/training/no-drums/10/7a9c9ccfe4624c1dc9bc08e2bb96711e.mid	B- minor	B major	n
+7aaed50cdf99fba3c47fcc8dcca8e48e	GMD/training/all-instruments-with-drums/2/7aaed50cdf99fba3c47fcc8dcca8e48e.mid	C# major	C# major	y
+7b085e60ebd8aa7f7cc0833fc46b3258	GMD/training/no-drums/17/7b085e60ebd8aa7f7cc0833fc46b3258.mid	G minor	C minor	n
+7c21109e3732fdcc1213d46d465d6974	GMD/training/all-instruments-with-drums/6/7c21109e3732fdcc1213d46d465d6974.mid	A minor	A minor	y
+7f0fa84ae1a8d5fed47a3c7d2f74d44e	GMD/training/all-instruments-with-drums/2/7f0fa84ae1a8d5fed47a3c7d2f74d44e.mid	D minor	D minor	y
+806d6e2f9bf1ee47928f8be9162a58d7	GMD/training/no-drums/20/806d6e2f9bf1ee47928f8be9162a58d7.mid	E- minor	F# minor	n
+80ace266a4de3f0817355a8c7b41a158	GMD/training/no-drums/8/80ace266a4de3f0817355a8c7b41a158.mid	C major	C major	y
+810ca6a31dbfb5c7e0114b3ab4067c15	GMD/training/no-drums/40/810ca6a31dbfb5c7e0114b3ab4067c15.mid	G major	G major
+85e29f1a671ed469fd1a99c12b1439dd	GMD/training/all-instruments-with-drums/13/85e29f1a671ed469fd1a99c12b1439dd.mid	F major	F major	y
+879216067b7701d6d21d7294fb5214dd	GMD/training/all-instruments-with-drums/6/879216067b7701d6d21d7294fb5214dd.mid	Unknown		
+87c4c4038fd9d1cb308db895c894b681	GMD/training/all-instruments-with-drums/2/87c4c4038fd9d1cb308db895c894b681.mid	D major	D major	y
+89dc0db1a1cff370aa9af38ace418830	GMD/training/no-drums/24/89dc0db1a1cff370aa9af38ace418830.mid	G major G major
+8d9ab92bbe6ac2c0b787356841ce73dd	GMD/training/all-instruments-with-drums/10/8d9ab92bbe6ac2c0b787356841ce73dd.mid	B- minor	B- minor	y
+8fa3b3530ea10a43902158ce4f8c3d58	GMD/training/all-instruments-with-drums/7/8fa3b3530ea10a43902158ce4f8c3d58.mid	B major	B major	y
+9127d4d162381a50eb4a5ce43168a137	GMD/training/no-drums/9/9127d4d162381a50eb4a5ce43168a137.mid	A major	F# minor	n
+91a74f876c942d44fbc84a9963016e5f	GMD/training/no-drums/35/91a74f876c942d44fbc84a9963016e5f.mid	A- major	A- major	y
+9511144da1b1e9a6bb876cad256967a8	GMD/training/no-drums/24/9511144da1b1e9a6bb876cad256967a8.mid	E- major	E- major	y
+951689e8dbe3a84638ef1267a06fbdcf	GMD/training/no-drums/54/951689e8dbe3a84638ef1267a06fbdcf.mid	F major	F major	y
+976b52da61533fdcb603b3380164a2fc	GMD/training/no-drums/34/976b52da61533fdcb603b3380164a2fc.mid	C minor	C minor	y
+9a30035ea8bb9c8f4e0fc517f298e7c5	GMD/training/no-drums/27/9a30035ea8bb9c8f4e0fc517f298e7c5.mid	A- major	A- major	y
+9ab8d8b7acab9bd3e586a4b75e393922	GMD/training/no-drums/49/9ab8d8b7acab9bd3e586a4b75e393922.mid	C minor	C minor	y
+9b815eb3b91dd14ff4ad170cbda05dae	GMD/training/all-instruments-with-drums/4/9b815eb3b91dd14ff4ad170cbda05dae.mid	F major	F major	y
+9c21486ed6013f242ec60b58252fcc47	GMD/training/no-drums/49/9c21486ed6013f242ec60b58252fcc47.mid	E minor	E minor	y
+9d010115c3c3ab1eea0bcc8b82826ae4	GMD/training/all-instruments-with-drums/9/9d010115c3c3ab1eea0bcc8b82826ae4.mid	C minor	C minor	y
+a398df19253135927eff15757aa96c63	GMD/training/all-instruments-with-drums/1/a398df19253135927eff15757aa96c63.mid	B- major	F major	n
+a3eeb347660f18210faffa231b38b1e7	GMD/training/all-instruments-with-drums/2/a3eeb347660f18210faffa231b38b1e7.mid	C# major	C# major	y
+a64b89c6ce9304c392912300c476af4b	GMD/training/no-drums/30/a64b89c6ce9304c392912300c476af4b.mid	E- major	E- major	y
+a82bacab5832d66a2bcd42c1db3f830c	GMD/training/all-instruments-with-drums/12/a82bacab5832d66a2bcd42c1db3f830c.mid	C major	C major	y
+a870ca2c75852fbc3a9fbe1c1619856e	GMD/training/no-drums/40/a870ca2c75852fbc3a9fbe1c1619856e.mid	D major	D major	y
+a8c01b123daa864631fe430fdd174053	GMD/training/all-instruments-with-drums/4/a8c01b123daa864631fe430fdd174053.mid	E major	E major	y
+aa6b9eaa11252f758a42d6ba7c216707	GMD/training/no-drums/48/aa6b9eaa11252f758a42d6ba7c216707.mid	F major	F major	y
+adbd38f2b10939e7f45d9dcc48d486fb	GMD/training/no-drums/7/adbd38f2b10939e7f45d9dcc48d486fb.mid	F major	F major	y
+af2c308d76134b07299a41ec67e0516f	GMD/training/all-instruments-with-drums/8/af2c308d76134b07299a41ec67e0516f.mid	G minor	G minor	y
+af41ebe9fbd3aa1e7d3b8d795ea3ea81	GMD/training/no-drums/26/af41ebe9fbd3aa1e7d3b8d795ea3ea81.mid	G major	G major	y
+b22a32d309525607bc837b0f33ea1255	GMD/training/no-drums/45/b22a32d309525607bc837b0f33ea1255.mid	G major	G major	y
+b27d4b357674f5afc741d771e188fdf9	GMD/training/no-drums/6/b27d4b357674f5afc741d771e188fdf9.mid	B minor	B minor
+b29e420865b89f61f10b2804e1901d7d	GMD/training/no-drums/37/b29e420865b89f61f10b2804e1901d7d.mid	E- major	E- major
+b355b6d511455780c50d1d4661302f20	GMD/training/all-instruments-with-drums/12/b355b6d511455780c50d1d4661302f20.mid	G major	G major	y
+b4ef0e1097e115ce6bd0e3014262e305	GMD/training/no-drums/48/b4ef0e1097e115ce6bd0e3014262e305.mid	D major	D major	y
+b8e042bd381574ef7474b8f89256fa62	GMD/training/all-instruments-with-drums/6/b8e042bd381574ef7474b8f89256fa62.mid	A minor	A minor	y
+ba3890dd1e9acdf5974aceb9ef3e3d59	GMD/training/no-drums/13/ba3890dd1e9acdf5974aceb9ef3e3d59.mid	E minor	E- minor
+ba472a90150cfb2eed3563e776e0dddb	GMD/training/no-drums/22/ba472a90150cfb2eed3563e776e0dddb.mid	A minor	A minor	y
+bb071605fa752257619688e443d17723	GMD/training/no-drums/3/bb071605fa752257619688e443d17723.mid	Unknown	C# minor	n
+bb906b8194d0ff9a5a59418c6037a273	GMD/training/no-drums/40/bb906b8194d0ff9a5a59418c6037a273.mid	Unknown	A minor	n
+bd62c4d8ab03838423ba30d57ca2da2f	GMD/training/no-drums/46/bd62c4d8ab03838423ba30d57ca2da2f.mid	F major	F major	y
+beff5abe07f788863cab860dd7dd437f	GMD/training/all-instruments-with-drums/8/beff5abe07f788863cab860dd7dd437f.mid	F# minor	A major	n
+c26492822398a46b4e05f4fb7d2c8953	GMD/training/no-drums/15/c26492822398a46b4e05f4fb7d2c8953.mid	E- major	A- major	n
+c31a36c8b8e451bb04ba33673c104bc8	GMD/training/all-instruments-with-drums/2/c31a36c8b8e451bb04ba33673c104bc8.mid	G major	G major	y
+c344f385760410e6b07c79e39cce2f2c	GMD/training/all-instruments-with-drums/11/c344f385760410e6b07c79e39cce2f2c.mid	B- major	B- major	y
+c378cdcf3a78bba23eb7a681466c8a65	GMD/training/no-drums/50/c378cdcf3a78bba23eb7a681466c8a65.mid	Unknown	F major	n
+c3cf43902a75d0004d6b12ba1f65d713	GMD/training/all-instruments-with-drums/12/c3cf43902a75d0004d6b12ba1f65d713.mid	D major	C major	n
+c3f00f0ce493ecb46b519bdc3b73bc98	GMD/training/no-drums/10/c3f00f0ce493ecb46b519bdc3b73bc98.mid	E major	E major	y
+c5d41906e44e15429e19ff33f72f60ca	GMD/training/no-drums/28/c5d41906e44e15429e19ff33f72f60ca.mid	G major	G major	y
+c7800b5dd86abacbccd721221fedef24	GMD/training/no-drums/14/c7800b5dd86abacbccd721221fedef24.mid	C major	C major	y
+c980489d2a07607a755b6f6ddb69cef9	GMD/training/no-drums/50/c980489d2a07607a755b6f6ddb69cef9.mid	C major	C major	y
+cb590abbdd3e76a1912d4ff934a0982d	GMD/training/all-instruments-with-drums/10/cb590abbdd3e76a1912d4ff934a0982d.mid	G major	G major	y
+cfb49b3f705e9c6422c88c139fc6ea3d	GMD/training/no-drums/2/cfb49b3f705e9c6422c88c139fc6ea3d.mid	F# major	F# major	y
+d086bd5096f790da8daf3e737c0cfe2e	GMD/training/no-drums/34/d086bd5096f790da8daf3e737c0cfe2e.mid	E- major	D major	n
+d172ee26564c4fd3b6e110f8cf3fc591	GMD/training/no-drums/27/d172ee26564c4fd3b6e110f8cf3fc591.mid	C# minor	C# minor	y
+d1750d060609475f99904fb1d3685bbd	GMD/training/no-drums/33/d1750d060609475f99904fb1d3685bbd.mid	C# minor	C# minor	y
+d36d57054cfd21bd65e3d9375e1c3136	GMD/training/all-instruments-with-drums/1/d36d57054cfd21bd65e3d9375e1c3136.mid	C major	C major	y
+d39010ea78f73b4596c9acfa44839625	GMD/training/all-instruments-with-drums/1/d39010ea78f73b4596c9acfa44839625.mid	G major	G minor	n
+d47dac4b0dd4b9ef34135c8fe70eaef3	GMD/training/no-drums/51/d47dac4b0dd4b9ef34135c8fe70eaef3.mid	E- minor	F# minor	n
+d7979fb801c0ad1ed618821f0c2623d3	GMD/training/no-drums/48/d7979fb801c0ad1ed618821f0c2623d3.mid	D minor	D minor	y
+d86353864f5f30040409f73a3652f11c	GMD/training/all-instruments-with-drums/6/d86353864f5f30040409f73a3652f11c.mid	F major	F major	y
+da0a28dcb7ec48bdd6dd2842058dc0bf	GMD/training/no-drums/47/da0a28dcb7ec48bdd6dd2842058dc0bf.mid	B- major	B- major	y
+da7d3e1c3f1b40e933dfbcb3fb5f99db	GMD/training/no-drums/40/da7d3e1c3f1b40e933dfbcb3fb5f99db.mid	D major	D major	y
+db4ccda12f1bba33b070d84165d41211	GMD/training/no-drums/27/db4ccda12f1bba33b070d84165d41211.mid	D major	D major	y
+df44db7bd3d4484d1173e26f526cc8ec	GMD/training/all-instruments-with-drums/5/df44db7bd3d4484d1173e26f526cc8ec.mid	F major	F major	y
+df702770d014c8b997ecee5e3f97ea5c	GMD/training/no-drums/25/df702770d014c8b997ecee5e3f97ea5c.mid	A- major	A- major	y
+e0405e993489ffb3ca4c9efbee993cba	GMD/training/no-drums/32/e0405e993489ffb3ca4c9efbee993cba.mid	G minor	C major	n
+e287a7de437ee883bb7d6b6c4e85c388	GMD/training/no-drums/8/e287a7de437ee883bb7d6b6c4e85c388.mid	E major	E major	y
+e52823937e40e8f6cf22e84b8c3437b3	GMD/training/no-drums/7/e52823937e40e8f6cf22e84b8c3437b3.mid	C# major	C# major	y
+e5c7d7608fc19cce26cf0ae153a3938e	GMD/training/no-drums/33/e5c7d7608fc19cce26cf0ae153a3938e.mid	E minor	F# minor	n
+e746bea45cca8c02fe4656a1264e304e	GMD/training/no-drums/45/e746bea45cca8c02fe4656a1264e304e.mid	E- major	E- major	y
+e8a7a611eb9bd6fce89b09532c97cffa	GMD/training/all-instruments-with-drums/7/e8a7a611eb9bd6fce89b09532c97cffa.mid	E- major	F major	n
+e99a729368c9fb829fbf17cbee00613b	GMD/training/all-instruments-with-drums/5/e99a729368c9fb829fbf17cbee00613b.mid	F major	F major	y
+eb5eab838017e832b0e16b732f90bac4	GMD/training/all-instruments-with-drums/6/eb5eab838017e832b0e16b732f90bac4.mid	F minor	F minor	y
+ecdedf009615cbf2928ccdc282ff75bd	GMD/training/no-drums/29/ecdedf009615cbf2928ccdc282ff75bd.mid	C minor	C minor	y
+f118783b282c0f3a52e6385bbbf1c83f	GMD/training/all-instruments-with-drums/11/f118783b282c0f3a52e6385bbbf1c83f.mid	E- major	E- major	y
+f1afbd9675adec6ca7f94e1379158fba	GMD/training/no-drums/24/f1afbd9675adec6ca7f94e1379158fba.mid	C major	C major	y
+f2e1d9c2d65090d74d6352c0203a0491	GMD/training/no-drums/50/f2e1d9c2d65090d74d6352c0203a0491.mid	C# major	C# major	y
+f42eee2658642d25ea0a6d413ef50689	GMD/training/no-drums/31/f42eee2658642d25ea0a6d413ef50689.mid	G major	G major	y
+f4afdb1cf72bd2df2a5d9cb7787c17d0	GMD/training/no-drums/38/f4afdb1cf72bd2df2a5d9cb7787c17d0.mid	D minor	D minor	y
+f590ce5d3a63d094c96c903c6345496f	GMD/training/no-drums/37/f590ce5d3a63d094c96c903c6345496f.mid	C minor	F# minor	n
+f61e0974a10a7fa8d1e1fa171968e731	GMD/training/all-instruments-with-drums/3/f61e0974a10a7fa8d1e1fa171968e731.mid	D major	D major	y
+f7a37a033bc9bb4c1eac33cb30a1ad66	GMD/training/all-instruments-with-drums/2/f7a37a033bc9bb4c1eac33cb30a1ad66.mid	Unknown	G minor	n
+f7a568f0fa1048eb483f154b21535c99	GMD/training/no-drums/9/f7a568f0fa1048eb483f154b21535c99.mid	F major	F major	y
+f7d035db95965ef5c7bf39efc58565ba	GMD/training/no-drums/34/f7d035db95965ef5c7bf39efc58565ba.mid	G major	G minor	n
+f9984723a57ca5084ae5ccd555c23c20	GMD/training/no-drums/49/f9984723a57ca5084ae5ccd555c23c20.mid	A major	A major	y
+f9a6fb2393aaf636adb09ee277223e2f	GMD/training/no-drums/6/f9a6fb2393aaf636adb09ee277223e2f.mid	F major	G major	n
+fc3fdca87eaa3d4cdcffa3721b2d1229	GMD/training/all-instruments-with-drums/13/fc3fdca87eaa3d4cdcffa3721b2d1229.mid	F major	C major	n
+fd4b4635a05b660bf14e7c2241b3a347	GMD/training/no-drums/43/fd4b4635a05b660bf14e7c2241b3a347.mid	E- major	E- major	y
+fddd2430d8e532bac27ee4b69e433309	GMD/training/all-instruments-with-drums/1/fddd2430d8e532bac27ee4b69e433309.mid	G minor	G minor	y
+fe32d20b6f8263786adba249e03721d3	GMD/training/no-drums/54/fe32d20b6f8263786adba249e03721d3.mid	B- minor	B- major	n
+ff8588fc4a4794594f45eef6f4f6625b	GMD/training/all-instruments-with-drums/8/ff8588fc4a4794594f45eef6f4f6625b.mid	D major	D major	y

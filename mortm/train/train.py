@@ -1035,6 +1035,18 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                         optimizer_step += 1
                         trainer.optimizer_steps = optimizer_step
 
+                        # §9.1/E2: total_steps の指定%時点でフルFT途中チェックポイントを保存(opt-in)。
+                        _pcts = getattr(train_args, "checkpoint_percents", None)
+                        _tot = train_args.scheduler.get("total_steps") if isinstance(train_args.scheduler, dict) else None
+                        if _pcts and _tot and (trainer.local_rank == 0):
+                            for _p in _pcts:
+                                if optimizer_step == max(1, int(round(_p / 100.0 * _tot))):
+                                    torch.save(
+                                        model.module.state_dict(),
+                                        f"{save_directory}/{model_name}.ckpt_p{_p}.pth",
+                                    )
+                                    print(f"[fullFT] checkpoint saved at {_p}% (step {optimizer_step}/{_tot})", flush=True)
+
                     reduced_loss = reduce_tensor(loss, op=dist.ReduceOp.SUM) if _is_dist_ready() else loss.detach()
                     avg_loss = (reduced_loss / world_size).item() if _is_dist_ready() else reduced_loss.item()
 

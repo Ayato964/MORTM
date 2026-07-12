@@ -191,16 +191,21 @@ class _AbstractMidiConverter(_AbstractConverter):
         else:
             try:
                 self.midi_data: PrettyMIDI = PrettyMIDI(f"{directory}/{file_name}")
-                time_s = self.midi_data.time_signature_changes
-                for t in time_s:
-                    t_s: TimeSignature = t
-                    if not (t_s.numerator == 4 and t_s.denominator == 4):
-                        self.is_error = True
-                        self.error_reason = "旋律に変拍子が混じっていました。"
-                        break
             except Exception:
                 self.is_error = True
                 self.error_reason = "MIDIのロードができませんでした。"
+
+        # §9.5 / L1: 拍子検査。実装は小節長を (60/tempo)*4 で 4/4 ハードコードするため
+        # (ct_time_to_beat / ShiftTimeContainer.shift)、4/4 以外・拍子変化曲は除外する。
+        # ロード経路(file / 渡された midi_data)に依らず必ず検査する。
+        # 無記載(time_signature_changes 空)は 4/4 とみなし含める(設計書 E0-1 の裁定)。
+        # 除外は is_error + 固定 error_reason で行い、E0 の除外率会計で計数する。
+        if not self.is_error:
+            for t_s in self.midi_data.time_signature_changes:
+                if not (t_s.numerator == 4 and t_s.denominator == 4):
+                    self.is_error = True
+                    self.error_reason = "旋律に変拍子が混じっていました。"
+                    break
 
         if not self.is_error:
             self.tempo_change_time, self.tempo = self.midi_data.get_tempo_changes()

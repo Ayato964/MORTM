@@ -38,11 +38,14 @@ class FoundationDataMaker(_AbstractConverter):
     """
 
     def __init__(self, converter: MIDIConverter, min_measure=1, max_measure=8, additional_prompt=None,
-                 disable_block_augment: bool = False):
+                 disable_block_augment: bool = False, meta_drop_prob: float = 0.0):
         super().__init__(FoundationDataMaker, None, None)
         self.converter = converter
         self.tokenizer = converter.tokenizer
         self.aya_node = [0]
+        # §9.2: aya_node と同順(index 揃え)の per-sample pattern_key(方向タグ真実源)。
+        # index 0 は aya_node[0]=0 のダミーに対応する空文字。convert() でのみ追記する。
+        self.aya_pattern = [""]
         self.min_measure = min_measure
         self.max_measure = max_measure
         self.additional_prompt = additional_prompt
@@ -50,6 +53,14 @@ class FoundationDataMaker(_AbstractConverter):
         # ブロックは固定順 [SYSTEM, PAST_M, CONST_M, FUTURE_M] で 3 ブロック全て残す（決定的）。
         # ※ _build_melody_block 内の楽器順シャッフルはブロック内の別レイヤーなので影響しない。
         self.disable_block_augment = disable_block_augment
+        # META(SYSTEM) 独立 Bernoulli ドロップ確率。
+        # 【v1.4 裁定】A1 は p_drop=0(既定)に復帰。理由: META が prefix に無く後置される
+        # サンプルでも、CONST 区間の学習目標は全確率の法則により Σ_m p(CONST|prefix,m)p(m|prefix)
+        # = 真の meta-free 条件付き/周辺分布に厳密一致する。よって位置的自由だけで meta-free 方向は
+        # 被覆済みで、ドロップは分布情報を足さない(v1.3 の CFG 同型根拠は数学的誤りとして撤回)。
+        # 本フラグは E5 の ablation 変数(自由連続生成の終端率・自発 META 率への効果測定)専用。
+        # disable_block_augment(A2)では常に無効。
+        self.meta_drop_prob = meta_drop_prob
         self.stats = {
             "total_samples": 0,
             "deletion_count": {0: 0, 1: 0, 2: 0},
@@ -61,6 +72,7 @@ class FoundationDataMaker(_AbstractConverter):
             "permutation_patterns": {},
             "skipped_windows": 0,
             "instrument_finish_reasons": {},
+            "meta_dropped": 0,   # §9.0: META をドロップしたサンプル数(E0-2 のドロップ率算出用)
         }
 
         if converter.is_error:
@@ -89,6 +101,9 @@ class FoundationDataMaker(_AbstractConverter):
         if not self.is_error:
             array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
             if len(array_dict) > 1:
+                # §9.2: pattern_key を index 揃えで同梱(ローダは array{i} のみ読むため無害)
+                if len(self.aya_pattern) == len(self.aya_node):
+                    array_dict['pattern_keys'] = np.array(self.aya_pattern)
                 out_dir = self._get_out_dir(save_directory)
                 np.savez(os.path.join(out_dir, self.converter.file_name), **array_dict)
                 if save_stats:
@@ -122,6 +137,9 @@ class FoundationDataMaker(_AbstractConverter):
         array_dict = {f'array{i}': arr for i, arr in enumerate(self.aya_node)}
         if len(array_dict) <= 1:
             return None
+        # §9.2: pattern_key を index 揃えで同梱(ローダは array{i} のみ読むため無害)
+        if len(self.aya_pattern) == len(self.aya_node):
+            array_dict['pattern_keys'] = np.array(self.aya_pattern)
         out_dir = self._get_out_dir(save_directory)
         stats_data = None
         if save_stats and self.stats:
@@ -417,10 +435,16 @@ class FoundationDataMaker(_AbstractConverter):
                     pos = random.randint(0, len(ordered_music))
                     ordered_music.insert(pos, ("CONST_M", remaining_music["CONST_M"]))
 
-                # SYSTEM は全ブロックの中でランダムな位置に挿入
-                system_pos = random.randint(0, len(ordered_music))
+                # --- META(SYSTEM) 独立ドロップ (§9.0) ---
+                # 音楽ブロック削除の「後」に Bernoulli(meta_drop_prob) で META を落とす。
+                # 残す場合の挿入位置は従来どおり全体一様。音楽側の削除分布 k は不変。
+                # 音楽ブロックは k<=2 のため必ず 1 つ以上残り、META を落としても空系列にならない。
                 remaining_blocks = ordered_music.copy()
-                remaining_blocks.insert(system_pos, ("SYSTEM", system_block))
+                if random.random() < self.meta_drop_prob:
+                    self.stats["meta_dropped"] += 1
+                else:
+                    system_pos = random.randint(0, len(ordered_music))
+                    remaining_blocks.insert(system_pos, ("SYSTEM", system_block))
 
             # --- 統計更新 ---
             self.stats["total_samples"] += 1
@@ -439,6 +463,7 @@ class FoundationDataMaker(_AbstractConverter):
             # --- 連結して保存（EOS は必ず先頭）---
             sample = np.concatenate([eos_token] + [blk for _, blk in remaining_blocks])
             self.aya_node.append(sample)
+            self.aya_pattern.append(pattern_key)  # §9.2: 方向タグ真実源(index 揃え)
 
             now_measure += past_len
 
@@ -513,9 +538,14 @@ class GenerationDataMaker(FoundationDataMaker):
         - "meta"        : [SYSTEM(meta)]            <MGEN> CONST <TE>   (メタのみ -> CONST)
         - "meta_past"   : [SYSTEM] <PAST_M>..<TAG_END>   <MGEN> CONST <TE>
         - "meta_future" : [SYSTEM] <FUTURE_M>..<TAG_END> <MGEN> CONST <TE>
+        - "infill"      : [SYSTEM] <PAST_M>..<TAG_END> <FUTURE_M>..<TAG_END> <MGEN> CONST <TE>
+                          (PAST と FUTURE の両方を条件にその間の CONST を補完)
+        - "inst_comp"   : [SYSTEM(target)] <CONST_M>[他楽器]..<TAG_END> <MGEN> [対象楽器のCONST] <TE>
+                          (同一CONST窓の他楽器の旋律から、指定した1楽器の旋律を生成。≥2楽器の窓のみ)
 
         EOS は系列先頭固定。CONST(=生成対象)は <MGEN> 以降に置く(loss_mask対応)。
         ブロックの並び替え・削除は行わない(SFTは決定的)。
+        infill / inst_comp も meta_past/future と同様に CoT(<thinking>+フルmeta予測)を確率的に付与する。
         """
         if self.is_error:
             return self.stats
@@ -636,6 +666,53 @@ class GenerationDataMaker(FoundationDataMaker):
                     # CoT時のみ <MGEN> 直後にフルmeta(=full_system_block)を予測させる
                     cot_meta = full_system_block if cot else None
                     gen_field = self._build_gen_field(const_seqs, active_programs, cot_meta=cot_meta)
+                    sample = np.concatenate([eos_token, partial_system, cond_block, gen_field])
+                    if cot:
+                        counts["_cot"] = counts.get("_cot", 0) + 1
+                elif task == "infill":
+                    # PAST + FUTURE を条件に、その間の CONST を補完(全楽器)。
+                    cond_past = self._build_melody_block("<PAST_M>", past_seqs, active_programs)
+                    cond_future = self._build_melody_block("<FUTURE_M>", future_seqs, active_programs)
+                    cot = random.random() < self.COT_PROB
+                    partial_system = self._build_partial_system(
+                        active_program_info, gmc_tok, genre_tokens, key_tok,
+                        inc_density=random.random() < 0.5,
+                        inc_length=random.random() < 0.5,
+                        inc_genre=random.random() < 0.5,
+                        inc_key=random.random() < 0.5,
+                        thinking=cot,
+                    )
+                    cot_meta = full_system_block if cot else None
+                    gen_field = self._build_gen_field(const_seqs, active_programs, cot_meta=cot_meta)
+                    # 時系列順: PAST -> FUTURE
+                    sample = np.concatenate([eos_token, partial_system, cond_past, cond_future, gen_field])
+                    if cot:
+                        counts["_cot"] = counts.get("_cot", 0) + 1
+                elif task == "inst_comp":
+                    # 同一CONST窓の「他楽器の旋律」を条件に、対象1楽器の旋律を生成。
+                    # 2楽器以上ある窓でのみ成立(piano+sax なら 1↔1)。
+                    if len(active_programs) < 2:
+                        continue
+                    target = random.choice(active_programs)
+                    cond_programs = [p for p in active_programs if p != target]
+                    target_info = [(p, d) for (p, d) in active_program_info if p == target]
+                    cond_block = self._build_melody_block("<CONST_M>", const_seqs, cond_programs)
+                    cot = random.random() < self.COT_PROB
+                    partial_system = self._build_partial_system(
+                        target_info, gmc_tok, genre_tokens, key_tok,
+                        inc_density=random.random() < 0.5,
+                        inc_length=random.random() < 0.5,
+                        inc_genre=random.random() < 0.5,
+                        inc_key=random.random() < 0.5,
+                        thinking=cot,
+                    )
+                    # CoT時は対象楽器のフルmeta(全属性)を <MGEN> 直後に予測させる
+                    cot_meta = self._build_partial_system(
+                        target_info, gmc_tok, genre_tokens, key_tok,
+                        inc_density=True, inc_length=True, inc_genre=True, inc_key=True,
+                        thinking=False,
+                    ) if cot else None
+                    gen_field = self._build_gen_field(const_seqs, [target], cot_meta=cot_meta)
                     sample = np.concatenate([eos_token, partial_system, cond_block, gen_field])
                     if cot:
                         counts["_cot"] = counts.get("_cot", 0) + 1

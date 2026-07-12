@@ -23,6 +23,9 @@ class TrainArgs:
             self.big_batch_size = data['big_batch_size'] if data.get('big_batch_size') else 16
             self.val_total_tokens = data['val_total_tokens'] if data.get('val_total_tokens') else 50000000
             self.shuffle = data['shuffle'] if data.get('shuffle') else True
+            # §9.1/E2: フルFT の途中チェックポイントを total_steps の指定%時点で保存する。
+            # None(既定)なら従来どおり保存しない(E1 等に影響なし・opt-in)。
+            self.checkpoint_percents: Optional[list] = data.get('checkpoint_percents')
             dataset_batch_allocation = data.get('dataset_batch_allocation')
             self.dataset_batch_allocation: Optional[list[int]] = None
 

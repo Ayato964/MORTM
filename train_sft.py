@@ -156,13 +156,13 @@ def run_sft(model_config, train_config, base_checkpoint, root_directory, save_di
 
 
 if __name__ == "__main__":
-    BASE_CKPT = "out/models/mortm/4_5/MORTM.4.5D-Lite_1.1424479484558105.pth"
-    MODEL_CONFIG = "configs/models/mortm/foundation/80M.json"
+    BASE_CKPT = "out/models/4_5/MORTM.4.5D-160M.pth"
+    MODEL_CONFIG = "configs/models/mortm/foundation/160M.json"
     TRAIN_CONFIG = "configs/train/mortm/sft/generation.json"
     ROOT = ("/home/takaaki-nagoshi/data/sft/generation/train.json",)
     EVAL = ("/home/takaaki-nagoshi/data/sft/generation/eval.json",)
     SAVE_DIR = "out/models/mortm/sft/generation"
-    VERSION = "4.5D-Lite-SFT-gen"
+    VERSION = "4.5D-160M-SFT-gen"
 
     os.makedirs(SAVE_DIR, exist_ok=True)
     run_sft(MODEL_CONFIG, TRAIN_CONFIG, BASE_CKPT, ROOT, SAVE_DIR, VERSION, eval_list_json=EVAL)

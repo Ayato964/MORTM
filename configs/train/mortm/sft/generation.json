@@ -1,0 +1,17 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 16,
+  "accumulation_steps": 4,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 2000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0002,
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.03,
+    "total_steps": 38310
+  },
+  "_note": "SFT(LoRA+Emb/Wout) generation \u53ef\u5909\u9577+\u30b8\u30e3\u30f3\u30eb. eff128=bs16*accum4*2gpu(160M\u7528OOM\u56de\u907f; 80M\u306fbs64*accum1). total_steps=38310(1epoch eff128, 5tasks: train_samples=4,903,643/81,457files @2026-07-01)"
+}

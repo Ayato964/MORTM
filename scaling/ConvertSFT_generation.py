@@ -23,7 +23,7 @@ PROGRAM = ["PIANO", "SAX"]
 MIN_MEASURE = 1
 MAX_MEASURE = 8
 THREAD_VALUE = 25
-SFT_TASKS = ("meta", "meta_past", "meta_future")
+SFT_TASKS = ("meta", "meta_past", "meta_future", "infill", "inst_comp")
 
 
 def load_genre_map(json_path):
