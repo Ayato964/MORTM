@@ -54,8 +54,10 @@ META ドロップは **E5 の ablation 変数**に降格(config フラグのみ)
 ## 凍結ゲート(進行)
 - ✅ **§7閾値凍結(概念的に確定)**: 各閾値の論理/文献背景(H2=Bavarian FIM, 他=効果量/等価性の標準)をユーザ承認→凍結。※git tag `prereg-v1` は現作業のcommit要(ユーザ判断待ち, 自動commitしない)。
 - ✅ **曲単位98/1/1 split構築** `scaling/make_paper_split.py` → `docs/splits/{train,val,test}_songs.txt`(git管理)。train217,222/val2,199/test2,288、重複0・決定論・曲単位(リーク防止)。
-- 🚩 **要対応(E1前)**: 既存`json_v5`/`json_v5_noaug`索引は旧split基準→**新splitのtrain曲のみで学習索引を作り直す**必要(test/valリーク防止)。npz再生成不要、索引再構築のみ。
-- ⏳ TEST-SEQ(test曲・時系列全ブロック) / TEST-TASK(test曲・protocol_builder窓 各N=1000) 構築 → 凍結`testset-v1`。
+- ✅ **§7凍結**: commit `cbf9705` / tag **`prereg-v1`**(2026-07-12)。
+- ✅ **リークフリー索引再構築** `scaling/make_paper_indices.py` → `/home/.../data/paper/{A1,A2}/{200M..3.2B}/train.json`+val/test。train∩test=0・train∩val=0 検証済。A1 train 11.5B / A2 16.9B tok利用可。
+- ✅ **TEST-SEQ** = A2 `test.json`(固定順・全ブロック・test曲2,240)。
+- ⏳ **TEST-TASK**(test曲・protocol_builder窓 各N=1000×5タスク) 構築 → commit+tag `testset-v1`。
 - ⏳ **キー200曲検証**: サンプル`docs/splits/key_verify_200_hashes.txt`確定。pipeline key付与TSVをバックグラウンド生成中→`docs/splits/key_verify_200.tsv`。ユーザは human_key/match 列を記入。
 - ~~cb57431~~ = 無視でOK(ユーザ確定)。
 
