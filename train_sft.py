@@ -1,4 +1,4 @@
-"""SFT 学習 (デモ用): SOTA 80M (MORTM.4.5D-Lite) に LoRA を載せて生成タスクを微調整する。
+"""SFT 学習 (デモ用): SOTA 80M (MORTM.4.5D-80M) に LoRA を載せて生成タスクを微調整する。
 
 MORTMTrainSet を継承した MORTMSFTTrainSet を定義し、以下を差し込む:
   1. 損失を MaskedCrossEntropyLoss に変更 (<MGEN> 以降のみ損失 = SFT)
@@ -131,11 +131,15 @@ class MORTMSFTTrainSet(MORTMTrainSet):
 
 
 def run_sft(model_config, train_config, base_checkpoint, root_directory, save_directory,
-            version, eval_list_json=None, project_name="MORTM_SFT_Demo", log_scale=True):
+            version, eval_list_json=None, project_name="MORTM_SFT_Demo", log_scale=True, seed=None):
     """run_train.py と同型。SFT トレーナーを構築して train_custom で起動する。"""
     import torch.distributed as dist
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
+
+    if seed is not None:
+        from mortm.utils.repro import set_seed
+        set_seed(int(seed), deterministic=False)  # 最適化ゆらぎ評価: seed毎にRNGを変える
 
     tokenizer = Tokenizer(get_token_converter_pro(TO_MUSIC))
     progress = _DefaultLearningProgress()
@@ -156,13 +160,36 @@ def run_sft(model_config, train_config, base_checkpoint, root_directory, save_di
 
 
 if __name__ == "__main__":
-    BASE_CKPT = "out/models/4_5/MORTM.4.5D-160M.pth"
-    MODEL_CONFIG = "configs/models/mortm/foundation/160M.json"
-    TRAIN_CONFIG = "configs/train/mortm/sft/generation.json"
-    ROOT = ("/home/takaaki-nagoshi/data/sft/generation/train.json",)
-    EVAL = ("/home/takaaki-nagoshi/data/sft/generation/eval.json",)
-    SAVE_DIR = "out/models/mortm/sft/generation"
-    VERSION = "4.5D-160M-SFT-gen"
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--arm", type=str, required=True, choices=["A1","A2","A1-40B-80M","A1-40B-160M"], help="Model arm")
+    parser.add_argument("--budget", type=str, required=True, choices=["50M", "200M", "800M"], help="Token budget: 50M, 200M, 800M")
+    parser.add_argument("--backbone_cfg", type=str, default="configs/models/mortm/foundation/80M.json")
+    parser.add_argument("--backbone_ckpt", type=str, required=True, help="Path to backbone .pth file")
+    parser.add_argument("--train_json", type=str, default="/home/takaaki-nagoshi/data/sft/analysis/train.json")
+    parser.add_argument("--eval_json", type=str, default="/home/takaaki-nagoshi/data/sft/analysis/eval.json")
+    parser.add_argument("--save_dir", type=str, default="out/models/paper/E3")
+    parser.add_argument("--seed", type=int, default=None, help="乱数シード(複数シード頑健性評価用)")
+    parser.add_argument("--train_config", type=str, default=None, help="学習config上書き(160MのOOM回避config等)")
+    args = parser.parse_args()
 
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    run_sft(MODEL_CONFIG, TRAIN_CONFIG, BASE_CKPT, ROOT, SAVE_DIR, VERSION, eval_list_json=EVAL)
+    train_config = args.train_config or f"configs/train/mortm/sft/analysis_{args.budget}.json"
+    suffix = f"_s{args.seed}" if args.seed is not None else ""
+    save_dir = os.path.join(args.save_dir, f"{args.arm}_sft_{args.budget}{suffix}")
+    version = f"E3-{args.arm}-sft-{args.budget}{suffix}"
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    print(f"Starting SFT analysis training for arm={args.arm}, budget={args.budget}, seed={args.seed}...")
+    run_sft(
+        model_config=args.backbone_cfg,
+        train_config=train_config,
+        base_checkpoint=args.backbone_ckpt,
+        root_directory=(args.train_json,),
+        save_directory=save_dir,
+        version=version,
+        eval_list_json=(args.eval_json,),
+        project_name="MORTM_E3_SFT",
+        seed=args.seed,
+    )
+

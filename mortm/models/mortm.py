@@ -10,7 +10,7 @@ import loralib.layers as lora
 
 from .modules.progress import LearningProgress
 from .modules.config import MORTMArgs
-from .modules.layers import MORTMDecoder
+from .modules.layers import MORTMDecoder, PMA
 from flash_attn.bert_padding import pad_input, unpad_input
 
 from ..train.tokenizer import Tokenizer
@@ -377,3 +377,32 @@ class MORTM(nn.Module):
         active_params = total_params - total_inactive_params
 
         return total_params, active_params
+
+
+class ClassificationMORTM(MORTM):
+    def __init__(self, args, class_num, progress: LearningProgress):
+        super().__init__(args, progress)
+        self.pma = PMA(self.d_model, self.d_model * 2)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.d_model * 2, self.d_model // 2),
+            nn.ReLU(),
+            nn.Linear(self.d_model // 2, class_num),
+        )
+
+    def forward(self, x, padding_mask=None, is_causal=False, is_save_cache=False):
+        x: Tensor = self.embedding(x).to(dtype=torch.bfloat16)
+        if padding_mask is not None:
+            batch, tgt_len, embed_dim = x.size()
+            x, indices, cu_seqlens, max_s, used_seqlens = unpad_input(x, padding_mask)
+        else:
+            tgt_len, embed_dim = x.size()
+            batch = None
+            indices = cu_seqlens = max_s = used_seqlens = None
+
+        out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens,
+                           max_seqlen=max_s, batch_size=batch, indices=indices,
+                           is_save_cache=is_save_cache)
+
+        pooled = self.pma(out, cu_seqlens)   # (batch, d_model*2)
+        cl = self.classifier(pooled)         # (batch, class_num)
+        return cl

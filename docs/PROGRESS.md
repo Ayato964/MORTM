@@ -61,7 +61,16 @@ META ドロップは **E5 の ablation 変数**に降格(config フラグのみ)
 - ⏳ **キー200曲検証**: サンプル`docs/splits/key_verify_200_hashes.txt`確定。pipeline key付与TSVをバックグラウンド生成中→`docs/splits/key_verify_200.tsv`。ユーザは human_key/match 列を記入。
 - ~~cb57431~~ = 無視でOK(ユーザ確定)。
 
-## 次 ⏭️
+## E1 LR（v1.6 §4.3, ユーザ裁定: 旧スイープ流用）
+旧noaug LRスイープ(`out/models/mortm/scaling/lr_sweep/`)の実測最適LRを**両アーム共通で流用**(LRスイープ再実行は不要)。
+サイズ別最適LR: 10M=3.2e-3 / 20M=2.4e-3 / 40M=1.6e-3 / 80M=6.0e-4(1.2e-3とタイ) / 160M=8.0e-4。べき則 LR≈1.16e-2·N^-0.55。
+§4.3整合: LRはサイズ決定・目的関数非依存 → 両アーム同一LR=「理想形」。論文に「LRバイアス排除」と明記(§8.11防御)。
+
+## ▶ E1 本学習 実行中（主結果）★2026-07-13 点火
+- ✅ **E1 A1(80M,3.2B) 走行中**: `run_e1.py`+`configs/train/mortm/paper/E1_A1_80M.json`(bs32×accum16×2gpu, lr6e-4, cos warmup10%, total_steps5759, checkpoint%[10,25,50,75,100])。両GPU95%, loss6.72→低下中, wandb MORTM_Paper_E1, 保存=out/models/paper/E1/A1_80M_3.2B。
+- ⏳ **A2(80M,3.2B)**: A1完了後にチェーン自動起動(total_steps4064, 同一設定)。
+- ⏳ 後続: S=10M(3.2e-3,400M)×3seed×A1/A2 + A3a/b/c(要convert()フラグ+データ生成) + 零SFT評価(protocol_builder+metrics+direction_loss on TEST-TASK/TEST-SEQ)。
+- total_steps算出: `estimate_total_steps`(=総系列/(bs×accum×world))。トークン揃え(3.2B)でstep差(A1 5759/A2 4064)は§8.1既知。
 - 9.1 フルFTトレーナ(E2用) / 9.3 protocol_builder / 9.4 metrics / B.3セグメント損失(pattern_key復元器, §4.3方向別val lossに必須)
 - §7凍結(tag `prereg-v1`) → TEST-SEQ/TEST-TASK凍結(tag `testset-v1`) → E1(§4.3 LRスイープ→S×3/M×1)
 

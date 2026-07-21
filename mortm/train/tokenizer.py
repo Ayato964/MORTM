@@ -118,8 +118,22 @@ class Tokenizer:
         else:
             self.music_token_list = music_token
             with open(load_data, 'r') as file:
-                self.tokens: dict = json.load(file)
-                self.rev_tokens: dict = {v: k for k, v in self.tokens.items()}
+                self.tokens = json.load(file)
+            for t in music_token:
+                dummy = {}
+                t._set_tokens(dummy)
+                ids = []
+                for k in dummy.keys():
+                    if k in self.tokens:
+                        ids.append(self.tokens[k])
+                if ids:
+                    t.start = min(ids)
+                    t.end = max(ids)
+                else:
+                    t.start = len(self.tokens)
+                    t._set_tokens(self.tokens)
+                    t.end = len(self.tokens) - 1
+            self.rev_tokens = {v: k for k, v in self.tokens.items()}
 
     def _init_mx_dict(self, mx) -> dict:
         my_dict = dict()

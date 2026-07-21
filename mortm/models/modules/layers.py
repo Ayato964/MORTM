@@ -1,4 +1,5 @@
 import json
+import math
 from typing import Optional, Literal
 
 import numpy
@@ -13,7 +14,7 @@ import loralib.layers as lora
 from typing import Tuple, List
 import numpy as np
 
-from .attention import FlashSelfAttentionM, FlashCrossAttentionM, linear
+from .attention import FlashSelfAttentionM, FlashCrossAttentionM, linear, flash_attn_varlen_kvpacked_func
 from .config import MORTMArgs, MORTM_LIVE_Args
 
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
@@ -109,7 +110,7 @@ class VisionDecoder(nn.Module):
 
         return x_recon
 
-class Pool(nn.Module):
+class AttentionPool(nn.Module):
     """Attention Poolingによるシーケンス集約モジュール"""
     def __init__(self, args: MORTMArgs):
         super().__init__()
@@ -132,6 +133,47 @@ class Pool(nn.Module):
 
         return torch.stack(output_vectors) # shape: [B, d_model]
 
+
+class PMA(nn.Module):
+    def __init__(self, d_model: int, out_dim: int, h_dim=64):
+        super().__init__()
+        assert out_dim % h_dim == 0
+        self.num_heads = out_dim // h_dim
+        self.head_dim = h_dim
+        self.out_dim = out_dim
+        self.d_model = d_model
+
+        self.q_seed = nn.Parameter(torch.empty(1, out_dim))
+        nn.init.normal_(self.q_seed, std=math.sqrt(1.0 / d_model))
+
+        self.w_kv = nn.Linear(d_model, out_dim * 2)
+        self.w_o = nn.Linear(out_dim, out_dim)
+
+    def forward(self, x: Tensor, cu_seqlens: Tensor) -> Tensor:
+        # x: (total_tokens, d_model), packed varlen
+        batch = cu_seqlens.numel() - 1
+        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen_k = int(seqlens.max().item())
+
+        kv = self.w_kv(x)
+        kv = kv.view(-1, 2, self.num_heads, self.head_dim)
+
+        # 1 seed query per sequence
+        q = self.q_seed.expand(batch, -1).view(batch, self.num_heads, self.head_dim)
+        cu_seqlens_q = torch.arange(
+            batch + 1, device=x.device, dtype=torch.int32
+        )  # each query length = 1
+
+        out = flash_attn_varlen_kvpacked_func(
+            q, kv,
+            cu_seqlens_q,
+            cu_seqlens.to(torch.int32),
+            1,               # max_seqlen_q
+            max_seqlen_k,    # max_seqlen_k
+        )  # (total_q=batch, num_heads, head_dim)
+
+        out = out.view(batch, self.out_dim)
+        return self.w_o(out)
 
 class DummyDecoder(nn.Module):
     def __init__(self):

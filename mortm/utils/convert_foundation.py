@@ -38,7 +38,8 @@ class FoundationDataMaker(_AbstractConverter):
     """
 
     def __init__(self, converter: MIDIConverter, min_measure=1, max_measure=8, additional_prompt=None,
-                 disable_block_augment: bool = False, meta_drop_prob: float = 0.0):
+                 disable_block_augment: bool = False, meta_drop_prob: float = 0.0,
+                 augment_mode: str = "full"):
         super().__init__(FoundationDataMaker, None, None)
         self.converter = converter
         self.tokenizer = converter.tokenizer
@@ -61,6 +62,13 @@ class FoundationDataMaker(_AbstractConverter):
         # 本フラグは E5 の ablation 変数(自由連続生成の終端率・自発 META 率への効果測定)専用。
         # disable_block_augment(A2)では常に無効。
         self.meta_drop_prob = meta_drop_prob
+        # §E3 因子分解アブレーション(A1の拡張を要素分解, disable_block_augment=Falseの時のみ有効):
+        #   "full"      : A1 = 削除 + 並び替え(CONST位置random) + META位置random
+        #   "perm_only" : A3a = 削除OFF(k=0,全ブロック保持) + 並び替えON + META位置random
+        #   "del_only"  : A3b = 削除ON + 並び替えOFF(固定正順) + META先頭固定
+        #   "meta_first": A3c = 削除ON + 並び替えON + META先頭固定(A1との差=META位置randomの効果)
+        assert augment_mode in ("full", "perm_only", "del_only", "meta_first"), augment_mode
+        self.augment_mode = augment_mode
         self.stats = {
             "total_samples": 0,
             "deletion_count": {0: 0, 1: 0, 2: 0},
@@ -414,36 +422,53 @@ class FoundationDataMaker(_AbstractConverter):
                     ("FUTURE_M", music_blocks_map["FUTURE_M"]),
                 ]
             else:
+                mode = self.augment_mode
+
                 # --- 削除処理: k ∈ {0, 1, 2} 個のブロックを一様にランダム削除 ---
-                k = random.choice([0, 1, 2])
-                delete_names = random.sample(music_block_names, k)
-                remaining_music = {
-                    name: blk for name, blk in music_blocks_map.items()
-                    if name not in delete_names
-                }
+                # A3a(perm_only)は削除OFF(k=0で全ブロック保持)。
+                if mode == "perm_only":
+                    k = 0
+                    remaining_music = dict(music_blocks_map)
+                else:
+                    k = random.choice([0, 1, 2])
+                    delete_names = random.sample(music_block_names, k)
+                    remaining_music = {
+                        name: blk for name, blk in music_blocks_map.items()
+                        if name not in delete_names
+                    }
 
                 # --- 並び替え ---
-                # PAST → FUTURE の時系列順を固定し、CONST だけ 3 択でランダム挿入する。
-                # 3 択: PASTより前 / PASTとFUTUREの間 / FUTUREより後
-                ordered_music = []
-                if "PAST_M" in remaining_music:
-                    ordered_music.append(("PAST_M", remaining_music["PAST_M"]))
-                if "FUTURE_M" in remaining_music:
-                    ordered_music.append(("FUTURE_M", remaining_music["FUTURE_M"]))
-                if "CONST_M" in remaining_music:
-                    # 0 〜 len(ordered_music) のいずれかに挿入
-                    pos = random.randint(0, len(ordered_music))
-                    ordered_music.insert(pos, ("CONST_M", remaining_music["CONST_M"]))
+                # A3b(del_only)は並び替えOFF(固定正順 PAST→CONST→FUTURE)。
+                # それ以外: PAST → FUTURE の時系列順を固定し、CONST だけ 3 択でランダム挿入。
+                if mode == "del_only":
+                    ordered_music = [
+                        (name, remaining_music[name])
+                        for name in ["PAST_M", "CONST_M", "FUTURE_M"]
+                        if name in remaining_music
+                    ]
+                else:
+                    ordered_music = []
+                    if "PAST_M" in remaining_music:
+                        ordered_music.append(("PAST_M", remaining_music["PAST_M"]))
+                    if "FUTURE_M" in remaining_music:
+                        ordered_music.append(("FUTURE_M", remaining_music["FUTURE_M"]))
+                    if "CONST_M" in remaining_music:
+                        # 0 〜 len(ordered_music) のいずれかに挿入
+                        pos = random.randint(0, len(ordered_music))
+                        ordered_music.insert(pos, ("CONST_M", remaining_music["CONST_M"]))
 
                 # --- META(SYSTEM) 独立ドロップ (§9.0) ---
                 # 音楽ブロック削除の「後」に Bernoulli(meta_drop_prob) で META を落とす。
-                # 残す場合の挿入位置は従来どおり全体一様。音楽側の削除分布 k は不変。
+                # 残す場合の挿入位置: del_only/meta_first は先頭固定(位置0)、full/perm_only は全体一様。
                 # 音楽ブロックは k<=2 のため必ず 1 つ以上残り、META を落としても空系列にならない。
                 remaining_blocks = ordered_music.copy()
                 if random.random() < self.meta_drop_prob:
                     self.stats["meta_dropped"] += 1
                 else:
-                    system_pos = random.randint(0, len(ordered_music))
+                    if mode in ("del_only", "meta_first"):
+                        system_pos = 0
+                    else:
+                        system_pos = random.randint(0, len(ordered_music))
                     remaining_blocks.insert(system_pos, ("SYSTEM", system_block))
 
             # --- 統計更新 ---
@@ -733,36 +758,42 @@ class GenerationDataMaker(FoundationDataMaker):
 
 
 class AnalysisDataMaker(FoundationDataMaker):
-    """分析SFTタスク (MIDI -> メタ予測。生成の逆) のシーケンス生成器。
+    """分析SFTタスク (CONST音楽 -> フルmeta。生成"meta"タスクの入出力を反転しただけ) の生成器。
 
-    構造: <EOS> <CONST_M>[旋律]<TAG_END> <TRIGGER> [予測対象(答え)] <TE>
-      <META>  : フルmeta(楽器別密度/長さ/ジャンル/キー)
-      <KEY>   : k_<key>
-      <DENCE> : <INST_x><NOTE_DENSE_x> (楽器別)
-      <GENRE> : <GENRE_xxx>
-      <LENGTH>: <GEN_MEASURE_COUNT_n>
-    loss_mask が <TRIGGER> 以降のみ損失計算するため、予測対象はトリガー後に置く。
+    生成SFT "meta": <EOS> [SYSTEMフルmeta] <MGEN> CONST <TE>       (meta -> 音楽)
+    分析     Const2Meta: <EOS> <CONST_M>[CONST音楽]<TAG_END> <META> [SYSTEMフルmeta] <TE>   (音楽 -> meta)
+
+    フルmeta は生成SFTと完全に同一(make_system_prompt + GMC + ジャンル)を「そのまま」使う。
+    key/dence/genre を単独ターゲットにするタスクは作らない(基盤/生成が学習していない形式のため)。
+    loss_mask が <META> 以降のみ損失計算するため、答え(フルmeta)は <META> の後に置く。
     """
 
-    def convert_analysis_sft(self, tasks=("meta", "key", "dence", "genre", "length"),
-                             genre_tokens=None, *args, **kwargs):
+    def convert_analysis_sft(self, genre_tokens=None, *args, **kwargs):
         if self.is_error:
             return self.stats
+
         measure_token_id = self.tokenizer.get("<SME>")
         s_e = self.tokenizer.get_length_tuple("s")
+
         valid_programs = [p for p in self.converter.program_list if p in self.seq_dict]
         if not valid_programs:
             return self.stats
-        seq_inds = {p: np.where(self.seq_dict[p] == measure_token_id)[0] for p in valid_programs}
-        inst_finish_dict = {p: False for p in valid_programs}
-        counts = {t: 0 for t in tasks}
+
+        seq_inds = {}
+        for program in valid_programs:
+            seq_inds[program] = np.where(self.seq_dict[program] == measure_token_id)[0]
+
+        inst_finish_dict = {program: False for program in valid_programs}
+        count = 0
         now_measure = 0
 
         while not all(inst_finish_dict.values()):
-            const_len = random.randint(self.min_measure, self.max_measure)  # 分析対象の長さも可変
+            # 分析対象(CONST)の長さは各窓で可変 (min..max 小節)。GMC がこれを反映する。
+            const_len = random.randint(self.min_measure, self.max_measure)
             const_seqs = {}
             active_program_info = []
-            is_skip = False
+            is_skip_window = False
+
             for program in valid_programs:
                 if inst_finish_dict[program]:
                     continue
@@ -770,72 +801,59 @@ class AnalysisDataMaker(FoundationDataMaker):
                 if now_measure + const_len >= len(inds):
                     inst_finish_dict[program] = True
                     continue
-                cs = self.seq_dict[program][inds[now_measure]:inds[now_measure + const_len]]
-                if not np.any(np.isin(cs, np.arange(s_e[0], s_e[1]))):
-                    continue
-                if not self._check_instrument_constraint(program, cs):
-                    continue
-                dt = self._calculate_density_token(cs, program)
-                if dt is None:
-                    is_skip = True
-                    break
-                const_seqs[program] = cs
-                active_program_info.append((program, dt))
 
-            if is_skip or len(active_program_info) == 0:
+                const_start = inds[now_measure]
+                const_end = inds[now_measure + const_len]
+                const_seq = self.seq_dict[program][const_start:const_end]
+
+                # 分析対象なので音符必須
+                if not np.any(np.isin(const_seq, np.arange(s_e[0], s_e[1]))):
+                    continue
+                if not self._check_instrument_constraint(program, const_seq):
+                    continue
+                density_token = self._calculate_density_token(const_seq, program)
+                if density_token is None:
+                    is_skip_window = True
+                    break
+
+                const_seqs[program] = const_seq
+                active_program_info.append((program, density_token))
+
+            if is_skip_window or len(active_program_info) == 0:
                 if all(inst_finish_dict.values()):
                     break
                 now_measure += const_len
                 continue
 
-            active_programs = [p for p, _ in active_program_info]
-            eos = np.array([self.tokenizer.get("<EOS>")], dtype=int)
-            # 分析対象の旋律ブロック: <CONST_M>[<INST> seq <ESEQ>]*<TAG_END>
+            active_programs = [prog for prog, _ in active_program_info]
+
+            # 入力: CONST 音楽ブロック <CONST_M>[<INST> seq <ESEQ>]* <TAG_END>
             music_block = self._build_melody_block("<CONST_M>", const_seqs, active_programs)
 
-            # フルmeta(make_system_promptのSYSTEM..TAG_END中身)からkey/各トークンを取得
-            def _amc(p):
+            # 答え: 生成SFTと同一のフルmeta。GMC(=const_len) と ジャンルを key の直前に付与。
+            def _append_measure_count(p: list):
                 p.append(self.tokenizer.get(f"<GEN_MEASURE_COUNT_{const_len}>"))
                 if genre_tokens:
                     p.extend(genre_tokens)
-            full_sys = self.converter.make_system_prompt(0, active_program_info, call_function=_amc)
-            full_meta = np.array(full_sys[1:], dtype=int)  # <SYSTEM>..<TAG_END>(=メタ分析の答え)
-            key_lo, key_hi = self.tokenizer.get_length_tuple("k")
-            key_toks = [int(t) for t in full_meta if key_lo <= int(t) < key_hi]
 
-            # 各分析タスクの (トリガー, 予測対象) を構築
-            def target_for(task):
-                if task == "meta":
-                    return self.tokenizer.get("<META>"), list(full_meta)
-                if task == "key":
-                    return self.tokenizer.get("<KEY>"), key_toks
-                if task == "dence":
-                    tgt = []
-                    for prog, dt in active_program_info:
-                        tgt += [self.tokenizer.get(f"<INST_{prog}>"), int(dt)]
-                    return self.tokenizer.get("<DENCE>"), tgt
-                if task == "genre":
-                    return self.tokenizer.get("<GENRE>"), list(genre_tokens or [])
-                if task == "length":
-                    return self.tokenizer.get("<LENGTH>"), [self.tokenizer.get(f"<GEN_MEASURE_COUNT_{const_len}>")]
-                return None, None
+            system_prompt = self.converter.make_system_prompt(
+                0, active_program_info, call_function=_append_measure_count)
+            eos_token = np.array([system_prompt[0]], dtype=int)
+            full_meta = np.array(system_prompt[1:], dtype=int)  # <SYSTEM>..<TAG_END>
 
+            trig = np.array([self.tokenizer.get("<META>")], dtype=int)
             te = np.array([self.tokenizer.get("<TE>")], dtype=int)
-            for task in tasks:
-                trig, tgt = target_for(task)
-                if trig is None or not tgt:
-                    continue
-                sample = np.concatenate([eos, music_block,
-                                         np.array([trig] + list(tgt), dtype=int), te])
-                self.aya_node.append(sample)
-                counts[task] += 1
+
+            # <EOS> <CONST_M>[音楽]<TAG_END> <META> <SYSTEM>[フルmeta]<TAG_END> <TE>
+            sample = np.concatenate([eos_token, music_block, trig, full_meta, te])
+            self.aya_node.append(sample)
+            count += 1
 
             now_measure += const_len
 
-        self.stats["sft_analysis_counts"] = counts
-        total = sum(counts.values())
+        self.stats["sft_analysis_count"] = count
         total_tokens = int(sum(len(arr) for arr in self.aya_node[1:]))
-        self.stats["total_samples"] = total
+        self.stats["total_samples"] = count
         self.stats["total_tokens"] = total_tokens
-        print(f"[AnalysisDataMaker] 分析タスク完了: {total} サンプル ({counts})  総トークン {total_tokens}")
+        print(f"[AnalysisDataMaker] 分析タスク完了: {count} サンプル  総トークン {total_tokens}")
         return self.stats

@@ -171,3 +171,32 @@ def bootstrap_ci(values, stat=np.mean, n_boot=10000, alpha=0.05, seed=0):
     boots = np.array([stat(rng.choice(v, size=len(v), replace=True)) for _ in range(n_boot)])
     lo, hi = np.percentile(boots, [100 * alpha / 2, 100 * (1 - alpha / 2)])
     return float(stat(v)), float(lo), float(hi)
+
+
+def context_gen_vocabulary_js(gen_tokens, ctx_tokens, tokenizer):
+    """入力文脈(ctx)の音楽トークン分布と生成区間(gen)の音楽トークン分布の間のJS距離。"""
+    s_lo, s_hi = tokenizer.get_length_tuple("s")
+    p_lo, p_hi = tokenizer.get_length_tuple("p")
+    d_lo, d_hi = tokenizer.get_length_tuple("d")
+    
+    # 音楽コンテンツトークンの最大IDを調べる
+    max_id = max(s_hi, p_hi, d_hi)
+    
+    def get_distribution(tokens):
+        # 音楽コンテンツトークン(s, p, d)のみを集計
+        valid_toks = []
+        for t in tokens:
+            v = int(t)
+            if (s_lo <= v < s_hi) or (p_lo <= v < p_hi) or (d_lo <= v < d_hi):
+                valid_toks.append(v)
+        if not valid_toks:
+            return np.zeros(max_id)
+        hist = np.bincount(valid_toks, minlength=max_id).astype(float)
+        return hist / hist.sum() if hist.sum() > 0 else hist
+
+    p = get_distribution(gen_tokens)
+    q = get_distribution(ctx_tokens)
+    if p.sum() == 0 or q.sum() == 0:
+        return float("nan")
+    return js_divergence(p, q)
+

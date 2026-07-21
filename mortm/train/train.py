@@ -1177,13 +1177,16 @@ def _train(args, t_args, save_directory, trainer, version, today_date,
 
 def train_mortm(tokenizer, model_config: str, train_config: str, root_directory, save_directory, version: str,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, eval_list_json: str = None,
-                progress: LearningProgress = _DefaultLearningProgress(), log_scale=False,project_name=None):
+                progress: LearningProgress = _DefaultLearningProgress(), log_scale=False,project_name=None,
+                seed: int = 42):
 
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
-    # DDP環境でのプロセス間の再現性と同期を確保するため、すべての乱数シードを固定
-    seed = 42
+    # DDP環境でのプロセス間の再現性と同期を確保するため、すべての乱数シードを固定。
+    # seed は呼び出し側(run_e1のseed_tag)から受け取る。既定42で従来挙動を維持。
+    # ★注意: 全rankで同一seedにすること(モデル初期化はDDPがrank0からbroadcastするため一致必須)。
+    # マルチseedアブレーションではこの seed がモデル初期化のばらつき源になる。
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
