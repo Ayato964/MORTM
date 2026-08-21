@@ -271,156 +271,412 @@ class FFN(nn.Module):
         return y
 
 
-
 class Gate(nn.Module):
-    def __init__(self, args, layer_id, route_scale=1.0):
+    """
+    Sigmoid-gated MoE router with auxiliary-loss-free load balancing.
+
+    制御則
+    ------------------------------------------------------------------
+        delta      = clamp((ema_counts - mu) / mu, -1, 1)      # 平均ゼロのベクトル
+        gamma_eff  = clamp(cv / bias_gain_ref, max=1.0)        # スカラー
+        bias       = -gamma_eff * delta
+
+    ここで cv = std(ema_counts)/mu であり、delta の平均はゼロなので
+
+        cv = ||delta||_2 / sqrt(N)
+
+    が恒等的に成り立つ。したがって
+
+        ||bias|| = ||delta||^2 / (bias_gain_ref * sqrt(N))
+
+    つまりこれは線形P制御ではなく **二次制御** である。この指数が 1 であることが
+    設計の中核で、3つの性質を同時に生む:
+
+      1. 均衡近傍で介入が線形より速く消える（誤差が半分 -> bias は 1/4）
+      2. 激しい不均衡には superlinear に立ち上がる
+      3. 振動に対する負のフィードバック。境界ギャップが小さい層（僅差領域）は
+         プラントゲインが極端に高く、固定ゲインだと過剰応答して振動し
+         エキスパートを殺す。cv スケーリングは振動が始まると空間CVが下がるため
+         ループゲインを自動的に下げ、振動を止める。
+
+    指数を 0（固定gamma）にすると 3 が失われ、僅差領域で時間CVが 1.3 を超える
+    リミットサイクルに入る（空間CVは低いままなので気付きにくい）。
+    指数を 2 にすると介入が弱すぎて負荷が偏る。
+
+    設計上の約束（変更する前に読むこと）
+    ------------------------------------------------------------------
+    1. routing_bias は top-k の「選択」にのみ加算する。出力の重み付けには
+       素のスコアを使う。bias が weights に漏れると、負荷の都合で選ばれた
+       エキスパートが負荷由来の信号で訓練されてしまう。
+
+    2. routing_bias は self.training で切り替えない。学習中ずっと bias 込みで
+       選択・学習してきたので、bias 込みの選択こそが学習済みの挙動である。
+       止めるべきは「更新」であって「適用」ではない。
+
+    3. 更新は copy_（上書き）で行う。ema_counts は alpha=1-decay で正規化された
+       DCゲイン=1 の平均推定量であり積分器ではないため、これは P制御である。
+       積分項は意図的に入れていない。定常誤差が残るが、それは
+       「均衡 / ルーティング歪み」のトレードオフ上で自動的に止まる機構として働く。
+       CV=0 は目的ではない（ランダムルーティングで達成できてしまう）。
+
+    4. 出力値に影響する状態は buffer にする。更新タイミングだけを決める
+       カウンタは Python int にする。buffer にすると毎 forward で
+       GPU->CPU 同期が発生し、MoE層数 x forward 回数だけ遅くなる。
+
+    checkpoint 移行
+    ------------------------------------------------------------------
+    buffer を新規追加しているので旧 checkpoint からは
+    load_state_dict(..., strict=False) でロードする。
+    routing_bias / ema_counts は名前が同じなので引き継がれる。
+    """
+
+    # model.to(torch.bfloat16) は buffer も含めてキャストする。bf16 は仮数8bit
+    # なので counts が数千のオーダーになると EMA が数%狂い（実測 7.7%）、
+    # bias に 0.015 程度の誤差が乗る。健全な定常状態の |bias| は 0.002 程度なので
+    # これは信号がノイズに埋もれる水準。以下の buffer は fp32 を維持する。
+    _FP32_BUFFERS = ("routing_bias", "ema_counts", "ema_counts_sq", "ema_counts_long",
+                     "pending_counts", "diag_gap", "diag_distortion", "diag_aff_loss")
+
+    def _apply(self, *args, **kwargs):
+        mod = super()._apply(*args, **kwargs)
+        for name in Gate._FP32_BUFFERS:
+            buf = mod._buffers.get(name)
+            if buf is not None and buf.is_floating_point() and buf.dtype is not torch.float32:
+                mod._buffers[name] = buf.float()
+        return mod
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # 旧 checkpoint が bf16 で保存されていた場合に備えて明示的に戻す
+        for name in Gate._FP32_BUFFERS:
+            k = prefix + name
+            if k in state_dict and state_dict[k].is_floating_point():
+                state_dict[k] = state_dict[k].float()
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def __init__(self, args, layer_id: int, route_scale: float = 1.0):
         super().__init__()
+        n_exp = args.num_experts
 
         self.topk = args.topk_experts
+        self.n_exp = n_exp
         self.score_func = args.score_type
-        self.gate_bias: bool = args.use_gate_bias
         self.layer_id = layer_id
         self.route_scale = route_scale
 
-        # self.gamma = getattr(args, "bias_update_rate", 1e-3)
+        # --- 制御パラメータ ---
         self.ema_decay = getattr(args, "ema_decay", 0.97)
-        self.bias_cv_threshold = getattr(args, "bias_cv_threshold", 0.70)
-        self.bias_threshold = getattr(args, "bias_threshold", 1500000)
-        self._bias_step = torch.zeros(1)
+        self.long_decay = getattr(args, "ema_decay_long", 0.999)   # tau ~ 1000
+        self.manual_step = getattr(args, "gate_manual_step", False)
+        self.bias_gain_ref = getattr(args, "bias_gain_ref", 1.2)
+        self.update_every = getattr(args, "bias_update_every", 1)   # = grad_accum_steps
 
-        if getattr(args, "use_gate_lora", False):
-            self.gate_proj = lora.Linear(
-                args.d_model, args.num_experts,
-                r=args.lora_r, lora_alpha=args.lora_alpha, bias=False
-            )
-        else:
-            self.gate_proj = nn.Linear(args.d_model, args.num_experts, bias=False)
-
-        self.register_buffer("routing_bias", torch.zeros(args.num_experts))
-        self.register_buffer("ema_counts", torch.zeros(args.num_experts))
-
-        # ===== DEAD EXPERT logging only =====
-        self.register_buffer("zero_streak", torch.zeros(args.num_experts, dtype=torch.long))
+        # --- 監視・診断 ---
+        self.cv_alert_threshold = getattr(args, "bias_cv_threshold", 0.70)
         self.dead_steps_threshold = getattr(args, "dead_steps_threshold", 16)
         self.dead_clear_patience = getattr(args, "dead_clear_patience", 16)
-        self.dead_clear_streak = 0
-        # ====================================
+        self.log_every = getattr(args, "gate_log_every", 10)     # flush 何回ごとにログ判定
+        self.diag_every = getattr(args, "gate_diag_every", 50)   # 0 で診断オフ
 
-        self.is_update = False
-        self.dead_expert_alert = False
+        if getattr(args, "use_gate_lora", False):
+            import loralib as lora
+            self.gate_proj = lora.Linear(
+                args.d_model, n_exp,
+                r=args.lora_r, lora_alpha=args.lora_alpha, bias=False,
+            )
+        else:
+            self.gate_proj = nn.Linear(args.d_model, n_exp, bias=False)
 
-        if self.gate_bias:
-            print("Using gate bias")
-        print(f"Gate Type:{self.score_func}")
+        # ============ 出力値に影響する状態（buffer 必須）============
+        self.register_buffer("routing_bias", torch.zeros(n_exp, dtype=torch.float32))
+        self.register_buffer("ema_counts", torch.zeros(n_exp, dtype=torch.float32))
+        self.register_buffer("ema_init", torch.tensor(False))
+        self.register_buffer("bias_enabled", torch.tensor(bool(args.use_gate_bias)))
 
+        # ============ 監視状態（学習再開で失わないため buffer）============
+        # 部分累積窓は保存しない。_pending_steps（Python int）と永続性を揃えるため
+        # persistent=False にする。片方だけ復元すると次の flush が約2倍の量になる。
+        self.register_buffer("pending_counts", torch.zeros(n_exp, dtype=torch.float32),
+                             persistent=False)
+        self.register_buffer("ema_counts_sq", torch.zeros(n_exp, dtype=torch.float32))
+        # 長期EMA。データのドメイン相関を検出するための第2時定数
+        self.register_buffer("ema_counts_long", torch.zeros(n_exp, dtype=torch.float32))
+        self.register_buffer("zero_streak", torch.zeros(n_exp, dtype=torch.long))
+        self.register_buffer("cv_alert", torch.tensor(False))
+        self.register_buffer("dead_alert", torch.tensor(False))
+        self.register_buffer("dead_clear_streak", torch.zeros((), dtype=torch.long))
+        for k in ("diag_gap", "diag_distortion", "diag_aff_loss"):
+            self.register_buffer(k, torch.tensor(float("nan")))
+
+        # ============ 出力に影響しないカウンタ（同期回避のため int）============
+        self._pending_steps = 0
+        self._flush_count = 0
+        self._last_diag_flush = -1
+
+        if bool(self.bias_enabled):
+            print(f"[MOE_{layer_id}] gate bias: on (quadratic, gain_ref={self.bias_gain_ref})")
+        print(f"[MOE_{layer_id}] score func: {self.score_func}")
+
+    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits = self.gate_proj(x)
+        # スコアは fp32 で計算・保持する。routing_bias も fp32。
+        logits = self.gate_proj(x).float()
         scores = logits.softmax(dim=-1) if self.score_func == "softmax" else logits.sigmoid()
-        routing_scores = scores + self.routing_bias if (self.training and self.gate_bias) else scores
 
+        # --- 選択: bias 込み。self.training で切り替えない ---
+        routing_scores = scores + self.routing_bias if self.bias_enabled else scores
         _, indices = torch.topk(routing_scores, self.topk, dim=-1)
+
+        # --- 重み: bias を含まない素のスコアから取る ---
         weights = scores.gather(dim=-1, index=indices)
-        if self.score_func == "softmax":
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
+
+        # sigmoid は各次元独立で top-k 和が [0, topk] の任意値をとるため正規化が必須。
+        # これがないと「全スコアを一律に上げる」縮退方向が開き、ゲートが
+        # エキスパート間の相対比較（競合）を学習しなくなる:
+        #   正規化なし : dL/ds_i = <g, E_i>            ... 中心化されない
+        #   正規化あり : dL/ds_i = (1/S)<g, E_i - y>   ... 混合出力 y を基準に中心化
+        # softmax でも top-k 部分和は 1 未満なので同様に正規化する。
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-9)
         weights = weights * self.route_scale
 
         if self.training:
-            self._monitor_load_balance(indices, update_bias=self.gate_bias)
+            # 診断は flush 境界の直前 micro-batch で1回だけ走らせる。
+            # manual_step=True のときは _pending_steps が増えないので、
+            # 境界を予測できない。その場合は毎 micro-batch 走らせず
+            # diag_every 回の flush ごとに最初の micro-batch で走らせる。
+            if self.diag_every > 0 and self._flush_count % self.diag_every == 0:
+                at_boundary = (self._pending_steps == 0 if self.manual_step
+                               else self._pending_steps + 1 >= self.update_every)
+                if at_boundary and self._flush_count != self._last_diag_flush:
+                    self._last_diag_flush = self._flush_count
+                    self._diagnose(scores, indices)
+            self._observe(indices)
 
         return weights.to(dtype=x.dtype), indices
 
+    # ------------------------------------------------------------------
     @torch.no_grad()
-    def _monitor_load_balance(self, indices: torch.Tensor, update_bias: bool):
-        counts = torch.bincount(indices.flatten(), minlength=self.routing_bias.numel()).float()
+    def _diagnose(self, scores: torch.Tensor, indices: torch.Tensor) -> None:
+        """bias が「境界上の僅差の反転」に留まっているかを測る。
 
+        bias_absmax / boundary_gap の比で判定する（routing_stats 参照）:
+            < 0.1  親和性に介入していない
+            ~ 1    境界上の僅差のみ反転（理想的な動作領域）
+            > 3    親和性を上書きしている。bias 設定ではなくゲート自体を見るべき
+
+        affinity_loss は「捨てた品質」を単位付きで直接測る唯一の指標。
+        distortion（歪み率）だけではモード崩壊と僅差を区別できないが、
+        1件あたりの損失 = affinity_loss / distortion を見れば区別できる。
+        """
+        k = self.topk
+        if k >= self.n_exp:
+            return
+
+        top_val, top_idx = torch.topk(scores, k + 1, dim=-1)
+
+        # 境界ギャップ: 第k位 - 第(k+1)位。bias なしの順位で測る
+        gap = (top_val[..., k - 1] - top_val[..., k]).flatten().median()
+
+        # 歪み率: bias によって top-k 集合が変わったトークンの割合
+        ref = top_idx[..., :k]
+        changed = (ref.sort(dim=-1).values != indices.sort(dim=-1).values).any(dim=-1)
+        distortion = changed.to(torch.float32).mean()
+
+        # 親和性損失: bias なしなら得られたスコア和との差
+        aff_loss = (top_val[..., :k].sum(-1)
+                    - scores.gather(-1, indices).sum(-1)).flatten().mean()
+
+        self.diag_gap.copy_(gap)
+        self.diag_distortion.copy_(distortion)
+        self.diag_aff_loss.copy_(aff_loss)
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _observe(self, indices: torch.Tensor) -> None:
+        """負荷を集計し、update_every 回ごとに bias を更新する。
+
+        bincount / EMA / bias 更新は全て GPU 上で完結し同期を起こさない。
+        同期が入るのは _log の中だけで、そこは log_every で間引いている。
+        """
+        # bincount は同期しないので毎 micro-batch 実行して良い
+        self.pending_counts += torch.bincount(
+            indices.flatten(), minlength=self.n_exp
+        ).to(self.pending_counts.dtype)
+
+        # manual_step=True のとき flush は trainer が gate_step() で明示的に起こす。
+        # activation checkpointing 下では forward が backward 中に再実行され
+        # _observe が2回呼ばれるため、自動 flush では実効 tau が半減する。
+        # counts の一律スケールは bias に影響しない（delta も cv もスケール不変）が
+        # flush 頻度は影響を受けるので、確実にしたいなら manual_step を使う。
+        if self.manual_step:
+            return
+        self._pending_steps += 1
+        if self._pending_steps < self.update_every:
+            return
+        self._pending_steps = 0
+        self.gate_step()
+
+    @torch.no_grad()
+    def gate_step(self) -> None:
+        """累積した負荷を flush して bias を1回更新する。
+
+        manual_step=True のとき、trainer が optimizer.step() の直後に
+        1回だけ呼ぶ。activation checkpointing / 任意の grad_accum に対して
+        「optimizer step 1回 = bias 更新1回」が厳密に保証される。
+
+            for m in model.modules():
+                if isinstance(m, Gate):
+                    m.gate_step()
+        """
+        self._flush_count += 1
+        counts = self.pending_counts.clone()
+        self.pending_counts.zero_()
+
+        # all_reduce は flush 時のみ。しないと rank ごとに違う bias ができモデルが分岐する
         if dist.is_initialized():
             dist.all_reduce(counts)
 
-        if counts.sum() == 0:
+        # 測定の平滑化。alpha=1-decay により DCゲイン=1 の平均推定量になる（積分器ではない）。
+        # 初回だけ counts をそのまま入れる。`if ema.sum() == 0` は同期を起こすので
+        # torch.where で分岐する。
+        d = self.ema_decay
+        self.ema_counts.copy_(torch.where(
+            self.ema_init, d * self.ema_counts + (1.0 - d) * counts, counts))
+        self.ema_counts_sq.copy_(torch.where(
+            self.ema_init,
+            d * self.ema_counts_sq + (1.0 - d) * counts * counts,
+            counts * counts))
+        dl = self.long_decay
+        self.ema_counts_long.copy_(torch.where(
+            self.ema_init, dl * self.ema_counts_long + (1.0 - dl) * counts, counts))
+        self.ema_init.fill_(True)
+
+        mu = self.ema_counts.mean()
+        cv = self.ema_counts.std(unbiased=False) / (mu + 1e-6)
+
+        # 死亡連続回数（同期しない。bias は触らない）
+        zero = counts == 0
+        self.zero_streak[zero] += 1
+        self.zero_streak[~zero] = 0
+
+        if self._flush_count % self.log_every == 0:
+            self._log(cv)
+
+        if not self.bias_enabled:
             return
 
-        n_exp = self.routing_bias.numel()
+        # cv = ||delta||/sqrt(N) なのでこれは二次制御になる。
+        # sigmoid / softmax で式は同一（sum/n_exp == mean）なので分岐しない。
+        gamma_eff = torch.clamp(cv / self.bias_gain_ref, max=1.0)
+        delta = ((self.ema_counts - mu) / (mu + 1e-6)).clamp(-1.0, 1.0)
+
+        new_bias = -gamma_eff * delta
+        new_bias -= new_bias.mean()   # clamp で崩れたゼロ和を戻す
+        self.routing_bias.copy_(new_bias)
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _log(self, cv: torch.Tensor) -> None:
+        """アラートの立ち上がり／立ち下がりのみ出力。ここだけ同期が入る。
+
+        死亡エキスパートは検出のみ。clip 範囲内の bias は「境界上のゆらぎの補正」
+        しかできないため、スコアが崩壊しきったエキスパートは bias では救済できない。
+        その場合は gate_proj.weight の該当行を健全な行からコピー＋ノイズで
+        再初期化する別経路で扱う。
+        """
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        if self.ema_counts.sum() == 0:
-            self.ema_counts.copy_(counts)
-        else:
-            self.ema_counts.mul_(self.ema_decay).add_(counts, alpha=1.0 - self.ema_decay)
-
-        mean = self.ema_counts.mean()
-        std = self.ema_counts.std(unbiased=False)
-        cv = std / (mean + 1e-6)
-
-        if cv > self.bias_cv_threshold and not self.is_update:
+        high = bool(cv > self.cv_alert_threshold)
+        if high != bool(self.cv_alert):
+            self.cv_alert.fill_(high)
             if rank == 0:
-                print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} | Distribution: {self.ema_counts.long().tolist()}")
-                print(f"[MOE_{self.layer_id}] BIAS: ON!!")
-            self.is_update = True
-            self.gate_bias = True
-        elif cv <= self.bias_cv_threshold and self.is_update:
-            if rank == 0:
-                print(f"[MOE_MONITOR] LAYER ID: {self.layer_id} CV: {cv:.4f} CLEAR!")
-            self.is_update = False
+                tag = "HIGH" if high else "CLEAR"
+                extra = f" | dist={self.ema_counts.long().tolist()}" if high else ""
+                print(f"[MOE_MONITOR] L{self.layer_id} CV={float(cv):.4f} {tag}{extra}")
 
-        zero_mask = (counts == 0)
-
-        self.zero_streak[zero_mask] += 1
-        self.zero_streak[~zero_mask] = 0
-
-        persistent_dead_mask = (self.zero_streak >= self.dead_steps_threshold)
-        persistent_dead_ids = torch.nonzero(persistent_dead_mask, as_tuple=False).flatten().tolist()
-        persistent_dead_count = len(persistent_dead_ids)
-
-        if persistent_dead_count > 0 and not self.dead_expert_alert:
-            if rank == 0:
-                print(
-                    f"[MOE_DEAD] LAYER ID: {self.layer_id} | "
-                    f"persistent dead experts: {persistent_dead_count}/{n_exp} | "
-                    f"ids: {persistent_dead_ids} | CV: {cv:.4f}"
-                )
-            print(f"[MOE_{self.layer_id}] BIAS: ON!!")
-
-            self.dead_expert_alert = True
-            self.dead_clear_streak = 0
-            self.gate_bias = True
-
-        elif persistent_dead_count == 0  and self.dead_expert_alert:
-            self.dead_clear_streak += 1
-            if self.dead_clear_streak >= self.dead_clear_patience:
+        dead = torch.nonzero(self.zero_streak >= self.dead_steps_threshold).flatten()
+        if dead.numel() > 0:
+            self.dead_clear_streak.zero_()
+            if not bool(self.dead_alert):
+                self.dead_alert.fill_(True)
                 if rank == 0:
-                    print(f"[MOE_DEAD] LAYER ID: {self.layer_id} CLEAR!")
-                self.dead_expert_alert = False
-                self.dead_clear_streak = 0
-        # ==========================================================
+                    print(f"[MOE_DEAD] L{self.layer_id} {dead.numel()}/{self.n_exp} dead "
+                          f"ids={dead.tolist()} CV={float(cv):.4f}")
+        elif bool(self.dead_alert):
+            self.dead_clear_streak += 1
+            if int(self.dead_clear_streak) >= self.dead_clear_patience:
+                self.dead_alert.fill_(False)
+                self.dead_clear_streak.zero_()
+                if rank == 0:
+                    print(f"[MOE_DEAD] L{self.layer_id} CLEAR")
 
-        if not update_bias:
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def finalize_bias(self) -> None:
+        """学習終了時に呼ぶ。長期EMA から routing_bias を作り直す。
+
+        通常の routing_bias は直近 tau=33 ステップの負荷から作られるため、
+        学習が偏ったドメインのフェーズで終わると、そのフェーズ用の bias が
+        固定されて出荷される。長期EMA（tau=1000）から作り直すことで
+        学習全体を通した平均的な負荷補正になる。
+        """
+        if not bool(self.ema_init) or not bool(self.bias_enabled):
             return
-
-        if cv < 0.2:
-            self._bias_step += 1
-
-        if self._bias_step >= self.bias_threshold:
-            self._bias_step = 0
-            self.gate_bias = False
-            print(f"[MOE_{self.layer_id}] BIAS: OFF!!")
-
-        if self.score_func == "sigmoid":
-            x = self.ema_counts
-            mu = x.mean()
-            delta = (x - mu) / (mu + 1e-6)
-            delta = delta.clamp(-1.0, 1.0)
-
-        elif self.score_func == "softmax":
-            target = self.ema_counts.sum() / n_exp
-            err = (self.ema_counts - target) / (target + 1e-6)
-            delta = err.clamp(-1.0, 1.0)
-
-        else:
-            delta = torch.zeros_like(self.routing_bias)
-
-        gamma_eff = torch.clamp(cv / 1.2, max=1.0)
+        src = self.ema_counts_long
+        mu = src.mean()
+        cv = src.std(unbiased=False) / (mu + 1e-6)
+        gamma_eff = torch.clamp(cv / self.bias_gain_ref, max=1.0)
+        delta = ((src - mu) / (mu + 1e-6)).clamp(-1.0, 1.0)
         new_bias = -gamma_eff * delta
+        new_bias -= new_bias.mean()
         self.routing_bias.copy_(new_bias)
+
+    @torch.no_grad()
+    def routing_stats(self) -> dict:
+        """学習ループから任意に呼ぶ。この層が3領域のどこにいるかを判定する。
+
+          (1) ばらばら   : cv 低 / gap 大  -> 健全。gamma_eff が自動で絞っている
+          (2) モード崩壊 : cv 高 / gap 大  -> bias では直らない。ゲート自体を見る
+          (3) 僅差       : cv 高 / gap 小  -> bias が最も安く効く領域
+
+        bias_per_gap:
+            < 0.1  介入していない（1）
+            ~ 1    境界上の僅差のみ反転（3・理想）
+            > 3    親和性を上書き（2・警告）
+
+        temporal_cv はリミットサイクル検出用。cv が低いのに temporal_cv が
+        高い（> 0.5 程度）場合、エキスパートが順番に飢餓状態になる振動が
+        起きている。二次制御では通常起きないが、bias_gain_ref を
+        下げすぎた場合（= ゲインを上げた場合）に現れる。
+
+        loss_per_flip = affinity_loss / distortion は 1トークン反転あたりの
+        品質コスト。(2) では (3) の約2倍になる。
+        """
+        mu = self.ema_counts.mean()
+        var = (self.ema_counts_sq - self.ema_counts * self.ema_counts).clamp_min(0.0)
+        babs = float(self.routing_bias.abs().max())
+        gap = float(self.diag_gap)
+        dist_ = float(self.diag_distortion)
+        aff = float(self.diag_aff_loss)
+        ok = lambda v: v == v  # not nan
+
+        return {
+            "layer": self.layer_id,
+            "cv": float(self.ema_counts.std(unbiased=False) / (mu + 1e-6)),
+            "temporal_cv": float((var.sqrt() / (self.ema_counts + 1e-6)).mean()),
+            "bias_absmax": babs,
+            "boundary_gap": gap,
+            "bias_per_gap": babs / gap if ok(gap) and gap > 0 else float("nan"),
+            "distortion": dist_,
+            "affinity_loss": aff,
+            "loss_per_flip": aff / dist_ if ok(dist_) and dist_ > 0 else float("nan"),
+            "timescale_divergence": float((
+                self.ema_counts / (self.ema_counts.mean() + 1e-6)
+                - self.ema_counts_long / (self.ema_counts_long.mean() + 1e-6)
+            ).abs().max()),
+            "dead_now": int((self.ema_counts == 0).sum()),
+            "load_min": float(self.ema_counts.min()),
+            "load_max": float(self.ema_counts.max()),
+        }
 
 class Expert(nn.Module):
 

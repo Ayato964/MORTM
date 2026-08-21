@@ -62,6 +62,7 @@ class MORTM(nn.Module):
             Tensor: Output logits.
         """
         x: Tensor = self.embedding(x).to(dtype=torch.bfloat16)
+        
         if padding_mask is not None:
             batch, tgt_len, embed_dim = x.size()
             x, indices, cu_seqlens, max_s, used_seqlens = unpad_input(x, padding_mask)

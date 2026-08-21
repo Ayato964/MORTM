@@ -1,0 +1,16 @@
+{
+  "vocab_size": 700,
+  "d_model": 768,
+  "dim_feedforward": 3072,
+  "num_heads": 12,
+  "d_layer": 17,
+  "dropout": 0.2,
+  "position_length": 5000,
+  "min_length": 40,
+  "use_moe_encoder": false,
+  "use_moe_decoder": false,
+  "norm_type": "rmsnorm",
+  "use_silu": true,
+  "use_bias": false,
+  "use_rope": true
+}
