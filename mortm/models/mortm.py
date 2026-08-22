@@ -219,6 +219,11 @@ class MORTM(nn.Module):
         Returns:
             Tensor: Sampled token indices.
         """
+        if temperature <= 0:
+            # greedy。評価用に決定的な出力が要る場面で使う
+            # (CARL の報酬は ana の推論結果から作るので、サンプリングすると
+            #  同じ生成物でも報酬が毎回変わり、GRPO の優位性が乱数を測ってしまう)。
+            return torch.argmax(logits, dim=-1)
         logits = logits / temperature
         probs = self.softmax(logits)
 
@@ -380,11 +385,14 @@ class MORTM(nn.Module):
 
 
 class ClassificationMORTM(MORTM):
-    def __init__(self, args, class_num, progress: LearningProgress):
+    def __init__(self, args, class_num, progress: LearningProgress, pma_out_dim: int = None):
         super().__init__(args, progress)
-        self.pma = PMA(self.d_model, self.d_model * 2)
+        # pma_out_dim 既定は d_model*2 (従来=E3互換)。過学習抑制のため小さくも指定可(例: d_model)。
+        pod = pma_out_dim if pma_out_dim is not None else self.d_model * 2
+        self.pma_out_dim = pod
+        self.pma = PMA(self.d_model, pod)
         self.classifier = nn.Sequential(
-            nn.Linear(self.d_model * 2, self.d_model // 2),
+            nn.Linear(pod, self.d_model // 2),
             nn.ReLU(),
             nn.Linear(self.d_model // 2, class_num),
         )

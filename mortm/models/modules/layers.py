@@ -160,6 +160,13 @@ class PMA(nn.Module):
 
         # 1 seed query per sequence
         q = self.q_seed.expand(batch, -1).view(batch, self.num_heads, self.head_dim)
+
+        # FlashAttention は fp16/bf16 のみ対応。q_seed(fp32 Parameter)は Linear を通らず
+        # autocast の半精度化を受けないため、kv(autocast下でbf16)と型が食い違う。半精度に揃える。
+        attn_dtype = kv.dtype if kv.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        kv = kv.to(attn_dtype)
+        q = q.to(attn_dtype)
+
         cu_seqlens_q = torch.arange(
             batch + 1, device=x.device, dtype=torch.int32
         )  # each query length = 1

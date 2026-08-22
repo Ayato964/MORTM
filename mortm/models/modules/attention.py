@@ -220,13 +220,13 @@ class FlashSelfAttentionM(nn.Module):
                             self.cache_seqlens[i] = l
 
                 out = flash_attn_varlen_qkvpacked_func(
-                    qkv, dropout_p=self.drop, causal=is_causal,
+                    qkv, dropout_p=(self.drop if self.training else 0.0), causal=is_causal,
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
                 )
             else:
                 # ALiBi
                 out = flash_attn_varlen_qkvpacked_func(
-                    qkv, dropout_p=self.drop, causal=is_causal,
+                    qkv, dropout_p=(self.drop if self.training else 0.0), causal=is_causal,
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                     alibi_slopes=self.alibi_slopes
                 )
@@ -384,13 +384,13 @@ class FlashCrossAttentionM(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
                 causal=False,
-                dropout_p=self.drop
+                dropout_p=(self.drop if self.training else 0.0)
             )
         else:
             q, kv = self.qkv_block(q=x, kv=encoder_x)
             q = q.unsqueeze(0)
             kv = kv.unsqueeze(0)
-            out = flash_attn_kvpacked_func(q=q, kv=kv, dropout_p=self.drop, causal=False)
+            out = flash_attn_kvpacked_func(q=q, kv=kv, dropout_p=(self.drop if self.training else 0.0), causal=False)
             out = rearrange(out, "b s h d -> (b s) (h d)")
             return self.qkv_block.comp(out)
 

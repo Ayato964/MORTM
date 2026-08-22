@@ -1181,7 +1181,9 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
                 seed: int = 42):
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        # 既定 nccl(従来の2GPU学習を維持)。env MORTM_DDP_BACKEND=gloo でCPU通信に切替
+        # (NVMLドライバ不整合でNCCLが使えない環境の1GPUフォールバック用, E5)。
+        dist.init_process_group(backend=os.environ.get("MORTM_DDP_BACKEND", "nccl"))
 
     # DDP環境でのプロセス間の再現性と同期を確保するため、すべての乱数シードを固定。
     # seed は呼び出し側(run_e1のseed_tag)から受け取る。既定42で従来挙動を維持。
@@ -1248,7 +1250,9 @@ def train_custom(trainer: AbstractTrainSet, t_args, root_directory, save_directo
                  progress: LearningProgress = _DefaultLearningProgress(), coll_fn=None):
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        # 既定 nccl(従来の2GPU学習を維持)。env MORTM_DDP_BACKEND=gloo でCPU通信に切替
+        # (NVMLドライバ不整合でNCCLが使えない環境の1GPUフォールバック用, E5)。
+        dist.init_process_group(backend=os.environ.get("MORTM_DDP_BACKEND", "nccl"))
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
