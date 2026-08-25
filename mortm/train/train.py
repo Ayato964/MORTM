@@ -429,7 +429,7 @@ class MixedSequenceBatchSampler:
             yield batch_indices
 
 class MORTMTrainSet(AbstractTrainSet):
-    def __init__(self, args: MORTMArgs, t_args: TrainArgs, tokenizer: Tokenizer, calc_val_loss_tokens, progress: LearningProgress, log_scale=False, project_name="", config=None,  load_directory=None, model_name=None):
+    def __init__(self, args: MORTMArgs, t_args: TrainArgs, tokenizer: Tokenizer, calc_val_loss_tokens, progress: LearningProgress, log_scale=False, project_name="", config=None, load_directory=None, model_name=None, wandb_id=None):
         self.tokenizer = tokenizer
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -455,18 +455,25 @@ class MORTMTrainSet(AbstractTrainSet):
         total_param, self.active_params = self.model.module.get_param()
         adam = torch.optim.AdamW(self.model.parameters(), lr=t_args.lr_param)
 
-        if self.local_rank == 0:
-            with open(config, 'r') as f:
-                data: dict = json.load(f)
-                if log_scale:
-                    data['model_params'] = self.active_params
-                    data['total_params'] = total_param
-                    wandb.init(
-                        project=project_name,
-                        name=model_name,
-                        config=data,
-                        reinit=True
-                    )
+        if self.local_rank == 0 and project_name:
+            wandb_kwargs = {
+                "project": project_name,
+                "name": model_name,
+                "reinit": True,
+            }
+            if config is not None:
+                with open(config, 'r') as f:
+                    data: dict = json.load(f)
+                    if log_scale:
+                        data['model_params'] = self.active_params
+                        data['total_params'] = total_param
+                    wandb_kwargs["config"] = data
+
+            if wandb_id is not None:
+                wandb_kwargs["id"] = wandb_id
+                wandb_kwargs["resume"] = "allow"
+
+            wandb.init(**wandb_kwargs)
 
         super().__init__(criterion=nn.CrossEntropyLoss(ignore_index=0).to(device),
                          optimizer=adam,
@@ -948,10 +955,131 @@ def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: n
         return 0.0
 
     return (val_loss / all_count).item()
+
+
+def _save_checkpoint(
+    checkpoint_path: str,
+    trainer: AbstractTrainSet,
+    epoch: int,
+    outer_batch_idx: int,
+    total_outer_batches: int,
+    optimizer_step: int,
+    verification_loss: float,
+    model_name: str,
+    version: str,
+    wandb_run_id: Optional[str] = None,
+):
+    """
+    トレーニングの全状態（モデル重み、Optimizer、Scheduler、ウォームアップ・ステップ数、
+    ビッグバッチ進捗、トークン数、RNG状態、W&B Run ID）をアトミックに上書き保存する。
+    一時ファイル（.tmp）に書き出してから置換することで、書き込み中のクラッシュによる破損を防ぐ。
+    """
+    raw_model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+
+    rng_states = {
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
+    }
+
+    all_tokens_val = trainer.all_tokens.item() if isinstance(trainer.all_tokens, Tensor) else int(trainer.all_tokens)
+
+    w_id = wandb_run_id
+    if w_id is None and wandb.run is not None:
+        w_id = getattr(wandb.run, "id", None)
+
+    checkpoint_data = {
+        "model_state_dict": raw_model.state_dict(),
+        "optimizer_state_dict": trainer.optimizer.state_dict(),
+        "scheduler_state_dict": trainer.scheduler.state_dict() if trainer.scheduler is not None else None,
+        "epoch": epoch,
+        "outer_batch_idx": outer_batch_idx,
+        "total_outer_batches": total_outer_batches,
+        "optimizer_step": optimizer_step,
+        "all_tokens": all_tokens_val,
+        "last_val_calc_tokens": trainer.last_val_calc_tokens,
+        "verification_loss": verification_loss,
+        "rng_states": rng_states,
+        "wandb_run_id": w_id,
+        "model_name": model_name,
+        "version": version,
+        "timestamp": datetime.datetime.now().isoformat(),
+    }
+
+    checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    tmp_path = checkpoint_path + ".tmp"
+    torch.save(checkpoint_data, tmp_path)
+    os.replace(tmp_path, checkpoint_path)
+
+
+def _load_checkpoint(
+    checkpoint_path: str,
+    trainer: AbstractTrainSet,
+    device: torch.device,
+) -> dict:
+    """
+    チェックポイントファイルから全状態を復元する。
+    モデル重み、Optimizer、Scheduler（ウォームアップ数含む）、トークン数、ステップ数、乱数状態を復元。
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # 1. モデル重みの復元
+    raw_model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+    raw_model.load_state_dict(ckpt["model_state_dict"])
+
+    # MoE Gate 内部の _flush_count カウンタを optimizer_step に同期
+    opt_step = ckpt.get("optimizer_step", 0)
+    for m in raw_model.modules():
+        if hasattr(m, "_flush_count"):
+            m._flush_count = opt_step
+
+    # 2. Optimizer の復元
+    if "optimizer_state_dict" in ckpt and ckpt["optimizer_state_dict"] is not None:
+        trainer.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+    # 3. Scheduler（ウォームアップ・ステップ進行）の復元
+    if trainer.scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+        trainer.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+    # 4. カウンタ・トークン数の復元
+    if isinstance(trainer.all_tokens, Tensor):
+        trainer.all_tokens.fill_(ckpt.get("all_tokens", 0))
+    else:
+        trainer.all_tokens = ckpt.get("all_tokens", 0)
+
+    trainer.last_val_calc_tokens = ckpt.get("last_val_calc_tokens", 0)
+    trainer.optimizer_steps = ckpt.get("optimizer_step", 0)
+
+    # 5. 乱数状態（RNG States）の復元
+    # 5. 乱数状態（RNG States）の復元
+    rng_states = ckpt.get("rng_states")
+    if rng_states is not None:
+        if "torch_rng" in rng_states and rng_states["torch_rng"] is not None:
+            t_rng = rng_states["torch_rng"]
+            if isinstance(t_rng, torch.Tensor):
+                t_rng = t_rng.cpu().byte()
+            torch.set_rng_state(t_rng)
+        if "cuda_rng" in rng_states and rng_states["cuda_rng"] is not None and torch.cuda.is_available():
+            try:
+                c_rng = [s.cpu().byte() if isinstance(s, torch.Tensor) else s for s in rng_states["cuda_rng"]]
+                torch.cuda.set_rng_state_all(c_rng)
+            except Exception:
+                pass
+        if "numpy_rng" in rng_states and rng_states["numpy_rng"] is not None:
+            np.random.set_state(rng_states["numpy_rng"])
+        if "python_rng" in rng_states and rng_states["python_rng"] is not None:
+            random.setstate(rng_states["python_rng"])
+
+    return ckpt
+
+
 def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: AbstractTrainSet,
                 train_loader: DataLoader, val_loader: DataLoader,
                 message: Messenger, progress: LearningProgress,
-                writer, coll_fn=None):
+                writer, coll_fn=None, resume: bool = True,
+                resume_checkpoint_path: Optional[str] = None, version: str = ""):
 
     model = trainer.model
     criterion = trainer.criterion
@@ -966,17 +1094,58 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
     all_count = 1
     optimizer_step = 0
     verification_loss = 0.0
+    start_epoch = 0
+    resume_outer_batch_idx = 0
 
     device = torch.device(f"cuda:{local_rank}")
+    checkpoint_path = resume_checkpoint_path if resume_checkpoint_path is not None else f"{save_directory}/{model_name}.checkpoint.pt"
 
-    for epoch in range(train_args.num_epochs):
+    # チェックポイント存在確認とDDPプロセス間共有
+    has_checkpoint = False
+    if resume:
+        if local_rank == 0:
+            has_checkpoint = os.path.exists(checkpoint_path)
+        if _is_dist_ready():
+            obj = [has_checkpoint]
+            dist.broadcast_object_list(obj, src=0)
+            has_checkpoint = obj[0]
+
+    if has_checkpoint:
+        if local_rank == 0:
+            print(f"\033[32m[Checkpoint]\033[0m チェックポイントを検出しました: {checkpoint_path}")
+        ckpt = _load_checkpoint(checkpoint_path, trainer, device)
+        start_epoch = ckpt.get("epoch", 0)
+        resume_outer_batch_idx = ckpt.get("outer_batch_idx", 0)
+        optimizer_step = ckpt.get("optimizer_step", 0)
+        trainer.optimizer_steps = optimizer_step
+        verification_loss = ckpt.get("verification_loss", 0.0)
+
+        # 前エポックの全Outer Batchが完了している場合は次エポックから開始
+        if resume_outer_batch_idx >= len(train_loader):
+            start_epoch += 1
+            resume_outer_batch_idx = 0
+
+        if local_rank == 0:
+            total_outer = ckpt.get("total_outer_batches", len(train_loader))
+            tokens = ckpt.get("all_tokens", 0)
+            print(
+                f"\033[32m[Resume 完了]\033[0m Epoch: {start_epoch + 1}/{train_args.num_epochs}, "
+                f"Outer Batch: {resume_outer_batch_idx}/{total_outer}, "
+                f"Optimizer Step: {optimizer_step}, "
+                f"Tokens: {_format_large_count(tokens)}, "
+                f"Val Loss: {verification_loss:.4f}"
+            )
+
+    if _is_dist_ready():
+        dist.barrier()
+
+    for epoch in range(start_epoch, train_args.num_epochs):
         _set_loader_epoch(train_loader, epoch)
         _set_loader_epoch(val_loader, epoch)
 
         try:
-            count = 1
+            count = 0
             epoch_loss = EpochObserver(1000)
-            verification_loss = 0.0
 
             model.train()
             optimizer.zero_grad()
@@ -984,7 +1153,12 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
             if local_rank == 0:
                 _print_epoch_summary(epoch, train_args, train_loader, optimizer_step)
 
-            for pack in train_loader:
+            for pack_idx, pack in enumerate(train_loader):
+                count += 1
+                if epoch == start_epoch and pack_idx < resume_outer_batch_idx:
+                    # すでに処理済みのビッグバッチは高速スキップ（Sampler生成器の状態を進める）
+                    continue
+
                 begin_time = time.time()
 
                 pre_processing_dataset = trainer.pre_processing(pack, progress)
@@ -1010,7 +1184,6 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                 synced_len = _sync_min_loader_length(local_len, device)
 
                 mini_c = 0
-                count += 1
 
                 for pack2 in inner_loader:
                     if mini_c >= synced_len:
@@ -1078,12 +1251,13 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                 if local_rank == 0:
                     if mail_bool:
                         t = end_time - begin_time
-                        end_time_progress = (t * len(train_loader) * train_args.num_epochs) / 3600
+                        remaining_outer = (len(train_loader) * train_args.num_epochs) - (epoch * len(train_loader) + count)
+                        end_time_progress = (t * max(1, remaining_outer)) / 3600
                         message.send_message(
-                            "学習開始のお知らせ",
-                            f"{model_name}の学習が開始されました。"
-                            f"\n\n シーケンスの1回目の処理が終了しました。かかった時間は{t:.1f}秒でした。\n"
-                            f"終了見込み時間は{end_time_progress:.2f}時間です"
+                            "学習状況のお知らせ",
+                            f"{model_name}の学習が進行中です。"
+                            f"\n\n 1ビッグバッチの処理時間: {t:.1f}秒でした。\n"
+                            f"残り終了見込み時間は約{end_time_progress:.2f}時間です"
                         )
                         mail_bool = False
 
@@ -1108,6 +1282,37 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
 
                     trainer.optional_logging(verification_loss, optimizer_step)
 
+                    # Validation 評価直後にもチェックポイントを上書き保存
+                    if local_rank == 0:
+                        _save_checkpoint(
+                            checkpoint_path,
+                            trainer,
+                            epoch=epoch,
+                            outer_batch_idx=count,
+                            total_outer_batches=len(train_loader),
+                            optimizer_step=optimizer_step,
+                            verification_loss=verification_loss,
+                            model_name=model_name,
+                            version=version,
+                        )
+
+                # ビッグバッチ完了ごとにチェックポイントを上書き保存
+                if local_rank == 0:
+                    _save_checkpoint(
+                        checkpoint_path,
+                        trainer,
+                        epoch=epoch,
+                        outer_batch_idx=count,
+                        total_outer_batches=len(train_loader),
+                        optimizer_step=optimizer_step,
+                        verification_loss=verification_loss,
+                        model_name=model_name,
+                        version=version,
+                    )
+
+            # エポック内のOuter Batchループ完了、次エポック用にリセット
+            resume_outer_batch_idx = 0
+
             if not epoch1_end:
                 epoch1_end = True
                 verification_loss = get_verification_loss(
@@ -1127,9 +1332,22 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
 
                 if train_args.is_save_training_progress:
                     torch.save(
-                        model.module.state_dict(),
+                        model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
                         f"{save_directory}/{model_name}.train.{epoch}.{verification_loss:.4f}.pth"
                     )
+
+                # エポック完了時のチェックポイント更新
+                _save_checkpoint(
+                    checkpoint_path,
+                    trainer,
+                    epoch=epoch + 1,
+                    outer_batch_idx=0,
+                    total_outer_batches=len(train_loader),
+                    optimizer_step=optimizer_step,
+                    verification_loss=verification_loss,
+                    model_name=model_name,
+                    version=version,
+                )
 
         except torch.cuda.OutOfMemoryError:
             if local_rank == 0:
@@ -1143,7 +1361,8 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
 
 def _train(args, t_args, save_directory, trainer, version, today_date,
            message, train_loader, val_loader,
-           progress, coll_fn=None):
+           progress, coll_fn=None, resume: bool = True,
+           resume_checkpoint_path: Optional[str] = None):
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     writer = None
@@ -1155,18 +1374,23 @@ def _train(args, t_args, save_directory, trainer, version, today_date,
         _print_loader_summary(train_loader, val_loader, t_args, trainer.world_size)
 
     try:
-        model, loss = self_turing(f"{args.name}.{version}", t_args, save_directory, trainer,
-                                         message=message,
-                                         train_loader=train_loader, val_loader=val_loader,
-                                         progress=progress,
-                                         writer=writer,
-                                         coll_fn=coll_fn
-                                         )
+        model, loss = self_turing(
+            f"{args.name}.{version}", t_args, save_directory, trainer,
+            message=message,
+            train_loader=train_loader, val_loader=val_loader,
+            progress=progress,
+            writer=writer,
+            coll_fn=coll_fn,
+            resume=resume,
+            resume_checkpoint_path=resume_checkpoint_path,
+            version=version,
+        )
 
         if local_rank == 0:
             message.send_message("機械学習終了のお知らせ",
                                  f"{args.name}.{version}の機械学習が終了しました。 \n 結果の報告です。\n 損失関数: {loss}")
-            torch.save(model.module.state_dict(), f"{save_directory}/{args.name}.{version}_{loss}.pth")
+            raw_model = model.module if hasattr(model, "module") else model
+            torch.save(raw_model.state_dict(), f"{save_directory}/{args.name}.{version}_{loss}.pth")
 
         return model
 
@@ -1177,8 +1401,8 @@ def _train(args, t_args, save_directory, trainer, version, today_date,
 
 def train_mortm(tokenizer, model_config: str, train_config: str, root_directory, save_directory, version: str,
                 message: Messenger = _DefaultMessenger(), load_model_directory: str=None, eval_list_json: str = None,
-                progress: LearningProgress = _DefaultLearningProgress(), log_scale=False,project_name=None,
-                seed: int = 42):
+                progress: LearningProgress = _DefaultLearningProgress(), log_scale=False, project_name=None,
+                seed: int = 42, resume: bool = True, resume_checkpoint_path: Optional[str] = None):
 
     if not dist.is_initialized():
         # 既定 nccl(従来の2GPU学習を維持)。env MORTM_DDP_BACKEND=gloo でCPU通信に切替
@@ -1193,23 +1417,33 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # 決定論的な動作を優先（速度は落ちる可能性があるが、デッドロック回避のため）
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
 
     args = MORTMArgs(json_directory=model_config)
     t_args = TrainArgs(json_directory=train_config)
-    trainer = MORTMTrainSet(args, t_args, tokenizer, t_args.val_total_tokens, progress, load_directory=load_model_directory, project_name=project_name, config=model_config, log_scale=log_scale, model_name=version)
 
-    # os.environ['CUDA_LAUNCH_BLOCKING'] = '1' # デバッグ終了につき無効化
+    # 既存のチェックポイントから W&B Run ID を検出して再接続
+    model_name = f"{args.name}.{version}"
+    effective_ckpt_path = resume_checkpoint_path if resume_checkpoint_path is not None else f"{save_directory}/{model_name}.checkpoint.pt"
+    wandb_id = None
+    if resume and os.path.exists(effective_ckpt_path):
+        try:
+            header = torch.load(effective_ckpt_path, map_location="cpu", weights_only=False)
+            wandb_id = header.get("wandb_run_id")
+        except Exception:
+            pass
+
+    trainer = MORTMTrainSet(
+        args, t_args, tokenizer, t_args.val_total_tokens, progress,
+        load_directory=load_model_directory, project_name=project_name,
+        config=model_config, log_scale=log_scale, model_name=version,
+        wandb_id=wandb_id
+    )
+
     today_date = datetime.date.today().strftime('%Y%m%d')
 
-    # rank 0 だけ NTFS をスキャンしてブロードキャスト。
-    # ntfs-3g (FUSE) への並列 readdir は D クラスデッドロックを引き起こすため、
-    # 全ランクが同時に os.walk するのを避ける。
     if local_rank == 0:
         grouped_paths, dataset_names = _collect_grouped_paths(root_directory)
     else:
@@ -1238,16 +1472,19 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
         val_dataset = _build_preloading_dataset(eval_grouped_paths, progress, eval_dataset_names)
         train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=t_args.shuffle)
 
-    _train(args, t_args, save_directory, trainer,message=message, version=version, today_date=today_date,
-           train_loader=train_loader, val_loader=val_loader,coll_fn=collate_fn,
-           progress=progress)
+    _train(
+        args, t_args, save_directory, trainer, message=message, version=version, today_date=today_date,
+        train_loader=train_loader, val_loader=val_loader, coll_fn=collate_fn,
+        progress=progress, resume=resume, resume_checkpoint_path=effective_ckpt_path
+    )
 
     if dist.is_initialized():
         dist.destroy_process_group()
 
 def train_custom(trainer: AbstractTrainSet, t_args, root_directory, save_directory, version: str,
                  message: Messenger = _DefaultMessenger(), eval_list_json: str = None,
-                 progress: LearningProgress = _DefaultLearningProgress(), coll_fn=None):
+                 progress: LearningProgress = _DefaultLearningProgress(), coll_fn=None,
+                 resume: bool = True, resume_checkpoint_path: Optional[str] = None):
 
     if not dist.is_initialized():
         # 既定 nccl(従来の2GPU学習を維持)。env MORTM_DDP_BACKEND=gloo でCPU通信に切替
@@ -1269,9 +1506,12 @@ def train_custom(trainer: AbstractTrainSet, t_args, root_directory, save_directo
         val_dataset = _build_preloading_dataset(eval_grouped_paths, progress, eval_dataset_names)
         train_loader, val_loader = get_data_loader(t_args, (mortm_dataset, val_dataset), shuffle=True)
 
-    _train(trainer.args, t_args, save_directory, trainer, message=message, version=version, today_date=today_date,
-           train_loader=train_loader, val_loader=val_loader, coll_fn=coll_fn,
-           progress=progress)
+    _train(
+        trainer.args, t_args, save_directory, trainer, message=message, version=version, today_date=today_date,
+        train_loader=train_loader, val_loader=val_loader, coll_fn=coll_fn,
+        progress=progress, resume=resume, resume_checkpoint_path=resume_checkpoint_path
+    )
 
     if dist.is_initialized():
         dist.destroy_process_group()
+

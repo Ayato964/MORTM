@@ -112,6 +112,12 @@ class AbstractTrainSet:
 
     def backward(self, accumulation_steps, is_step, progress, lr_param, *args):
         loss: Tensor = self.criterion(*args)
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"\033[31m[Warning]\033[0m NaN or Inf loss detected: {loss.item() if loss.numel() == 1 else 'tensor'}. Skipping backward.")
+            if is_step:
+                self.optimizer.zero_grad()
+            return loss.detach()
+
         return_loss = loss.clone()
         loss = loss / accumulation_steps
         loss.backward()

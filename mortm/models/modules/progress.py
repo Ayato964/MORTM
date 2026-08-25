@@ -1,4 +1,5 @@
 from abc import abstractmethod
+import math
 import torch
 
 
@@ -25,6 +26,11 @@ class _DefaultLearningProgress(LearningProgress):
 
     def step_optimizer(self, optimizer, model, accumulation_steps, **kwargs):
         norm = self.get_gradient_norm(model)
+        if math.isnan(norm) or math.isinf(norm):
+            print(f"\033[31m 警告\033[0m：勾配NORMがNaN/Infです({norm})。パラメータ更新をスキップして勾配をリセットします。")
+            optimizer.zero_grad()
+            return
+
         if not (1e-4 < norm < 3.0):
             print(
                 f"\033[31m 警告\033[0m：NORMが既定値から逸脱しています。学習率、またはバッチサイズを調整してください。({norm:.4f})")

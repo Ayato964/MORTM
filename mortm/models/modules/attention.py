@@ -376,6 +376,7 @@ class FlashCrossAttentionM(nn.Module):
         if cu_seqlens_q is not None:
             q, kv = self.qkv_block(q=x, kv=encoder_x)
 
+            drop_p = self.drop if self.training else 0.0
             out = flash_attn_varlen_kvpacked_func(
                 q=q,
                 kv=kv,

@@ -1,7 +1,13 @@
+import argparse
 import os
 from mortm.train.train import train_mortm
 from mortm.train.tokenizer import Tokenizer, TO_MUSIC, get_token_converter_pro
 from mortm.utils.messager import _DefaultMessenger
+
+parser = argparse.ArgumentParser(description="MORTM Training")
+parser.add_argument("--no-resume", action="store_true", help="Do not resume from existing checkpoint")
+parser.add_argument("--checkpoint", type=str, default=None, help="Path to specific checkpoint file to resume from")
+args = parser.parse_args()
 
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
@@ -20,4 +26,6 @@ model = train_mortm(
     project_name="MORTM4.5_Foundation",
     message=message,
     eval_list_json=("out/music_eval.json", "out/cm_eval.json"),
+    resume=not args.no_resume,
+    resume_checkpoint_path=args.checkpoint,
 )
