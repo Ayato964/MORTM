@@ -759,57 +759,246 @@ class SharedExpert(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+class _DispatchGather(torch.autograd.Function):
+    """x[token_ids] の gather。backward を決定的にするためだけに存在する。
+
+    token_ids には同じトークンが k 回現れるので、既定の backward（index_add）は
+    同じ行への atomic 加算が衝突し、実行ごとに加算順が変わって勾配がビット単位で
+    変わる。旧実装（エキスパートごとに index_select）は1回の呼び出し内に重複が
+    無いため決定的だったので、その性質を保つ。
+
+    inv は order の逆順列（inv[order[i]] = i）。g を inv で並べ替えると
+    「トークン順」に戻るので、あとは k 個ずつ通常の reduction で足せば順序が固定
+    される。逆順列による index_select は重複が無いので backward も決定的。
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, token_ids: torch.Tensor, inv: torch.Tensor, k: int):
+        ctx.save_for_backward(inv)
+        ctx.k = k
+        ctx.n_tok = x.size(0)
+        return x.index_select(0, token_ids)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (inv,) = ctx.saved_tensors
+        g = grad_out.index_select(0, inv).view(ctx.n_tok, ctx.k, -1).sum(dim=1)
+        return g, None, None, None
+
+
 class MoE(nn.Module):
+    """Routed MoE。エキスパート重みは 1 本のテンソルにスタックして保持する。
+
+    重みレイアウト
+    ------------------------------------------------------------------
+        w13 : [E, D, 2F]   w1 が [..., :F]、w3 が [..., F:]（nn.Linear の転置）
+        w2  : [E, F, D]
+
+    ModuleList をやめた理由（速度）
+    ------------------------------------------------------------------
+    旧実装は Python の for でエキスパートを1個ずつ回し、境界を得るために
+    counts.cumsum(0).cpu() で毎層 GPU->CPU 同期していた。E=64/L=11 では
+
+        MoE 1層あたり 554 カーネル / 学習1ステップ 26,430 カーネル
+
+    となり、カーネル発行数がトークン数ではなく「E x 層数」で決まる。この結果
+    16k トークン以下では GPU 稼働率が 28-46% まで落ち、GPU が命令待ちで遊ぶ。
+    スタック + _grouped_mm にすると発行数は 10,414 に減り、同期も無くなる。
+
+    実測（A80M_E64 = D768/F192/E64/k7/L11、fwd+bwd の1 micro-batch）:
+
+        1,024 tok : 162.0 ms ->  42.8 ms (3.78x)
+        4,096 tok : 179.5 ms ->  47.4 ms (3.79x)
+        8,192 tok : 180.3 ms ->  75.2 ms (2.40x)
+       16,384 tok : 204.4 ms -> 130.4 ms (1.57x)
+       32,768 tok : 302.4 ms -> 252.1 ms (1.20x)   <- 現行の学習設定
+        生成 256  :  41.0 ms ->  15.0 ms (2.73x)
+
+    32,768 tok で 1.2x に留まるのは、そこでは既に GPU 稼働率が 85% あり
+    CPU 律速が解けているため。小さい micro-batch ほど効く。
+
+    E が小さいと逆効果になる（同じ計算量で E=4 なら 0.59x = 1.7倍遅い）。
+    ループ1回あたりの GPU 仕事量が大きくなり、発行コストが相対的に消えるため。
+    損益分岐は E=8 付近なので grouped_min_experts で切り替える。
+
+    _grouped_mm を使わない条件（自動でループ経路に落ちる）
+    ------------------------------------------------------------------
+      - use_ffn_lora=True   : lora.Linear はスタックできない
+      - E < grouped_min_experts
+      - CUDA 以外 / bf16・fp16 以外（_grouped_mm の要件）
+
+    ループ経路もスタック済みの重みを使うので、どちらを通っても state_dict は同一。
+
+    再現性（変更するときは必ずここを読むこと）
+    ------------------------------------------------------------------
+    forward・backward とも run-to-run でビット単位に再現する。旧実装が持っていた
+    性質で、論文の再現性のために維持している。実測で確認済み。
+
+    これは自明ではない。1トークンが k 個のエキスパートに送られるので、素直に
+    書くと dispatch / combine の両方で「同じ行への重複 index」が生じ、
+    index_add の atomic 加算が実行ごとに違う順序で走って結果が変わる
+    （実際に一度そう書いて run-to-run で 1.4e-2 ずれた）。旧実装はエキスパート
+    ごとにループしていたため1回の呼び出し内に重複が無く、たまたま決定的だった。
+
+    そこで両方向とも「逆順列 inv で並べ替えてから k 個ずつ通常の reduction で
+    足す」形にしてある（combine は _routed_grouped 内、dispatch は
+    _DispatchGather.backward）。逆順列による index_select は重複が無いので
+    その backward も決定的になる。
+
+    例外: use_bias=True のとき b13 の勾配だけは非決定的になる。b13 を
+    index_select で行ごとに展開するため、その backward が重複 index への
+    atomic 加算になるため。実運用の A80M_E64 は use_bias=false なので影響しない。
+    """
+
+    _GROUPED_DTYPES = (torch.bfloat16, torch.float16)
 
     def __init__(self, args: MORTMArgs, layer_id, route_scale=1):
         super().__init__()
         self.dim = args.d_model
+        self.d_ff = args.dim_feedforward
         self.n_routed_experts = args.num_experts
         self.n_activated_experts = args.topk_experts
         self.gate = Gate(args, layer_id, route_scale=route_scale)
-        self.experts = nn.ModuleList([Expert(args) for i in range(self.n_routed_experts)])
         self.shared_experts = SharedExpert(args)
+
+        self.use_lora = bool(args.use_ffn_lora)
+        self.use_bias = bool(args.use_bias)
+        self.grouped_min_experts = getattr(args, "moe_grouped_min_experts", 16)
+
+        if self.use_lora:
+            # LoRA は低ランク行列を各エキスパートに持つのでスタックできない
+            self.experts = nn.ModuleList([Expert(args) for _ in range(self.n_routed_experts)])
+            self.stacked = False
+            return
+
+        self.stacked = True
+        E, D, FF = self.n_routed_experts, self.dim, self.d_ff
+        self.w13 = nn.Parameter(torch.empty(E, D, 2 * FF))
+        self.w2 = nn.Parameter(torch.empty(E, FF, D))
+        if self.use_bias:
+            self.b13 = nn.Parameter(torch.empty(E, 2 * FF))
+            self.b2 = nn.Parameter(torch.empty(E, D))
+        self._reset_expert_parameters()
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _reset_expert_parameters(self) -> None:
+        """nn.Linear の既定初期化と一致させる。
+
+        nn.Linear は kaiming_uniform_(a=sqrt(5)) で、これは
+        U(-1/sqrt(fan_in), 1/sqrt(fan_in)) と等価。w13 は転置で保持しているので
+        fan_in は D、w2 は FF になる。ここを変えると学習の初期挙動が変わる。
+        """
+        bw = 1.0 / math.sqrt(self.dim)
+        bo = 1.0 / math.sqrt(self.d_ff)
+        self.w13.uniform_(-bw, bw)
+        self.w2.uniform_(-bo, bo)
+        if self.use_bias:
+            self.b13.uniform_(-bw, bw)
+            self.b2.uniform_(-bo, bo)
+
+    def _use_grouped(self, x: torch.Tensor) -> bool:
+        return (self.stacked
+                and self.n_routed_experts >= self.grouped_min_experts
+                and x.is_cuda
+                and x.dtype in self._GROUPED_DTYPES
+                and hasattr(torch, "_grouped_mm"))
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _route(indices: torch.Tensor, n_exp: int, k: int):
+        """(expert 昇順の割当, 並べ替え順, 対応トークン, グループ境界) を返す。
+
+        境界は int32 のまま GPU に置く。ここを .cpu() すると層ごとに
+        GPU->CPU 同期が入り、CPU 側の先行実行が止まる（それが旧実装だった）。
+
+        token_ids は旧実装の arange(T).repeat_interleave(k)[order] と同値。
+        indices を flatten した位置 p は必ずトークン p//k のものなので、
+        order をそのまま整数除算すれば同じ列が得られる（実測で完全一致）。
+        """
+        sorted_expert, order = torch.sort(indices.reshape(-1))
+        token_ids = order // k
+        offsets = torch.bincount(sorted_expert, minlength=n_exp).cumsum(0).to(torch.int32)
+        return sorted_expert, order, token_ids, offsets
+
+    def _routed_grouped(self, x_flat: torch.Tensor, weights, indices) -> torch.Tensor:
+        k = self.n_activated_experts
+        n_tok = x_flat.size(0)
+        sorted_expert, order, token_ids, offsets = self._route(
+            indices, self.n_routed_experts, k)
+
+        # order の逆順列。dispatch の backward と combine の両方で使う
+        inv = torch.empty_like(order)
+        inv.scatter_(0, order, torch.arange(order.numel(), device=order.device))
+
+        xs = _DispatchGather.apply(x_flat, token_ids, inv, k)
+        h = torch._grouped_mm(xs, self.w13, offs=offsets)
+        if self.use_bias:
+            h = h + self.b13.index_select(0, sorted_expert)
+        a, b = h.chunk(2, dim=-1)
+        # chunk は非連続 view を返すので _grouped_mm に渡す前に詰める
+        out = torch._grouped_mm((F.silu(a) * b).contiguous(), self.w2, offs=offsets)
+        if self.use_bias:
+            out = out + self.b2.index_select(0, sorted_expert)
+
+        # 逆順列でトークン順に戻し、各トークンの k 個を通常の reduction で足す。
+        #
+        # ここを index_add_ にしてはいけない。1トークンが k 回現れるので同じ行への
+        # atomic 加算が衝突し、実行ごとに加算順が変わって結果がビット単位で変わる
+        # （実測 1.4e-2 の run-to-run 差）。旧実装はエキスパートごとに index_add_ を
+        # 呼んでおり、1回の呼び出し内では同じトークンが2度出ないため決定的だった。
+        # 論文用の再現性を保つため、その性質を維持する。
+        out = out.index_select(0, inv).view(n_tok, k, -1)
+        return (out * weights.reshape(n_tok, k, 1)).sum(dim=1)
+
+    def _routed_loop(self, x_flat: torch.Tensor, weights, indices) -> torch.Tensor:
+        """_grouped_mm を使えない場合の経路。ここだけ GPU->CPU 同期が入る。"""
+        k = self.n_activated_experts
+        assign_expert = indices.reshape(-1)
+        order = torch.argsort(assign_expert)
+        assign_expert = assign_expert[order]
+        assign_weight = weights.reshape(-1)[order]
+        token_ids = order // k
+
+        counts = torch.bincount(assign_expert, minlength=self.n_routed_experts)
+        boundaries = counts.cumsum(0).cpu().tolist()
+
+        y_flat = torch.zeros_like(x_flat)
+        start = 0
+        for expert_id, end in enumerate(boundaries):
+            if end == start:
+                continue
+            cur_token_ids = token_ids[start:end]
+            cur_weights = assign_weight[start:end].unsqueeze(-1)
+            expert_in = x_flat.index_select(0, cur_token_ids)
+
+            if self.stacked:
+                w13 = self.w13[expert_id]
+                h = expert_in @ w13
+                if self.use_bias:
+                    h = h + self.b13[expert_id]
+                a, b = h.chunk(2, dim=-1)
+                expert_out = (F.silu(a) * b) @ self.w2[expert_id]
+                if self.use_bias:
+                    expert_out = expert_out + self.b2[expert_id]
+            else:
+                expert_out = self.experts[expert_id](expert_in)
+
+            y_flat.index_add_(0, cur_token_ids, expert_out * cur_weights)
+            start = end
+        return y_flat
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weights, indices = self.gate(x)
 
         orig_shape = x.shape
         x_flat = x.reshape(-1, x.size(-1))  # [T, D]
-        k = self.n_activated_experts
 
-        assign_expert = indices.reshape(-1)  # [T*K]
-        assign_weight = weights.reshape(-1)  # [T*K]
+        route = self._routed_grouped if self._use_grouped(x_flat) else self._routed_loop
+        y = route(x_flat, weights, indices)
 
-        token_ids = torch.arange(x_flat.size(0), device=x.device)
-        token_ids = token_ids.repeat_interleave(k)  # [T*K]
-
-        order = torch.argsort(assign_expert)
-        assign_expert = assign_expert[order]
-        assign_weight = assign_weight[order]
-        token_ids = token_ids[order]
-
-        counts = torch.bincount(assign_expert, minlength=self.n_routed_experts)
-        boundaries = counts.cumsum(0).cpu().tolist()
-
-        y_flat = torch.zeros_like(x_flat)
-
-        start = 0
-        for expert_id, end in enumerate(boundaries):
-            if end == start:
-                continue
-
-            cur_token_ids = token_ids[start:end]
-            cur_weights = assign_weight[start:end].unsqueeze(-1)
-
-            expert_in = x_flat.index_select(0, cur_token_ids)
-            expert_out = self.experts[expert_id](expert_in)
-
-            y_flat.index_add_(0, cur_token_ids, expert_out * cur_weights)
-            start = end
-
-        z = self.shared_experts(x_flat).view(orig_shape)
-        y = y_flat.view(orig_shape)
-        return y + z
+        z = self.shared_experts(x_flat)
+        return (y + z).view(orig_shape)
 
 
 class NormTanh(nn.Module):

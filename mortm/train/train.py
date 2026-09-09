@@ -30,6 +30,7 @@ from mortm.utils.messager import Messenger, _DefaultMessenger
 from mortm.models.modules.progress import LearningProgress, _DefaultLearningProgress
 from .datasets import MORTM_SEQDataset, ClassDataSets, PreLoadingDatasets, TensorDataset, PianoRollDataset
 from mortm.models.mortm import MORTM, MORTMArgs
+from mortm.models.modules.layers import MoE, Gate
 from mortm.utils.pianoroll_convert import *
 from .epoch import EpochObserver
 from .config import AbstractTrainSet, TrainArgs
@@ -450,7 +451,18 @@ class MORTMTrainSet(AbstractTrainSet):
 
         # MoEのようにバッチによって特定のExpert（パラメータ）が全く使われないことがある構造では、
         # find_unused_parameters=True が必須です。
-        self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
+        #
+        # ただしエキスパート重みをスタック（w13 / w2 の1本のテンソル）で持つ場合は、
+        # どのエキスパートが選ばれても同じテンソルに勾配が入るため「未使用パラメータ」は
+        # 発生しません。find_unused_parameters=True は毎 iteration 自動微分グラフを
+        # 走査するので、不要なら切った方が速くなります。
+        moes = [mod for mod in self.model.modules() if isinstance(mod, MoE)]
+        find_unused = (not moes) or any(not mod.stacked for mod in moes)
+
+        self.model = DDP(self.model, device_ids=[self.local_rank],
+                         find_unused_parameters=find_unused)
+        if self.local_rank == 0:
+            print(f"[DDP] find_unused_parameters={find_unused}")
 
         total_param, self.active_params = self.model.module.get_param()
         adam = torch.optim.AdamW(self.model.parameters(), lr=t_args.lr_param)
@@ -527,12 +539,28 @@ class MORTMTrainSet(AbstractTrainSet):
         global_tokens = self.get_synced_tokens()
 
         if self.local_rank == 0:
-            wandb.log({
+            log_data = {
                 "axis/val_loss": val_loss,
                 "axis/tokens": global_tokens,
                 "axis/flops": 6 * self.active_params * global_tokens,
-                "trainer/global_step": step
-            })
+                "trainer/global_step": step,
+            }
+            raw_model = self.model.module if hasattr(self.model, "module") else self.model
+            for m in raw_model.modules():
+                if isinstance(m, Gate):
+                    s = m.routing_stats()
+                    lid = s["layer"]
+                    log_data[f"moe/L{lid}_cv"] = s["cv"]
+                    log_data[f"moe/L{lid}_temporal_cv"] = s["temporal_cv"]
+                    if math.isfinite(s["bias_per_gap"]):
+                        log_data[f"moe/L{lid}_bias_per_gap"] = s["bias_per_gap"]
+                    if math.isfinite(s["distortion"]):
+                        log_data[f"moe/L{lid}_distortion"] = s["distortion"]
+                    if math.isfinite(s["affinity_loss"]):
+                        log_data[f"moe/L{lid}_affinity_loss"] = s["affinity_loss"]
+                    log_data[f"moe/L{lid}_dead_experts"] = s["dead_now"]
+
+            wandb.log(log_data)
 
     def loss_mask(self, x: torch.Tensor) -> torch.Tensor:
         # 生成: <MGEN>/<CGEN>, メタ分析: <META>, 属性別分析: <KEY>/<DENCE>/<GENRE>/<LENGTH>
@@ -784,6 +812,33 @@ def update_log(model, writer, global_step):
             writer.add_scalar(f"params_mean/{name}", param.grad.mean(), global_step)
             writer.add_scalar(f"params_std/{name}", param.grad.std(), global_step)
             writer.add_scalar(f"Parameter Norm/{name}", param.grad.norm(), global_step)
+
+def _print_moe_stats(model: nn.Module, optimizer_step: int, local_rank: int = 0):
+    if local_rank != 0:
+        return
+    raw_model = model.module if hasattr(model, "module") else model
+    gates = [m for m in raw_model.modules() if isinstance(m, Gate)]
+    if not gates:
+        return
+
+    print(f"\n\033[36m[MOE_STATS]\033[0m Routing Stats (Step {optimizer_step}):")
+    for g in gates:
+        s = g.routing_stats()
+        b_gap = f"{s['bias_per_gap']:.2f}" if math.isfinite(s['bias_per_gap']) else "N/A"
+        gap = f"{s['boundary_gap']:.4f}" if math.isfinite(s['boundary_gap']) else "N/A"
+        distort = f"{s['distortion'] * 100:.1f}%" if math.isfinite(s['distortion']) else "N/A"
+        aff = f"{s['affinity_loss']:.4f}" if math.isfinite(s['affinity_loss']) else "N/A"
+        print(
+            f"  [L{s['layer']:02d}] "
+            f"CV={s['cv']:.3f} | "
+            f"TempCV={s['temporal_cv']:.3f} | "
+            f"Gap={gap} | "
+            f"Bias/Gap={b_gap} | "
+            f"Distort={distort} | "
+            f"AffLoss={aff} | "
+            f"Dead={s['dead_now']}/{g.n_exp}"
+        )
+
 
 def progress_bar(epoch, sum_epoch, sequence, batch_size, loss, lr, verif_loss):
     per = sequence / batch_size * 100
@@ -1139,6 +1194,9 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
     if _is_dist_ready():
         dist.barrier()
 
+    # 学習開始前（チェックポイント復元直後）に現在のMoEルーティング統計を表示
+    _print_moe_stats(model, optimizer_step, local_rank=local_rank)
+
     for epoch in range(start_epoch, train_args.num_epochs):
         _set_loader_epoch(train_loader, epoch)
         _set_loader_epoch(val_loader, epoch)
@@ -1280,8 +1338,6 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                             optimizer_step
                         )
 
-                    trainer.optional_logging(verification_loss, optimizer_step)
-
                     # Validation 評価直後にもチェックポイントを上書き保存
                     if local_rank == 0:
                         _save_checkpoint(
@@ -1295,6 +1351,10 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                             model_name=model_name,
                             version=version,
                         )
+
+                    # MoEログの表示 & wandb記録
+                    _print_moe_stats(model, optimizer_step, local_rank=local_rank)
+                    trainer.optional_logging(verification_loss, optimizer_step)
 
                 # ビッグバッチ完了ごとにチェックポイントを上書き保存
                 if local_rank == 0:
@@ -1318,7 +1378,6 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                 verification_loss = get_verification_loss(
                     model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn
                 )
-                trainer.optional_logging(verification_loss, optimizer_step)
 
             sync_tokens = reduce_tensor(trainer.all_tokens, op=dist.ReduceOp.SUM).item() if _is_dist_ready() else trainer.all_tokens.item()
 
@@ -1348,6 +1407,9 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                     model_name=model_name,
                     version=version,
                 )
+
+                _print_moe_stats(model, optimizer_step, local_rank=local_rank)
+                trainer.optional_logging(verification_loss, optimizer_step)
 
         except torch.cuda.OutOfMemoryError:
             if local_rank == 0:

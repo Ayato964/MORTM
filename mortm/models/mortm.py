@@ -345,7 +345,8 @@ class MORTM(nn.Module):
     def get_param(self):
         """
         Calculate the total number of parameters and the number of active parameters.
-        Includes safeguards against None types in MoE experts list.
+        Handles both expert layouts: stacked ([E, D, 2F] tensors) and the legacy
+        ModuleList of per-expert nn.Linear.
 
         Returns:
             Tuple[int, int]: (Total parameters, Active parameters during inference)
@@ -360,18 +361,28 @@ class MORTM(nn.Module):
 
         first_layer = self.decoder.layers[0]
 
-        if not hasattr(first_layer, 'ffn') or not hasattr(first_layer.ffn, 'experts'):
+        if not hasattr(first_layer, 'ffn'):
             return total_params, total_params
 
         moe_module = first_layer.ffn
-        experts_list = moe_module.experts
 
-        valid_expert = next((e for e in experts_list if e is not None), None)
-
-        if valid_expert is None:
+        if getattr(moe_module, 'stacked', False):
+            # スタック形式: 1エキスパート分は先頭次元 E で割れば出る
+            one_expert_params = sum(
+                p.numel() // self.args.num_experts
+                for name, p in moe_module.named_parameters(recurse=False)
+                if name in ('w13', 'w2', 'b13', 'b2')
+            )
+        elif hasattr(moe_module, 'experts'):
+            valid_expert = next((e for e in moe_module.experts if e is not None), None)
+            if valid_expert is None:
+                return total_params, total_params
+            one_expert_params = sum(p.numel() for p in valid_expert.parameters())
+        else:
             return total_params, total_params
 
-        one_expert_params = sum(p.numel() for p in valid_expert.parameters())
+        if one_expert_params == 0:
+            return total_params, total_params
 
         num_routed_experts = self.args.num_experts
         num_active_experts = self.args.topk_experts

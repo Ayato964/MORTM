@@ -1,5 +1,5 @@
 {
-  "big_batch_size": 18432,
+  "big_batch_size": 92160,
   "batch_size": 64,
   "dataset_batch_allocation": [
     60,
