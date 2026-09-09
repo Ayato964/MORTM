@@ -32,7 +32,7 @@ from flash_attn.bert_padding import unpad_input
 
 from ...models.mortm import MORTM
 from ...models.modules.config import MORTMArgs
-from ...models.modules.layers import PMA
+from ...models.modules.layers import PMA, MILPool
 from ...utils.convert_foundation import INSTRUMENT_RULES
 from ...utils.convert import split_sequence_measure  # 小節分割(density算出に使用)
 from .task_norm import rev_safe
@@ -71,16 +71,27 @@ class AnalysisMORTM(MORTM):
     - 併せてデコーダ出力を PMA でプーリングし、OutHead で 1 次元に落として判別する。
     """
 
-    def __init__(self, args: MORTMArgs, progress, pma_out_dim: Optional[int] = None):
+    DISC_POOLS = ("mil", "pma")
+
+    def __init__(self, args: MORTMArgs, progress, pma_out_dim: Optional[int] = None,
+                 pool: str = "mil"):
         super().__init__(args, progress)
-        pod = pma_out_dim if pma_out_dim is not None else self.d_model
-        self.pma_out_dim = pod
-        self.pma = PMA(self.d_model, pod)
-        self.out_head = nn.Sequential(          # AI(1) / Human(0) の 1 次元ロジット
-            nn.Linear(pod, self.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(self.d_model // 2, 1),
-        )
+        if pool not in self.DISC_POOLS:
+            raise ValueError(f"未知の判別プーリング: {pool} (選択肢 {self.DISC_POOLS})")
+        self.disc_pool = pool
+        if pool == "mil":
+            # LogSumExp / MIL。折り畳み系列は「bag に1つでも AI 区間があれば AI」
+            # という MIL の設定そのもので、加重平均(PMA)では希釈に負ける。
+            self.mil = MILPool(self.d_model)
+        else:
+            pod = pma_out_dim if pma_out_dim is not None else self.d_model
+            self.pma_out_dim = pod
+            self.pma = PMA(self.d_model, pod)
+            self.out_head = nn.Sequential(      # AI(1) / Human(0) の 1 次元ロジット
+                nn.Linear(pod, self.d_model // 2),
+                nn.ReLU(),
+                nn.Linear(self.d_model // 2, 1),
+            )
 
     def forward_with_disc(self, x: Tensor, padding_mask: Tensor, is_causal: bool = True,
                           meta_id: Optional[int] = None):
@@ -122,16 +133,30 @@ class AnalysisMORTM(MORTM):
             # 判別: 音楽ブロックだけを packed のまま切り出してプーリングする
             p_out, p_cu = (out, cu_seqlens) if meta_id is None else \
                 _pack_music_only(out, cu_seqlens, x, padding_mask, meta_id)
-            disc = self.out_head(self.pma(p_out, p_cu)).squeeze(-1)
+            if self.disc_pool == "mil":
+                disc = self.mil(p_out, p_cu)                       # (B,) 直接ロジット
+            else:
+                disc = self.out_head(self.pma(p_out, p_cu)).squeeze(-1)
             # 言語: pad を戻して語彙へ射影
             logits = self.Wout(pad_input(out, indices, b, s))
         return logits.float(), disc.squeeze(-1).float() if disc.dim() > 1 else disc.float()
 
     def mark_trainable(self):
-        """LoRA + PMA/OutHead のみ学習可能にする(backbone 本体は凍結)。"""
+        """LoRA + PMA/OutHead のみ学習可能にする(backbone 本体は凍結)。
+
+        ★ LoRA を **明示的に** True へ戻すこと。loralib の
+          `mark_only_lora_as_trainable` は「`lora_` を含まない名前を False にする」
+          だけで、LoRA を True にはしない(構築直後の True を前提にしている)。
+          偶数ラウンドが ana を全凍結していた頃はその False が残り続け、R3 以降
+          LoRA が一度も更新されなかった。実測の痕跡:
+            - r1 と r17 の lora テンソルが 170/170 完全一致
+            - 学習対象が R1 だけ 3,164,929、R3 以降は 2,068,225(差 = LoRA 分)
+            - CE(META推論)が R3-R17 で 0.685-0.697 に固定
+              (Wout も backbone も LoRA も凍結 = 勾配経路にパラメータが無い)
+        """
         mark_only_lora_as_trainable(self)
         for name, p in self.named_parameters():
-            if name.startswith("pma") or name.startswith("out_head"):
+            if ("lora_" in name) or name.startswith(("pma", "out_head", "mil")):
                 p.requires_grad = True
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
@@ -328,7 +353,9 @@ class OddRoundConfig:
     def __init__(self, batch_size=16, pool_size=256, lr=1e-4, disc_weight=1.0,
                  acc_threshold=0.85, eval_window=100, max_steps=100000,
                  max_measures=8, top_p=0.9, temperature=1.0, max_new=1200,
-                 grad_clip=1.0, gen_chunk=16):
+                 grad_clip=1.0, gen_chunk=16,
+                 auc_threshold=0.93, auc_min_slope=0.01, auc_slope_window=50,
+                 auc_patience=10, auc_min_steps=3000):
         self.batch_size = batch_size
         self.pool_size = pool_size          # gem プールの本数(生成とキー推定を償却する単位)
         self.lr = lr
@@ -343,6 +370,25 @@ class OddRoundConfig:
         self.grad_clip = grad_clip
         self.gen_chunk = gen_chunk      # 一度に生成するバッチ幅(VRAM 制約)
 
+        # --- 停止判定(AUC ベース) ---
+        # 正解率は `disc_logit > 0` という未較正の閾値に依存し、報酬が実際に使うのは
+        # 連続スコアなので、判定は AUC で行う(理由は q_table.roc_auc の docstring)。
+        self.auc_threshold = auc_threshold   # 従来の「両分画 0.85」に相当する強さ。
+                                             # 等分散ガウス近似で d'=2.07 <-> AUC=0.93
+        # 到達しないまま max_steps まで空回りするのを防ぐ「収束したら打ち切る」判定。
+        # v1 は R1 が +0.023/1000step で上昇中のまま 6000 step で切られる一方、
+        # R3 以降は 3000 step で収束したあと 3000 step 無駄に回していた。
+        # ★ 判定は **直近区間の傾き** で行う。「最良値を min_delta 上回らない回数」で
+        #   数える実装は失敗した: AUC のノイズは実測 ±0.02 あり、一度ノイズで高値が
+        #   出ると最良値がそこへ張り付いて以後ほぼ超えられない。実際 R1 は区間平均が
+        #   0.654 -> 0.731 -> 0.759 -> 0.771 と単調上昇し、最終区間でも +0.033/1000step
+        #   で伸びていたのに step 3620 で打ち切られた。
+        #   「ノイズの最高値を超えたか」ではなく「トレンドが平坦になったか」を測る。
+        self.auc_min_slope = auc_min_slope       # 1000step あたりの改善がこれ未満なら平坦
+        self.auc_slope_window = auc_slope_window # 傾きを取る評価点数(log_every ごと)
+        self.auc_patience = auc_patience         # 平坦が連続何回続いたら打ち切るか
+        self.auc_min_steps = auc_min_steps       # これ以前は判定しない(立ち上がり保護)
+
 
 class OddRound:
     """MORTM-ana を教師あり学習し、判別精度が閾値を超えたら次ラウンドへ渡す。
@@ -354,9 +400,10 @@ class OddRound:
 
     def __init__(self, gem, ana, tokenizer, device, qtable, cfg: OddRoundConfig,
                  optimizer=None, rng=None):
-        from .q_table import mix_batch, accuracy_by_source, should_stop_odd
+        from .q_table import mix_batch, accuracy_by_source, should_stop_odd, auc_by_source
         self._mix_batch = mix_batch
         self._acc_by_source = accuracy_by_source
+        self._auc_by_source = auc_by_source
         self._should_stop = should_stop_odd
 
         self.gem, self.ana = gem, ana
@@ -372,7 +419,27 @@ class OddRound:
             [p for p in self.ana.parameters() if p.requires_grad], lr=cfg.lr)
         self.round_no = 0          # 表示用。ドライバが各ラウンドで設定する
         self.quiet_pool = False    # True でプール更新ログを抑制(充填時に使う)
-        print(f"[OddRound] 学習対象パラメータ: {n_train:,} (LoRA + PMA + 判別ヘッド。backbone は凍結)")
+        # 内訳を必ず出す。合計だけを出していたため、3,164,929 -> 2,068,225 と
+        # LoRA が落ちていたのを 8 ラウンド見逃した。欠けたら学習前に落とす。
+        grp = {"LoRA": 0, "判別プール": 0, "判別ヘッド": 0}
+        for name, prm in self.ana.named_parameters():
+            if not prm.requires_grad:
+                continue
+            k = ("LoRA" if "lora_" in name else
+                 "判別プール" if name.startswith(("pma", "mil")) else
+                 "判別ヘッド" if name.startswith("out_head") else None)
+            if k is None:
+                raise RuntimeError(f"OddRound: 想定外の学習対象パラメータ {name}")
+            grp[k] += prm.numel()
+        for k, v in grp.items():
+            if v == 0 and not (k == "判別ヘッド" and self.ana.disc_pool == "mil"):
+                # MIL はスコアラが直接ロジットを出すので out_head を持たない
+                raise RuntimeError(
+                    f"OddRound: {k} が学習対象に入っていません。requires_grad が "
+                    f"どこかで False にされたまま戻っていない可能性があります。")
+        print(f"[OddRound] 学習対象パラメータ: {n_train:,} "
+              f"(LoRA {grp['LoRA']:,} / 判別プール[{self.ana.disc_pool}] "
+              f"{grp['判別プール']:,} / 判別ヘッド {grp['判別ヘッド']:,}。backbone は凍結)")
 
     # -- gem プールの生成(生成 + キー/密度の実測をまとめて償却) --------
     @torch.no_grad()
@@ -492,7 +559,12 @@ class OddRound:
         self.opt.zero_grad(set_to_none=True)
 
         acc = self._acc_by_source(disc.detach(), is_ai, source)
-        return {"loss": float(loss.detach()), "ce": float(ce), "bce": float(bce), **acc}
+        # ★ 生ロジットも返す。AUC は閾値を通す前のスコアが要るので、ここで捨てると
+        #   後から復元できない(v1 は正解率しか残しておらず、17ラウンドぶんの AUC が
+        #   永久に計算不能になった)。
+        return {"loss": float(loss.detach()), "ce": float(ce), "bce": float(bce), **acc,
+                "_raw": (disc.detach().float().cpu().numpy(),
+                         np.asarray(is_ai, dtype=np.float32), list(source))}
 
     # -- ラウンド本体 -------------------------------------------------
     def run(self, human_pool, log_every=20, on_step=None):
@@ -517,7 +589,10 @@ class OddRound:
         self.q.add(gem_pool)                    # 今ラウンド分を蓄積(commit は最後)
         hist = {k: deque(maxlen=cfg.eval_window)
                 for k in ("gem", "human", "qtable", "overall")}
+        raw_buf = deque(maxlen=cfg.eval_window)   # AUC 用に生ロジットを窓ぶん貯める
         reason, step = None, 0
+        best_auc, stale, last_auc, slope = -1.0, 0, {}, float("nan")
+        auc_hist = deque(maxlen=cfg.auc_slope_window)   # (step, AUC) の履歴
 
         for step in range(1, cfg.max_steps + 1):
             if step % max(1, cfg.pool_size // cfg.batch_size) == 0:
@@ -529,46 +604,77 @@ class OddRound:
                 gem_pool = fresh
                 self.q.add(gem_pool)
             st = self.train_step(human_pool, gem_pool)
-            if on_step is not None:
-                on_step({f"odd/{k}": v for k, v in st.items()} |
-                        {"odd/qtable_size": len(self.q), "odd/step": step})
+            raw_buf.append(st.pop("_raw"))
             for k in hist:
                 if k in st:
                     hist[k].append(st[k])
+
+            # --- AUC は窓が埋まってから log_every ごとに評価する ---
+            # バッチ 8 本(人間4/gem2/QTab2)だけだと AUC は 8 ペアしか使えず極端に荒い。
+            # eval_window ぶん(既定100バッチ=800サンプル)まとめて計算する。
+            if len(raw_buf) == cfg.eval_window and step % log_every == 0:
+                sc = np.concatenate([r[0] for r in raw_buf])
+                ya = np.concatenate([r[1] for r in raw_buf])
+                sr = [x for r in raw_buf for x in r[2]]
+                last_auc = self._auc_by_source(sc, ya, sr)
+                a_gem = last_auc.get("auc_gem", float("nan"))
+                if a_gem == a_gem:                      # not nan
+                    best_auc = max(best_auc, a_gem)     # 表示用(判定には使わない)
+                    auc_hist.append((step, a_gem))
+                    if len(auc_hist) == cfg.auc_slope_window:
+                        xs = np.array([h[0] for h in auc_hist], dtype=np.float64)
+                        ys = np.array([h[1] for h in auc_hist], dtype=np.float64)
+                        slope = float(np.polyfit(xs, ys, 1)[0] * 1000.0)   # /1000step
+                        stale = stale + 1 if slope < cfg.auc_min_slope else 0
+                    if a_gem >= cfg.auc_threshold:
+                        reason = (f"discriminator ready: AUC(人間 vs gem) {a_gem:.4f} "
+                                  f">= {cfg.auc_threshold}")
+                    elif step >= cfg.auc_min_steps and stale >= cfg.auc_patience:
+                        reason = (f"AUC 収束: 直近{cfg.auc_slope_window}点の傾き "
+                                  f"{slope:+.4f}/1000step < {cfg.auc_min_slope} が "
+                                  f"{stale} 回連続 (最良 {best_auc:.4f} / 現在 {a_gem:.4f})")
+
+            if on_step is not None:
+                on_step({f"odd/{k}": v for k, v in st.items()} |
+                        {f"odd/{k}": v for k, v in last_auc.items()} |
+                        {"odd/qtable_size": len(self.q), "odd/step": step,
+                         "odd/auc_best": best_auc, "odd/auc_stale": stale})
+
             if step % log_every == 0:
                 avg_now = {k: (float(np.mean(v)) if len(v) else float("nan"))
                            for k, v in hist.items()}
                 nan = float("nan")
                 w = len(hist["gem"])
-                th = cfg.acc_threshold
-                ok = (avg_now["gem"] >= th and avg_now["human"] >= th)
 
                 def bar(v, width=20):
                     t = 0.0 if v != v else min(1.0, max(0.0, v))
-                    return "█" * int(round(t * width)) + "·" * (width - int(round(t * width)))
+                    return "\u2588" * int(round(t * width)) + "\u00b7" * (width - int(round(t * width)))
 
+                a_gem = last_auc.get("auc_gem", nan)
+                a_qt = last_auc.get("auc_qtable", nan)
+                lh = last_auc.get("logit_mean_human", nan)
+                lg = last_auc.get("logit_mean_gem", nan)
                 print(
                     f"[R{self.round_no} 奇数/判別器] step {step:6d}/{cfg.max_steps}\n"
                     f"  損失       合計 {st['loss']:.4f}"
                     f"  = META推論 {st['ce']:.4f} (交差エントロピー)"
                     f" + AI/人間判別 {st['bce']:.4f} (BCE)  ← 下がるほど良い\n"
-                    f"  判別正解率 今回   gem {st.get('gem', nan):.3f}  "
-                    f"人間 {st.get('human', nan):.3f}  "
-                    f"Q-Table {st.get('qtable', nan):.3f}  "
-                    f"全体 {st.get('overall', nan):.3f}\n"
-                    f"             直近{w:3d}回平均  "
-                    f"gem {avg_now['gem']:.3f} {bar(avg_now['gem'])}\n"
-                    f"                          "
-                    f"人間 {avg_now['human']:.3f} {bar(avg_now['human'])}\n"
-                    f"  ラウンド終了条件  gem と 人間 の両方が直近{cfg.eval_window}回平均で "
-                    f"{th:.2f} 以上  → {'★達成' if ok else '未達'}\n"
+                    f"  ★AUC       人間 vs gem {a_gem:.4f} {bar(a_gem)}\n"
+                    f"             人間 vs Q-Table {a_qt:.4f}   "
+                    f"(過去の弱い gem。こちらは高くて当然)\n"
+                    f"             最良 {best_auc:.4f} / 傾き {slope:+.4f}/1000step "
+                    f"/ 平坦 {stale}回\n"
+                    f"             (目標 {cfg.auc_threshold:.2f} 到達 か、傾き "
+                    f"< {cfg.auc_min_slope} が {cfg.auc_patience} 回連続で終了)\n"
+                    f"  較正       平均ロジット 人間 {lh:+.2f} / gem {lg:+.2f}  "
+                    f"(報酬は 0.5-z/8 なので、この間隔が報酬の目盛りを決める)\n"
+                    f"  参考:正解率 gem {avg_now['gem']:.3f} / 人間 {avg_now['human']:.3f} "
+                    f"(直近{w}回平均。閾値 0 固定なので偏る。判定には使わない)\n"
                     f"  Q-Table    確定 {len(self.q)} 本 / 今ラウンド蓄積 {len(self.q.new)} 本"
-                    f"  (過去の AI 例を 1/4 混ぜて、直近の gem 専用検出器への退化を防ぐ)")
-            if len(hist["gem"]) == cfg.eval_window and len(hist["human"]) == cfg.eval_window:
-                avg = {k: float(np.mean(v)) for k, v in hist.items() if len(v)}
-                reason = self._should_stop(avg, cfg.acc_threshold)
-                if reason:
-                    break
+                    f"  (過去の AI 例を 1/4 混ぜて、直近の gem 専用検出器への退化を防ぐ)",
+                    flush=True)
+            if reason:
+                break
 
         qstats = self.q.commit()                # ★ラウンド終了時に一括更新
         print(f"[R{self.round_no} 奇数/判別器] 終了理由: {reason or 'max_steps 到達'}\n"

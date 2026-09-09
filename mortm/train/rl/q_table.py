@@ -176,6 +176,72 @@ def accuracy_by_source(disc_logit, is_ai, source) -> Dict[str, float]:
     return out
 
 
+def roc_auc(scores, labels) -> float:
+    """AUC = 「AI サンプルのスコアが人間サンプルより高い」確率。同点は 0.5 扱い。
+
+    Mann-Whitney U を順位から求める(scikit-learn 非依存)。
+
+    ★ なぜ正解率ではなく AUC で判定するのか:
+      1. **閾値に依存しない**。正解率は `disc_logit > 0` という決め打ちの線で
+         切っており、その線は一度も較正していない。実測(v1 R17)では線が最適位置から
+         ずれていて、同一の判別器が gem 0.745 / 人間 0.870 と非対称に見えていた。
+         線を最適点に置けば両方 0.814 で揃う。つまり見かけの非対称の大半は
+         能力差ではなく線の置き場所だった。
+      2. **報酬が実際に消費しているのは連続スコア**である
+         (`discriminator_reward(z) = clamp(0.5 - z/8)` は閾値判定を使わない)。
+         停止判定が「閾値で切った正解率」を見ていたのは、測る対象と使う対象の不一致。
+      3. 正解率から d' を逆算する手もあるが、それは「両クラスが等分散の正規分布」を
+         仮定する。AI クラスは gem と Q-Table の混合なので成り立たない。AUC は無仮定。
+
+    注意: AUC は較正を完全に無視する。「順位づけは上手いがスコアが過信気味」を
+    見逃すので、報酬の目盛りが妥当かは別途クラス別の平均ロジットで見ること
+    (v1 は正解率 0.74 に対し平均ロジット +2.2 の過信状態だった)。
+    """
+    s = np.asarray(scores, dtype=np.float64)
+    y = np.asarray(labels, dtype=np.float64)
+    pos, neg = s[y > 0.5], s[y <= 0.5]
+    if len(pos) == 0 or len(neg) == 0:
+        return float("nan")
+    order = np.argsort(s, kind="mergesort")
+    ranks = np.empty(len(s), dtype=np.float64)
+    ranks[order] = np.arange(1, len(s) + 1, dtype=np.float64)
+    # 同点は平均順位にする(そうしないと同点だらけのとき AUC が偏る)
+    su = np.sort(s)
+    i = 0
+    while i < len(su):
+        j = i
+        while j + 1 < len(su) and su[j + 1] == su[i]:
+            j += 1
+        if j > i:
+            avg = (i + j + 2) / 2.0
+            ranks[np.isin(s, su[i])] = avg
+        i = j + 1
+    r_pos = ranks[y > 0.5].sum()
+    n1, n0 = len(pos), len(neg)
+    return float((r_pos - n1 * (n1 + 1) / 2.0) / (n1 * n0))
+
+
+def auc_by_source(disc_logit, is_ai, source) -> Dict[str, float]:
+    """人間を負例に固定して、AI 側の出所ごとに AUC を出す。
+
+    停止判定に使うのは `gem`(最新の生成器)。Q-Table は「過去の弱い gem」なので
+    検出が容易で、混ぜた AUC は最新 gem を捕まえられないまま高く出てしまう。
+    """
+    import torch
+    s = torch.as_tensor(disc_logit).float().cpu().numpy()
+    y = np.asarray(is_ai, dtype=np.float32)
+    src = np.asarray(source)
+    hum = src == HUMAN
+    out = {"auc_overall": roc_auc(s, y)}
+    for tag in (GEM, QTAB):
+        m = hum | (src == tag)
+        out[f"auc_{tag}"] = roc_auc(s[m], y[m]) if (src == tag).any() and hum.any() else float("nan")
+    # 較正の観測(報酬の目盛りが妥当かを見るため)
+    out["logit_mean_human"] = float(s[hum].mean()) if hum.any() else float("nan")
+    out["logit_mean_gem"] = float(s[src == GEM].mean()) if (src == GEM).any() else float("nan")
+    return out
+
+
 def should_stop_odd(acc: Dict[str, float], threshold: float = 0.85) -> Optional[str]:
     """奇数ラウンドの終了判定。**最新 gem 分画の精度**で判断する。
 

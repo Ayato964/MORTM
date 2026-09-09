@@ -45,42 +45,18 @@ class MORTMArgs:
             self.debug_attention: bool = False
 
 
-class V_MORTMArgs(MORTMArgs):
+class MORTM5Args(MORTMArgs):
     def __init__(self, json_directory: str):
         super().__init__(json_directory)
 
         with open(json_directory, 'r') as f:
             data: dict = json.load(f)
-            self.name = "V_MORTM"
-            self.vocab_size = data['vocab_size'] if data.get('vocab_size') else 128
-            self.d_layer = data['d_layer'] if data.get('d_layer') else 12
-            self.num_heads = data['num_heads']
-            self.d_model = data['d_model']
-            self.d_spect = data['d_spect'] if data.get('d_spect') else 128
-            self.patch_size = data['patch_size'] if data.get('patch_size') else 4
-            self.dim_feedforward = data['dim_feedforward']
-            self.dropout = data['dropout']
+            self.name = "MORTM5"
 
-            self.num_experts = data['num_experts'] if data.get('num_experts') else 12
-            self.topk_experts = data['topk_experts'] if data.get('topk_experts') else 2
-            self.num_groups = data['num_groups'] if data.get('num_groups') else 1
-            self.topk_groups = data['topk_groups'] if data.get('topk_groups') else 1
-            self.route_scale = data['route_scale'] if data.get('route_scale') else 1
-            self.score_type = data['score_type'] if data.get('score_type') else "softmax"
-
-            self.use_moe_decoder = True if data.get('use_moe_decoder') is None else data['use_moe_decoder']
-
-class MORTM_LIVE_Args(MORTMArgs):
-    def __init__(self, json_directory: str):
-        super().__init__(json_directory)
-
-        self.name = "MORTM_LIVE"
-        self.device = "cuda"
-        with open(json_directory, 'r') as f:
-            data: dict = json.load(f)
-            self.name = "MORTM_LIVE"
-            self.inst_list: List[int] = data['inst_list'] if data.get('inst_list') else [1, 5, 19, 27, 34, 65, 10, 74]
-            self.instrument_num = data['instrument_num'] if data.get('instrument_num') else 8
-            self.ticks_per_measure = data['ticks_per_measure'] if data.get('ticks_per_measure') else 96
-            self.pianoroll_time_step = data['pianoroll_time_step'] if data.get('pianoroll_time_step') else 16
-            self.chunk = data['chunk'] if data.get('chunk') else 16
+            self.roll_w = 24 if data.get("roll_w") is None else data["roll_w"]
+            self.roll_h = 128 if data.get("roll_h") is None else data["roll_h"]
+            self.track_size = 4 if data.get("track_size") is None else data["track_size"]
+            self.first_channel = 64 if data.get("first_channel") is None else data["first_channel"]
+            self.max_channel = 128 if data.get("max_channel") is None else data["max_channel"]
+            self.encoder_wout = 2048 if data.get("encoder_wout") is None else data["encoder_wout"]
+            self.encoder_layer = 8 if data.get("encoder_layer") is None else data["encoder_layer"]

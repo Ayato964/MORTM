@@ -100,8 +100,8 @@ def _is_legacy_merged(ckpt: str, sd: dict) -> bool:
     return any(k.endswith("lora_B") and float(v.abs().sum()) > 0 for k, v in sd.items())
 
 
-def load_ana(config: str, ckpt: str, device):
-    """分析器をロードする。判別ヘッド(PMA/OutHead)は新規なので strict=False。"""
+def load_ana(config: str, ckpt: str, device, pool: str = "mil"):
+    """分析器をロードする。判別プール/ヘッドは新規なので strict=False。"""
     from ...models.modules.config import MORTMArgs
     from ..train import _DefaultLearningProgress
 
@@ -110,13 +110,15 @@ def load_ana(config: str, ckpt: str, device):
         prog.set_device(device)
     except Exception:
         pass
-    m = AnalysisMORTM(MORTMArgs(config), prog).to(device)
+    m = AnalysisMORTM(MORTMArgs(config), prog, pool=pool).to(device)
     sd = torch.load(ckpt, map_location=device)
     sd.pop(_UNMERGED_MARK, None)
     missing, unexpected = m.load_state_dict(sd, strict=False)
-    new = [k for k in missing if k.startswith(("pma", "out_head"))]
-    other = [k for k in missing if not k.startswith(("pma", "out_head"))]
-    print(f"[CARL] ana ロード: 新規ヘッド {len(new)} / 欠損 {len(other)} / 余剰 {len(unexpected)}")
+    HEADS = ("pma", "out_head", "mil")
+    new = [k for k in missing if k.startswith(HEADS)]
+    other = [k for k in missing if not k.startswith(HEADS)]
+    print(f"[CARL] ana ロード: 判別プール[{pool}] 新規 {len(new)} / "
+          f"欠損 {len(other)} / 余剰 {len(unexpected)}")
     if other or unexpected:
         raise RuntimeError(f"ana の重みが噛み合っていない: missing={other[:5]} unexpected={unexpected[:5]}")
     return m
@@ -202,7 +204,8 @@ class CARLDriver:
                  max_blank_ratio: float = 0.5, keep_round_ckpts: bool = False,
                  use_wandb: bool = True, run_name: Optional[str] = None,
                  ana_resume: Optional[str] = None, q_resume: Optional[str] = None,
-                 pool_limit: int = 40000):
+                 gem_resume: Optional[str] = None,
+                 pool_limit: int = 40000, disc_pool: str = "mil"):
         from ..tokenizer import Tokenizer, get_token_converter_pro, TO_MUSIC
 
         self.dev = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -214,7 +217,21 @@ class CARLDriver:
         print("[CARL] モデルをロードしています...")
         self.gem = load_gem(P.GEM_CONFIG, P.resolve(P.GEM_CKPT), self.dev, train=True)
         self.base = load_gem(P.BASE_CONFIG, P.resolve(P.BASE_CKPT), self.dev, train=False)
-        self.ana = load_ana(P.ANA_CONFIG, P.resolve(P.ANA_INIT_CKPT), self.dev)
+        self.ana = load_ana(P.ANA_CONFIG, P.resolve(P.ANA_INIT_CKPT), self.dev,
+                            pool=disc_pool)
+
+        if gem_resume and os.path.exists(gem_resume):
+            g = torch.load(P.resolve(gem_resume), map_location=self.dev)
+            if _is_legacy_merged(gem_resume, g):
+                raise RuntimeError(f"マージ済み旧形式ckpt: {gem_resume}")
+            g.pop(_UNMERGED_MARK, None)
+            self.gem.load_state_dict(g)
+            print(f"[CARL] gem を再開: {gem_resume} ({len(g)} テンソル復元)")
+
+        # ★ Q-Table は再開処理より **前** に作る。以前は下で生成していたため
+        #   `q_resume` 指定時に self.qtable が未定義で AttributeError になり、
+        #   仮に通っても直後の再代入で復元内容が捨てられていた(再開経路が死んでいた)。
+        self.qtable = QTable(q_max=q_max, rng=self.rng)
         if ana_resume:
             # 奇数ラウンドで学習済みの LoRA + PMA/OutHead を上乗せする(backbone は上で復元済み)。
             if q_resume and os.path.exists(q_resume):
@@ -230,7 +247,6 @@ class CARLDriver:
                 raise RuntimeError(f"ana 再開ckptに未知のキー: {unexp[:5]}")
             print(f"[CARL] ana を再開: {ana_resume} ({len(extra)} テンソル復元)")
 
-        self.qtable = QTable(q_max=q_max, rng=self.rng)
         self.odd_cfg = odd_cfg or OddRoundConfig()
         self.even_cfg = even_cfg or EvenRoundConfig()
         self.keep_round_ckpts = keep_round_ckpts
@@ -260,7 +276,7 @@ class CARLDriver:
         self.wandb = _init_wandb(use_wandb, run_name, {
             "q_max": q_max, "seed": seed, "max_blank_ratio": max_blank_ratio,
             "odd": vars(self.odd_cfg), "even": vars(self.even_cfg),
-            "gem_ckpt": P.GEM_CKPT, "n_ana": len(self.human_ana),
+            "gem_ckpt": P.GEM_CKPT, "disc_pool": disc_pool, "n_ana": len(self.human_ana),
             "n_gem": len(self.human_gem),
         })
 
@@ -274,7 +290,10 @@ class CARLDriver:
     def run_odd(self, rnd: int):
         print(f"\n{'='*72}\n[CARL] ラウンド {rnd} (奇数): MORTM-ana(分析器 + AI/人間判別器)を学習\n"
               f"  目的: gem の出力を「AI が書いた」と見抜けるようにする。\n"
-              f"        判別正解率が gem・人間の両方で {self.odd_cfg.acc_threshold:.2f} を超えたら次へ。\n{'='*72}")
+              f"        判定は **AUC(人間 vs 最新gem)**。{self.odd_cfg.auc_threshold:.2f} 到達か、\n"
+              f"        {self.odd_cfg.auc_patience} 回連続で傾き < {self.odd_cfg.auc_min_slope}/1000step "
+              f"(収束)で次へ。\n"
+              f"        正解率で判定しないのは、閾値 0 が未較正で分画間に偏りが出るため。\n{'='*72}")
         for p in self.gem.parameters():
             p.requires_grad = False
         self.gem.eval()
@@ -302,9 +321,12 @@ class CARLDriver:
         #   本来 Q-Table に入るはずだった分布を忠実に再構成できる。
         self.ensure_qtable()
 
+        # ★ ここで ana を全凍結してはいけない。次の奇数ラウンドの mark_trainable は
+        #   loralib の仕様上 LoRA を True へ戻さないため、R3 以降 LoRA が永久凍結して
+        #   いた(判別を PMA + out_head の 2.07M だけが担う frozen-probe 状態)。
+        #   ana は critique(@torch.no_grad)でしか使わないので requires_grad は不要。
+        #   eval() は LoRA のマージと dropout 無効化のために必要なので残す。
         self.ana.eval()
-        for p in self.ana.parameters():
-            p.requires_grad = False
         n_train, n_total = unfreeze_attention_only(self.gem)
         print(f"[EvenRound] 学習対象: Attention のみ {n_train/1e6:.1f}M / 全 {n_total/1e6:.1f}M "
               f"({100*n_train/n_total:.1f}%) — FFN・埋め込み・LoRA は凍結")
@@ -323,6 +345,9 @@ class CARLDriver:
         opt = torch.optim.AdamW([p for p in self.gem.parameters() if p.requires_grad],
                                 lr=self.even_cfg.lr)
         print(f"[EvenRound] lr={self.even_cfg.lr} / group_size={self.even_cfg.group_size} "
+              f"/ prompts={getattr(self.even_cfg, 'prompts_per_step', '?')} "
+              f"(= {self.even_cfg.group_size * getattr(self.even_cfg, 'prompts_per_step', 0)} "
+              f"rollouts/step) "
               f"/ max_steps={self.even_cfg.max_steps} / kl_stop={self.even_cfg.kl_stop} "
               f"/ reward_stop={self.even_cfg.reward_stop}")
         from collections import deque
@@ -340,15 +365,17 @@ class CARLDriver:
         reason, step = None, 0
         while reason is None and step < self.even_cfg_max_steps():
             step += 1
-            idx = self.rng.choice(len(self.human_gem),
-                                  size=max(1, self.even_cfg.group_size // 2), replace=False)
+            # ★ プロンプト本数は group_size から独立に決める。以前は group_size//2 に
+            #   縛られていたため、G を上げると自動でプロンプト数も増えて生成コストが
+            #   二乗で膨らんだ。1 step のロールアウト数 = prompts_per_step * group_size。
+            n_prompt = max(1, getattr(self.even_cfg, "prompts_per_step",
+                                      max(1, self.even_cfg.group_size // 2)))
+            idx = self.rng.choice(len(self.human_gem), size=n_prompt, replace=False)
             recs = [self.human_gem[i] for i in np.atleast_1d(idx)]
 
             roll = er.rollout(recs)
-            refs = roll["refs"]        # 人間が書いた正解 CONST(同一プロンプトの真値)
-            pred_metas, disc, key_rank = er.critique(roll)
-            rewards, parts = er.compute_reward(roll, pred_metas, disc, references=refs,
-                                              key_rankings=key_rank)
+            crit = er.critique(roll)              # 既定では disc の forward 1 回だけ
+            rewards, parts = er.compute_reward(roll, crit)
             # マイクロバッチに割って逆伝播まで済ませる(勾配は貯まった状態で返る)
             loss, pg, kl = er.step_backward(roll, rewards)
             torch.nn.utils.clip_grad_norm_(
@@ -363,23 +390,23 @@ class CARLDriver:
             mv["disc"].append(parts["disc"])
             # 停止判定は移動平均で行う(生値は毎ステップ別ロールアウトなので揺れが大きい)
             avg = {k: float(np.mean(v)) for k, v in mv.items()}
-            self._log({"even/reward": mr, "even/reward_meta": parts["meta"],
-                       "even/reward_disc": parts["disc"], "even/reward_sim": parts["sim"],
+            self._log({"even/reward": mr,
+                       "even/reward_disc": parts["disc"],
+                       "even/pen_density": parts["density"], "even/pen_key": parts["key"],
+                       "even/pen_struct": parts["struct"], "even/pen_sim": parts["sim"],
                        "even/kl": mkl, "even/pg_loss": float(pg),
                        "even/loss": float(loss.detach()), "even/step": step,
                        "even/reward_min": float(rewards.min()),
                        "even/reward_max": float(rewards.max()),
                        "even/reward_sd": float(rewards.std()),
                        "even/similarity": parts.get("sim_mean", float("nan")),
+                       "even/out_of_key": parts.get("oo_key_mean", float("nan")),
+                       "even/density_ok": parts.get("density_ok", float("nan")),
                        "even/reward_ma": avg["reward"], "even/kl_ma": avg["kl"],
                        "even/disc_ma": avg["disc"],
-                       **{f"even/hit_{k}": v for k, v in parts.get("hit", {}).items()},
                        "even/empty_rate": parts.get("empty_rate", 0.0),
-                       "even/reward_struct": parts.get("struct", 0.0),
                        "even/struct_measure": parts.get("struct_measure", float("nan")),
                        "even/struct_inst": parts.get("struct_inst", float("nan")),
-                       "even/key_top1": parts.get("key_top1", float("nan")),
-                       "even/key_top3": parts.get("key_top3", float("nan")),
                        "round": rnd})
             if step % steps_per_check == 0:
                 print(self._format_even_log(rnd, step, mr, rewards, parts, avg,
@@ -482,24 +509,21 @@ class CARLDriver:
         torch.save({"table": self.qtable.table, "round": self.qtable.round}, qp)
         print(f"[CARL] Q-Table 充填完了: {st['size']} 本 -> {qp} に保存")
 
-    def _format_even_log(self, rnd, step, mr, rewards, parts, avg, kl, loss) -> str:
+    def _format_even_log(self, rnd, step, mr, rewards, parts, avg,
+                         kl, loss) -> str:
         """偶数ラウンドの1ブロック。各行が「何の指標か / どちらが良いか / 目標」を持つ。
 
-        値だけ並べると、加点なのか減点なのか・1.00 が良いのか悪いのかが読めない。
-        符号と到達目標を必ず併記する。
+        報酬 v2 は **駆動項が判別器ただ一つ、残りは全部ガードレール(減点のみ)** なので、
+        「加点はどれか」「減点はどれか」が一目で分かるように並べる。
         """
         cfg = self.even_cfg
         nan = float("nan")
-        hit = parts.get("hit", {})
-        # ana が推論しない項目(gmc)は常に 0.00 になるだけなので出さない
-        hit = {k: v for k, v in hit.items() if k != "gmc"}
 
         hack_kl = avg["kl"] > cfg.kl_stop
         hack_disc = avg["disc"] > cfg.disc_stop
         verdict = ("★該当 → 巻き戻し" if (hack_kl and hack_disc) else "該当なし")
 
         def bar(v, lo, hi, w=20):
-            """[lo,hi] を w 文字のゲージにする。進捗を目で追えるようにするため。"""
             t = 0.0 if hi <= lo else min(1.0, max(0.0, (v - lo) / (hi - lo)))
             return "█" * int(round(t * w)) + "·" * (w - int(round(t * w)))
 
@@ -508,20 +532,23 @@ class CARLDriver:
         L.append(f"  総合報酬   今回 {mr:+.3f}   直近{cfg.stop_window}平均 {avg['reward']:+.3f} "
                  f"/ 目標 {cfg.reward_stop:+.2f}  {bar(avg['reward'], 0, cfg.reward_stop)}")
         L.append(f"             ばらつき sd {float(rewards.std()):.3f}  "
-                 f"範囲 {float(rewards.min()):+.2f}〜{float(rewards.max()):+.2f}")
-        L.append(f"  ├加点 判別器 {parts['disc']:+.3f}  [0〜+1.0] "
-                 f"高いほど ana を「人間が書いた」と誤認させている")
-        L.append(f"  ├減点 META   {parts['meta']:+.3f}  [-1.0〜+0.75] "
-                 f"ana の推論 META が条件からずれた分(完全一致なら加点)")
-        L.append(f"  ├減点 構造   {parts.get('struct', 0.0):+.3f}  [-0.5〜0] "
-                 f"小節数・楽器の指示違反(生成物から実測)")
-        L.append(f"  └減点 類似度 {parts['sim']:+.3f}  [-0.5〜0] "
+                 f"範囲 {float(rewards.min()):+.2f}〜{float(rewards.max()):+.2f}"
+                 f"   (上限 +1.00 = ana を完全に騙し違反ゼロ)")
+        L.append(f"  ■駆動 判別器 {parts['disc']:+.3f}  [0〜+1.0] "
+                 f"高いほど ana を「人間が書いた」と誤認させている。0.5 = 五分五分")
+        L.append(f"  ├減点 density {parts['density']:+.3f}  [-{cfg.density_penalty:.2f}〜0] "
+                 f"CONST区間の音符密度が指示から外れた分(ルールベース実測)")
+        L.append(f"  ├減点 キー    {parts['key']:+.3f}  [-{cfg.key_penalty:.2f}〜0] "
+                 f"スケール外音が人間の正解より過剰な分")
+        L.append(f"  ├減点 構造    {parts['struct']:+.3f}  [-{cfg.struct_penalty:.2f}〜0] "
+                 f"小節数・楽器の指示違反")
+        L.append(f"  └減点 類似度  {parts['sim']:+.3f}  [-{cfg.sim_penalty:.2f}〜0] "
                  f"人間の正解に似すぎた分(実測 {parts.get('sim_mean', nan):.3f}、0.5超で減点開始)")
         L.append(f"  指示追従   小節 {100*parts.get('struct_measure', nan):5.1f}%  "
-                 f"楽器 {100*parts.get('struct_inst', nan):5.1f}%   ← ルールベース実測(高いほど良い)")
-        L.append(f"             ana推論の一致度 " +
-                 "  ".join(f"{k} {v:.2f}" for k, v in sorted(hit.items())) +
-                 f"  key(1位) {parts.get('key_top1', nan):.2f} (3位以内 {parts.get('key_top3', nan):.2f})")
+                 f"楽器 {100*parts.get('struct_inst', nan):5.1f}%  "
+                 f"density一致 {100*parts.get('density_ok', nan):5.1f}%  "
+                 f"スケール外音 {parts.get('oo_key_mean', nan):.3f}"
+                 f"   ← 全てルールベース実測(判別器を騙しても誤魔化せない)")
         L.append(f"  生成       空生成率 {100*parts.get('empty_rate', 0.0):.1f}%  ← 0% が正常")
         L.append(f"  方策の乖離 KL {kl:.4f}   直近{cfg.stop_window}平均 {avg['kl']:.4f} "
                  f"/ 上限 {cfg.kl_stop:.2f}  {bar(avg['kl'], 0, cfg.kl_stop)}  低いほど base に近い")
@@ -557,7 +584,7 @@ class CARLDriver:
         try:
             if which == "ana":
                 sd = {k: v.detach().clone() for k, v in m.state_dict().items()
-                      if ("lora_" in k) or k.startswith(("pma", "out_head"))}
+                      if ("lora_" in k) or k.startswith(("pma", "out_head", "mil"))}
             else:
                 sd = {k: v.detach().clone() for k, v in m.state_dict().items()}
         finally:
@@ -572,8 +599,14 @@ class CARLDriver:
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rounds", type=int, default=6)
+    ap.add_argument("--max_total_steps", type=int, default=100000)
+    ap.add_argument("--target_hits", type=int, default=6)
+    ap.add_argument("--start_round", type=int, default=1)
     ap.add_argument("--q_max", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=42)
     a = ap.parse_args()
-    CARLDriver(q_max=a.q_max, seed=a.seed).run(rounds=a.rounds)
+    # run() は (max_total_steps, target_hits, start_round, max_rounds) を取る。
+    # `rounds=` を渡して TypeError で落ちていたので引数名を合わせる。
+    CARLDriver(q_max=a.q_max, seed=a.seed).run(
+        max_total_steps=a.max_total_steps, target_hits=a.target_hits,
+        start_round=a.start_round)

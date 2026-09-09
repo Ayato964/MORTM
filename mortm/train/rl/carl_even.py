@@ -42,8 +42,8 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 
 from ...utils.key_from_tokens import get_key_from_tokens, tokens_to_notes
-from .carl_odd import density_token_of, generate_chunked
-from .task_norm import rev_safe
+from .carl_odd import density_token_of, generate_chunked, inst_names_of
+from .task_norm import parse_gen_output, rev_safe
 
 
 # ----------------------------------------------------------------------
@@ -52,7 +52,17 @@ from .task_norm import rev_safe
 @dataclass
 class EvenRoundConfig:
     """偶数ラウンド(GRPO)のハイパーパラメータ。"""
-    group_size: int = 8               # 1 つの META あたりのロールアウト本数 G
+    group_size: int = 16              # 1 つの META あたりのロールアウト本数 G。
+                                      # ★ G=8 では優位性の統計量が荒すぎた:
+                                      #   グループ標準偏差の相対誤差 26.7%(= グループ
+                                      #   ごとに実効学習率が ±27% ばらつく)、
+                                      #   グループ平均の SE 0.064 は「gem平均→人間平均」
+                                      #   の系統差 0.213 の 30% に相当。G=16 で
+                                      #   それぞれ 18.3% / 0.045 に下がる。
+    prompts_per_step: int = 4         # 1 step で引くプロンプト本数。
+                                      # ロールアウト総数 = prompts_per_step * group_size。
+                                      # 以前は group_size//2 に固定されており、G を
+                                      # 上げると生成コストが二乗で増えた。
     temperature: float = 1.0
     top_p: float = 0.9
     max_new: int = 1200
@@ -64,7 +74,7 @@ class EvenRoundConfig:
     grad_clip: float = 1.0
 
     clip_eps: float = 0.2             # PPO/GRPO の比クリップ幅
-    kl_coef: float = 0.3              # β: KL 正則化の重み。0.1 では優位性(大きさ~1)に負けるため強化
+    kl_coef: float = 0.05             # β: KL 正則化の重み。
 
     # 終了条件
     gen_chunk: int = 16               # 一度に生成するバッチ幅(KVキャッシュのVRAM制約)
@@ -78,28 +88,63 @@ class EvenRoundConfig:
                                       # (報酬もMETA一致率も伸びている局面で KL は普通に上がる)。
     stop_window: int = 20             # 停止判定に使う移動平均の窓(生値の単発スパイクで切らない)
     snapshot_every: int = 20          # 健全な重みを退避する間隔(ハッキング時の巻き戻し先)
-    reward_stop: float = 1.25         # 平均報酬がこれを超えたら達成として停止
+    reward_stop: float = 0.625        # 平均報酬がこれを超えたら達成として停止(本物の人間の平均値)。
+                                      # ★ v2 は加点を全廃したので上限が +1.00 になり、
+                                      #   **0.5 = 「ana が平均して五分五分」** を意味する。
+                                      #   v1 の 1.25 は上限 2.00 のうち約 0.50 が無条件の
+                                      #   加点で構成されており、達成には「ana の META 推論が
+                                      #   ほぼ完璧」かつ「判別器が半分騙されている」が同時に
+                                      #   必要だった(8ラウンド中 0 回達成)。
 
-    # 報酬の内訳
+    # 報酬の内訳(v2)
     #
-    # ★ 設計方針: **判別器を報酬の主要な伸びしろにする**。
-    #   META/キーは完全一致でのみ加点し、外せば減点する対称な採点にする。
-    #   ただし META の加点は ana の推論能力で頭打ちになる(genre 0.31)ため、
-    #   実際に残る伸びしろは R_disc 側に偏る。
-    #   構造と類似度は加点を置かず減点だけにして、抜け道を塞ぐ。
+    # ★ 設計方針: **駆動項は R_disc ただ一つ。他は全部ガードレール**。
+    #
+    #   v1 は density / inst / key に加点を置いていたため、全サンプルに無条件で
+    #   約 +0.50 が入っていた(実測 density +0.227 / inst +0.245 / key +0.03)。
+    #   GRPO はグループ内で報酬を標準化するので **定数項は勾配に一切寄与しない**。
+    #   加点は「平均報酬を高く見せて目標 1.25 を近く錯覚させる」だけの働きしかせず、
+    #   実際 8 ラウンドで報酬は 0.730 -> 0.643 と一度も改善しなかった。
+    #
+    #   v2 では加点を全廃し、違反時のみ減点する「ガードレール」に統一する。
+    #   **ガードレールは人間の正解が必ず 0 点になるよう定義する**のが原則:
+    #     density : 条件ラベルは const_seq から計算されたものなので、生成CONSTから
+    #               同じ規則で測れば定義上一致する(人間の正解 2168/2168 = 100% 実測)。
+    #     struct  : 小節数・楽器も同様に定義上一致する。
+    #     key     : 条件キーは曲レベル(time=0, window_measures=999)なので CONST 区間の
+    #               スケール外音比率は 0 にならない(人間実測: 中央 0.000 / 90% 0.251 /
+    #               95% 0.411)。固定閾値だと人間まで減点されるので、**同一レコードの
+    #               人間の正解を基準にした相対閾値**にする。
+    #     sim     : 元から減点のみ。
+    #
+    #   これにより上限は R_disc の +1.00 になり、0.5 = 「ana が五分五分」という
+    #   解釈可能な目盛りになる。
     empty_penalty: float = -1.0       # 音符を1つも生成しなかった場合の報酬(他項目を無視して確定)
-    disc_weight: float = 1.0          # 判別器報酬の重み(報酬の主役)
-    struct_penalty: float = 0.5       # 構造遵守(小節数/楽器)の **減点** の重み。
-                                      # 生成物から直接実測するので判別器を騙しても
-                                      # 誤魔化せない。遵守度 score に対し -w*(1-score)。
-    meta_bonus: float = 0.25          # density / genre / inst が完全一致したときの加点
-    meta_penalty: float = 0.25        # 同・最も外したときの減点(ゼロ交差は距離 0.5)
-    key_bonus: float = 0.25           # キーが 1 位で当たったときの加点(2 位は 0)
-    key_penalty: float = 0.25         # キーが 3 位以降のときの減点(順位に応じて連続)
+    disc_weight: float = 1.0          # 判別器報酬の重み(唯一の駆動項)
+
+    struct_penalty: float = 0.5       # 小節数/楽器の違反(ルールベース実測)
+    density_penalty: float = 0.25     # density の違反(ルールベース・CONST区間・楽器別)
+    density_tolerance: int = 1        # level 差がこれ以下なら違反ゼロ。
+                                      # density は ceil(平均比率*10) の量子化なので、
+                                      # 音符 1 個で level が飛ぶ。境界ノイズを吸収する。
+    key_penalty: float = 0.25         # スケール外音が人間より過剰な分の減点
+    key_tau_floor: float = 0.20       # 人間が完全にダイアトニックでも、これだけは許す
+    key_margin: float = 0.10          # 人間の実測比率に上乗せする余裕
+
     sim_penalty: float = 0.5          # 参照(人間の原曲)に似すぎた場合の減点の上限。
     sim_center: float = 0.75          # sigmoid の中心(この類似度で減点が半分)
     sim_sharpness: float = 12.0       # sigmoid の鋭さ。大きいほど center 付近で切り立つ
     adv_eps: float = 1e-4
+
+    # ana に META を推論させるか。既定 False。
+    # ★ disc ロジットは `_pack_music_only` + 因果マスクにより **音楽ブロックだけの関数**
+    #   なので、判別に META は要らない。v1 は R_meta / R_key のためだけに 32 本 x 最大
+    #   128 トークンの greedy 生成を毎ステップ回していたが、density と key が
+    #   ルールベースになった今、残るのは genre だけ(8ラウンドで 0.337 -> 0.345 と不動)。
+    #   True にすると critique の戻り値に pred_metas / key_rankings が入るが、
+    #   **v2 の compute_reward はそれらを採点しない**(診断用の観測窓として残してある)。
+    #   採点に戻すなら compute_reward 側に項を足すこと。
+    use_ana_meta: bool = False
 
 
 # ----------------------------------------------------------------------
@@ -304,6 +349,122 @@ def structural_reward(gen, cond_meta, tokenizer) -> Tuple[float, Dict[str, float
     return (m_score + i_score) / 2.0, {"measure": m_score, "inst": i_score}
 
 
+# ----------------------------------------------------------------------
+# ルールベースのガードレール(density / key)
+# ----------------------------------------------------------------------
+_PITCH_CLASS = {'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4,
+                'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9,
+                'A#': 10, 'Bb': 10, 'B': 11}
+_MAJOR_STEPS = (0, 2, 4, 5, 7, 9, 11)
+_MINOR_STEPS = (0, 2, 3, 5, 7, 8, 10, 11)   # 自然的短音階 + 導音(第7音上げ)
+
+
+def key_pitch_classes(key_token, tokenizer) -> Optional[frozenset]:
+    """`k_CM` 等のキートークン -> ダイアトニックな音class集合。
+
+    短調は導音(第7音上げ)を含める。含めないと、調性内の主要な進行である
+    V-i の導音が全部「調外」に数えられてしまう。
+    """
+    if key_token is None:
+        return None
+    name = rev_safe(tokenizer, int(key_token))
+    if not isinstance(name, str) or not name.startswith("k_"):
+        return None
+    body = name[2:]
+    if len(body) < 2:
+        return None
+    mode, tonic = body[-1], body[:-1]
+    root = _PITCH_CLASS.get(tonic)
+    if root is None or mode not in ("M", "m"):
+        return None                       # k_Unknown 等
+    steps = _MAJOR_STEPS if mode == "M" else _MINOR_STEPS
+    return frozenset((root + i) % 12 for i in steps)
+
+
+def out_of_key_ratio(notes, pcs: Optional[frozenset]) -> Optional[float]:
+    """音符列のうち、指定キーのスケールから外れた音の割合 [0,1]。
+
+    キー推定(`get_key_from_tokens`)ではなく **照合** にするのが要点:
+      - 1 小節でも測れる(数小節から調は決まらないので推定は当てにならない)
+      - 相対調の曖昧さが消える(C major と A minor は同じ音class集合)
+      - music21 を呼ばないので実質ゼロコスト(推定は 1 本 97ms かかる)
+    """
+    if pcs is None or not notes:
+        return None
+    out = sum(1 for n in notes if (int(n.pitch) % 12) not in pcs)
+    return out / len(notes)
+
+
+def key_violation(gen_notes, ref_notes, pcs, tau_floor: float = 0.20,
+                  margin: float = 0.10) -> Tuple[float, Optional[float]]:
+    """スケール外音が「同じ窓で人間が書いた量」を超えた分だけを違反とする [0,1]。
+
+    条件キーは曲レベル(time=0)の値なので、CONST 窓が転調区間に当たると人間の
+    正解でもスケール外音が大量に出る(実測: 90 パーセンタイルで 0.251、
+    95 パーセンタイルで 0.411)。固定閾値にすると人間の正解まで減点されるため、
+    **同一レコードの人間の正解を基準**にする。
+
+        tau = max(tau_floor, 人間の比率) + margin
+        violation = clip((生成の比率 - tau) / (1 - tau), 0, 1)
+
+    人間の正解を入れれば生成比率 == 人間比率 なので必ず violation = 0 になる。
+    """
+    g = out_of_key_ratio(gen_notes, pcs)
+    if g is None:
+        return 0.0, None
+    r = out_of_key_ratio(ref_notes, pcs)
+    tau = max(tau_floor, r if r is not None else 0.0) + margin
+    if tau >= 1.0:
+        return 0.0, g
+    return float(min(1.0, max(0.0, (g - tau) / (1.0 - tau)))), g
+
+
+def density_violation(gen, cond_meta_parsed, cond_inst_names, tokenizer,
+                      tolerance: int = 1) -> Tuple[float, Optional[bool]]:
+    """生成 CONST から楽器ごとに density を実測し、条件ラベルとの差を違反度にする。
+
+    条件の `<NOTE_DENSE_n>` は `convert_foundation.py` が **const_seq のみ** から
+    `_calculate_density_token` で作ったものなので、生成 CONST に同じ規則を当てれば
+    直接比較できる(人間の正解で 2168/2168 = 100% 一致を実測済み)。
+
+    ana の推論を介さないので、判別器を騙しても誤魔化せない。
+
+    Returns: (違反度 [0,1], 完全一致だったか(測れなければ None))
+    """
+    levels_cond = [_dense_level(t, tokenizer) for t in (cond_meta_parsed.get("density") or ())]
+    if not levels_cond or not cond_inst_names:
+        return 0.0, None
+    gen_seqs = parse_gen_output(gen, tokenizer)
+
+    viol, ok, n = [], 0, 0
+    span = max(1.0, 9.0 - tolerance)
+    for name, want in zip(cond_inst_names, levels_cond):
+        if want is None:
+            continue
+        seq = gen_seqs.get(name)
+        if seq is None or len(seq) == 0:
+            continue                      # 楽器の欠落は R_struct の担当。二重計上しない
+        try:
+            got_tok = density_token_of(np.asarray(seq, dtype=np.int64), name, tokenizer)
+        except Exception:
+            got_tok = None
+        n += 1
+        if got_tok is None:               # 規則上限を超えた = 明確な違反
+            viol.append(1.0)
+            continue
+        got = _dense_level(got_tok, tokenizer)
+        if got is None:
+            viol.append(1.0)
+            continue
+        d = abs(got - want)
+        if d <= tolerance:
+            ok += 1
+        viol.append(min(1.0, max(0.0, (d - tolerance) / span)))
+    if not viol:
+        return 0.0, None
+    return float(np.mean(viol)), (ok == n)
+
+
 def _has_note(seq: Sequence[int], tokenizer) -> bool:
     """生成物に shift(`s_`) トークンが1つでもあるか = 音符があるか。"""
     lo, hi = tokenizer.get_length_tuple("s")
@@ -312,11 +473,16 @@ def _has_note(seq: Sequence[int], tokenizer) -> bool:
 
 def to_piano_roll(tokenizer, seq: Sequence[int], fps: float = 16.0,
                   tempo: int = 120) -> np.ndarray:
-    """トークン列 -> (128, T) の 2 次元バイナリ・ピアノロール。
+    """トークン列 -> (128, T) の 2 次元バイナリ・ピアノロール。"""
+    return notes_to_roll(tokens_to_notes(tokenizer, seq, tempo), fps)
 
-    `tokens_to_notes` で秒単位の音符に戻し、fps で量子化して鳴っている枠を 1 にする。
+
+def notes_to_roll(notes, fps: float = 16.0) -> np.ndarray:
+    """音符リスト -> (128, T) のバイナリ・ピアノロール。
+
+    `tokens_to_notes` は安くないので、キー照合と類似度で同じ音符列を使い回せるよう
+    トークン列からの変換と分離してある。
     """
-    notes = tokens_to_notes(tokenizer, seq, tempo)
     if not notes:
         return np.zeros((128, 1), dtype=bool)
     end = max(n.end for n in notes)
@@ -568,45 +734,48 @@ class EvenRound:
         return [self._CONST_M] + body + [self._TAG_END]
 
     @torch.no_grad()
-    def critique(self, rollouts: Dict) -> Tuple[List[Dict], Tensor]:
-        """MORTM-ana に (a) META 推論 と (b) AI/Human 判定 をさせる。
+    def critique(self, rollouts: Dict) -> Dict:
+        """MORTM-ana に生成物を読ませる。
 
-        手順は仕様どおり 2 パス:
-          パス1: `<EOS> <CONST_M>..<TAG_END> <META>` から <TE> まで自己回帰で META を生成。
-          パス2: 生成し切った系列(<TE> 込み)を丸ごと入れ直し、PMA+OutHead で判定。
+        既定(`use_ana_meta=False`)では **判別ロジットだけ** を取る forward 1 回で済む。
 
-        Returns: (推論 META の parse 結果, 判別ロジット (N,))
+        ★ なぜ META 推論を回さなくてよいか:
+          `forward_with_disc(meta_id=<META>)` は `_pack_music_only` で `<META>` の手前
+          までを切り出してプーリングし、デコーダは因果マスクなので、その位置は
+          `<META>` 以降のトークンを一切見ない。つまり **disc ロジットは音楽ブロック
+          だけの関数**である。v1 は R_meta / R_key のためだけに 32 本 x 最大 128
+          トークンの greedy 生成を毎ステップ回していたが、density と key が
+          ルールベースになった今、それで得られるのは genre だけ。
+
+        Returns: {"disc": (N,), "pred_metas": list|None, "key_rankings": list|None}
         """
         recs = rollouts.get("recs") or [None] * len(rollouts["gens"])
         analysis_prompts = [
             [self._EOS] + self.to_const_block(g, r) + [self._META]
             for g, r in zip(rollouts["gens"], recs)
         ]
-        # パス1: META の推論(<TE> で停止)
-        # ★ greedy で推論させる。サンプリングだと同一の生成物でも評価のたびに
-        #   META が変わり、報酬が ±0.2 揺れる(実測: 優位性の分散の 46% が
-        #   この乱数だった)。GRPO はグループ内の報酬差を優位性にするので、
-        #   その差が乱数だと勾配が毎ステップ別方向を向いて打ち消し合う。
+
+        if not getattr(self.cfg, "use_ana_meta", False):
+            x, pad = self._pad_batch(analysis_prompts)
+            _, disc = self.ana.forward_with_disc(x, pad, is_causal=True, meta_id=self._META)
+            return {"disc": disc.float().cpu(), "pred_metas": None, "key_rankings": None}
+
+        # --- 以下は従来経路(use_ana_meta=True のときだけ) ---
+        # パス1: META の推論(<TE> で停止)。greedy で推論させる。サンプリングだと
+        # 同一の生成物でも評価のたびに META が変わり報酬が乱数化する。
         pred_tokens = generate_chunked(
             self.ana, analysis_prompts, self.tok, self.dev,
-            10 ** 6,                                   # 小節では止めない
-            chunk=self.cfg.gen_chunk,
-            p=1.0, temperature=0.0,
-            max_new=128, seed=None)
+            10 ** 6, chunk=self.cfg.gen_chunk,
+            p=1.0, temperature=0.0, max_new=128, seed=None)
         pred_metas = [parse_meta(pt, self.tok) for pt in pred_tokens]
 
         # パス2: <TE> まで含む完成系列を入れ直し、判別ヘッドを通す
         full = [ap + [int(t) for t in pt] + [self._TE]
                 for ap, pt in zip(analysis_prompts, pred_tokens)]
         x, pad = self._pad_batch(full)
-        # 奇数ラウンドと同じく、判別は音楽ブロックのみで行う
         logits, disc = self.ana.forward_with_disc(
             x, pad, is_causal=True, meta_id=self._META)
 
-        # キー候補の順位: ana が実際にキーを吐いた位置の直前(=そこを予測する位置)の
-        # ロジットを見て、キー語彙(k_*)だけを確率順に並べる。
-        # 「ana が条件キーをどれだけ上位に置いたか」を測るので、相対調のように
-        # 構成音が同一で 1 位を取り切れない対でも 2 位で拾える。
         klo, khi = self.tok.get_length_tuple("k")
         rankings = []
         for i, seq in enumerate(full):
@@ -617,74 +786,101 @@ class EvenRound:
             row = logits[i, pos - 1, klo:khi]
             order = torch.argsort(row, descending=True).cpu().numpy()
             rankings.append([int(klo + o) for o in order])
-        return pred_metas, disc.float().cpu(), rankings
+        return {"disc": disc.float().cpu(), "pred_metas": pred_metas,
+                "key_rankings": rankings}
 
     # -- 報酬 ---------------------------------------------------------
-    def compute_reward(self, rollouts: Dict, pred_metas: List[Dict], disc: Tensor,
-                       references: Optional[List[Sequence[int]]] = None,
-                       key_rankings: Optional[List[List[int]]] = None
+    def compute_reward(self, rollouts: Dict, critique_out: Dict
                        ) -> Tuple[Tensor, Dict[str, float]]:
-        """R = R_meta + R_disc + R_sim を系列ごとに合算する。
+        """R = R_disc - (density + key + 構造 + 類似度 の違反)。
 
-        references: 各ロールアウトに対応する人間の CONST(ピアノロール比較の参照)。
-                    None のときは R_sim を 0 とする。
+        **駆動項は R_disc ただ一つ。他は全部ガードレール**(違反したときだけ減点)。
+        v1 のように density/inst/key へ加点を置くと、全サンプルに同じ定数が乗る。
+        GRPO はグループ内で報酬を標準化するので、定数は勾配に一切寄与せず、
+        平均報酬を高く見せて目標を近く錯覚させるだけになる。
+
+        ガードレールは **人間の正解が必ず 0 点** になるよう定義してある:
+          density : 条件ラベルは const_seq から作られたものなので定義上一致する
+          struct  : 小節数・楽器も同様
+          key     : 同一レコードの人間の正解を基準にした相対閾値
+          sim     : 自分自身との比較なので人間は満額の減点になるが、これは
+                    「人間の正解を丸写しするな」という項なので意図どおり
+
+        範囲: -1.0(空生成) 〜 +1.0(ana を完全に騙し、違反ゼロ)
         """
         cfg = self.cfg
-        rs, parts = [], {"meta": 0.0, "disc": 0.0, "sim": 0.0, "struct": 0.0}
-        hit_sum, hit_n, sims, key_ranks = {}, {}, [], []
+        disc = critique_out["disc"]
+        rs = []
+        parts = {"disc": 0.0, "density": 0.0, "key": 0.0, "struct": 0.0, "sim": 0.0}
+        sims, oo_keys = [], []
         n_empty = 0
         struct_m, struct_i = [], []
+        dens_ok_n = dens_n = 0
+        refs = rollouts.get("refs")
+
         for i, gen in enumerate(rollouts["gens"]):
-            # 音符が1つも無い生成は問答無用で最低評価にする。
-            # 空の CONST は類似度 0 -> similarity_reward(0)=+0.5 が満額入るため、
-            # 「何も書かない」が部分的に報われる抜け道になっていた。
+            # 音符が1つも無い生成は問答無用で最低評価。空の CONST は違反ゼロに
+            # なってしまうため、他項目を無視して確定させる。
             if not _has_note(gen, self.tok):
                 rs.append(cfg.empty_penalty)
                 n_empty += 1
-                # 構造の統計にも 0 として計上する。除外すると「空生成が増えるほど
-                # struct_measure が 1.00 に近づく」という逆立ちした表示になり、
-                # ログ上は満点なのに実際は何も書けていない状況を見逃す。
                 struct_m.append(0.0); struct_i.append(0.0)
                 continue
-            r_meta, hits = meta_match_reward(rollouts["cond"][i], pred_metas[i],
-                                             cfg.meta_penalty, tokenizer=self.tok,
-                                             bonus=cfg.meta_bonus)
-            # key は順位ベース(1位 +bonus / 2位 0 / 以降 -penalty へ連続)
-            rk = (key_rankings[i] if key_rankings and i < len(key_rankings) else [])
-            r_key, rank = key_rank_reward(rollouts["cond"][i].get("key"), rk,
-                                          cfg.key_penalty, cfg.key_bonus)
-            r_meta += r_key
-            if rank is not None:
-                key_ranks.append(rank)
-            for k, v in hits.items():          # v は [0,1] の一致度(部分点)
-                hit_sum[k] = hit_sum.get(k, 0.0) + float(v)
-                hit_n[k] = hit_n.get(k, 0) + 1
+
+            cond = rollouts["cond"][i]
+            cond_raw = rollouts["cond_raw"][i]
+            ref = refs[i] if refs is not None else None
+
+            # --- 駆動項: 判別器 ---
             r_disc = cfg.disc_weight * discriminator_reward(float(disc[i]))
-            # 構造は加点しない。遵守度 score から外れた分だけ引く(0 〜 -struct_penalty)。
-            s_score, sd = structural_reward(gen, rollouts["cond_raw"][i], self.tok)
-            r_struct = -cfg.struct_penalty * (1.0 - s_score)
+
+            # --- ガードレール1: 構造(小節数・楽器) ---
+            s_score, sd = structural_reward(gen, cond_raw, self.tok)
+            p_struct = -cfg.struct_penalty * (1.0 - s_score)
             struct_m.append(sd["measure"]); struct_i.append(sd["inst"])
-            if references is not None and references[i] is not None:
-                sim = roll_similarity(to_piano_roll(self.tok, gen),
-                                      to_piano_roll(self.tok, references[i]))
+
+            # --- ガードレール2: density(CONST区間・楽器別・ルールベース) ---
+            v_dens, all_ok = density_violation(
+                gen, cond, inst_names_of(cond_raw, self.tok), self.tok,
+                tolerance=cfg.density_tolerance)
+            p_dens = -cfg.density_penalty * v_dens
+            if all_ok is not None:
+                dens_n += 1
+                dens_ok_n += int(all_ok)
+
+            # --- 音符列は key と sim で共用する(tokens_to_notes は安くない) ---
+            gen_notes = tokens_to_notes(self.tok, gen)
+            ref_notes = tokens_to_notes(self.tok, ref) if ref is not None else None
+
+            # --- ガードレール3: キー(スケール外音の過剰分) ---
+            pcs = key_pitch_classes(cond.get("key"), self.tok)
+            v_key, oo = key_violation(gen_notes, ref_notes, pcs,
+                                      cfg.key_tau_floor, cfg.key_margin)
+            p_key = -cfg.key_penalty * v_key
+            if oo is not None:
+                oo_keys.append(oo)
+
+            # --- ガードレール4: 人間の正解に似すぎ ---
+            if ref_notes is not None:
+                sim = roll_similarity(notes_to_roll(gen_notes), notes_to_roll(ref_notes))
                 sims.append(sim)
-                r_sim = similarity_reward(sim, cfg.sim_penalty,
+                p_sim = similarity_reward(sim, cfg.sim_penalty,
                                           cfg.sim_center, cfg.sim_sharpness)
             else:
-                r_sim = 0.0
-            parts["meta"] += r_meta; parts["disc"] += r_disc
-            parts["sim"] += r_sim; parts["struct"] += r_struct
-            rs.append(r_meta + r_disc + r_sim + r_struct)
+                p_sim = 0.0
+
+            parts["disc"] += r_disc; parts["density"] += p_dens
+            parts["key"] += p_key; parts["struct"] += p_struct; parts["sim"] += p_sim
+            rs.append(r_disc + p_dens + p_key + p_struct + p_sim)
+
         n = max(1, len(rs))
         stats = {k: v / n for k, v in parts.items()}
-        # 属性別の一致率(どの指示を守れていないかを見るため)
-        stats["hit"] = {k: hit_sum[k] / hit_n[k] for k in hit_sum}
         stats["sim_mean"] = float(np.mean(sims)) if sims else float("nan")
+        stats["oo_key_mean"] = float(np.mean(oo_keys)) if oo_keys else float("nan")
         stats["empty_rate"] = n_empty / n
         stats["struct_measure"] = float(np.mean(struct_m)) if struct_m else float("nan")
         stats["struct_inst"] = float(np.mean(struct_i)) if struct_i else float("nan")
-        stats["key_top1"] = float(np.mean([r == 1 for r in key_ranks])) if key_ranks else float("nan")
-        stats["key_top3"] = float(np.mean([r <= 3 for r in key_ranks])) if key_ranks else float("nan")
+        stats["density_ok"] = (dens_ok_n / dens_n) if dens_n else float("nan")
         return torch.tensor(rs, dtype=torch.float32), stats
 
     # -- 学習ステップ用のバッチ組み立て --------------------------------

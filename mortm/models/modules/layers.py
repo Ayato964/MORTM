@@ -15,100 +15,194 @@ from typing import Tuple, List
 import numpy as np
 
 from .attention import FlashSelfAttentionM, FlashCrossAttentionM, linear, flash_attn_varlen_kvpacked_func
-from .config import MORTMArgs, MORTM_LIVE_Args
+from .config import MORTMArgs, MORTM5Args
 
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
 
 
-class CNNBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups):
-        super(CNNBlock, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, groups=groups, bias=False)
-        self.norm = nn.GroupNorm(num_groups=out_channels // 8, num_channels=out_channels, affine=True)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        return F.silu(x)
-
-class VisionEncoder(nn.Module):
-    def __init__(self, args: MORTM_LIVE_Args, encoder_output_dim):
-        super(VisionEncoder, self).__init__()
-
-        # stride=(2, 2) -> 出力サイズ (64, 8)
-        self.conv1 = CNNBlock(in_channels=args.instrument_num * 2, out_channels=args.instrument_num * 4, kernel_size=3, stride=(2, 2), padding=1, groups=1)
-
-        # stride=(2, 2) -> 出力サイズ (32, 4)
-        self.conv2 = CNNBlock(args.instrument_num * 4, args.instrument_num * 4, kernel_size=3, stride=(2, 2), padding=1, groups=1)
-
-        # stride=(2, 1) -> 出力サイズ (16, 4)
-        self.conv3 = CNNBlock(args.instrument_num * 4, args.instrument_num * 8, kernel_size=3, stride=(2, 1), padding=1, groups=1)
-
-        self.fc_mu = nn.Linear(encoder_output_dim, args.d_model)
-        self.fc_log_var = nn.Linear(encoder_output_dim, args.d_model)
-
-        self.out_channel = args.instrument_num * 8
-        self.width =  args.pianoroll_time_step // 4
-        self.height = 16
-
-
-    def reparameterize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std) # 標準正規分布からノイズをサンプリング
-        return mu + eps * std
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        #print(x.shape)
-        h_flat = torch.flatten(x, start_dim=1)
-        mu = self.fc_mu(h_flat)
-        log_var = self.fc_log_var(h_flat)
-        z = self.reparameterize(mu, log_var)
-        return z, mu, log_var
-
-
-class VisionDecoder(nn.Module):
-    def __init__(self, args: MORTM_LIVE_Args, encoder_output_dim:int,  encoder_output_shape = (64, 2, 32)):
+class ResNetBlock(nn.Module):
+    """
+    ConvNeXt スタイルの現代的 Inverted Residual (SoTA) ブロック
+    - 7x7 Depthwise Conv による広い受容野（ピアノロールの時間・音高の文脈抽出）
+    - GroupNorm (1グループ = LayerNormと同等) によるバッチサイズ非依存の安定した正規化
+    - 1x1 Conv でチャンネルを expand_ratio 倍（既定: 4倍）に広げ、GELU活性化後に圧縮する Inverted Bottleneck 構造
+    - クリーンな残差接続
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int | Tuple[int, int] = 1,
+        expand_ratio: int = 4,
+        kernel_size: int = 7,
+    ):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
 
-        # エンコーダーの最終出力次元 (平坦化前)
-        self.encoder_output_dim = encoder_output_dim
-        self.encoder_output_shape = encoder_output_shape # (C, H, W)
+        # 1. 空間特徴抽出 (Depthwise Conv: チャンネル独立で大受容野を効率的に計算)
+        padding = kernel_size // 2
+        self.dwconv = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=in_channels,
+            bias=False,
+        )
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=in_channels)
 
-        # 1. d_model次元の潜在変数zを、転置畳み込みできる形に復元する全結合層
-        self.fc = nn.Linear(args.d_model, self.encoder_output_dim)
+        # 2. チャンネル特徴混合 (Inverted Bottleneck: 4倍に拡大して非線形活性化後、圧縮)
+        hidden_dim = in_channels * expand_ratio
+        self.pwconv1 = nn.Conv2d(in_channels, hidden_dim, kernel_size=1)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv2d(hidden_dim, out_channels, kernel_size=1)
 
-        # 2. 転置畳み込みで画像サイズを大きくしていく層 (エンコーダーの逆)
-        # 入力: (64, 16, 4)
-        self.deconv1 = nn.Sequential(
-            nn.ConvTranspose2d(self.encoder_output_shape[0], self.encoder_output_shape[0] // 2, kernel_size=3, stride=(2, 1), padding=1, output_padding=(1, 0), bias=False),
-            nn.GroupNorm(self.encoder_output_shape[0] // 2 // 8, self.encoder_output_shape[0] // 2),
-            nn.SiLU()
+        # 3. 残差パス (解像度やチャンネル数が変化する場合のみ 1x1 Conv で整合)
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.GroupNorm(num_groups=1, num_channels=out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = self.shortcut(x)
+
+        out = self.dwconv(x)
+        out = self.norm(out)
+        out = self.pwconv1(out)
+        out = self.act(out)
+        out = self.pwconv2(out)
+
+        return out + identity
+
+
+class ResNetUpBlock(nn.Module):
+    """
+    ConvNeXt スタイルの現代的アップサンプリングブロック (SoTA)
+    - 転置畳み込み特有のチェッカーボードアーティファクト（格子ノイズ）を防止するため、
+      Nearest Upsample -> 7x7 Depthwise ConvNeXt ResNetBlock の構成を採用
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        scale_factor: int | Tuple[int, int] = 1,
+        expand_ratio: int = 4,
+        kernel_size: int = 7,
+    ):
+        super().__init__()
+        self.scale_factor = scale_factor
+        if scale_factor != 1:
+            self.upsample = nn.Upsample(scale_factor=scale_factor, mode="nearest")
+        else:
+            self.upsample = nn.Identity()
+        self.block = ResNetBlock(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=1,
+            expand_ratio=expand_ratio,
+            kernel_size=kernel_size,
         )
 
-        self.deconv2 = nn.Sequential(
-            nn.ConvTranspose2d(self.encoder_output_shape[0] // 2, self.encoder_output_shape[0] // 2, kernel_size=3, stride=(2, 2), padding=1, output_padding=1, bias=False),
-            nn.GroupNorm(self.encoder_output_shape[0] // 2 // 8, self.encoder_output_shape[0] // 2),
-            nn.SiLU()
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.upsample(x)
+        return self.block(x)
+
+
+class ResNetEncoder(nn.Module):
+    def __init__(self, args: MORTM5Args):
+        super().__init__()
+        self.track_size = args.track_size
+        self.input_channel = self.track_size * 2
+        self.resnet = nn.Sequential(
+            ResNetBlock(self.input_channel, args.first_channel, stride=1),
+            ResNetBlock(args.first_channel, args.first_channel, stride=2),
+            ResNetBlock(args.first_channel, args.max_channel, stride=(2, 1)),
+            ResNetBlock(args.max_channel, args.max_channel, stride=2)
+
         )
 
-        self.deconv3 = nn.Sequential(
-            nn.ConvTranspose2d(self.encoder_output_shape[0] // 2, args.instrument_num * 2, kernel_size=3, stride=(2, 2), padding=1, output_padding=1, bias=False),
+        self.init_h = 16
+        self.init_w = 6
+        flatten_dim = args.max_channel * self.init_h * self.init_w
+        self.w_out = nn.Linear(flatten_dim, args.encoder_wout)
+    
+    def forward(self, x: Tensor) -> Tensor:
+        
+        if x.dim() == 5: #Shape: [Batch, Sequence, Track * 2, height, width]
+            b, s = x.shape[0], x.shape[1]
+            x = x.reshape(b * s, x.shape[2], x.shape[3], x.shape[4])
+            x = self.resnet(x)
+            x = x.reshape(x.shape[0], -1)    
+            x = self.w_out(x)
+            return x.reshape(b, s, -1)
+
+
+        if x.dim() == 4: # Shape: [Batch, Track * 2, height, width]
+            x = self.resnet(x)
+            x = x.reshape(x.shape[0], -1)    
+            x = self.w_out(x)
+            return x
+
+
+class ResNetDecoder(nn.Module):
+    """
+    ResNet (エンコーダ) と完全に対称・鏡像となる SoTA デコーダ
+    - 潜在ベクトル [B, 2048] (または [B, S, 2048]) を元のピアノロール [B, 8, 128, 24] (または [B, S, 8, 128, 24]) に完全復元
+    - 4段階の対称アップサンプリング: (16x6 -> 32x12 -> 64x12 -> 128x24)
+    - チャンネル推移もエンコーダの完全逆順: (128 -> 128 -> 64 -> 64 -> 8)
+    """
+    def __init__(self, args: MORTM5Args):
+        super().__init__()
+        self.track_size = args.track_size
+        self.output_channel = self.track_size * 2
+        self.max_channel = args.max_channel
+        self.first_channel = args.first_channel
+        self.roll_h = args.roll_h
+        self.roll_w = args.roll_w
+
+        # 1. 特徴マップ形状への復元プロジェクション (2048 -> 128 * 16 * 6 = 12288)
+        self.init_h = 16
+        self.init_w = 6
+        flatten_dim = self.max_channel * self.init_h * self.init_w
+        self.w_in = nn.Linear(args.encoder_wout, flatten_dim)
+
+        # 2. エンコーダと完全に対称な4段デコーダ
+        # Encoder: (8->64, s=1) -> (64->64, s=2) -> (64->128, s=(2,1)) -> (128->128, s=2)
+        # Decoder: (128->128, scale=2) -> (128->64, scale=(2,1)) -> (64->64, scale=2) -> (64->8, scale=1)
+        self.decoder = nn.Sequential(
+            ResNetUpBlock(self.max_channel, self.max_channel, scale_factor=2),           # (16, 6)   -> (32, 12), 128ch -> 128ch
+            ResNetUpBlock(self.max_channel, self.first_channel, scale_factor=(2, 1)),   # (32, 12)  -> (64, 12), 128ch -> 64ch
+            ResNetUpBlock(self.first_channel, self.first_channel, scale_factor=2),       # (64, 12)  -> (128, 24), 64ch -> 64ch
+            ResNetUpBlock(self.first_channel, self.output_channel, scale_factor=1),      # (128, 24) -> (128, 24), 64ch -> 8ch
         )
-        # 出力: (16, 128, 16) - 元のピアノロールサイズ
 
-    def forward(self, z):
-        # (N, d_model) -> (N, 4096)
-        h = self.fc(z)
-        h_reshaped = h.view(-1, *self.encoder_output_shape)
-        #print(self.encoder_output_shape,  h_reshaped.shape)
+    def forward(self, x: Tensor) -> Tensor:
+        # 5次元の場合: 入力 [Batch, Sequence, 2048] -> 出力 [Batch, Sequence, Track*2, 128, 24]
+        if x.dim() == 3:
+            b, s = x.shape[0], x.shape[1]
+            x = x.reshape(b * s, -1)
+            x = self.w_in(x)
+            x = x.reshape(b * s, self.max_channel, self.init_h, self.init_w)
+            x = self.decoder(x)
+            return x.reshape(b, s, self.output_channel, self.roll_h, self.roll_w)
 
-        x_recon = self.deconv3(self.deconv2(self.deconv1(h_reshaped)))
+        # 4次元の場合: 入力 [Batch, 2048] -> 出力 [Batch, Track*2, 128, 24]
+        if x.dim() == 2:
+            x = self.w_in(x)
+            x = x.reshape(x.shape[0], self.max_channel, self.init_h, self.init_w)
+            x = self.decoder(x)
+            return x
 
-        return x_recon
+        raise ValueError(f"Expected 2D [Batch, Dim] or 3D [Batch, Seq, Dim] tensor, got {x.dim()}D (shape: {x.shape})")
+
+    
 
 class AttentionPool(nn.Module):
     """Attention Poolingによるシーケンス集約モジュール"""
@@ -181,6 +275,73 @@ class PMA(nn.Module):
 
         out = out.view(batch, self.out_dim)
         return self.w_o(out)
+
+class MILPool(nn.Module):
+    """LogSumExp による Multiple-Instance Learning 型プーリング(PMA の代替)。
+
+    なぜ PMA では駄目だったか
+    ------------------------------------------------------------------
+    PMA は学習済み seed query 1 本による **加重平均**、つまりトークン特徴分布の
+    1 次モーメントしか計算できない。ところが CARL の判別課題では:
+
+      1. 効いている特徴が **ヒストグラムと標準偏差**(音価分布/発音位置分布/跳躍幅/
+         グリッド整合率)であり、加重平均では表現できない。実測でも表層統計 + 小 MLP
+         が 0.799 に対し PMA 判別器は 0.78 で同着、それ以上を一切取れなかった。
+      2. 入力が **人間PAST ++ AI CONST ++ 人間FUTURE** を畳んだ最大 24 小節で、
+         AI が書いたのは一部だけ。加重平均だとクラス差が AI トークン比率に比例して
+         希釈される(自前ベースラインで gen-only 0.888 -> folded 0.799 と実測)。
+      3. デコーダが因果マスクなので、PAST 内の位置は AI 区間の情報を構造的に
+         持てないのに、ほぼ等重みで平均に入る(R17 時点でも attention logit の std は
+         推定 0.18 しかなく、実質ほぼ一様平均だった)。
+
+    LogSumExp/MIL が効く理由
+    ------------------------------------------------------------------
+    折り畳み系列は「bag に 1 つでも陽性インスタンスがあれば陽性」という MIL の
+    問題設定そのもの。各トークンを instance として個別にスコアリングし、
+    **soft-max 的に集約**する:
+
+        s_t  = scorer(h_t)                          # トークンごとの AI らしさ
+        bag  = (1/r) * log( (1/N) * sum_t exp(r * s_t) )
+
+      r -> 0   : 平均プーリング(従来の PMA と同じ挙動)
+      r -> inf : 最大プーリング(「どこか 1 箇所でも AI 的なら AI」)
+
+    r は学習可能にしてあるので、データから平均寄り/最大寄りを選べる。1/N で割って
+    いるので **系列長に不変**(入力は 1 小節から 1552 トークンまで幅がある)。
+
+    副産物として s_t が「どの位置を AI 的と見たか」の可視化になる。PMA の
+    attention 重みと違い、s_t は直接 bag スコアへの寄与を表すので解釈が素直。
+    """
+
+    def __init__(self, d_model: int, hidden: Optional[int] = None, r_init: float = 2.0):
+        super().__init__()
+        h = hidden or d_model
+        self.scorer = nn.Sequential(
+            nn.Linear(d_model, h), nn.GELU(), nn.Linear(h, 1))
+        # r は正である必要があるので log 空間で持つ
+        self.log_r = nn.Parameter(torch.tensor(float(math.log(r_init))))
+
+    def forward(self, x: Tensor, cu_seqlens: Tensor, return_scores: bool = False):
+        """x: (total_tokens, d_model) packed varlen / cu_seqlens: (B+1,)
+
+        Returns: (B,) の bag スコア。return_scores=True なら (bag, per-token スコア)。
+        """
+        s = self.scorer(x).squeeze(-1).float()          # (total_tokens,)
+        r = self.log_r.exp().clamp(0.05, 20.0)
+        cu = cu_seqlens.detach().to("cpu").tolist()      # 同期は 1 回だけにまとめる
+        out = []
+        for i in range(len(cu) - 1):
+            lo, hi = int(cu[i]), int(cu[i + 1])
+            if hi <= lo:
+                out.append(s.new_zeros(()))
+                continue
+            seg = s[lo:hi]
+            # logsumexp は内部で最大値を引くので、r*seg が大きくても安定
+            out.append((torch.logsumexp(r * seg, dim=0)
+                        - math.log(float(hi - lo))) / r)
+        bag = torch.stack(out)
+        return (bag, s) if return_scores else bag
+
 
 class DummyDecoder(nn.Module):
     def __init__(self):

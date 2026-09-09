@@ -52,7 +52,11 @@ GEN_SFT_MANIFEST = "/home/takaaki-nagoshi/data/sft/generation/train.json"
 GEN_SFT_EVAL = "/home/takaaki-nagoshi/data/sft/generation/eval.json"
 
 # --- 出力 ---------------------------------------------------------------
-OUT_DIR = _p("out/models/mortm/rl/carl")
+# ★ 本番と検証で必ず分けること。既定のまま短いスモークテストを回すと `_save` が
+#   r1 -> r2 -> r3 ... と順に上書きし、過去ランのチェックポイントを破壊する
+#   (実害あり: v1 ランの MORTM-ana.carl.r1.pth / MORTM-gem.carl.r2.pth /
+#    qtable.r1.pt を失った)。CARL_OUT_DIR で退避先を指定する。
+OUT_DIR = os.environ.get("CARL_OUT_DIR") or _p("out/models/mortm/rl/carl")
 
 
 def resolve(path: str) -> str:
