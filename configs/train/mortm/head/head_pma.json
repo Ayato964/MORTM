@@ -1,0 +1,15 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 128,
+  "accumulation_steps": 2,
+  "num_epochs": 5,
+  "is_save_training_progress": true,
+  "val_total_tokens": 2000000,
+  "train_dataset_split": 0.99,
+  "shuffle": true,
+  "lr_param": 0.0002,
+  "scheduler": {
+    "type": "none"
+  },
+  "_note": "E3 frozen-probe PMA分類ヘッド学習用。inner batch128 x accum2 x 2GPU = 実効512。lr=2e-4定数(4e-4は過学習=key/genre best epoch0だったため下げた)。backbone凍結でPool(PMA)+headのみ学習。外側big_batch=4096npz→内側でサンプル展開。エポック毎保存→ eval側でval最良採用。"
+}

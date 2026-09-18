@@ -1,0 +1,20 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 32,
+  "accumulation_steps": 32,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 5000000,
+  "train_dataset_split": 0.99,
+  "shuffle": true,
+  "lr_param": 0.0006,
+  "checkpoint_percents": [
+    100
+  ],
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.1,
+    "total_steps": 5759
+  },
+  "_note": "E1 A1(aug) M=80M, 3.2B tok. eff512x2gpu, lr6e-4(流用), warmup10%(§4.3). total_steps=5759(1epoch, 1.08margin)"
+}

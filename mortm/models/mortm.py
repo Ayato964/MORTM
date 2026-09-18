@@ -38,7 +38,8 @@ class MORTM(nn.Module):
         self.dim_feedforward = args.dim_feedforward
         self.dropout = args.dropout
         print("Bias:", args.use_bias)
-        print(f"Use LoRA Selection: Attention LoRA: {args.use_attn_lora}, Gate LoRA: {args.use_gate_lora}, FFN LoRA: {args.use_ffn_lora}")
+        _shared_lora = getattr(args, "use_shared_expert_lora", getattr(args, "use_shared_ffn_lora", False))
+        print(f"Use LoRA Selection: Attention LoRA: {args.use_attn_lora}, Gate LoRA: {args.use_gate_lora}, FFN LoRA: {args.use_ffn_lora}, Shared Expert LoRA: {_shared_lora}")
 
         self.decoder = MORTMDecoder(args, progress=progress)
 

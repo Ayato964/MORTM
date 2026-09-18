@@ -1,0 +1,17 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 16,
+  "accumulation_steps": 4,
+  "num_epochs": 3,
+  "is_save_training_progress": true,
+  "val_total_tokens": 500000,
+  "train_dataset_split": 0.99,
+  "shuffle": true,
+  "lr_param": 0.0002,
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.05,
+    "total_steps": 2600
+  },
+  "_note": "MoE A80M-E64 JAZZ SFT: Attn+Gate LoRA (r=8), Stacked Experts Frozen, Bias OFF"
+}

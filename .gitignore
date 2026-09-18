@@ -65,3 +65,29 @@ checkpoints/
 *~
 .DS_Store
 Thumbs.db
+
+# Data & Audio/MIDI Samples
+data/
+*.mid
+*.midi
+*.npz
+bench/cache/
+
+
+# Scratch & Temporary files
+scratch/
+temp.py
+.codex
+MCK_DONE
+package-lock.json
+install.cmd
+
+# Experiment logs, raw reports & reproduction runs
+experiments/depth_ablation_80M/
+ai_report/
+report/
+mortm_repro/
+docs/E1_*_results.md
+docs/E1_experiment_summary.md
+Bug_Report.md
+HANDOFF.md

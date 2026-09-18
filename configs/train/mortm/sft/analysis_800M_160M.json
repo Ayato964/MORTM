@@ -1,0 +1,18 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 16,
+  "accumulation_steps": 8,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 2000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0002,
+  "checkpoint_percents": [6.25, 25],
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.03,
+    "total_steps": 21671
+  },
+  "_note": "E3分析SFT予算スイープ(LoRA)の160M版。80M版(analysis_800M.json)と実効バッチを一致させOOM回避: micro16*accum8*2gpu=256/opt-step=80M版(128*1*2)と同一 → total_steps/checkpoint_percentsのトークン対応も同一。50M/200M/800Mは80Mと完全同一手順・同一データ(train_800M.json)。"
+}

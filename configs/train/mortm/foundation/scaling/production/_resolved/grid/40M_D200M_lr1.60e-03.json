@@ -1,0 +1,17 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 32,
+  "accumulation_steps": 16,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 5000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0016,
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.05,
+    "total_steps": 252
+  },
+  "_resolved_note": "auto-resolved by run_train_many_project.py: lr=0.0016, total_steps=252"
+}

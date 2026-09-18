@@ -1,0 +1,17 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 32,
+  "accumulation_steps": 16,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 5000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 6e-4,
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.05,
+    "total_steps": 1302
+  },
+  "_note": "effective_batch=512 (32x16), ref total_steps for ~800M token dataset. run_scale.py overrides total_steps."
+}

@@ -1,0 +1,18 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 8,
+  "accumulation_steps": 64,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 5000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0012,
+  "scheduler": {
+    "type": "cos",
+    "warmup_steps": 682,
+    "warmup_ratio": 0.05,
+    "total_steps": 13642
+  },
+  "_resolved_note": "tokencmp B_remi_86M lr=0.0012 b8/a64 steps=13642"
+}

@@ -50,6 +50,11 @@ def load_gem(config: str, ckpt: str, device, train: bool = False):
             f"`python -m mortm.train.rl.fix_merged_ckpt {ckpt}` で修復してから使ってください。")
     sd.pop(_UNMERGED_MARK, None)
     m.load_state_dict(sd)
+    for mod in m.modules():
+        if hasattr(mod, "manual_step"):
+            mod.manual_step = True
+    if torch.cuda.is_available():
+        m = m.to(dtype=torch.bfloat16)
     if train:
         m.train()
     else:
@@ -59,17 +64,19 @@ def load_gem(config: str, ckpt: str, device, train: bool = False):
     return m
 
 
-def unfreeze_attention_only(model) -> tuple:
-    """全パラメータを凍結し、**Attention の本体重みだけ**を解放する。
+def unfreeze_attention_and_gate(model) -> tuple:
+    """全パラメータを凍結し、**Attention の本体重み**と **Gate の重み**だけを解放する。
 
-    KV 連想記憶の見立てに基づく設計。FFN が音楽的知識(key-value メモリ)を保持して
-    いるなら、それを書き換える必要はない。書き換えるべきは「何を引くか」を決める
-    Attention 側であり、問題を生成品質の改善から **知識探索の改善** に読み替える。
+    KV 連想記憶の見立てに基づく設計。FFN Experts が音楽的知識(key-value メモリ)を
+    保持しているなら、書き換えるべきは「何を引くか」を決める Attention 側と、
+    「どの Expert を引くか」を決める Gate(MoE router) 側である。
+    問題を生成品質の改善から **知識探索・ルーティングの改善** に読み替える。
 
-    解放するのは `self_attention.qkv_block.{qkv_weight,W_o}.weight` のみ。
-    LoRA(`lora_A`/`lora_B`)は Attention のものも含めて凍結する。
-    なお gem は eval() で回すため loralib がマージ状態になり、LoRA は計算グラフから
-    そもそも外れる。requires_grad=False は二重の担保。
+    解放するのは:
+      - `self_attention.qkv_block.{qkv_weight,W_o}.weight` (Attention 本体)
+      - `ffn.gate.gate_proj.weight` (MoE Gate)
+    LoRA(`lora_A`/`lora_B`)は Attention・Shared Expert のものも含めて完全に固定(凍結)する。
+    FFN Experts、Shared Expert、Embedding、Norm 等もすべて完全凍結する。
 
     Returns:
         (解放したパラメータ数, 全パラメータ数)
@@ -77,12 +84,16 @@ def unfreeze_attention_only(model) -> tuple:
     n_train = n_total = 0
     for name, p in model.named_parameters():
         n_total += p.numel()
-        is_attn = ".self_attention." in name and name.endswith(".weight")
         is_lora = name.endswith(("lora_A", "lora_B"))
-        p.requires_grad = bool(is_attn and not is_lora)
+        is_attn = ".self_attention." in name and name.endswith(".weight") and not is_lora
+        is_gate = ".ffn.gate." in name and name.endswith(".weight") and not is_lora
+        p.requires_grad = bool(is_attn or is_gate)
         if p.requires_grad:
             n_train += p.numel()
     return n_train, n_total
+
+
+unfreeze_attention_only = unfreeze_attention_and_gate
 
 
 def _is_legacy_merged(ckpt: str, sd: dict) -> bool:
@@ -121,6 +132,11 @@ def load_ana(config: str, ckpt: str, device, pool: str = "mil"):
           f"欠損 {len(other)} / 余剰 {len(unexpected)}")
     if other or unexpected:
         raise RuntimeError(f"ana の重みが噛み合っていない: missing={other[:5]} unexpected={unexpected[:5]}")
+    for mod in m.modules():
+        if hasattr(mod, "manual_step"):
+            mod.manual_step = True
+    if torch.cuda.is_available():
+        m = m.to(dtype=torch.bfloat16)
     return m
 
 
@@ -327,9 +343,9 @@ class CARLDriver:
         #   ana は critique(@torch.no_grad)でしか使わないので requires_grad は不要。
         #   eval() は LoRA のマージと dropout 無効化のために必要なので残す。
         self.ana.eval()
-        n_train, n_total = unfreeze_attention_only(self.gem)
-        print(f"[EvenRound] 学習対象: Attention のみ {n_train/1e6:.1f}M / 全 {n_total/1e6:.1f}M "
-              f"({100*n_train/n_total:.1f}%) — FFN・埋め込み・LoRA は凍結")
+        n_train, n_total = unfreeze_attention_and_gate(self.gem)
+        print(f"[EvenRound] 学習対象: Attention + Gate {n_train/1e6:.1f}M / 全 {n_total/1e6:.1f}M "
+              f"({100*n_train/n_total:.1f}%) — FFN Experts・Shared Expert・埋め込み・LoRA は完全凍結")
         # ★ eval() で回すこと。理由は 2 つある。
         #   1. dropout を切る。train() だと logp_new だけにノイズが乗り、凍結 base(eval)
         #      との差が KL に化けて、重みが動く前から KL が 3 を超えてしまう
@@ -604,9 +620,15 @@ if __name__ == "__main__":
     ap.add_argument("--start_round", type=int, default=1)
     ap.add_argument("--q_max", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--run_name", type=str, default="MORTM.4.5E-A80M-E64-CARL")
+    ap.add_argument("--no_wandb", action="store_true")
     a = ap.parse_args()
     # run() は (max_total_steps, target_hits, start_round, max_rounds) を取る。
     # `rounds=` を渡して TypeError で落ちていたので引数名を合わせる。
-    CARLDriver(q_max=a.q_max, seed=a.seed).run(
+    CARLDriver(
+        q_max=a.q_max, seed=a.seed,
+        use_wandb=not a.no_wandb, run_name=a.run_name
+    ).run(
         max_total_steps=a.max_total_steps, target_hits=a.target_hits,
-        start_round=a.start_round)
+        start_round=a.start_round
+    )

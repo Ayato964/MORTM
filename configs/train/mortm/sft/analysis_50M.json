@@ -1,0 +1,17 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 128,
+  "accumulation_steps": 1,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 2000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0002,
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.03,
+    "total_steps": 1348
+  },
+  "_note": "E3 複数シード補強用の専用50Mラン(LoRA). train_50M.json(50Mユニーク)を1エポック学習し、LRを50Mに整合減衰。エポック終了保存(.train.0.*.pth)=50M点。total_steps=345,228samples/(2gpu*128)=1,348。シードを変えて再現性(最適化ゆらぎ)を評価。"
+}

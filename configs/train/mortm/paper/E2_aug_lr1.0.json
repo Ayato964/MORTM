@@ -1,0 +1,24 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 32,
+  "accumulation_steps": 16,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 50000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "checkpoint_percents": [
+    2,
+    10,
+    20,
+    50,
+    100
+  ],
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.1,
+    "total_steps": 3211
+  },
+  "lr_param": 0.0006,
+  "_note": "E2 aug_lr1.0 (v1.8g 曝露一致対照). A1起点フルFT, A1形式1.6B, LR=6e-4(×1.0). 主図の動く対照線(A1起点+同一FTデータ, 総曝露3.2B+xをnoaugと一致). [bs32/accum16=eff1024, A1形式データゆえbs32安全(=A1事前学習と同一), 2GPU DDP]"
+}

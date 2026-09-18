@@ -908,7 +908,10 @@ class SharedExpert(nn.Module):
 
     def __init__(self, args: MORTMArgs):
         super().__init__()
-        if not args.use_ffn_lora:
+        use_shared_lora = getattr(args, "use_shared_expert_lora", None)
+        if use_shared_lora is None:
+            use_shared_lora = getattr(args, "use_shared_ffn_lora", args.use_ffn_lora)
+        if not use_shared_lora:
             self.w1 = nn.Linear(args.d_model, args.d_model, bias=args.use_bias)
             self.w2 = nn.Linear(args.d_model, args.d_model, bias=args.use_bias)
             self.w3 = nn.Linear(args.d_model, args.d_model, bias=args.use_bias)

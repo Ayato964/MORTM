@@ -1,0 +1,20 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 16,
+  "accumulation_steps": 64,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 5000000,
+  "train_dataset_split": 0.99,
+  "shuffle": true,
+  "lr_param": 0.0006,
+  "checkpoint_percents": [
+    100
+  ],
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.1,
+    "total_steps": 4064
+  },
+  "_note": "E1 A2(noaug/固定順) M=80M, 3.2B tok. 実効バッチ=A1と同一(§4.3): micro16×accum32×2gpu=eff1024, total_steps4064。2GPU DDP維持。★A2は固定順で全3ブロック保持→系列が長く活性化ピークが高いため、bs32では片rankが16GB VRAMで瞬間OOM→except OutOfMemoryError握り潰し→片rankのみteardown→DDPデッドロック(Outer2/Inner162で決定的再現)。micro-batchを16に半減しピーク回避。勾配累積はLayerNorm系Transformerで数学的に等価ゆえeff1024維持で公平性不変。A1(既完走,bs32/accum16)と実効バッチ・最適化は同一。"
+}

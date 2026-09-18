@@ -1,0 +1,24 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 64,
+  "accumulation_steps": 16,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 5000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0032,
+  "checkpoint_percents": [
+    10,
+    25,
+    50,
+    75,
+    100
+  ],
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.05,
+    "total_steps": 844
+  },
+  "_note": "E5(曲一致) A1-songmatch M=10M. A2(固定順)の52,786曲に制限したAny-Order完全augを、manifest内反復で400Mトークンに一致(=同一曲を反復するハンデ)。regimeはE1_A1_10Mと同一(bs64×accum8×2gpu=eff1024, lr3.2e-3, cos warmup0.05, total_steps844=400M)。num_epochs=1(反復はmanifestに内包)。3seed(s42/s1337/s2024)。比較対象=既存A2_10M_400M_{seed}。 [E5修正] NVMLドライバ不整合でマルチGPU-NCCL不可→1GPU学習、accum8→16でeff1024維持(bs64×accum16×1gpu)。"
+}

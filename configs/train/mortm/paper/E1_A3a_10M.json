@@ -1,0 +1,24 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 64,
+  "accumulation_steps": 8,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 5000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0032,
+  "checkpoint_percents": [
+    10,
+    25,
+    50,
+    75,
+    100
+  ],
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.05,
+    "total_steps": 501
+  },
+  "_note": "S規模アブレーション A3a=perm_only(削除OFF/並替ON/META位置random)。A1の削除因子を除いた版。 M=10M,400M,1seed(s42)。A1/A2 10Mと同一regime(bs64×accum8×2gpu=eff1024,lr3.2e-3,cos warmup0.05)。total_steps=501はestimate_total_steps(A3a/400M)算出。valは学習内部99/1 split(train曲のみ生成のため)。data=data/paper/A3a/400M。"
+}

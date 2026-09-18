@@ -1,0 +1,14 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 64,
+  "accumulation_steps": 8,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 5000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0032,
+  "checkpoint_percents": [10, 25, 50, 75, 100],
+  "scheduler": {"type": "cos", "warmup_ratio": 0.05, "total_steps": 844},
+  "_note": "S規模アブレーション A1(順列+削除,aug) M=10M, 400M tok, 3seed(s42/s1337/s2024)。scaling/LRスイープ regime忠実踏襲: bs64×accum8×2gpu=eff1024, lr3.2e-3(10M最適,同regimeで検証済), cos warmup0.05。total_steps=844はestimate_total_steps(A1/400M, step_margin1.08込)でアーム毎算出(E1と同一手法, A2は516)。checkpoint%[10,25,50,75,100]は方向別val曲線(direction_loss)用。data=data/paper/A1/400M。"
+}

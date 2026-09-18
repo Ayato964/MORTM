@@ -1,0 +1,21 @@
+{
+  "vocab_size": 700,
+  "d_model": 512,
+  "dim_feedforward": 1365,
+  "num_heads": 8,
+  "d_layer": 7,
+  "dropout": 0.2,
+  "position_length": 5000,
+  "min_length": 40,
+  "num_experts": 8,
+  "topk_experts": 2,
+  "num_groups": 1,
+  "topk_groups": 1,
+  "use_moe_encoder": false,
+  "use_moe_decoder": false,
+  "norm_type": "rmsnorm",
+  "use_silu": true,
+  "use_bias": false,
+  "use_rope": true,
+  "_param_note": "~19.1M params: 2x700x512 + 7x(4x512^2 + 3x512x1024 + 2x512) + 512"
+}

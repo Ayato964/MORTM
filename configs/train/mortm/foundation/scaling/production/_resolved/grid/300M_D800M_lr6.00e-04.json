@@ -1,0 +1,17 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 8,
+  "accumulation_steps": 64,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 5000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0006,
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.05,
+    "total_steps": 1641
+  },
+  "_resolved_note": "300M rerun lr=0.0006 steps=1641"
+}

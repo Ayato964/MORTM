@@ -11,6 +11,7 @@ import wandb
 from einops import rearrange
 import numpy as np
 import gc
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 torch.set_float32_matmul_precision('high')
@@ -560,7 +561,8 @@ class MORTMTrainSet(AbstractTrainSet):
                         log_data[f"moe/L{lid}_affinity_loss"] = s["affinity_loss"]
                     log_data[f"moe/L{lid}_dead_experts"] = s["dead_now"]
 
-            wandb.log(log_data)
+            if wandb.run is not None:
+                wandb.log(log_data)
 
     def loss_mask(self, x: torch.Tensor) -> torch.Tensor:
         # 生成: <MGEN>/<CGEN>, メタ分析: <META>, 属性別分析: <KEY>/<DENCE>/<GENRE>/<LENGTH>
@@ -1130,6 +1132,53 @@ def _load_checkpoint(
     return ckpt
 
 
+def _prefetched_outer_batches(train_loader, trainer, progress, skip_until: int = 0):
+    """Outer バッチの前処理を1つ先読みしながら (pack_idx, pack, dataset) を yield する。
+
+    従来は「前処理(CPU) -> 学習(GPU) -> 前処理(CPU) -> ...」と直列だったため、
+    前処理の間 GPU が完全に停止していた。実測では 183秒周期のうち 30秒(16.4%)が
+    GPU アイドルで、同時に 12W <-> 236W の負荷ステップを 3分ごとに作り出していた。
+
+    次の Outer バッチの前処理を裏で走らせることで、
+      - GPU のアイドル区間が消える(スループット改善)
+      - 電源から見た負荷ステップが平坦化する
+    の両方が得られる。
+
+    メモリは常に最大2バッチ分を保持する。pre_processing を uint8 化した後なら
+    1バッチ約6.6GB なので 2つでも約13GB に収まる(float32 のままでは 54GB 必要で破綻する)。
+    """
+    it = enumerate(train_loader)
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="preproc")
+
+    def _submit(idx, pk):
+        return (idx, pk, pool.submit(trainer.pre_processing, pk, progress))
+
+    try:
+        pending = None
+        # resume 時の読み飛ばし。ここでは前処理を走らせない。
+        for pack_idx, pack in it:
+            if pack_idx < skip_until:
+                continue
+            pending = _submit(pack_idx, pack)
+            break
+
+        while pending is not None:
+            idx, pk, fut = pending
+
+            # 「今のバッチを待つ」前に「次のバッチ」を投入しておく。
+            # ワーカーは1本なので、次の前処理は今の前処理が終わってから走り、
+            # 呼び出し側が学習している間に進行する。
+            nxt = None
+            for n_idx, n_pack in it:
+                nxt = _submit(n_idx, n_pack)
+                break
+
+            yield idx, pk, fut.result()
+            pending = nxt
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: AbstractTrainSet,
                 train_loader: DataLoader, val_loader: DataLoader,
                 message: Messenger, progress: LearningProgress,
@@ -1211,15 +1260,14 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
             if local_rank == 0:
                 _print_epoch_summary(epoch, train_args, train_loader, optimizer_step)
 
-            for pack_idx, pack in enumerate(train_loader):
-                count += 1
-                if epoch == start_epoch and pack_idx < resume_outer_batch_idx:
-                    # すでに処理済みのビッグバッチは高速スキップ（Sampler生成器の状態を進める）
-                    continue
+            # 次の Outer バッチの前処理を裏で先読みし、GPU のアイドル区間を埋める。
+            _skip_until = resume_outer_batch_idx if epoch == start_epoch else 0
+            for pack_idx, pack, pre_processing_dataset in _prefetched_outer_batches(
+                train_loader, trainer, progress, skip_until=_skip_until
+            ):
+                count = pack_idx + 1
 
                 begin_time = time.time()
-
-                pre_processing_dataset = trainer.pre_processing(pack, progress)
 
                 # 空でも continue せず _sync_min_loader_length に必ず参加する。
                 # 一方のランクだけが continue すると dist.all_reduce がズレて NCCL デッドロックになる。

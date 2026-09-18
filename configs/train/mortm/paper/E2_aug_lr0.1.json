@@ -1,0 +1,24 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 32,
+  "accumulation_steps": 16,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 50000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "checkpoint_percents": [
+    2,
+    10,
+    20,
+    50,
+    100
+  ],
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.1,
+    "total_steps": 3211
+  },
+  "lr_param": 6e-05,
+  "_note": "E2 aug_lr0.1 (H2, Bavarian音楽版). A1起点(上振れ確認)のフルFT(LoRA不使用), A1形式aug データ1.6B(=pretrain50%)で全パラ継続学習. LR=A2 pretrainピーク6e-4×倍率=6e-05. eff1024(bs16×accum32×2gpu), cos再スケジュール, total_steps=3211. ckpt%[2,10,20,50,100]=32M/160M/320M/800M/1.6Bトークン. 各ckptをTEST-TASK補完プロトコルで評価(§7 H2: 25%=800M/50%=1.6B判定). [bs32/accum16=eff1024, A1形式データゆえbs32安全(=A1事前学習と同一), 2GPU DDP]"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "MORTM5",
+  "d_model": 2048,
+  "dim_feedforward": 2048,
+  "num_heads": 8,
+  "dropout": 0.1,
+  "roll_w": 24,
+  "roll_h": 128,
+  "track_size": 4,
+  "first_channel": 64,
+  "max_channel": 128,
+  "encoder_wout": 2048,
+  "encoder_layer": 8
+}

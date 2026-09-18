@@ -1,0 +1,15 @@
+{
+  "batch_size": 16,
+  "big_batch_size": 4,
+  "accumulation_steps": 1,
+  "lr_param": 0.0003,
+  "scheduler": {
+    "type": "cos",
+    "warmup_steps": 10,
+    "total_steps": 100
+  },
+  "num_epochs": 1,
+  "train_dataset_split": 0.8,
+  "is_save_training_progress": false,
+  "shuffle": true
+}

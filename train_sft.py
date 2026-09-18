@@ -39,8 +39,10 @@ class MORTMSFTTrainSet(MORTMTrainSet):
                  config=None, load_directory=None, model_name=None):
         # --- 2 & 3: Attention と FFN に LoRA を追加 (rank=4)。モデル構築前に設定する ---
         args.use_attn_lora = True
-        args.use_ffn_lora = True
-        args.use_gate_lora = False
+        args.use_ffn_lora = False
+        args.use_gate_lora = True
+        args.use_gate_bias = True
+        args.gate_manual_step = True    # バイアス更新をフリーズ (適用は維持)
         args.lora_r = self.LORA_RANK
 
         self.tokenizer = tokenizer
@@ -54,6 +56,7 @@ class MORTMSFTTrainSet(MORTMTrainSet):
         # --- ベース SOTA 重みをロード。LoRA(lora_A/lora_B)は ckpt に無いため strict=False ---
         if load_directory is not None:
             sd = torch.load(load_directory, map_location=device)
+            sd = {k.replace("module.", ""): v for k, v in sd.items()}
             missing, unexpected = self.model.load_state_dict(sd, strict=False)
             non_lora_missing = [k for k in missing if "lora_" not in k]
             if self.local_rank == 0:
@@ -63,6 +66,14 @@ class MORTMSFTTrainSet(MORTMTrainSet):
                     print(f"[SFT][警告] lora以外のmissingキー: {non_lora_missing[:5]}")
                 if unexpected:
                     print(f"[SFT][警告] unexpectedキー: {unexpected[:5]}")
+
+        # 特化型SFT: 事前学習バイアスの適用は維持し、学習中の更新のみフリーズ
+        for m in self.model.modules():
+            if hasattr(m, "manual_step"):
+                m.manual_step = True
+
+        # MoE スタック重みとの型一致のため bfloat16 に統一
+        self.model = self.model.to(dtype=torch.bfloat16)
 
         # --- ベース凍結、LoRA アダプタのみ学習可能に ---
         mark_only_lora_as_trainable(self.model)
@@ -86,13 +97,16 @@ class MORTMSFTTrainSet(MORTMTrainSet):
             print(f"[SFT] LoRA rank={self.LORA_RANK}  学習可能パラメータ={n_train/1e6:.3f}M / 全体={total_param/1e6:.1f}M")
         adam = torch.optim.AdamW(trainable, lr=t_args.lr_param)
 
-        if self.local_rank == 0 and log_scale and config is not None:
-            with open(config, "r") as f:
-                data: dict = json.load(f)
-            data["model_params"] = self.active_params
-            data["total_params"] = total_param
-            data["sft_lora_rank"] = self.LORA_RANK
-            wandb.init(project=project_name, name=model_name, config=data, reinit=True)
+        if self.local_rank == 0 and log_scale and config is not None and os.environ.get("WANDB_MODE") != "disabled":
+            try:
+                with open(config, "r") as f:
+                    data: dict = json.load(f)
+                data["model_params"] = self.active_params
+                data["total_params"] = total_param
+                data["sft_lora_rank"] = self.LORA_RANK
+                wandb.init(project=project_name, name=model_name, config=data, reinit=True)
+            except Exception as e:
+                print(f"[SFT][WandB スキップ] {e}")
 
         # --- 1: 損失を MaskedCrossEntropyLoss に変更 ---
         AbstractTrainSet.__init__(
@@ -162,8 +176,9 @@ def run_sft(model_config, train_config, base_checkpoint, root_directory, save_di
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arm", type=str, required=True, choices=["A1","A2","A1-40B-80M","A1-40B-160M"], help="Model arm")
-    parser.add_argument("--budget", type=str, required=True, choices=["50M", "200M", "800M"], help="Token budget: 50M, 200M, 800M")
+    parser.add_argument("--arm", type=str, default="A1", help="Model arm")
+    parser.add_argument("--budget", type=str, default="50M", help="Token budget: 50M, 200M, 800M")
+    parser.add_argument("--version", type=str, default=None, help="明示的なモデルバージョン名")
     parser.add_argument("--backbone_cfg", type=str, default="configs/models/mortm/foundation/80M.json")
     parser.add_argument("--backbone_ckpt", type=str, required=True, help="Path to backbone .pth file")
     parser.add_argument("--train_json", type=str, default="/home/takaaki-nagoshi/data/sft/analysis/train.json")
@@ -171,12 +186,14 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="out/models/paper/E3")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード(複数シード頑健性評価用)")
     parser.add_argument("--train_config", type=str, default=None, help="学習config上書き(160MのOOM回避config等)")
+    parser.add_argument("--project", type=str, default="MORTM_SFT_JAZZ", help="WandBプロジェクト名")
+    parser.add_argument("--no_wandb", action="store_true", help="WandBログを無効化")
     args = parser.parse_args()
 
     train_config = args.train_config or f"configs/train/mortm/sft/analysis_{args.budget}.json"
     suffix = f"_s{args.seed}" if args.seed is not None else ""
-    save_dir = os.path.join(args.save_dir, f"{args.arm}_sft_{args.budget}{suffix}")
-    version = f"E3-{args.arm}-sft-{args.budget}{suffix}"
+    version = args.version or f"E3-{args.arm}-sft-{args.budget}{suffix}"
+    save_dir = args.save_dir if args.version else os.path.join(args.save_dir, f"{args.arm}_sft_{args.budget}{suffix}")
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -189,7 +206,8 @@ if __name__ == "__main__":
         save_directory=save_dir,
         version=version,
         eval_list_json=(args.eval_json,),
-        project_name="MORTM_E3_SFT",
+        project_name=args.project,
+        log_scale=not args.no_wandb,
         seed=args.seed,
     )
 

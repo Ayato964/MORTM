@@ -1,0 +1,18 @@
+{
+  "big_batch_size": 4096,
+  "batch_size": 128,
+  "accumulation_steps": 1,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 2000000,
+  "train_dataset_split": 0.99,
+  "shuffle": false,
+  "lr_param": 0.0002,
+  "checkpoint_percents": [6.25, 25],
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.03,
+    "total_steps": 21671
+  },
+  "_note": "E3分析SFT予算スイープ(LoRA). train_800M.json(800Mユニーク,12転調,meta-only)を1エポック学習し、checkpoint_percents[6.25%,25%]で50M/200Mチェックポイントを保存、800Mはエポック終了保存(.train.0.*.pth)。total_steps=5,547,992samples/(2gpu*128)=21,671。A1/A2両アームで同一。"
+}

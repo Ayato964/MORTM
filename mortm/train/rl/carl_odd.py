@@ -94,7 +94,7 @@ class AnalysisMORTM(MORTM):
             )
 
     def forward_with_disc(self, x: Tensor, padding_mask: Tensor, is_causal: bool = True,
-                          meta_id: Optional[int] = None):
+                          meta_id: Optional[int] = None, return_logits: bool = False):
         """言語ロジットと判別ロジットを同時に返す。
 
         Args:
@@ -137,9 +137,11 @@ class AnalysisMORTM(MORTM):
                 disc = self.mil(p_out, p_cu)                       # (B,) 直接ロジット
             else:
                 disc = self.out_head(self.pma(p_out, p_cu)).squeeze(-1)
-            # 言語: pad を戻して語彙へ射影
-            logits = self.Wout(pad_input(out, indices, b, s))
-        return logits.float(), disc.squeeze(-1).float() if disc.dim() > 1 else disc.float()
+            # 言語: pad を戻して語彙へ射影 (Meta推論を省く場合は不要)
+            logits = None
+            if return_logits:
+                logits = self.Wout(pad_input(out, indices, b, s)).float()
+        return logits, disc.squeeze(-1).float() if disc.dim() > 1 else disc.float()
 
     def mark_trainable(self):
         """LoRA + PMA/OutHead のみ学習可能にする(backbone 本体は凍結)。
@@ -158,6 +160,10 @@ class AnalysisMORTM(MORTM):
         for name, p in self.named_parameters():
             if ("lora_" in name) or name.startswith(("pma", "out_head", "mil")):
                 p.requires_grad = True
+        # Wout と embedding は判別器では学習しない
+        if hasattr(self, "Wout"):
+            for p in self.Wout.parameters():
+                p.requires_grad = False
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
@@ -274,46 +280,46 @@ def rebuild_meta_from_generated(seq: np.ndarray, active_program_info, tokenizer,
     return build_meta(info, key_str, measures, tokenizer, genre_tokens=genre)
 
 
-def build_analysis_sample(music_block: np.ndarray, meta: np.ndarray, tokenizer) -> np.ndarray:
-    """`<EOS> <CONST_M>[音楽]<TAG_END> <META> <SYSTEM>[meta]<TAG_END> <TE>`(分析SFTと同一規則)。"""
-    return np.concatenate([
-        np.array([tokenizer.get("<EOS>")], dtype=int),
-        music_block,
-        np.array([tokenizer.get("<META>")], dtype=int),
-        meta,
-        np.array([tokenizer.get("<TE>")], dtype=int),
-    ])
+def build_analysis_sample(music_block: np.ndarray, tokenizer, meta: Optional[np.ndarray] = None) -> np.ndarray:
+    """`<EOS> <CONST_M>[音楽]<TAG_END> <META>` (音楽ブロック + プーリング境界マーカー)。
+    偶数ラウンドの判別入力形式と完全一致させる。META推論は行わないため答え側METAは結合しない。
+    """
+    EOS = tokenizer.get("<EOS>")
+    META = tokenizer.get("<META>")
+    m = [int(t) for t in music_block]
+    if m and m[0] == EOS:
+        m = m[1:]
+    return np.asarray([EOS] + m + [META], dtype=np.int64)
 
 
 # ----------------------------------------------------------------------
-# 損失: META の MaskedCE + AI/Human の BCE
+# 損失: AI/Human の BCE (Meta推論SFTは撤廃)
 # ----------------------------------------------------------------------
 class OddRoundLoss(nn.Module):
-    """L = CE(META 区間のみ) + w * BCE(AI/Human)。
+    """L = w * BCE(AI/Human)。Meta推論(CE)は撤廃し純粋判別器として学習する。"""
 
-    META 区間 = `<META>` トリガ以降(答え側)。CONST(問題側)には損失を掛けない。
-    """
-
-    def __init__(self, meta_trigger_id: int, disc_weight: float = 1.0, ignore_index: int = 0):
+    def __init__(self, meta_trigger_id: Optional[int] = None, disc_weight: float = 1.0,
+                 ignore_index: int = 0):
         super().__init__()
-        self.meta_trigger_id = meta_trigger_id
         self.disc_weight = disc_weight
-        self.ignore_index = ignore_index
 
     def build_meta_mask(self, x: Tensor) -> Tensor:
-        """`<META>` 以降を True にするマスクを作る(x: (B,S) 入力トークン列)。"""
-        is_trig = (x == self.meta_trigger_id)
-        return is_trig.cumsum(dim=1) > 0
+        return torch.zeros_like(x, dtype=torch.bool)
 
-    def forward(self, logits: Tensor, target: Tensor, meta_mask: Tensor,
-                disc_logit: Tensor, is_ai: Tensor):
-        # 言語: META 区間だけを残し、他は ignore_index に落とす
-        tgt = target.clone()
-        tgt[~meta_mask] = self.ignore_index
-        ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(),
-                             tgt.reshape(-1).long(), ignore_index=self.ignore_index)
+    def forward(self, *args, **kwargs):
+        """disc_logit と is_ai を受け取って BCE を計算する。
+        従来の (logits, target, mask, disc, y) にも (disc, y) にも対応。
+        """
+        if len(args) == 2:
+            disc_logit, is_ai = args
+        elif len(args) >= 5:
+            disc_logit, is_ai = args[3], args[4]
+        else:
+            disc_logit = kwargs.get("disc_logit", kwargs.get("disc"))
+            is_ai = kwargs.get("is_ai", kwargs.get("y"))
         bce = F.binary_cross_entropy_with_logits(disc_logit.float(), is_ai.float())
-        return ce + self.disc_weight * bce, ce.detach(), bce.detach()
+        zero_ce = torch.tensor(0.0, device=disc_logit.device)
+        return self.disc_weight * bce, zero_ce, bce.detach()
 
 
 # ----------------------------------------------------------------------
@@ -466,12 +472,7 @@ class OddRound:
         CONST_M, TAG_END, TE = (self.tok.get("<CONST_M>"), self.tok.get("<TAG_END>"),
                                 self.tok.get("<TE>"))
         pool = []
-        # 破棄理由の内訳。生成物に <BLANK> が含まれるのは正常なので弾かない。
-        # 弾くのは「分析ラベルが作れないもの」だけ:
-        #   empty   : 音符が1つも無い(生成失敗)
-        #   no_key  : キー推定不能(音符が少なすぎる等)
-        #   density : 密度が規則上限超過(convert_foundation と同一規則)
-        why = {"empty": 0, "no_key": 0, "density": 0}
+        why = {"empty": 0}
         from .gen_sft_pool import fold_to_const
 
         for rec, cond, g in zip(recs, conds, gens):
@@ -485,47 +486,13 @@ class OddRound:
             if not merged:
                 why["empty"] += 1
                 continue
-            # 以降は `[<INST_x> 系列 <ESEQ>]*` の形が要る(density_token_of が
-            # 楽器マーカーで区間を切るため)。畳んだブロックから前後のマーカーを外す。
-            seq = np.asarray([int(t) for t in const[1:-1]], dtype=np.int64)
-            names = inst_names_of(cond, self.tok)
-            key_str = get_key_from_tokens(self.tok, seq)
-            if key_str is None:
-                why["no_key"] += 1
-                continue
-            info, bad = [], False
-            for n in names:
-                try:
-                    # ★ 楽器ごとの系列を渡す。畳んだブロック全体を渡すと
-                    #   全楽器の小節が合算され、多楽器レコードで全楽器が
-                    #   同じ密度トークンになってしまう(人間側は楽器別に算出
-                    #   されているので、そこも非対称なラベルになる)。
-                    if n not in merged:
-                        bad = True
-                        break
-                    dens = density_token_of(np.asarray(merged[n], dtype=np.int64),
-                                            n, self.tok)
-                except Exception:
-                    dens = None
-                if dens is None:
-                    bad = True
-                    break
-                info.append((n, dens))
-            if bad:
-                why["density"] += 1
-                continue
-            # GMC は付けない。畳んだ CONST からは生成区間の長さが決定できず、
-            # ana にとって不可知なラベルになるため(人間側 `strip_gmc` と対称)。
-            meta = build_meta(info, key_str, None, self.tok,
-                              genre_tokens=genre_tokens_of(cond, self.tok))
-            pool.append({"seq": np.asarray(const, dtype=np.int64), "meta": meta})
+            pool.append({"seq": np.asarray(const, dtype=np.int64)})
         drop = sum(why.values())
         if getattr(self, "quiet_pool", False):
             self.last_pool_stats = {"kept": len(pool), "total": len(gens), **why}
             return pool
         print(f"  [gemプール更新] {len(pool)}/{len(gens)} 本を AI 例として採用"
-              f"  (破棄 {drop}: 音符なし {why['empty']} / キー推定不能 {why['no_key']} / "
-              f"密度が規則上限超過 {why['density']})")
+              f"  (破棄 {drop}: 音符なし/空 {why['empty']})")
         self.last_pool_stats = {"kept": len(pool), "total": len(gens), **why}
         return pool
 
@@ -540,16 +507,14 @@ class OddRound:
     def train_step(self, human_pool, gem_pool):
         items, is_ai, source = self._mix_batch(human_pool, gem_pool, self.q,
                                                self.cfg.batch_size, self.rng)
-        seqs = [build_analysis_sample(it["seq"], it["meta"], self.tok) for it in items]
+        seqs = [build_analysis_sample(it["seq"], self.tok) for it in items]
         x, pad = self._pad(seqs)
         y = torch.tensor(is_ai, dtype=torch.float32, device=self.dev)
 
-        # 判別は音楽ブロックのみ。META ブロックは人間/AI で書式が非対称なので、
-        # そこを見せると音楽を見ずに分類できてしまう。
-        logits, disc = self.ana.forward_with_disc(
-            x, pad, is_causal=True, meta_id=self.tok.get("<META>"))
-        mask = self.loss_fn.build_meta_mask(x)
-        loss, ce, bce = self.loss_fn(logits[:, :-1], x[:, 1:], mask[:, 1:], disc, y)
+        # 判別は音楽ブロックのみ。Meta推論(Wout)は省略し直接 disc ロジットを取得。
+        _, disc = self.ana.forward_with_disc(
+            x, pad, is_causal=True, meta_id=self.tok.get("<META>"), return_logits=False)
+        loss, ce, bce = self.loss_fn(disc, y)
 
         loss.backward()
         if self.cfg.grad_clip:

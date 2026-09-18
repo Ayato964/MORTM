@@ -19,8 +19,8 @@ def _p(*a):
 
 # --- 生成器(多タスク SFT 済み) -----------------------------------------
 # meta / meta_past / meta_future / infill / inst_comp を解けるモデル。
-GEM_CKPT = _p("out/models/mortm/sft/generation/MORTM4.5D-160M-SFT-gen.pth")
-GEM_CONFIG = _p("configs/models/mortm/rl/carl_160M_rl.json")
+GEM_CKPT = _p("out/models/mortm/sft/generation/MORTM.MORTM.4.5E-A80M-E64-SFT-gen_0.6928161978721619.pth")
+GEM_CONFIG = _p("configs/models/mortm/rl/carl_45e.json")
 
 # --- KL 参照(gem の初期重みそのもの) ------------------------------------
 # 別ファイルを用意せず GEM_CKPT を凍結ロードするのが既定。学習を再開する場合は
@@ -56,7 +56,7 @@ GEN_SFT_EVAL = "/home/takaaki-nagoshi/data/sft/generation/eval.json"
 #   r1 -> r2 -> r3 ... と順に上書きし、過去ランのチェックポイントを破壊する
 #   (実害あり: v1 ランの MORTM-ana.carl.r1.pth / MORTM-gem.carl.r2.pth /
 #    qtable.r1.pt を失った)。CARL_OUT_DIR で退避先を指定する。
-OUT_DIR = os.environ.get("CARL_OUT_DIR") or _p("out/models/mortm/rl/carl")
+OUT_DIR = os.environ.get("CARL_OUT_DIR") or _p("out/models/mortm/rl/carl_45e")
 
 
 def resolve(path: str) -> str:
