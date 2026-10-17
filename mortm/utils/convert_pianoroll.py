@@ -505,7 +505,14 @@ def midi_to_chunks(path: str | Path) -> tuple[np.ndarray, RollMeta]:
 
 
 def _flat_to_quantized_notes(flat: np.ndarray) -> list[tuple[int, int, int, int, int]]:
-    """Extract (slot, start, end, pitch, velocity) from [TOTAL_CHANNELS, total_steps, 128]."""
+    """Extract (slot, start, end, pitch, velocity) from [TOTAL_CHANNELS, total_steps, 128].
+
+    In ground-truth rolls, sustain in [start, next_onset) is a single contiguous run of 1s
+    followed by 0s. In model-reconstructed rolls, a long note crossing 24-step chunks may
+    momentarily dip below 0.5 at a chunk boundary while continuing with sustain >= 0.5 and
+    onset < 0.5 in the following steps. Bridging such onset-free gaps within [start, next_onset)
+    recovers chunk-crossing sustained notes while remaining a strict no-op on ground-truth rolls.
+    """
     total_steps = flat.shape[1]
     result: list[tuple[int, int, int, int, int]] = []
 
@@ -528,8 +535,31 @@ def _flat_to_quantized_notes(flat: np.ndarray) -> list[tuple[int, int, int, int,
             )
 
             end = start + 1
-            while end < next_onset and sustain[end, pitch] >= 0.5:
-                end += 1
+            while end < next_onset:
+                if sustain[end, pitch] >= 0.5:
+                    end += 1
+                    continue
+
+                # Look ahead within [end, next_onset) (up to 1 chunk = 24 steps)
+                # for an onset-free sustain continuation after a brief dropout.
+                look_limit = min(next_onset, end + CHUNK_STEPS + 1)
+                active_ahead = np.flatnonzero(sustain[end:look_limit, pitch] >= 0.5)
+                if len(active_ahead) > 0:
+                    gap_len = int(active_ahead[0])
+                    resume_pos = end + gap_len
+                    resumed_run = 0
+                    while (
+                        resume_pos + resumed_run < next_onset
+                        and sustain[resume_pos + resumed_run, pitch] >= 0.5
+                    ):
+                        resumed_run += 1
+
+                    if gap_len <= 3 or (
+                        resume_pos % CHUNK_STEPS == 0 and resumed_run >= 6
+                    ):
+                        end = resume_pos + resumed_run
+                        continue
+                break
 
             result.append((slot, start, end, pitch, velocity))
 

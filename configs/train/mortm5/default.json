@@ -1,12 +1,12 @@
 {
-  "batch_size": 128,
+  "batch_size": 256,
   "big_batch_size": 256,
-  "accumulation_steps": 8,
-  "lr_param": 0.0004,
+  "accumulation_steps": 4,
+  "lr_param": 0.0001,
   "scheduler": {
     "type": "none"
   },
-  "num_epochs": 1,
+  "num_epochs": 3,
   "train_dataset_split": 0.95,
   "is_save_training_progress": false,
   "shuffle": true
