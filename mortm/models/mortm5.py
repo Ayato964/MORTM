@@ -1,9 +1,10 @@
 from torch import nn
 from .modules.layers import *
-from vector_quantize_pytorch import ResidualVQ
+from vector_quantize_pytorch import GroupedResidualVQ
 
 import torch.distributed as dist
 from typing import Optional
+
 
 class MidiVision(nn.Module):
     def __init__(self, args: MORTM5Args, sync_codebook: Optional[bool] = None):
@@ -13,50 +14,48 @@ class MidiVision(nn.Module):
         if sync_codebook is None:
             sync_codebook = dist.is_available() and dist.is_initialized()
 
-        # 潜在ベクトルをRVQへ渡す前に正規化する。
-        # 無しの場合 ||z|| が学習中に無制限に漂流し(実測: 初期26.5 -> 772step目で426)、
-        # コードブックとスケールが乖離して全コードが「死んだコード」判定に落ちる。
-        # LayerNormにより ||z|| は sqrt(encoder_wout) に固定される。
-        self.pre_vq_norm = nn.LayerNorm(args.encoder_wout)
+        self.vq_groups = getattr(args, "vq_groups", 4)
+        assert args.encoder_wout % self.vq_groups == 0, (
+            f"encoder_wout ({args.encoder_wout}) must be divisible by vq_groups ({self.vq_groups})"
+        )
+        self.codebook_dim = args.encoder_wout // self.vq_groups
+        self.codebook_size = getattr(args, "codebook_size", 1024)
 
-        self.rvq = ResidualVQ(
+        # 各グループ(codebook_dim次元)ごとに独立してLayerNorm(アフィンなし)を適用する。
+        # elementwise_affine=False により量子化入力の分散を厳密に 1.0 に固定し、スケール膨張とCommit Loss肥大化を根絶する。
+        self.pre_vq_norm = nn.LayerNorm(self.codebook_dim, elementwise_affine=False)
+
+        self.rvq = GroupedResidualVQ(
             dim=args.encoder_wout,
-            codebook_dim=64,
+            groups=self.vq_groups,
+            codebook_dim=self.codebook_dim,
             num_quantizers=args.encoder_layer,
-            codebook_size=1024,
+            codebook_size=self.codebook_size,
             sync_codebook=sync_codebook,
-            # threshold_ema_dead_code: cluster_size は「1バッチあたり命中数」のEMA
-            #   (cluster_size = cluster_size*decay + 命中数*(1-decay)) なので、
-            #   定常値は1バッチ平均命中数そのもの。1チャンク=潜在ベクトル1本のため
-            #   inner batch 512 で量子化器が見るのは512本しかなく、1024コードに配ると
-            #   平均0.50命中/コード。既定の 2 では最大256コードしか生存できず
-            #   (実測 perplexity が 254 で天井に張り付く)、残り半分以上が毎step
-            #   置換され続ける回転ドア状態になる。バッチ/コード比0.5に合わせて下げる。
-            #   実測: 2.0 -> 使用424/perplexity254/実効63.8bit
-            #        0.25 -> 使用838/perplexity563/実効72.9bit
-            threshold_ema_dead_code=0.25,
-
-            # --- 以下はライブラリ既定値が本構成と致命的に噛み合わないため明示指定する ---
-
-            # rotation_trick: 既定 True。dead code 置換で残差が厳密に0になった量子化器で
-            #   rotated = ... * safe_div(||q||, ||x||) の分母が 1e-6 にクランプされ、
-            #   勾配を最大 1.57e6 倍に増幅する(実測: grad norm 6.27e6)。
-            #   通常の Straight-Through に戻すと同条件で 10.3 まで落ちる。
+            # 複数ビッグバッチを跨いでコードブックを安定保持するため長寿命EMA (decay=0.999) を使用
+            threshold_ema_dead_code=0.05,
+            # rotation_trick: 残差0時の勾配爆発を防ぐため Straight-Through を使用
             rotation_trick=False,
-
-            # kmeans_init: 既定 False (uniform乱数初期化) では潜在分布と全く重ならず、
-            #   どのコードも選ばれないまま毎forwardで約1000/1024個が置換され続ける。
             kmeans_init=True,
             kmeans_iters=10,
-
-            # decay: 既定 0.8 は速すぎてコードブックが各バッチに追従してしまう。
-            decay=0.95,
+            decay=0.999,
         )
 
         self.decoder = ResNetDecoder(args)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.pre_vq_norm(self.encoder(x))
-        x_q, tokens, commit_loss = self.rvq(x)
-        x = self.decoder(x_q)
-        return x, tokens, commit_loss
+    def forward(self, x: Tensor):
+        z = self.encoder(x)
+        orig_shape = z.shape
+        # グループ単位で正規化: [..., encoder_wout] -> [..., vq_groups, codebook_dim] -> [..., encoder_wout]
+        z_norm = self.pre_vq_norm(
+            z.reshape(*orig_shape[:-1], self.vq_groups, self.codebook_dim)
+        ).reshape(orig_shape)
+
+        x_q, tokens, commit_loss = self.rvq(z_norm)
+        # GroupedResidualVQ の tokens は [groups, B, (S,), num_quantizers] で返るため
+        # [B, (S,), groups * num_quantizers] (例: [B, 8]) に整形する
+        tokens = tokens.movedim(0, -2).flatten(-2)
+        commit_loss = commit_loss.mean()
+
+        out = self.decoder(x_q)
+        return out, tokens, commit_loss

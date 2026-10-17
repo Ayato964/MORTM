@@ -8,7 +8,11 @@
   "roll_h": 128,
   "track_size": 4,
   "first_channel": 64,
-  "max_channel": 128,
-  "encoder_wout": 2048,
-  "encoder_layer": 8
+  "max_channel": 256,
+  "bottle_channel": 128,
+  "encoder_wout": 512,
+  "vq_groups": 4,
+  "encoder_layer": 2,
+  "codebook_size": 1024
 }
+

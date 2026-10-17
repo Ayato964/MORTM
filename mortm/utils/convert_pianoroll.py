@@ -22,6 +22,20 @@ if STEPS_PER_BAR % CHUNK_STEPS != 0:
     raise ValueError("STEPS_PER_BAR must be divisible by CHUNK_STEPS.")
 DRUM_MIDI_CHANNEL = 9  # MIDI channel 10 in 1-based notation
 
+# midi_to_chunks が確保する flat 配列は [8, total_steps, 128] float32 = 4096 bytes/step。
+# total_steps は MIDI のノート終端 tick からそのまま導出されるため、壊れた tick 値が
+# そのまま配列 shape に化ける。実測 (GMD 809,180件中の10%走査) では
+#   2,147,496,864 steps -> 8TiB 要求 / 53,713,608 steps -> 205GB 要求
+# の2件が存在し、カーネルに __vm_enough_memory の拒否ログを残していた。
+# 上限は 4096 小節 (= 786,432 steps, 約3.0GB, 4/4 120bpm で約2.3時間)。
+# 走査した正常データの最長は 679,272 steps なので、実データを削らずに壊れた値だけを弾く。
+MAX_BARS = 4096
+MAX_TOTAL_STEPS = MAX_BARS * STEPS_PER_BAR
+
+
+class MidiTooLongError(ValueError):
+    """MIDI の長さが現実的な範囲を超えている。配列を確保する前に弾く。"""
+
 
 @dataclass(frozen=True)
 class Note:
@@ -291,10 +305,10 @@ def midi_to_roll(path: str | Path) -> tuple[np.ndarray, RollMeta]:
       7: track 4 onset velocity
       8: track 4 note-active mask
 
-    onset_velocity: 0.0 for no onset, otherwise MIDI velocity / 127.0
+    onset_velocity: 0.0 for no onset, otherwise 0.5 + 0.5 * (MIDI velocity / 127.0) in (0.5, 1.0]
     note_active:    0.0/1.0, active for every quantized audible step after CC64
 
-    Therefore the entire tensor lies in [0, 1].
+    Therefore the entire tensor lies in [0, 1], and 0.5 serves as the unified detection threshold.
     """
     mid = mido.MidiFile(str(path))
     _validate_four_four(mid)
@@ -332,8 +346,10 @@ def midi_to_roll(path: str | Path) -> tuple[np.ndarray, RollMeta]:
 
         # Same-pitch simultaneous onsets are not separately representable in a piano roll.
         # Keep the stronger velocity, and use the union of activity.
+        # Onset is represented as 0.5 + 0.5 * (velocity / 127.0) in (0.5, 1.0].
+        onset_val = np.float32(0.5 + 0.5 * (velocity / 127.0))
         flat[onset_ch, start, pitch] = max(
-            flat[onset_ch, start, pitch], np.float32(velocity / 127.0)
+            flat[onset_ch, start, pitch], onset_val
         )
         flat[sustain_ch, start:end, pitch] = 1
 
@@ -448,6 +464,15 @@ def midi_to_chunks(path: str | Path) -> tuple[np.ndarray, RollMeta]:
 
     num_chunks = max(1, (max_end + CHUNK_STEPS - 1) // CHUNK_STEPS)
     total_steps = num_chunks * CHUNK_STEPS
+    if total_steps > MAX_TOTAL_STEPS:
+        # ここで弾かないと np.zeros が数十GB〜数TBを要求する。
+        # 許可された場合、直後の .transpose().copy() が flat 全体を読むので
+        # 確保量はそのまま物理commitされ、さらに2倍になる。
+        raise MidiTooLongError(
+            f"total_steps={total_steps} exceeds MAX_TOTAL_STEPS={MAX_TOTAL_STEPS} "
+            f"({total_steps * TOTAL_CHANNELS * 128 * 4 / 1024**3:.1f}GB would be allocated); "
+            f"path={path}"
+        )
     flat = np.zeros(
         (TOTAL_CHANNELS, total_steps, 128), dtype=np.float32
     )
@@ -456,8 +481,9 @@ def midi_to_chunks(path: str | Path) -> tuple[np.ndarray, RollMeta]:
         onset_ch = slot * 2
         sustain_ch = onset_ch + 1
 
+        onset_val = np.float32(0.5 + 0.5 * (velocity / 127.0))
         flat[onset_ch, start, pitch] = max(
-            flat[onset_ch, start, pitch], np.float32(velocity / 127.0)
+            flat[onset_ch, start, pitch], onset_val
         )
         flat[sustain_ch, start:end, pitch] = 1
 
@@ -487,21 +513,22 @@ def _flat_to_quantized_notes(flat: np.ndarray) -> list[tuple[int, int, int, int,
         onset = flat[slot * 2]
         sustain = flat[slot * 2 + 1]
 
-        onset_steps, pitches = np.nonzero(onset)
+        onset_steps, pitches = np.nonzero(onset >= 0.5)
         order = np.argsort(onset_steps * 128 + pitches)
 
         for idx in order:
             start = int(onset_steps[idx])
             pitch = int(pitches[idx])
-            velocity = int(np.clip(np.rint(float(onset[start, pitch]) * 127.0), 1, 127))
+            raw_val = float(onset[start, pitch])
+            velocity = int(np.clip(np.rint((raw_val - 0.5) * 2.0 * 127.0), 1, 127))
 
-            next_onsets = np.flatnonzero(onset[start + 1 :, pitch])
+            next_onsets = np.flatnonzero(onset[start + 1 :, pitch] >= 0.5)
             next_onset = (
                 start + 1 + int(next_onsets[0]) if len(next_onsets) else total_steps
             )
 
             end = start + 1
-            while end < next_onset and sustain[end, pitch] != 0:
+            while end < next_onset and sustain[end, pitch] >= 0.5:
                 end += 1
 
             result.append((slot, start, end, pitch, velocity))

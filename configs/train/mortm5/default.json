@@ -1,14 +1,12 @@
 {
-  "batch_size": 512,
-  "big_batch_size": 512,
-  "accumulation_steps": 2,
+  "batch_size": 128,
+  "big_batch_size": 256,
+  "accumulation_steps": 8,
   "lr_param": 0.0004,
   "scheduler": {
-    "type": "cos",
-    "warmup_steps": 1000,
-    "total_steps": 1200000
+    "type": "none"
   },
-  "num_epochs": 3,
+  "num_epochs": 1,
   "train_dataset_split": 0.95,
   "is_save_training_progress": false,
   "shuffle": true

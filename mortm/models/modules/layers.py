@@ -120,22 +120,38 @@ class ResNetEncoder(nn.Module):
         super().__init__()
         self.track_size = args.track_size
         self.input_channel = self.track_size * 2
-        self.resnet = nn.Sequential(
-            ResNetBlock(self.input_channel, args.first_channel, stride=1),
-            ResNetBlock(args.first_channel, args.first_channel, stride=2),
-            ResNetBlock(args.first_channel, args.max_channel, stride=(2, 1)),
-            ResNetBlock(args.max_channel, args.max_channel, stride=2)
+        self.first_channel = args.first_channel
+        self.max_channel = args.max_channel
+        self.mid_channel = max(self.first_channel, self.max_channel // 2)
+        self.bottle_channel = getattr(args, "bottle_channel", 128)
 
+        # 5段階の深層ConvNeXtエンコーダ (各解像度でダウンサンプリング + stride=1 の特徴抽出ブロックを配置)
+        # (8, 128, 24) -> (64, 128, 24) -> (128, 64, 12) -> (256, 32, 12) -> (256, 16, 6) -> (128, 8, 3)
+        self.resnet = nn.Sequential(
+            # Stage 1: [B, 64, 128, 24] (フル解像度での半音・オンセット文脈抽出)
+            ResNetBlock(self.input_channel, self.first_channel, stride=1),
+            ResNetBlock(self.first_channel, self.first_channel, stride=1),
+            # Stage 2: [B, 128, 64, 12]
+            ResNetBlock(self.first_channel, self.mid_channel, stride=2),
+            ResNetBlock(self.mid_channel, self.mid_channel, stride=1),
+            # Stage 3: [B, 256, 32, 12]
+            ResNetBlock(self.mid_channel, self.max_channel, stride=(2, 1)),
+            ResNetBlock(self.max_channel, self.max_channel, stride=1),
+            # Stage 4: [B, 256, 16, 6]
+            ResNetBlock(self.max_channel, self.max_channel, stride=2),
+            ResNetBlock(self.max_channel, self.max_channel, stride=1),
+            # Stage 5: [B, 128, 8, 3] (全結合層の肥大化を防ぎCNN側で非線形凝縮)
+            ResNetBlock(self.max_channel, self.bottle_channel, stride=2),
+            ResNetBlock(self.bottle_channel, self.bottle_channel, stride=1),
         )
 
-        self.init_h = 16
-        self.init_w = 6
-        flatten_dim = args.max_channel * self.init_h * self.init_w
+        self.init_h = 8
+        self.init_w = 3
+        flatten_dim = self.bottle_channel * self.init_h * self.init_w
         self.w_out = nn.Linear(flatten_dim, args.encoder_wout)
     
     def forward(self, x: Tensor) -> Tensor:
-        
-        if x.dim() == 5: #Shape: [Batch, Sequence, Track * 2, height, width]
+        if x.dim() == 5:  # Shape: [Batch, Sequence, Track * 2, height, width]
             b, s = x.shape[0], x.shape[1]
             x = x.reshape(b * s, x.shape[2], x.shape[3], x.shape[4])
             x = self.resnet(x)
@@ -143,20 +159,21 @@ class ResNetEncoder(nn.Module):
             x = self.w_out(x)
             return x.reshape(b, s, -1)
 
-
-        if x.dim() == 4: # Shape: [Batch, Track * 2, height, width]
+        if x.dim() == 4:  # Shape: [Batch, Track * 2, height, width]
             x = self.resnet(x)
             x = x.reshape(x.shape[0], -1)    
             x = self.w_out(x)
             return x
 
+        raise ValueError(f"Expected 4D or 5D tensor, got {x.dim()}D (shape: {x.shape})")
+
 
 class ResNetDecoder(nn.Module):
     """
-    ResNet (エンコーダ) と完全に対称・鏡像となる SoTA デコーダ
-    - 潜在ベクトル [B, 2048] (または [B, S, 2048]) を元のピアノロール [B, 8, 128, 24] (または [B, S, 8, 128, 24]) に完全復元
-    - 4段階の対称アップサンプリング: (16x6 -> 32x12 -> 64x12 -> 128x24)
-    - チャンネル推移もエンコーダの完全逆順: (128 -> 128 -> 64 -> 64 -> 8)
+    ResNetEncoder と完全に対称・鏡像となる深層 ConvNeXt デコーダ
+    - 潜在ベクトル [B, 512] (または [B, S, 512]) を元のピアノロール [B, 8, 128, 24] に復元
+    - 段階的アップサンプリング: (8x3 -> 16x6 -> 32x12 -> 64x12 -> 128x24)
+    - 最終出力は GroupNorm ショートカットの干渉を受けない 1x1 Conv ヘッドで自由なロジットを出力
     """
     def __init__(self, args: MORTM5Args):
         super().__init__()
@@ -164,39 +181,50 @@ class ResNetDecoder(nn.Module):
         self.output_channel = self.track_size * 2
         self.max_channel = args.max_channel
         self.first_channel = args.first_channel
+        self.mid_channel = max(self.first_channel, self.max_channel // 2)
+        self.bottle_channel = getattr(args, "bottle_channel", 128)
         self.roll_h = args.roll_h
         self.roll_w = args.roll_w
 
-        # 1. 特徴マップ形状への復元プロジェクション (2048 -> 128 * 16 * 6 = 12288)
-        self.init_h = 16
-        self.init_w = 6
-        flatten_dim = self.max_channel * self.init_h * self.init_w
+        # 1. 特徴マップ形状への復元プロジェクション (512 -> 128 * 8 * 3 = 3072)
+        self.init_h = 8
+        self.init_w = 3
+        flatten_dim = self.bottle_channel * self.init_h * self.init_w
         self.w_in = nn.Linear(args.encoder_wout, flatten_dim)
 
-        # 2. エンコーダと完全に対称な4段デコーダ
-        # Encoder: (8->64, s=1) -> (64->64, s=2) -> (64->128, s=(2,1)) -> (128->128, s=2)
-        # Decoder: (128->128, scale=2) -> (128->64, scale=(2,1)) -> (64->64, scale=2) -> (64->8, scale=1)
+        # 2. エンコーダと完全に対称な深層デコーダ
         self.decoder = nn.Sequential(
-            ResNetUpBlock(self.max_channel, self.max_channel, scale_factor=2),           # (16, 6)   -> (32, 12), 128ch -> 128ch
-            ResNetUpBlock(self.max_channel, self.first_channel, scale_factor=(2, 1)),   # (32, 12)  -> (64, 12), 128ch -> 64ch
-            ResNetUpBlock(self.first_channel, self.first_channel, scale_factor=2),       # (64, 12)  -> (128, 24), 64ch -> 64ch
-            ResNetUpBlock(self.first_channel, self.output_channel, scale_factor=1),      # (128, 24) -> (128, 24), 64ch -> 8ch
+            # UpStage 1: (8, 3) -> (16, 6), 128ch -> 256ch
+            ResNetUpBlock(self.bottle_channel, self.max_channel, scale_factor=2),
+            ResNetBlock(self.max_channel, self.max_channel, stride=1),
+            # UpStage 2: (16, 6) -> (32, 12), 256ch -> 256ch
+            ResNetUpBlock(self.max_channel, self.max_channel, scale_factor=2),
+            ResNetBlock(self.max_channel, self.max_channel, stride=1),
+            # UpStage 3: (32, 12) -> (64, 12), 256ch -> 128ch
+            ResNetUpBlock(self.max_channel, self.mid_channel, scale_factor=(2, 1)),
+            ResNetBlock(self.mid_channel, self.mid_channel, stride=1),
+            # UpStage 4: (64, 12) -> (128, 24), 128ch -> 64ch
+            ResNetUpBlock(self.mid_channel, self.first_channel, scale_factor=2),
+            ResNetBlock(self.first_channel, self.first_channel, stride=1),
+            # Output Head: (128, 24), 64ch -> 8ch (logits)
+            ResNetBlock(self.first_channel, self.first_channel, stride=1),
+            nn.Conv2d(self.first_channel, self.output_channel, kernel_size=1),
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        # 5次元の場合: 入力 [Batch, Sequence, 2048] -> 出力 [Batch, Sequence, Track*2, 128, 24]
+        # 3次元の場合: 入力 [Batch, Sequence, Dim] -> 出力 [Batch, Sequence, Track*2, 128, 24]
         if x.dim() == 3:
             b, s = x.shape[0], x.shape[1]
             x = x.reshape(b * s, -1)
             x = self.w_in(x)
-            x = x.reshape(b * s, self.max_channel, self.init_h, self.init_w)
+            x = x.reshape(b * s, self.bottle_channel, self.init_h, self.init_w)
             x = self.decoder(x)
             return x.reshape(b, s, self.output_channel, self.roll_h, self.roll_w)
 
-        # 4次元の場合: 入力 [Batch, 2048] -> 出力 [Batch, Track*2, 128, 24]
+        # 2次元の場合: 入力 [Batch, Dim] -> 出力 [Batch, Track*2, 128, 24]
         if x.dim() == 2:
             x = self.w_in(x)
-            x = x.reshape(x.shape[0], self.max_channel, self.init_h, self.init_w)
+            x = x.reshape(x.shape[0], self.bottle_channel, self.init_h, self.init_w)
             x = self.decoder(x)
             return x
 
