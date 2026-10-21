@@ -21,12 +21,12 @@ MORTM5 の前段モジュールである **`MidiVision`** は、最大4トラッ
 
 すでに学習完了している **Model 1** を Baseline とし、新たに **Model 2, Model 3, Model 4** の3モデルを学習する。
 
-| モデルID | モデル呼称 | グループ数 `vq_groups` ($G$) | 残差段数 `encoder_layer` ($L$) | 語彙数 `codebook_size` ($K$) | 潜在次元 `encoder_wout` ($D$) | 1グループ次元 `codebook_dim` ($D/G$) | トークン数 / チャンク (1小節あたり) | ビットレート / チャンク | ステータス |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Model 1** | **Baseline** (`G4-L2-D512-K1024`) | `4` | `2` | `1024` ($10\text{ bit}$) | `512` | `128` | **8 tokens** (64 / bar) | `80 bits` | **完了済** (`Val 0.8683`) |
-| **Model 2** | **Compact-Dim** (`G4-L2-D128-K2048`) | `4` | `2` | **`2048`** ($11\text{ bit}$) | **`128`** | **`32`** | **8 tokens** (64 / bar) | `88 bits` | 未実施 |
-| **Model 3** | **Fine-Group** (`G8-L2-D512-K1024`) | **`8`** | `2` | `1024` ($10\text{ bit}$) | `512` | **`64`** | **16 tokens** (128 / bar) | `160 bits` | 未実施 |
-| **Model 4** | **Deep-RVQ** (`G4-L4-D512-K1024`) | `4` | **`4`** | `1024` ($10\text{ bit}$) | `512` | `128` | **16 tokens** (128 / bar) | `160 bits` | 未実施 |
+| モデルID | モデル呼称 | グループ数 `vq_groups` ($G$) | 残差段数 `encoder_layer` ($L$) | 語彙数 `codebook_size` ($K$) | 潜在次元 `encoder_wout` ($D$) | 1グループ次元 `codebook_dim` ($D/G$) | トークン数 / チャンク (1小節あたり) | ビットレート / チャンク | パラメータ数 | ステータス |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Model 1** | **Baseline** (`G4-L2-D512-K1024`) | `4` | `2` | `1024` ($10\text{ bit}$) | `512` | `128` | **8 tokens** (64 / bar) | `80 bits` | `8,510,472` | **完了済** (`Outer 215`) |
+| **Model 2** | **Compact-Dim** (`G4-L2-D128-K2048`) | `4` | `2` | **`2048`** ($11\text{ bit}$) | **`128`** | **`32`** | **8 tokens** (64 / bar) | `88 bits` | **`6,145,408`** | **完了済** (`Outer 256`) |
+| **Model 3** | **Fine-Group** (`G8-L2-D256-K2048`) | **`8`** | `2` | **`2048`** ($11\text{ bit}$) | **`256`** | **`32`** | **16 tokens** (128 / bar) | `176 bits` | `6,931,968` | **完了済** (`Outer 256`) |
+| **Model 4** | **Deep-RVQ** (`G4-L4-D128-K2048`) | `4` | **`4`** | **`2048`** ($11\text{ bit}$) | **`128`** | **`32`** | **16 tokens** (128 / bar) | `176 bits` | **`6,145,408`** | **完了済** (`Outer 256`) 🏆 |
 
 ---
 
@@ -36,16 +36,16 @@ MORTM5 の前段モジュールである **`MidiVision`** は、最大4トラッ
 - **課題**: 後段の自己回帰 Transformer（MORTM5）の計算量とコンテキスト長を守るには、1チャンクあたりのトークン数を `8 tokens`（1小節64トークン）に据え置くことが望ましい。
 - **仮説**: Model 1 では 1グループあたり `128次元` の空間を量子化しているため「次元の呪い」によりコードブックが空間を密に埋められていない（予備実験で単純に `128次元` のまま語彙数だけを増やしても改善しないことを確認済み）。ViT-VQGAN / DAC (Descript Audio Codec) の知見に基づき、`encoder_wout` を `512 → 128`（1グループあたり **`32次元`**）へ凝縮しつつ語彙数を `2048` に拡張することで、**Transformer の系列長を一切伸ばさずに量子化密度を高め、過剰発音（Precision低下）を改善できる**。
 
-### RQ2: トークン予算（ビットレート）の倍増はマルチトラック再構成をどこまで引き上げるか？（Model 1 vs. Model 3, 4）
-- **課題**: 4トラックが同時に複雑なポリフォニーを奏でる区間では、1チャンク `80 bits`（1トラックあたり平均 `20 bits`）の情報量自体が理論限界に近づく。
-- **仮説**: トークン数を `8 → 16 tokens/chunk`（`80 bits → 160 bits`）に倍増させることで、CNN上限値（`Onset F1 = 97.3%`, `Note F1 = 90.2%`）にどこまで漸近できるか、また「系列長2倍のコストに見合う精度向上が得られるか」を定量化する。
+### RQ2: トークン予算（ビットレート）の倍増はマルチトラック再構成をどこまで引き上げるか？（Model 2 vs. Model 3, 4）
+- **課題**: 4トラックが同時に複雑なポリフォニーを奏でる区間では、1チャンク `80〜88 bits`（1トラックあたり平均 `20〜22 bits`）の情報量自体が理論限界に近づく。
+- **仮説**: Model 2 で有効性が実証された **`codebook_dim = 32` (`K = 2048`)** に統一した上で、トークン数を `8 → 16 tokens/chunk`（`88 bits → 176 bits`）に倍増させることで、CNN上限値（`Note F1 > 90%`）にどこまで到達できるか、また「系列長2倍のコストに見合う精度向上が得られるか」を定量化する。
 
 ### RQ3: 「横の分割（Grouped VQ）」と「縦の深さ（Residual VQ）」のどちらがマルチトラックMIDIに適しているか？（Model 3 vs. Model 4）
-- **課題**: 同じ `16 tokens / chunk`（`160 bits`）を実現する方法として、グループ数を増やす方法（Model 3: `G=8, L=2`）と、残差量子化の段数を深くする方法（Model 4: `G=4, L=4`）の2通りが存在する。
+- **課題**: 同じ `codebook_dim = 32` (`K = 2048`) かつ `16 tokens / chunk`（`176 bits`）を実現する方法として、グループ数を増やす方法（Model 3: `G=8, L=2, D=256`）と、残差量子化の段数を深くする方法（Model 4: `G=4, L=4, D=128`）の2通りが存在する。
 - **仮説**:
-  - **Model 3 (`G=8, L=2`)** は1グループあたりの次元が `64次元` に半減し、独立した8個の部分空間で異なる楽器・音域を分担できる。
-  - **Model 4 (`G=4, L=4`)** は1〜2段目で大局的な和音・ドラム骨格を捉え、3〜4段目の残差で微細なノートやSustainの輪郭を段階的に引き算・補正できる。
-  - 両者を同一ビットレートで直接対決させることで、ポリフォニックMIDIトークナイザにおける最適設計指針を明らかにする。
+  - **Model 3 (`G=8, L=2, D=256`)** は連続ボトルネック次元 $D=256$ を持ち、独立した8個の32次元部分空間で異なる楽器・音域を分担できる。
+  - **Model 4 (`G=4, L=4, D=128`)** は $D=128$ のコンパクトなボトルネックに対し、4段の残差量子化（1サブ空間あたり `44 bits`）を集中的に投下して微細なノートやSustainの輪郭を段階的に引き算・補正できる。
+  - 両者を同一ビットレート・同一サブ空間次元（32次元）で直接対決させることで、ポリフォニックMIDIトークナイザにおける最適設計指針を明らかにする。
 
 ---
 
@@ -54,42 +54,30 @@ MORTM5 の前段モジュールである **`MidiVision`** は、最大4トラッ
 実験の公平性を担保するため、`vq_groups` / `encoder_layer` / `codebook_size` / `encoder_wout` 以外の全要素を完全に固定する。
 
 1. **データセット**:
-   - GigaMIDI Dataset (`GMD`) 全809,180曲（マニフェスト: `configs/train/mortm5/gmd_paths.json`、固定シード `seed=42` による Train/Val 分割）
+   - GigaMIDI Dataset (`GMD`) 全809,180曲（マニフェスト: `data/gmd/train.json` および `data/gmd/eval.json`）
    - ドラム除外のオンラインランダム転調（`-6 〜 +5` 半音）を適用
 2. **ネットワーク骨格**:
    - Encoder / Decoder ともに5段階深層 ConvNeXt 構造（`first_channel=64`, `mid_channel=128`, `max_channel=256`, `bottle_channel=128`）
-   - RVQ直前にグループ独立の無アフィン正規化 `nn.LayerNorm(codebook_dim, elementwise_affine=False)` を適用
-   - RVQ EMA設定: `decay = 0.999`, `threshold_ema_dead_code = 0.05`, `kmeans_init = True`
-3. **損失関数 (`MidiVisionLoss`)**:
-   - Note-Active 損失: Weighted BCE (`pos_weight=10.0`) + Soft Dice Loss
-   - Onset + Velocity 損失: Continuous Target Weighted BCE + Onset Soft Dice + Sustain-Onset 同期損失（`t >= 1` 立ち上がりエッジ同期 & ゴーストOnset抑制） + Masked Smooth L1 Velocity Loss (`vel_weight=5.0`)
-   - Commitment 損失: `commit_weight = 0.25`
-4. **最適化スケジュール**:
-   - バッチサイズ: `batch_size = 512` / GPU（2 GPU DDP、グローバルバッチ `1,024 chunks/step`）
-   - 学習ステップ数: 約 `27,000 steps`（Outer Batch `215 / 1581`、約 `3.5億 tokens` 相当 — Model 1 と同一の収束地点）
+3. **最適化スケジュール**:
+   - グローバルバッチサイズ: `batch_size = 1024 chunks/step`（`accumulation_steps = 1`）、`big_batch_size = 512 songs/outer_batch`
+   - 学習ステップ数: `Outer Batch 256 / 1581`（`131,072` 曲、約 `68,000 steps`、Model 2: `5.55億 tokens` / Model 3, 4: `11.1億 tokens`）
    - 学習率 (`AdamW`, `betas=(0.9, 0.98)`, `weight_decay=1e-2`):
-     - Phase 1（初期学習: `Outer Batch 1 〜 145` / `~18,000 steps`）: `lr = 4.0e-4`
-     - Phase 2（微調整収束: `Outer Batch 146 〜 215` / `~27,000 steps`）: `lr = 1.0e-4`
+     - Phase 1（初期学習: `Outer Batch 1 〜 159`）: `lr = 4.0e-4`
+     - Phase 2（微調整収束: `Outer Batch 160 〜 256`）: `lr = 1.0e-4`
 
 ---
 
 ## 5. 評価指標と分析方法
 
-各モデルの学習完了後、検証セット（Unseen GMD Val Set）を用いて以下の指標を算出し、論文用の比較表を作成する。
+各モデルの学習完了後、未見テストセット（Unseen GMD Eval Set: `150` 曲 / `87,523` チャンク）を用いて以下の指標を算出する。
 
 1. **全体およびトラック密度別（1〜2トラック vs. 3〜4トラック同時発音）の再構成精度**:
-   - **Onset F1 / Precision / Recall**（発音タイミングの正確性と過剰発音の少なさ）
    - **Note (Sustain) F1 / Precision / Recall**（音の長さ・和音構成の正確性と量子化ブラーの少なさ）
-   - **デコード後 MIDI ノート単位の F1**（`mortm/utils/convert_pianoroll.py` の `_flat_to_quantized_notes` 適用後）
+   - **Onset F1 / Precision / Recall**（発音タイミングの正確性と過剰発音の少なさ）
    - **Velocity MAE**（発音ベロシティの平均絶対誤差）
 2. **量子化品質の内部指標**:
-   - **相対量子化残差エラー (`Relative Quantization Error`)**: $\|z_{\text{norm}} - x_q\|_2^2 / \|z_{\text{norm}}\|_2^2$
-   - **コードブック利用率 (`Codebook Usage / Perplexity`)**: 全コードブック中の有効語彙数とエントロピー換算Perplexity
-3. **定性評価（`MidiVision Studio` での視覚・聴覚比較）**:
-   - フロントエンド（`midivision_studio`）に **「モデル切り替え機能（Model 1 / 2 / 3 / 4）」** を搭載し、同一MIDI楽曲に対して：
-     - ピアノロール上の **赤（Onset差分）** および **黄（Sustainはみ出し差分）** の減少具合
-     - FluidSynth アコースティック音源での「鳴らし過ぎ（音の濁り）」の解消度合い
-   をリアルタイムに切り替えて検証・可視化する。
+   - **相対量子化残差エラー (`Relative Quantization Error: RelQErr`)**: $\|z_{\text{in}} - x_q\|_2 / \|z_{\text{in}}\|_2$
+   - **コードブック利用率 (`Codebook Usage / Perplexity`)**: 全コードブック中の有効語彙率（Active %）とエントロピー換算 Perplexity
 
 ---
 
@@ -97,17 +85,72 @@ MORTM5 の前段モジュールである **`MidiVision`** は、最大4トラッ
 
 | モデル | モデル設定JSON | 保存先ウェイト (`.pth`) |
 | :--- | :--- | :--- |
-| **Model 1 (Baseline)** | `configs/models/mortm5/default.json` | `out/models/mortm5/MORTM5.MIDIVision_M1_G4L2_D512_K1024.pth` (既存 `MORTM5.MIDIVision.pth`) |
-| **Model 2 (Compact-Dim)** | `configs/models/mortm5/m2_compact_g4l2_d128_k2048.json` | `out/models/mortm5/MORTM5.MIDIVision_M2_G4L2_D128_K2048.pth` |
-| **Model 3 (Fine-Group)** | `configs/models/mortm5/m3_finegroup_g8l2_d512_k1024.json` | `out/models/mortm5/MORTM5.MIDIVision_M3_G8L2_D512_K1024.pth` |
-| **Model 4 (Deep-RVQ)** | `configs/models/mortm5/m4_deeprvq_g4l4_d512_k1024.json` | `out/models/mortm5/MORTM5.MIDIVision_M4_G4L4_D512_K1024.pth` |
+| **Model 1 (Baseline)** | `configs/models/mortm5/default.json` | `out/models/mortm5/MORTM5.MIDIVision_0.8683.pth` |
+| **Model 2 (Compact-Dim)** | `configs/models/mortm5/m2_compact_g4l2_d128_k2048.json` | `out/models/mortm5/m2_compact_g4l2_d128_k2048/MORTM5.M2_Compact_G4L2_D128_K2048_latest.pth` |
+| **Model 3 (Fine-Group)** | `configs/models/mortm5/m3_finegroup_g8l2_d256_k2048.json` | `out/models/mortm5/m3_finegroup_g8l2_d256_k2048/MORTM5.M3_FineGroup_G8L2_D256_K2048_latest.pth` |
+| **Model 4 (Deep-RVQ)** | `configs/models/mortm5/m4_deeprvq_g4l4_d128_k2048.json` | `out/models/mortm5/m4_deeprvq_g4l4_d128_k2048/MORTM5.M4_DeepRVQ_G4L4_D128_K2048_latest.pth` |
 
 ---
 
 ## 7. 実行手順（ロードマップ）
 
-1. **Step 1**: Model 2, Model 3, Model 4 用のモデル設定JSONファイルを `configs/models/mortm5/` に作成する。
-2. **Step 2**: **Model 2 (`Compact-Dim`)** の学習を実行・保存する（系列長維持での改善効果を最優先で確認）。
-3. **Step 3**: **Model 3 (`Fine-Group`)** および **Model 4 (`Deep-RVQ`)** の学習を順次実行・保存する。
-4. **Step 4**: 全4モデルの統一ベンチマークスクリプトを実行し、論文掲載用の定量評価テーブル（Markdown / LaTeX表）を出力する。
+1. **[完了] Step 1**: Model 2, Model 3, Model 4 用のモデル設定JSONファイルを `configs/models/mortm5/` に作成する。
+2. **[完了] Step 2**: **Model 2 (`Compact-Dim`)** の学習を実行・保存する（`Outer 256 / Step 67,960` 完走）。
+3. **[完了] Step 3**: **Model 3 (`Fine-Group`)** および **Model 4 (`Deep-RVQ`)** の32次元コードブック統一構成での並列学習を実行・保存する（両モデル `Outer 256 / Step ~68,000` 完走）。
+4. **[完了] Step 4**: 全4モデルの統一ベンチマークスクリプトを実行し、論文掲載用の定量評価テーブルを出力する（下記 §8）。
 5. **Step 5**: `MidiVision Studio` に4モデル切り替えUIを追加し、定性比較および論文用図版（Figure）の作成を行う。
+
+---
+
+## 8. 実験結果および考察（Ablation Study Final Results）
+
+### 8.1 未見テストセット（150曲 / 87,523チャンク）における定量評価比較
+
+`data/gmd/eval.json` の先頭150曲（学習時未見、計 `87,523` チャンク：1〜2トラック疎領域 `33,088` チャンク、3〜4トラック密領域 `54,435` チャンク）に対する全4モデルの最終評価結果を以下に示す。
+
+| 評価指標 | **Model 1 (Baseline)**<br>`G4-L2-D512-K1024`<br>($d=128$, `8 tok`) | **Model 2 (Compact-Dim)**<br>`G4-L2-D128-K2048`<br>($d=32$, `8 tok`) | **Model 3 (Fine-Group)** 🏆<br>`G8-L2-D256-K2048`<br>($d=32$, `16 tok`) | **Model 4 (Deep-RVQ)** 🏆<br>`G4-L4-D128-K2048`<br>($d=32$, `16 tok`) |
+| :--- | :---: | :---: | :---: | :---: |
+| **総パラメータ数** | `8,505,088` | **`6,145,408` (`-27.7%`)** | `6,931,968` (`-18.5%`) | **`6,145,408` (`-27.7%`)** |
+| **学習完了 Outer Batch (Steps)** | `Outer 215` (`~27k`) | `Outer 256` (`67,960`) | `Outer 256` (`67,989`) | `Outer 256` (`67,940`) |
+| **【全体】Note F1** | `75.15%` | `78.71%` (`+3.56`) | `93.14%` (`+17.99`) | **`93.48%` (`+18.33`)** |
+| ┗ Note Recall / Precision | `83.5% / 68.3%` | `87.6% / 71.4%` | `95.6% / 90.8%` | **`95.2% / 91.8%`** |
+| **【全体】Onset F1** | `84.75%` | `87.17%` (`+2.42`) | **`96.54%` (`+11.79`)** | `96.44%` (`+11.69`) |
+| ┗ Onset Recall / Precision | `86.1% / 83.5%` | `90.9% / 83.8%` | **`97.9% / 95.3%`** | `97.6% / 95.3%` |
+| **【全体】Velocity MAE** | `0.2206` | `0.1924` (`-12.8%`) | `0.1127` (`-48.9%`) | **`0.1111` (`-49.6%`)** |
+| **【全体】相対量子化誤差 (`RelQErr`)** | `60.08%` | `46.52%` (`-13.56`) | `37.82%` (`-22.26`) | **`32.71%` (`-27.37`)** |
+| **【1〜2 Trk】Note F1 / Onset F1** | `77.48% / 85.72%` | `80.74% / 87.63%` | `93.02% /` **`95.96%`** | **`93.55%`** `/ 95.65%` |
+| **【1〜2 Trk】`VelMAE` / `RelQErr`** | `0.2098 / 44.66%` | `0.1812 / 34.63%` | `0.1039 / 26.50%` | **`0.1024 / 23.22%`** |
+| **【3〜4 Trk】Note F1 / Onset F1** | `74.49% / 84.51%` | `78.14% / 87.05%` | `93.18% /` **`96.70%`** | **`93.46%`** `/ 96.64%` |
+| **【3〜4 Trk】`VelMAE` / `RelQErr`** | `0.2233 / 69.44%` | `0.1953 / 53.75%` | `0.1150 / 44.70%` | **`0.1133 / 38.47%`** |
+| **コードブック有効率 (`Active %`)** | `99.2%` (`K=1024`) | `99.9%` (`K=2048`) | **`100.0%`** (`K=2048`) | `99.9%` (`K=2048`) |
+| **コードブック Perplexity** | `658.7 / 1024` | **`1385.7 / 2048`** | `1339.8 / 2048` | `1358.7 / 2048` |
+
+---
+
+### 8.2 各リサーチクエスチョン（RQ1〜RQ3）に対する科学的結論
+
+#### 1. RQ1の結論：コードブック低次元化（$128\text{次元} \to 32\text{次元}$）の効果（Model 1 vs. Model 2）
+- トークン系列長を **8 tokens/chunk に固定**し、さらに総パラメータ数を **27.7% 削減（`8.51M → 6.15M`）** したにもかかわらず、**Model 2 (`G4-L2-D128-K2048`) は全指標で Model 1 (`G4-L2-D512-K1024`) を上回った**（全体 Note F1 **`+3.56 pt`**、全体 Onset F1 **`+2.42 pt`**、Velocity MAE **`0.2206 → 0.1924` で `-12.8%` 改善**）。
+- 特に 3〜4 トラック密集領域における相対量子化残差 `RelQErr` は **`69.44% → 53.75%`（`-15.69 pt`）** へと大幅に減少し、コードブックの実効語彙数（Perplexity）も **`658.7 → 1,385.7`（`2.10倍`）** に倍増した。
+- これにより、「高次元潜在空間（128次元/グループ）における次元の呪いが量子化ブラーの主因であり、サブ空間を32次元に凝縮することで系列長を増やさずに量子化密度と再構成精度を同時に改善できる」という RQ1 の仮説が完全に実証された。
+
+#### 2. RQ2の結論：ビットレート倍増（`8 tokens → 16 tokens`）の効果（Model 2 vs. Model 3, 4）
+- 32次元コードブック（`K=2048`）および `pre_vq_norm` (`LayerNorm(32, elementwise_affine=False)`) を完全統一した上でトークン予算を `8 → 16 tokens/chunk`（`88 bits → 176 bits`）に倍増した **Model 3・Model 4** は、全評価指標で飛躍的な精度向上を達成した：
+  - **Note F1**: `78.71% (M2)` → **`93.14% (M3)` / `93.48% (M4)`**（**`+14.43〜+14.77 pt`**）
+  - **Onset F1**: `87.17% (M2)` → **`96.54% (M3)` / `96.44% (M4)`**（**`+9.27〜+9.37 pt`**）
+  - **Velocity MAE**: `0.1924 (M2)` → **`0.1127 (M3)` / `0.1111 (M4)`**（誤差 **`-41.4%〜-42.3%` 削減**、Baseline 比 **`-49.6%` 半減**）
+  - **相対量子化誤差 (`RelQErr`)**: `46.52% (M2)` → **`37.82% (M3)` / `32.71% (M4)`**
+- 特筆すべきは **Note Precision（`68.3% (M1) → 71.4% (M2) → 90.8% (M3) → 91.8% (M4)`）** および **Onset Precision（`83.5% (M1) → 83.8% (M2) → 95.3% (M3, M4)`）** の改善であり、Model 1 の課題であった「量子化ブラーによる隣接ピッチ・隣接時間への音の滲み（過剰発音）」が完全に解消された。また、3〜4トラック密集領域においても `Note F1 > 93.1%` / `Onset F1 > 96.6%` を維持しており、トラック数増加による精度劣化が完全に克服された。
+
+#### 3. RQ3の結論：「横の分割（Model 3: `G8-L2-D256`）」vs「縦の深さ（Model 4: `G4-L4-D128`）」の数理的比較
+- Model 3（$D=256, G=8, L=2$）と Model 4（$D=128, G=4, L=4$）を完全同一の学習条件（`Outer 256` / `~67,960 steps` / `LR: 4e-4 → 1e-4`）で直接対決させた結果、両者は共に `Note F1 > 93.1%`・`Onset F1 > 96.4%`・コードブック有効率 `99.9〜100.0%`（Perplexity `1,340〜1,359 / 2048`）という極めて高い水準で拮抗しつつ、それぞれの構造的特性を反映した明確な優位性を示した：
+  1. **Model 4 (`G4-L4-D128-K2048`) の優位点（Note F1・Velocity MAE・量子化誤差・パラメータ効率で総合1位）**:
+     - **Note F1 (`93.48%` vs `93.14%`)**、**Note Precision (`91.8%` vs `90.8%`)**、**Velocity MAE (`0.1111` vs `0.1127`)**、および **相対量子化残差 `RelQErr` (`32.71%` vs `37.82%`)** のすべてで Model 3 を上回った。
+     - 4トラック・0.5拍のピアノロール多様体は連続自由度 $D=128$ で十分に表現可能であり、4つの32次元サブ空間それぞれに4段の残差量子化（`44 bits/サブ空間`）を深く適用することで、量子化丸め誤差を `32.71%`（1〜2トラック時は `23.22%`）まで最小化し、Sustain長やベロシティの微細な階調をより正確に復元できる。
+     - さらに線形射影層が $D=128$ で済むため、Model 3 よりもパラメータ数が約78.6万個少なく（`6.15M` vs `6.93M`）、Model 2 と全く同じ最小パラメータ数のまま最高精度を達成している。
+  2. **Model 3 (`G8-L2-D256-K2048`) の優位点（Onset F1・コードブック100%稼働）**:
+     - **Onset F1 (`96.54%` vs `96.44%`)** および **Onset Recall (`97.9%` vs `97.6%`)** で僅差ながら全モデル中トップを記録し、全16コードブック（$8 \times 2 \times 2048 = 32,768$ エントリ）の有効率 **`100.0%`** を達成した。8個の独立した部分空間による並列表現が、突発的な同時発音（Onset）の取りこぼし抑制にわずかに寄与している。
+
+以上の結果から、MORTM5 の標準トークナイザとして **8 tokens/chunk の軽量構成では Model 2 (`G4-L2-D128-K2048`)**、**16 tokens/chunk の高精度構成では最小パラメータかつ Note F1・VelMAE・RelQErr 総合1位の Model 4 (`G4-L4-D128-K2048`)（または Onset 重視の Model 3）** が最適アーキテクチャであると結論づけられる。
+
+

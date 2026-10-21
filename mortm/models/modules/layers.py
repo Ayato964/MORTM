@@ -1176,7 +1176,7 @@ class MoE(nn.Module):
             else:
                 expert_out = self.experts[expert_id](expert_in)
 
-            y_flat.index_add_(0, cur_token_ids, expert_out * cur_weights)
+            y_flat.index_add_(0, cur_token_ids, (expert_out * cur_weights).to(y_flat.dtype))
             start = end
         return y_flat
 

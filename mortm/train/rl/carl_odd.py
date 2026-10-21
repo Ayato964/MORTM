@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 
 from loralib import mark_only_lora_as_trainable
-from flash_attn.bert_padding import unpad_input
+from ...models.modules.attention import pad_input, unpad_input
 
 from ...models.mortm import MORTM
 from ...models.modules.config import MORTMArgs
@@ -82,16 +82,16 @@ class AnalysisMORTM(MORTM):
         if pool == "mil":
             # LogSumExp / MIL。折り畳み系列は「bag に1つでも AI 区間があれば AI」
             # という MIL の設定そのもので、加重平均(PMA)では希釈に負ける。
-            self.mil = MILPool(self.d_model)
+            self.mil = MILPool(self.d_model).to(self.progress.get_device())
         else:
             pod = pma_out_dim if pma_out_dim is not None else self.d_model
             self.pma_out_dim = pod
-            self.pma = PMA(self.d_model, pod)
+            self.pma = PMA(self.d_model, pod).to(self.progress.get_device())
             self.out_head = nn.Sequential(      # AI(1) / Human(0) の 1 次元ロジット
                 nn.Linear(pod, self.d_model // 2),
                 nn.ReLU(),
                 nn.Linear(self.d_model // 2, 1),
-            )
+            ).to(self.progress.get_device())
 
     def forward_with_disc(self, x: Tensor, padding_mask: Tensor, is_causal: bool = True,
                           meta_id: Optional[int] = None, return_logits: bool = False):
@@ -118,11 +118,9 @@ class AnalysisMORTM(MORTM):
             logits: (B, S, V)  次トークン予測の分布
             disc:   (B,)       AI/Human 判別のロジット(sigmoid 前)
         """
-        from flash_attn.bert_padding import pad_input
-
         # 重みは fp32 のままなので autocast 必須(kv_generate と同じ扱い)。
         # ここで包んでおかないと呼び出し側が忘れて bf16/fp32 の不一致で落ちる。
-        dev = "cuda" if x.is_cuda else "cpu"
+        dev = x.device.type
         with torch.autocast(device_type=dev, dtype=torch.bfloat16):
             emb = self.embedding(x).to(dtype=torch.bfloat16)
             b, s, _ = emb.size()

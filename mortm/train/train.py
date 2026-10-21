@@ -966,7 +966,7 @@ def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: n
                           trainer, train_args: TrainArgs, coll_fn=None):
     model.eval()
 
-    device = torch.device(f"cuda:{trainer.local_rank}")
+    device = torch.device(f"cuda:{trainer.local_rank}") if torch.cuda.is_available() else progress.get_device()
     val_loss = torch.tensor(0.0, device=device)
     all_count = torch.tensor(0.0, device=device)
 
@@ -990,7 +990,7 @@ def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: n
                 inner_sampler.set_epoch(0)
 
             for pack2 in inner_loader:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                     r_pack = trainer.epoch_fc(model, pack2, progress)
                     loss = trainer.get_eval_loss(*r_pack)
 
@@ -1201,7 +1201,7 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
     start_epoch = 0
     resume_outer_batch_idx = 0
 
-    device = torch.device(f"cuda:{local_rank}")
+    device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else progress.get_device()
     checkpoint_path = resume_checkpoint_path if resume_checkpoint_path is not None else f"{save_directory}/{model_name}.checkpoint.pt"
 
     # チェックポイント存在確認とDDPプロセス間共有
@@ -1300,7 +1300,7 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
 
                     is_step_optimizer = (mini_c % train_args.accumulation_steps == 0)
 
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                         r_pack = trainer.epoch_fc(model, pack2, progress)
                         loss = trainer.backward(
                             train_args.accumulation_steps,
@@ -1320,8 +1320,9 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                         if _pcts and _tot and (trainer.local_rank == 0):
                             for _p in _pcts:
                                 if optimizer_step == max(1, int(round(_p / 100.0 * _tot))):
+                                    raw_m = model.module if hasattr(model, "module") else model
                                     torch.save(
-                                        model.module.state_dict(),
+                                        raw_m.state_dict(),
                                         f"{save_directory}/{model_name}.ckpt_p{_p}.pth",
                                     )
                                     print(f"[fullFT] checkpoint saved at {_p}% (step {optimizer_step}/{_tot})", flush=True)
@@ -1374,7 +1375,8 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                     if local_rank == 0 and writer is not None:
                         update_log(model, writer, optimizer_step)
 
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     verification_loss = get_verification_loss(
                         model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn
                     )
@@ -1514,10 +1516,9 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
                 progress: LearningProgress = _DefaultLearningProgress(), log_scale=False, project_name=None,
                 seed: int = 42, resume: bool = True, resume_checkpoint_path: Optional[str] = None):
 
-    if not dist.is_initialized():
-        # 既定 nccl(従来の2GPU学習を維持)。env MORTM_DDP_BACKEND=gloo でCPU通信に切替
-        # (NVMLドライバ不整合でNCCLが使えない環境の1GPUフォールバック用, E5)。
-        dist.init_process_group(backend=os.environ.get("MORTM_DDP_BACKEND", "nccl"))
+    if not dist.is_initialized() and "WORLD_SIZE" in os.environ:
+        default_backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=os.environ.get("MORTM_DDP_BACKEND", default_backend))
 
     # DDP環境でのプロセス間の再現性と同期を確保するため、すべての乱数シードを固定。
     # seed は呼び出し側(run_e1のseed_tag)から受け取る。既定42で従来挙動を維持。
@@ -1526,10 +1527,12 @@ def train_mortm(tokenizer, model_config: str, train_config: str, root_directory,
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
 
     args = MORTMArgs(json_directory=model_config)
     t_args = TrainArgs(json_directory=train_config)
@@ -1596,15 +1599,14 @@ def train_custom(trainer: AbstractTrainSet, t_args, root_directory, save_directo
                  progress: LearningProgress = _DefaultLearningProgress(), coll_fn=None,
                  resume: bool = True, resume_checkpoint_path: Optional[str] = None):
 
-    if not dist.is_initialized():
-        # 既定 nccl(従来の2GPU学習を維持)。env MORTM_DDP_BACKEND=gloo でCPU通信に切替
-        # (NVMLドライバ不整合でNCCLが使えない環境の1GPUフォールバック用, E5)。
-        dist.init_process_group(backend=os.environ.get("MORTM_DDP_BACKEND", "nccl"))
+    if not dist.is_initialized() and "WORLD_SIZE" in os.environ:
+        default_backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=os.environ.get("MORTM_DDP_BACKEND", default_backend))
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     today_date = datetime.date.today().strftime('%Y%m%d')
 
     grouped_paths, dataset_names = _collect_grouped_paths(root_directory)
