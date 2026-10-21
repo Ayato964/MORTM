@@ -48,6 +48,11 @@ class MORTMArgs:
             # デバッグ用: Trueにすると観察用Attentionに切り替わりweightを保存する
             self.debug_attention: bool = False
 
+PAD_TOKEN_ID = 0
+BOS_TOKEN_ID = 1
+EOS_TOKEN_ID = 2
+RVQ_TOKEN_OFFSET = 3
+
 
 class MORTM5Args(MORTMArgs):
     def __init__(self, json_directory: str):
@@ -66,5 +71,23 @@ class MORTM5Args(MORTMArgs):
             self.encoder_wout = 512 if data.get("encoder_wout") is None else data["encoder_wout"]
             self.vq_groups = 4 if data.get("vq_groups") is None else data["vq_groups"]
             self.encoder_layer = 2 if data.get("encoder_layer") is None else data["encoder_layer"]
+            self.vq_layers = self.encoder_layer
             self.codebook_size = 1024 if data.get("codebook_size") is None else data["codebook_size"]
             self.use_pre_vq_norm = True if data.get("use_pre_vq_norm") is None else bool(data["use_pre_vq_norm"])
+
+            self.pad_token_id = PAD_TOKEN_ID
+            self.bos_token_id = BOS_TOKEN_ID
+            self.eos_token_id = EOS_TOKEN_ID
+            if data.get("position_length") is None:
+                self.position_length = 4096
+
+            rvq_vocab = self.vq_groups * self.codebook_size
+            if data.get("token_offset") is not None:
+                self.token_offset = int(data["token_offset"])
+            elif data.get("vocab_size") is not None:
+                self.token_offset = max(0, int(data["vocab_size"]) - rvq_vocab)
+            else:
+                self.token_offset = RVQ_TOKEN_OFFSET
+
+            if data.get("vocab_size") is None:
+                self.vocab_size = self.token_offset + rvq_vocab

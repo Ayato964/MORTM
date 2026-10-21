@@ -13,5 +13,6 @@
   "encoder_wout": 256,
   "vq_groups": 8,
   "encoder_layer": 2,
-  "codebook_size": 2048
+  "codebook_size": 2048,
+  "position_length": 4096
 }

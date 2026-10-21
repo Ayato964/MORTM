@@ -298,6 +298,9 @@ class TensorDataset(Dataset):
         self.seq = patch_list
 
 
+from mortm.models.modules.config import PAD_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID, RVQ_TOKEN_OFFSET
+
+
 class PPODataset(Dataset):
     def __init__(self,
                  sequences: Tensor,
@@ -326,3 +329,260 @@ class PPODataset(Dataset):
             self.advantages[index],
             self.returns[index]
         )
+
+
+class MORTM5MemmapDataset(Dataset):
+    """
+    MidiVision (M3 / M4) でトークン化されたフラットバイナリ (.bin + _offsets.npy) を
+    高速かつ省メモリに読み込む Dataset クラス。
+
+    - mode="flat":
+        AblationTransformer1 用。1トークン単位の自己回帰。
+        シーケンス先頭に [BOS] (1個)、末尾に [EOS] (1個) を付与する。
+    - mode="grouped":
+        AblationTransformer2 用。vq_groups (G) トークンを1ソフトトークンとして束ねる自己回帰。
+        シーケンス長が常に G の倍数になるよう、先頭に [BOS] * G、末尾に [EOS] * G を付与する。
+    """
+
+    def __init__(
+        self,
+        tokens_bin_path: str,
+        offsets_npy_path: str,
+        vq_groups: int = 8,
+        vq_layers: int = 2,
+        max_chunks: int = 128,
+        min_chunks: int = 8,
+        stride_chunks: Optional[int] = None,
+        mode: str = "flat",
+        bos_eos_mode: str = "always",
+        pad_token_id: int = PAD_TOKEN_ID,
+        bos_token_id: int = BOS_TOKEN_ID,
+        eos_token_id: int = EOS_TOKEN_ID,
+    ):
+        super().__init__()
+        if mode not in ("flat", "grouped"):
+            raise ValueError(f"mode must be 'flat' or 'grouped', got {mode}")
+        if bos_eos_mode not in ("always", "song_boundary", "none"):
+            raise ValueError(f"bos_eos_mode must be 'always', 'song_boundary', or 'none', got {bos_eos_mode}")
+
+        self.tokens_bin_path = os.path.abspath(tokens_bin_path)
+        self.offsets_npy_path = os.path.abspath(offsets_npy_path)
+        self.vq_groups = int(vq_groups)
+        self.vq_layers = int(vq_layers)
+        if self.vq_groups <= 0 or self.vq_layers <= 0:
+            raise ValueError(f"vq_groups ({self.vq_groups}) and vq_layers ({self.vq_layers}) must be positive.")
+        self.tokens_per_chunk = self.vq_groups * self.vq_layers
+
+        self.max_chunks = int(max_chunks)
+        self.min_chunks = int(min_chunks)
+        self.stride_chunks = int(stride_chunks) if stride_chunks is not None else int(max_chunks)
+        if self.min_chunks <= 0 or self.max_chunks < self.min_chunks or self.stride_chunks <= 0:
+            raise ValueError(
+                f"Invalid chunk window settings: min_chunks={self.min_chunks}, "
+                f"max_chunks={self.max_chunks}, stride_chunks={self.stride_chunks}."
+            )
+        self.mode = mode
+        self.bos_eos_mode = bos_eos_mode
+
+        self.pad_token_id = int(pad_token_id)
+        self.bos_token_id = int(bos_token_id)
+        self.eos_token_id = int(eos_token_id)
+
+        if not os.path.exists(self.tokens_bin_path):
+            raise FileNotFoundError(f"Tokens binary file not found: {self.tokens_bin_path}")
+        if not os.path.exists(self.offsets_npy_path):
+            raise FileNotFoundError(f"Offsets npy file not found: {self.offsets_npy_path}")
+
+        # もし隣接する {split}_state.json が存在すれば、vq_groups / vq_layers の設定不一致を検出する
+        if self.tokens_bin_path.endswith("_tokens.bin"):
+            candidate_state_path = self.tokens_bin_path[: -len("_tokens.bin")] + "_state.json"
+            if os.path.exists(candidate_state_path):
+                with open(candidate_state_path, "r", encoding="utf-8") as sf:
+                    state_meta = json.load(sf)
+                meta_g = state_meta.get("vq_groups")
+                meta_l = state_meta.get("vq_layers")
+                if (meta_g is not None and int(meta_g) != self.vq_groups) or (
+                    meta_l is not None and int(meta_l) != self.vq_layers
+                ):
+                    raise ValueError(
+                        f"Tokenizer metadata mismatch for {self.tokens_bin_path}: "
+                        f"state.json has (vq_groups={meta_g}, vq_layers={meta_l}), "
+                        f"but MORTM5MemmapDataset was initialized with (vq_groups={self.vq_groups}, vq_layers={self.vq_layers})."
+                    )
+
+        # shape: [N_songs, 2] -> (start_token_offset, num_tokens)
+        self.offsets = np.load(self.offsets_npy_path)
+        if self.offsets.ndim != 2 or self.offsets.shape[1] != 2:
+            raise ValueError(f"Expected offsets array of shape [N, 2], got {self.offsets.shape}")
+
+        bin_size_bytes = os.path.getsize(self.tokens_bin_path)
+        if bin_size_bytes % 2 != 0:
+            raise ValueError(
+                f"Tokens binary file size ({bin_size_bytes} bytes) is not aligned to uint16 (2 bytes): {self.tokens_bin_path}"
+            )
+        total_bin_tokens = bin_size_bytes // 2
+
+        if len(self.offsets) > 0:
+            if np.any(self.offsets[:, 0] < 0) or np.any(self.offsets[:, 1] <= 0):
+                raise ValueError(f"Offsets contain negative start or non-positive length in {self.offsets_npy_path}")
+            if np.any(self.offsets[:, 1] % self.tokens_per_chunk != 0):
+                raise ValueError(
+                    f"Offsets contain song token lengths not divisible by tokens_per_chunk ({self.tokens_per_chunk})"
+                )
+            required_tokens = int(np.max(self.offsets[:, 0] + self.offsets[:, 1]))
+            if total_bin_tokens < required_tokens:
+                raise ValueError(
+                    f"Tokens binary file {self.tokens_bin_path} is truncated: has {total_bin_tokens} tokens, "
+                    f"but offsets require at least {required_tokens} tokens."
+                )
+
+        self._memmap: Optional[np.memmap] = None
+        self.windows: np.ndarray = self._build_windows()
+
+    def _build_windows(self) -> np.ndarray:
+        """
+        各楽曲の (start_offset, num_tokens) から学習ウィンドウ
+        (token_start, token_len, is_song_start, is_song_end) のテーブルを構築する。
+        """
+        max_win_tokens = self.max_chunks * self.tokens_per_chunk
+        min_win_tokens = self.min_chunks * self.tokens_per_chunk
+        stride_tokens = self.stride_chunks * self.tokens_per_chunk
+
+        windows = []
+        for song_idx in range(len(self.offsets)):
+            start_offset = int(self.offsets[song_idx, 0])
+            num_tokens = int(self.offsets[song_idx, 1])
+
+            if num_tokens < min_win_tokens:
+                continue
+
+            if num_tokens <= max_win_tokens:
+                windows.append((start_offset, num_tokens, 1, 1))
+                continue
+
+            pos = 0
+            while pos < num_tokens:
+                rem = num_tokens - pos
+                if rem < min_win_tokens:
+                    break
+                win_len = min(max_win_tokens, rem)
+                is_first = 1 if pos == 0 else 0
+                is_last = 1 if (pos + win_len >= num_tokens) else 0
+                windows.append((start_offset + pos, win_len, is_first, is_last))
+                if pos + win_len >= num_tokens:
+                    break
+                pos += stride_tokens
+
+        if len(windows) == 0:
+            return np.zeros((0, 4), dtype=np.int64)
+        return np.asarray(windows, dtype=np.int64)
+
+    def _get_memmap(self) -> np.memmap:
+        if self._memmap is None:
+            self._memmap = np.memmap(self.tokens_bin_path, dtype=np.uint16, mode="r")
+        return self._memmap
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_memmap"] = None
+        return state
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, index: int) -> Tensor:
+        mmap = self._get_memmap()
+        token_start, token_len, is_first, is_last = self.windows[index]
+        raw_tokens = np.asarray(mmap[token_start : token_start + token_len], dtype=np.int64)
+        if raw_tokens.size != token_len:
+            raise RuntimeError(
+                f"Memmap slice length mismatch at [{token_start}:{token_start + token_len}]: "
+                f"expected {token_len}, got {raw_tokens.size}"
+            )
+
+        add_bos = (
+            self.bos_eos_mode == "always"
+            or (self.bos_eos_mode == "song_boundary" and is_first == 1)
+        )
+        add_eos = (
+            self.bos_eos_mode == "always"
+            or (self.bos_eos_mode == "song_boundary" and is_last == 1)
+        )
+
+        unit_width = 1 if self.mode == "flat" else self.vq_groups
+        parts = []
+        if add_bos:
+            parts.append(np.full(unit_width, self.bos_token_id, dtype=np.int64))
+        parts.append(raw_tokens)
+        if add_eos:
+            parts.append(np.full(unit_width, self.eos_token_id, dtype=np.int64))
+
+        seq = np.concatenate(parts, axis=0) if len(parts) > 1 else raw_tokens
+        return torch.from_numpy(seq)
+
+
+def mortm5_collate_fn(
+    batch: List[Tensor],
+    mode: str = "flat",
+    vq_groups: int = 8,
+    pad_token_id: int = PAD_TOKEN_ID,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """
+    MORTM5MemmapDataset のミニバッチから (input_ids, targets, padding_mask) を作成する。
+
+    - mode="flat" (AblationTransformer1):
+        shift = 1 トークン。
+        input_ids: [B, S - 1]
+        targets:   [B, S - 1]
+        padding_mask: [B, S - 1] (True = 有効トークン, False = PAD)
+    - mode="grouped" (AblationTransformer2):
+        shift = vq_groups (G) トークン (= 1 ソフトトークン)。
+        input_ids: [B, S - G]
+        targets:   [B, S - G]
+        padding_mask: [B, (S - G) // G] (True = 有効ソフトトークン, False = PAD)
+    """
+    from torch.nn.utils.rnn import pad_sequence
+
+    if mode not in ("flat", "grouped"):
+        raise ValueError(f"mode must be 'flat' or 'grouped', got {mode}")
+    if not batch:
+        raise ValueError("mortm5_collate_fn received an empty batch.")
+
+    vq_groups = int(vq_groups)
+    if vq_groups <= 0:
+        raise ValueError(f"vq_groups must be positive, got {vq_groups}")
+
+    shift = 1 if mode == "flat" else vq_groups
+    for idx, seq in enumerate(batch):
+        if seq.dim() != 1:
+            raise ValueError(f"Batch item {idx} must be a 1D tensor, got shape {tuple(seq.shape)}")
+        if seq.numel() <= shift:
+            raise ValueError(
+                f"Batch item {idx} length ({seq.numel()}) must be > shift ({shift}) for causal training."
+            )
+        if mode == "grouped" and seq.numel() % vq_groups != 0:
+            raise ValueError(
+                f"Batch item {idx} length ({seq.numel()}) is not divisible by vq_groups ({vq_groups}) in grouped mode."
+            )
+
+    padded = pad_sequence(batch, batch_first=True, padding_value=pad_token_id)
+
+    if mode == "grouped" and padded.size(1) % vq_groups != 0:
+        rem = vq_groups - (padded.size(1) % vq_groups)
+        pad_tail = torch.full(
+            (padded.size(0), rem), pad_token_id, dtype=padded.dtype, device=padded.device
+        )
+        padded = torch.cat([padded, pad_tail], dim=1)
+
+    input_ids = padded[:, :-shift].contiguous()
+    targets = padded[:, shift:].contiguous()
+
+    if mode == "flat":
+        padding_mask = input_ids != pad_token_id
+    else:
+        # ソフトトークン単位のマスク: [B, S_soft]
+        grouped_inputs = input_ids.reshape(input_ids.size(0), -1, vq_groups)
+        padding_mask = (grouped_inputs != pad_token_id).any(dim=-1)
+
+    return input_ids, targets, padding_mask
+
