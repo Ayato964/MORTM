@@ -699,17 +699,30 @@ async def _tok_probe_models(request):
     })
 
 
+_ONSET_LUT = np.rint(
+    np.clip(
+        np.float32(0.5) + np.float32(0.5) * (np.arange(128, dtype=np.float32) / np.float32(127.0)),
+        0.0,
+        1.0,
+    )
+    * np.float32(254.0)
+).astype(np.uint8)
+
+
 def _rasterize_sparse_notes_u8(num_chunks: int, notes_arr: np.ndarray) -> np.ndarray:
     total_steps = num_chunks * 24
     flat_u8 = np.zeros((8, total_steps, 128), dtype=np.uint8)
-    for slot, start, end, pitch, velocity in notes_arr:
-        onset_ch = int(slot) * 2
-        sustain_ch = onset_ch + 1
-        onset_val = np.float32(0.5 + 0.5 * (float(velocity) / 127.0))
-        onset_u8 = np.uint8(np.rint(np.clip(onset_val, 0.0, 1.0) * np.float32(254.0)))
-        if onset_u8 > flat_u8[onset_ch, start, pitch]:
-            flat_u8[onset_ch, start, pitch] = onset_u8
-        flat_u8[sustain_ch, start:end, pitch] = 254
+    if len(notes_arr) > 0:
+        slots = notes_arr[:, 0]
+        starts = notes_arr[:, 1]
+        ends = notes_arr[:, 2]
+        pitches = notes_arr[:, 3]
+        vels = notes_arr[:, 4]
+        onset_chs = slots * 2
+        np.maximum.at(flat_u8, (onset_chs, starts, pitches), _ONSET_LUT[vels])
+        sustain_chs = onset_chs + 1
+        for sch, s, e, p in zip(sustain_chs.tolist(), starts.tolist(), ends.tolist(), pitches.tolist()):
+            flat_u8[sch, s:e, p] = 254
     chunks_u8 = np.ascontiguousarray(
         flat_u8.reshape(8, num_chunks, 24, 128).transpose(1, 0, 3, 2)
     )
@@ -804,7 +817,7 @@ async def _tok_process_batch(request):
         raw = b"".join(STATE["tok_upload_parts"])
         STATE["tok_upload_parts"] = []
 
-    gpu_batch_chunks = int(request.query_params.get("gpu_batch_chunks", "1024"))
+    gpu_batch_chunks = int(request.query_params.get("gpu_batch_chunks", "4096"))
     flush_ckpt = request.query_params.get("flush", "0") == "1"
 
     header_len = int.from_bytes(raw[:4], byteorder="big")
@@ -816,8 +829,31 @@ async def _tok_process_batch(request):
     writers = STATE["tok_writers"]
     model_keys = list(writers.keys())
 
-    # Rasterize sparse quantized notes into uint8 chunks for a single coalesced GPU pass
-    song_arrays = []
+    # Streamingly rasterize and run GPU forward in windows of gpu_batch_chunks to keep Colab RAM < 200MB even for 500-song batches
+    model_token_buffers = {k: [] for k in model_keys}
+    staged_arrays = []
+    staged_chunks = 0
+
+    def _flush_staged_to_gpu():
+        nonlocal staged_chunks
+        if not staged_arrays:
+            return
+        cat_u8 = np.concatenate(staged_arrays, axis=0)
+        staged_arrays.clear()
+        staged_chunks = 0
+        n_c = len(cat_u8)
+        with torch.inference_mode():
+            for st in range(0, n_c, gpu_batch_chunks):
+                en = min(st + gpu_batch_chunks, n_c)
+                sub_u8 = torch.from_numpy(cat_u8[st:en]).to(device=DEVICE, non_blocking=True)
+                x = sub_u8.to(dtype=torch.float32).div_(254.0)
+                with torch.amp.autocast(device_type=DEVICE.type, dtype=torch.bfloat16, enabled=(DEVICE.type == "cuda")):
+                    for m_key in model_keys:
+                        toks = tok_models[m_key].encode_tokens(x, include_offset=True)
+                        toks_u16 = toks.to(dtype=torch.int32).cpu().numpy().astype(np.uint16)
+                        model_token_buffers[m_key].append(toks_u16)
+        del cat_u8
+
     cursor_b = 0
     for ev in events:
         if ev[0] == "song":
@@ -827,25 +863,12 @@ async def _tok_process_batch(request):
             decomp = zlib.decompress(comp_slice)
             notes_arr = np.frombuffer(decomp, dtype=np.int32).reshape(-1, 5)
             arr_u8 = _rasterize_sparse_notes_u8(int(n_chunks), notes_arr)
-            song_arrays.append(arr_u8)
+            staged_arrays.append(arr_u8)
+            staged_chunks += int(n_chunks)
+            if staged_chunks >= gpu_batch_chunks * 2:
+                _flush_staged_to_gpu()
 
-    model_token_buffers = {k: [] for k in model_keys}
-    if song_arrays:
-        all_chunks_u8 = np.concatenate(song_arrays, axis=0)
-        total_chunks = len(all_chunks_u8)
-        del song_arrays
-
-        with torch.inference_mode():
-            for start in range(0, total_chunks, gpu_batch_chunks):
-                end = min(start + gpu_batch_chunks, total_chunks)
-                sub_u8 = torch.from_numpy(all_chunks_u8[start:end]).to(device=DEVICE, non_blocking=True)
-                x = sub_u8.to(dtype=torch.float32).div_(254.0)
-                with torch.amp.autocast(device_type=DEVICE.type, dtype=torch.bfloat16, enabled=(DEVICE.type == "cuda")):
-                    for m_key in model_keys:
-                        toks = tok_models[m_key].encode_tokens(x, include_offset=True)
-                        toks_u16 = toks.to(dtype=torch.int32).cpu().numpy().astype(np.uint16)
-                        model_token_buffers[m_key].append(toks_u16)
-        del all_chunks_u8
+    _flush_staged_to_gpu()
 
     full_tokens_map = {
         m_key: (np.concatenate(model_token_buffers[m_key], axis=0) if model_token_buffers[m_key] else None)
@@ -916,7 +939,7 @@ def init_remote_colab_worker(
     remote_url: str,
     model_keys: List[str],
 ) -> Dict[str, MORTM5Args]:
-    print(f"[RemoteColab] Connecting to {remote_url} ...", flush=True)
+    print(f"[RemoteColab] Connecting to {remote_url} for models {model_keys} ...", flush=True)
     r = session.get(f"{remote_url}/health", timeout=30)
     r.raise_for_status()
     health = r.json()
@@ -977,12 +1000,12 @@ def init_remote_colab_worker(
     r_probe.raise_for_status()
     probe_info = r_probe.json()
     print(
-        f"[RemoteColab] Probe result: loaded={probe_info.get('loaded_from')}, "
+        f"[RemoteColab] Probe result ({remote_url}): loaded={probe_info.get('loaded_from')}, "
         f"missing={probe_info.get('missing')}, drive_mounted={probe_info.get('drive_mounted')}",
         flush=True,
     )
 
-    # 3. Upload any missing model weights from Mac (encoder+rvq only, 4MB chunked to bypass Cloudflare limits)
+    # 3. Upload any missing model weights from Mac (encoder+rvq only, 6MB chunked to bypass Cloudflare limits)
     for m_key in probe_info.get("missing", []):
         ckpt_path = DEFAULT_MODELS[m_key]["ckpt"]
         if not os.path.exists(ckpt_path):
@@ -1006,9 +1029,9 @@ def init_remote_colab_worker(
             up_buf,
         )
         up_comp = zlib.compress(up_buf.getvalue(), level=1)
-        print(f"[RemoteColab] Uploading {m_key} encoder+rvq weights ({len(up_comp) / 1e6:.2f} MB in 4MB chunks)...", flush=True)
+        print(f"[RemoteColab] Uploading {m_key} encoder+rvq weights ({len(up_comp) / 1e6:.2f} MB) -> {remote_url}...", flush=True)
         session.post(f"{remote_url}/tok_clear_upload", timeout=30).raise_for_status()
-        chunk_sz = 4 * 1024 * 1024
+        chunk_sz = 6 * 1024 * 1024
         for st in range(0, len(up_comp), chunk_sz):
             part = up_comp[st : st + chunk_sz]
             session.post(
@@ -1024,7 +1047,7 @@ def init_remote_colab_worker(
             timeout=120,
         )
         r_up.raise_for_status()
-        print(f"[RemoteColab] {m_key} ready on Colab GPU!", flush=True)
+        print(f"[RemoteColab] {m_key} ready on {remote_url}!", flush=True)
 
     return args_map
 
@@ -1052,7 +1075,7 @@ def _send_remote_batch(
     flush_ckpt: bool,
 ) -> Dict[str, Any]:
     flush_flag = "1" if flush_ckpt else "0"
-    max_single_post = 4 * 1024 * 1024  # 4 MB safe limit for Cloudflare Tunnel
+    max_single_post = 7 * 1024 * 1024  # 7 MB safe single-POST threshold for Cloudflare Tunnel
 
     for attempt in range(6):
         try:
@@ -1061,14 +1084,14 @@ def _send_remote_batch(
                     f"{remote_url}/tok_process_batch?gpu_batch_chunks={gpu_batch_chunks}&flush={flush_flag}",
                     data=payload,
                     headers={"Content-Type": "application/octet-stream"},
-                    timeout=180,
+                    timeout=240,
                 )
                 r.raise_for_status()
                 return r.json()
             else:
                 r_clr = session.post(f"{remote_url}/tok_clear_upload", timeout=30)
                 r_clr.raise_for_status()
-                chunk_sz = 4 * 1024 * 1024
+                chunk_sz = 6 * 1024 * 1024
                 for st in range(0, len(payload), chunk_sz):
                     part = payload[st : st + chunk_sz]
                     r_ap = session.post(
@@ -1082,14 +1105,14 @@ def _send_remote_batch(
                     f"{remote_url}/tok_process_batch?gpu_batch_chunks={gpu_batch_chunks}&flush={flush_flag}",
                     data=b"",
                     headers={"Content-Type": "application/octet-stream"},
-                    timeout=240,
+                    timeout=300,
                 )
                 r.raise_for_status()
                 return r.json()
         except Exception as e:
             if attempt == 5:
                 raise
-            print(f"\n  [RemoteColab Retry {attempt + 1}/5] {e}", flush=True)
+            print(f"\n  [RemoteColab Retry {attempt + 1}/5 on {remote_url}] {e}", flush=True)
             time.sleep(2.0 * (attempt + 1))
     raise RuntimeError("Unreachable")
 
@@ -1106,7 +1129,7 @@ def _bounded_midi_iter(tasks: List[Tuple[int, str, int]], num_workers: int, pool
             yield _midi_worker(t)
         return
 
-    max_in_flight = max(8, num_workers * 3)
+    max_in_flight = max(16, num_workers * 4)
     in_flight = deque()
     next_pos = 0
     n_tasks = len(tasks)
@@ -1128,6 +1151,202 @@ def _bounded_midi_iter(tasks: List[Tuple[int, str, int]], num_workers: int, pool
             yield midx, mpath, 0, None
 
 
+def process_split_remote_endpoints(
+    endpoints: List[Tuple[requests.Session, str, List[str]]],
+    remote_out_dir: str,
+    local_state_dir: Optional[str],
+    split: str,
+    json_path: str,
+    resume: bool = True,
+    require_drive: bool = True,
+    num_workers: int = 12,
+    min_chunks: int = 8,
+    gpu_batch_chunks: int = 4096,
+    remote_batch_chunks: int = 150000,
+    max_batch_bytes: int = 6 * 1024 * 1024,
+    checkpoint_every: int = 2000,
+    limit: Optional[int] = None,
+):
+    with open(json_path, "r", encoding="utf-8") as f:
+        midi_paths: List[str] = json.load(f)
+
+    if limit is not None and limit > 0:
+        midi_paths = midi_paths[:limit]
+
+    start_indices = []
+    all_model_keys = []
+    for sess, r_url, m_keys in endpoints:
+        all_model_keys.extend(m_keys)
+        r_init = sess.post(
+            f"{r_url}/tok_init_split",
+            json={
+                "out_dir": remote_out_dir,
+                "split": split,
+                "models": m_keys,
+                "resume": resume,
+                "require_drive": require_drive,
+            },
+            timeout=60,
+        )
+        if r_init.status_code != 200:
+            raise RuntimeError(f"Failed to initialize split '{split}' on Colab ({r_url}): {r_init.text}")
+        init_info = r_init.json()
+        start_indices.append(int(init_info["start_idx"]))
+
+    start_idx = min(start_indices)
+    total_files = len(midi_paths)
+
+    if start_idx >= total_files:
+        print(f"[{split}] Already completed on Google Drive ({start_idx}/{total_files} files). Skipping.", flush=True)
+        return
+
+    ep_desc = " & ".join(f"{u}({','.join(mk)})" for _, u, mk in endpoints)
+    print(
+        f"[{split}] Processing {total_files - start_idx:,} / {total_files:,} MIDI files "
+        f"(starting from index {start_idx}) -> [{ep_desc}] -> {remote_out_dir}",
+        flush=True,
+    )
+
+    tasks = [(idx, midi_paths[idx], min_chunks) for idx in range(start_idx, total_files)]
+    pending_events: List[Tuple[str, int, str, int, Optional[bytes]]] = []
+    pending_chunks = 0
+    pending_bytes = 0
+    processed_since_ckpt = 0
+
+    pbar = tqdm(total=total_files, initial=start_idx, desc=f"Colab Tokenizing [{split}]", unit="song", dynamic_ncols=True)
+
+    if num_workers > 0:
+        mp_ctx = mp.get_context("spawn")
+        pool = mp_ctx.Pool(processes=num_workers, maxtasksperchild=250)
+    else:
+        pool = None
+
+    sender_exec = ThreadPoolExecutor(max_workers=max(2, len(endpoints)), thread_name_prefix="colab_sender")
+    in_flight_sends: List[Any] = []
+
+    def _mirror_local_states(states_dict: Dict[str, Any]):
+        if not local_state_dir:
+            return
+        for m_key, st in states_dict.items():
+            mdir = Path(local_state_dir) / m_key
+            mdir.mkdir(parents=True, exist_ok=True)
+            spath = mdir / f"{split}_state.json"
+            tmp_s = str(spath) + ".tmp"
+            with open(tmp_s, "w", encoding="utf-8") as sf:
+                json.dump(st, sf, indent=2, ensure_ascii=False)
+            os.replace(tmp_s, spath)
+
+    def _wait_previous_sends():
+        nonlocal in_flight_sends
+        if not in_flight_sends:
+            return
+        combined_states = {}
+        any_flushed = False
+        for fut in in_flight_sends:
+            resp = fut.result()
+            st_map = resp.get("states", {})
+            combined_states.update(st_map)
+            if resp.get("flushed"):
+                any_flushed = True
+                _mirror_local_states(st_map)
+        in_flight_sends = []
+        if combined_states:
+            st0 = combined_states[all_model_keys[0]]
+            pbar.set_postfix(
+                valid=st0["valid_songs"],
+                skip=st0["skipped_songs"],
+                M_tok=f"{st0['total_tokens'] / 1e6:.2f}M",
+                drive="ok" if any_flushed else "buf",
+            )
+
+    def _dispatch_batch(payload: bytes, flush_now: bool):
+        nonlocal in_flight_sends
+        in_flight_sends = [
+            sender_exec.submit(
+                _send_remote_batch,
+                sess,
+                r_url,
+                payload,
+                gpu_batch_chunks,
+                flush_now,
+            )
+            for sess, r_url, _ in endpoints
+        ]
+
+    try:
+        for midi_idx, midi_path, n_chunks, comp_bytes in _bounded_midi_iter(tasks, num_workers, pool):
+            if comp_bytes is None:
+                pending_events.append(("skip", midi_idx, midi_path, 0, None))
+                pending_bytes += 32
+            else:
+                pending_events.append(("song", midi_idx, midi_path, n_chunks, comp_bytes))
+                pending_chunks += n_chunks
+                pending_bytes += len(comp_bytes) + 128
+
+            processed_since_ckpt += 1
+            pbar.update(1)
+
+            need_ckpt = processed_since_ckpt >= checkpoint_every
+            if (
+                pending_chunks >= remote_batch_chunks
+                or pending_bytes >= max_batch_bytes
+                or (need_ckpt and len(pending_events) >= 128)
+            ):
+                _wait_previous_sends()
+                payload = _pack_remote_batch(pending_events)
+                flush_now = need_ckpt
+                if flush_now:
+                    processed_since_ckpt = 0
+                _dispatch_batch(payload, flush_now)
+                pending_events.clear()
+                pending_chunks = 0
+                pending_bytes = 0
+
+        if pending_events:
+            _wait_previous_sends()
+            payload = _pack_remote_batch(pending_events)
+            _dispatch_batch(payload, True)
+            pending_events.clear()
+            pending_chunks = 0
+            pending_bytes = 0
+
+        _wait_previous_sends()
+
+        fin_states = {}
+        fin_sizes = {}
+        for sess, r_url, _ in endpoints:
+            r_fin = sess.post(f"{r_url}/tok_finish_split", timeout=180)
+            r_fin.raise_for_status()
+            fin_info = r_fin.json()
+            fin_states.update(fin_info.get("states", {}))
+            fin_sizes.update(fin_info.get("sizes_mb", {}))
+        _mirror_local_states(fin_states)
+
+    except BaseException:
+        if pool is not None:
+            pool.terminate()
+            pool.join()
+            pool = None
+        raise
+
+    finally:
+        pbar.close()
+        sender_exec.shutdown(wait=False, cancel_futures=True)
+        if pool is not None:
+            pool.close()
+            pool.join()
+
+    for m_key in all_model_keys:
+        st = fin_states[m_key]
+        sz_mb = fin_sizes[m_key]
+        print(
+            f"  -> [GoogleDrive: {remote_out_dir}/{m_key} / {split}] "
+            f"valid_songs={st['valid_songs']:,}, skipped={st['skipped_songs']:,}, "
+            f"total_chunks={st['total_chunks']:,}, total_tokens={st['total_tokens']:,} ({sz_mb:.2f} MB)",
+            flush=True,
+        )
+
+
 def process_split_remote(
     session: requests.Session,
     remote_url: str,
@@ -1145,158 +1364,21 @@ def process_split_remote(
     checkpoint_every: int = 1000,
     limit: Optional[int] = None,
 ):
-    with open(json_path, "r", encoding="utf-8") as f:
-        midi_paths: List[str] = json.load(f)
-
-    if limit is not None and limit > 0:
-        midi_paths = midi_paths[:limit]
-
-    r_init = session.post(
-        f"{remote_url}/tok_init_split",
-        json={
-            "out_dir": remote_out_dir,
-            "split": split,
-            "models": model_keys,
-            "resume": resume,
-            "require_drive": require_drive,
-        },
-        timeout=60,
+    process_split_remote_endpoints(
+        endpoints=[(session, remote_url, model_keys)],
+        remote_out_dir=remote_out_dir,
+        local_state_dir=local_state_dir,
+        split=split,
+        json_path=json_path,
+        resume=resume,
+        require_drive=require_drive,
+        num_workers=num_workers,
+        min_chunks=min_chunks,
+        gpu_batch_chunks=gpu_batch_chunks,
+        remote_batch_chunks=remote_batch_chunks,
+        checkpoint_every=checkpoint_every,
+        limit=limit,
     )
-    if r_init.status_code != 200:
-        raise RuntimeError(f"Failed to initialize split '{split}' on Colab: {r_init.text}")
-    init_info = r_init.json()
-    start_idx = int(init_info["start_idx"])
-    total_files = len(midi_paths)
-
-    if start_idx >= total_files:
-        print(f"[{split}] Already completed on Google Drive ({start_idx}/{total_files} files). Skipping.", flush=True)
-        return
-
-    print(
-        f"[{split}] Processing {total_files - start_idx:,} / {total_files:,} MIDI files "
-        f"(starting from index {start_idx}) -> Colab GPU -> {remote_out_dir}",
-        flush=True,
-    )
-
-    tasks = [(idx, midi_paths[idx], min_chunks) for idx in range(start_idx, total_files)]
-    pending_events: List[Tuple[str, int, str, int, Optional[bytes]]] = []
-    pending_chunks = 0
-    processed_since_ckpt = 0
-
-    pbar = tqdm(total=total_files, initial=start_idx, desc=f"Colab Tokenizing [{split}]", unit="song", dynamic_ncols=True)
-
-    if num_workers > 0:
-        mp_ctx = mp.get_context("spawn")
-        pool = mp_ctx.Pool(processes=num_workers, maxtasksperchild=250)
-    else:
-        pool = None
-
-    sender_exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="colab_sender")
-    in_flight_send = None
-
-    def _mirror_local_states(states_dict: Dict[str, Any]):
-        if not local_state_dir:
-            return
-        for m_key, st in states_dict.items():
-            mdir = Path(local_state_dir) / m_key
-            mdir.mkdir(parents=True, exist_ok=True)
-            spath = mdir / f"{split}_state.json"
-            tmp_s = str(spath) + ".tmp"
-            with open(tmp_s, "w", encoding="utf-8") as sf:
-                json.dump(st, sf, indent=2, ensure_ascii=False)
-            os.replace(tmp_s, spath)
-
-    def _wait_previous_send():
-        nonlocal in_flight_send
-        if in_flight_send is None:
-            return
-        resp = in_flight_send.result()
-        in_flight_send = None
-        states = resp.get("states", {})
-        if resp.get("flushed"):
-            _mirror_local_states(states)
-        if states:
-            st0 = states[model_keys[0]]
-            pbar.set_postfix(
-                valid=st0["valid_songs"],
-                skip=st0["skipped_songs"],
-                M_tok=f"{st0['total_tokens'] / 1e6:.2f}M",
-                drive="ok" if resp.get("flushed") else "buf",
-            )
-
-    try:
-        for midi_idx, midi_path, n_chunks, comp_bytes in _bounded_midi_iter(tasks, num_workers, pool):
-            if comp_bytes is None:
-                pending_events.append(("skip", midi_idx, midi_path, 0, None))
-            else:
-                pending_events.append(("song", midi_idx, midi_path, n_chunks, comp_bytes))
-                pending_chunks += n_chunks
-
-            processed_since_ckpt += 1
-            pbar.update(1)
-
-            need_ckpt = processed_since_ckpt >= checkpoint_every
-            if pending_chunks >= remote_batch_chunks or (need_ckpt and len(pending_events) >= 64):
-                _wait_previous_send()
-                payload = _pack_remote_batch(pending_events)
-                flush_now = need_ckpt
-                if flush_now:
-                    processed_since_ckpt = 0
-                in_flight_send = sender_exec.submit(
-                    _send_remote_batch,
-                    session,
-                    remote_url,
-                    payload,
-                    gpu_batch_chunks,
-                    flush_now,
-                )
-                pending_events.clear()
-                pending_chunks = 0
-
-        if pending_events:
-            _wait_previous_send()
-            payload = _pack_remote_batch(pending_events)
-            in_flight_send = sender_exec.submit(
-                _send_remote_batch,
-                session,
-                remote_url,
-                payload,
-                gpu_batch_chunks,
-                True,
-            )
-            pending_events.clear()
-            pending_chunks = 0
-
-        _wait_previous_send()
-
-        r_fin = session.post(f"{remote_url}/tok_finish_split", timeout=120)
-        r_fin.raise_for_status()
-        fin_info = r_fin.json()
-        _mirror_local_states(fin_info.get("states", {}))
-
-    except BaseException:
-        if pool is not None:
-            pool.terminate()
-            pool.join()
-            pool = None
-        raise
-
-    finally:
-        pbar.close()
-        sender_exec.shutdown(wait=False, cancel_futures=True)
-        if pool is not None:
-            pool.close()
-            pool.join()
-
-    for m_key in model_keys:
-        st = fin_info["states"][m_key]
-        sz_mb = fin_info["sizes_mb"][m_key]
-        print(
-            f"  -> [GoogleDrive: {remote_out_dir}/{m_key} / {split}] "
-            f"valid_songs={st['valid_songs']:,}, skipped={st['skipped_songs']:,}, "
-            f"total_chunks={st['total_chunks']:,}, total_tokens={st['total_tokens']:,} ({sz_mb:.2f} MB)",
-            flush=True,
-        )
 
 
 def load_midivision_model(config_path: str, ckpt_path: str, device: Any) -> Tuple[Any, MORTM5Args]:
@@ -1681,9 +1763,9 @@ def main():
     parser = argparse.ArgumentParser(description="Convert MIDI files into MORTM5 MidiVision flat binary token datasets.")
     parser.add_argument(
         "--remote_url",
-        type=str,
+        nargs="+",
         default=None,
-        help="Colab Remote GPU Worker tunnel URL (when set, tokenizes on Colab GPU and saves directly to Google Drive).",
+        help="One or more Colab Remote GPU Worker tunnel URLs (if 2 URLs given for 2 models, assigns 1 model per GPU session and broadcasts in parallel).",
     )
     parser.add_argument(
         "--remote_out_dir",
@@ -1719,11 +1801,12 @@ def main():
     parser.add_argument("--train_json", type=str, default=DEFAULT_SPLITS["train"])
     parser.add_argument("--val_json", type=str, default=DEFAULT_SPLITS["val"])
     parser.add_argument("--device", type=str, default="auto", help="Local device (auto, cuda:0, mps, cpu).")
-    parser.add_argument("--num_workers", type=int, default=8, help="Number of CPU worker processes for MIDI parsing.")
+    parser.add_argument("--num_workers", type=int, default=14, help="Number of CPU worker processes for MIDI parsing.")
     parser.add_argument("--min_chunks", type=int, default=8, help="Minimum chunks (8 chunks = 1 bar) required to keep a song.")
-    parser.add_argument("--gpu_batch_chunks", type=int, default=1024, help="Number of chunks per GPU forward batch.")
-    parser.add_argument("--remote_batch_chunks", type=int, default=4096, help="Number of chunks per HTTP batch sent to Colab.")
-    parser.add_argument("--checkpoint_every", type=int, default=1000, help="Flush state & offsets to disk/Drive every N songs.")
+    parser.add_argument("--gpu_batch_chunks", type=int, default=4096, help="Number of chunks per GPU forward batch.")
+    parser.add_argument("--remote_batch_chunks", type=int, default=180000, help="Max chunks per HTTP batch sent to Colab.")
+    parser.add_argument("--max_batch_mb", type=float, default=6.2, help="Max compressed payload MB per HTTP batch sent to Colab.")
+    parser.add_argument("--checkpoint_every", type=int, default=2000, help="Flush state & offsets to disk/Drive every N songs.")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit on number of MIDI files per split.")
     parser.add_argument("--no_resume", action="store_true", help="Start from scratch instead of resuming.")
     parser.add_argument("--selftest", action="store_true", help="Run end-to-end verification self-test and exit.")
@@ -1740,24 +1823,34 @@ def main():
         return
 
     if args.remote_url:
-        remote_url = args.remote_url.rstrip("/")
-        session = requests.Session()
-        init_remote_colab_worker(session, remote_url, args.models)
+        urls = [u.rstrip("/") for u in args.remote_url]
+        endpoints: List[Tuple[requests.Session, str, List[str]]] = []
+        if len(urls) >= 2 and len(args.models) >= 2:
+            for idx, m_key in enumerate(args.models):
+                u = urls[idx % len(urls)]
+                sess = requests.Session()
+                init_remote_colab_worker(sess, u, [m_key])
+                endpoints.append((sess, u, [m_key]))
+        else:
+            sess = requests.Session()
+            init_remote_colab_worker(sess, urls[0], args.models)
+            endpoints.append((sess, urls[0], args.models))
+
+        max_batch_bytes = int(args.max_batch_mb * 1024 * 1024)
         for split in args.splits:
-            process_split_remote(
-                session=session,
-                remote_url=remote_url,
+            process_split_remote_endpoints(
+                endpoints=endpoints,
                 remote_out_dir=args.remote_out_dir,
                 local_state_dir=args.out_dir,
                 split=split,
                 json_path=split_json_map[split],
-                model_keys=args.models,
                 resume=(not args.no_resume),
                 require_drive=(not args.allow_unmounted_drive),
                 num_workers=args.num_workers,
                 min_chunks=args.min_chunks,
                 gpu_batch_chunks=args.gpu_batch_chunks,
                 remote_batch_chunks=args.remote_batch_chunks,
+                max_batch_bytes=max_batch_bytes,
                 checkpoint_every=args.checkpoint_every,
                 limit=args.limit,
             )
