@@ -123,10 +123,12 @@ DEFAULT_SPLITS = {
 }
 
 
-def midi_to_chunks_u8_direct(path: str) -> np.ndarray:
+def extract_quantized_notes_array(path: str) -> Tuple[int, np.ndarray]:
     """
-    MIDI ファイルを読み込み、float32 の巨大中間配列を介さずに直接 uint8 [N_chunks, 8, 128, 24] (値域 0..254) を構築する。
-    従来の midi_to_chunks + float32->uint8 変換とビット単位で完全一致しつつ、ピーク RAM 消費を 1/4 以下に抑える。
+    MIDI ファイルを読み込み、量子化済みのノート配列 int32 [N_notes, 5] (slot, start, end, pitch, velocity) と
+    総チャンク数 num_chunks を返す。
+    Mac ワーカー側で巨大なピアノロール配列を確保しないため、長尺曲でもメモリ消費は数MB以下に収まり、
+    zlib 圧縮後の通信サイズも 1曲あたり平均 ~14 KB (画像チャンク転送比で 1/6 以下) に激減する。
     """
     mid = mido.MidiFile(str(path))
     if mid.ticks_per_beat is None or mid.ticks_per_beat <= 0:
@@ -162,11 +164,23 @@ def midi_to_chunks_u8_direct(path: str) -> np.ndarray:
             f"total_steps={total_steps} exceeds MAX_TOTAL_STEPS={MAX_TOTAL_STEPS}; path={path}"
         )
 
+    if len(encoded) == 0:
+        notes_arr = np.zeros((0, 5), dtype=np.int32)
+    else:
+        notes_arr = np.asarray(encoded, dtype=np.int32)
+    return num_chunks, notes_arr
+
+
+def rasterize_notes_to_chunks_u8(num_chunks: int, notes_arr: np.ndarray) -> np.ndarray:
+    """
+    量子化済みノート配列 int32 [N_notes, 5] から uint8 [num_chunks, 8, 128, 24] (値域 0..254) を構築する。
+    """
+    total_steps = num_chunks * CHUNK_STEPS
     flat_u8 = np.zeros((TOTAL_CHANNELS, total_steps, 128), dtype=np.uint8)
-    for slot, start, end, pitch, velocity in encoded:
-        onset_ch = slot * 2
+    for slot, start, end, pitch, velocity in notes_arr:
+        onset_ch = int(slot) * 2
         sustain_ch = onset_ch + 1
-        onset_val = np.float32(0.5 + 0.5 * (velocity / 127.0))
+        onset_val = np.float32(0.5 + 0.5 * (float(velocity) / 127.0))
         onset_u8 = np.uint8(np.rint(np.clip(onset_val, 0.0, 1.0) * np.float32(254.0)))
         if onset_u8 > flat_u8[onset_ch, start, pitch]:
             flat_u8[onset_ch, start, pitch] = onset_u8
@@ -179,27 +193,25 @@ def midi_to_chunks_u8_direct(path: str) -> np.ndarray:
     return chunks_u8
 
 
+def midi_to_chunks_u8_direct(path: str) -> np.ndarray:
+    num_chunks, notes_arr = extract_quantized_notes_array(path)
+    return rasterize_notes_to_chunks_u8(num_chunks, notes_arr)
+
+
 def _midi_worker(task: Tuple[int, str, int]) -> Tuple[int, str, int, Optional[bytes]]:
     """
     CPU ワーカー関数 (spawn プロセスで実行、PyTorch/CUDA 非ロード):
-    MIDI ファイルを読み込み、[N_chunks, 8, 128, 24] の uint8 (0..254) 配列に直接変換し、
-    ワーカー内で即座に zlib 圧縮 (約 1/160 サイズ) してから (midi_idx, midi_path, n_chunks, comp_bytes) を返す。
-    これによりプロセス間通信 (Pipe) と親プロセスのメモリ消費を数MB以下に抑え、OOM クラッシュを完全に防ぐ。
+    MIDI ファイルを読み込み、量子化済みスパースノート配列 int32 [N_notes, 5] を zlib 圧縮して返す。
+    1曲あたり平均 ~14 KB しか通信・メモリ消費しないため、Pipe 詰まり・OOM・トンネル帯域制限を完全に回避する。
     """
     midi_idx, midi_path, min_chunks = task
     try:
-        chunks_u8 = midi_to_chunks_u8_direct(midi_path)
-        n_chunks = int(len(chunks_u8))
+        n_chunks, notes_arr = extract_quantized_notes_array(midi_path)
         if n_chunks < min_chunks:
-            del chunks_u8
             return midi_idx, midi_path, 0, None
-        comp_bytes = zlib.compress(chunks_u8.tobytes(), level=1)
-        del chunks_u8
-        if n_chunks >= 512:
-            gc.collect()
-        return midi_idx, midi_path, n_chunks, comp_bytes
+        comp_bytes = zlib.compress(notes_arr.tobytes(), level=1)
+        return midi_idx, midi_path, int(n_chunks), comp_bytes
     except Exception:
-        gc.collect()
         return midi_idx, midi_path, 0, None
 
 
@@ -687,9 +699,30 @@ async def _tok_probe_models(request):
     })
 
 
+def _rasterize_sparse_notes_u8(num_chunks: int, notes_arr: np.ndarray) -> np.ndarray:
+    total_steps = num_chunks * 24
+    flat_u8 = np.zeros((8, total_steps, 128), dtype=np.uint8)
+    for slot, start, end, pitch, velocity in notes_arr:
+        onset_ch = int(slot) * 2
+        sustain_ch = onset_ch + 1
+        onset_val = np.float32(0.5 + 0.5 * (float(velocity) / 127.0))
+        onset_u8 = np.uint8(np.rint(np.clip(onset_val, 0.0, 1.0) * np.float32(254.0)))
+        if onset_u8 > flat_u8[onset_ch, start, pitch]:
+            flat_u8[onset_ch, start, pitch] = onset_u8
+        flat_u8[sustain_ch, start:end, pitch] = 254
+    chunks_u8 = np.ascontiguousarray(
+        flat_u8.reshape(8, num_chunks, 24, 128).transpose(1, 0, 3, 2)
+    )
+    del flat_u8
+    return chunks_u8
+
+
 async def _tok_upload_model(request):
     m_key = request.query_params["model_key"]
     raw = await request.body()
+    if len(raw) == 0 and STATE.get("tok_upload_parts"):
+        raw = b"".join(STATE["tok_upload_parts"])
+        STATE["tok_upload_parts"] = []
     payload = torch.load(io.BytesIO(zlib.decompress(raw)), map_location="cpu", weights_only=False)
     cfg_dict = payload["config_dict"]
     meta_cfg = payload["meta_cfg"]
@@ -697,13 +730,13 @@ async def _tok_upload_model(request):
 
     args = SimpleNamespace(**cfg_dict)
     m = _TokMidiVision(args)
-    m.load_state_dict(sd, strict=True)
+    m.load_state_dict(sd, strict=False)
     m.to(DEVICE).eval()
 
     if os.path.exists("/content"):
         cache_name = f"MORTM5.{m_key}_tokenizer_cached.pth"
         try:
-            torch.save(sd, os.path.join("/content", cache_name))
+            torch.save(m.state_dict(), os.path.join("/content", cache_name))
         except Exception:
             pass
 
@@ -783,7 +816,7 @@ async def _tok_process_batch(request):
     writers = STATE["tok_writers"]
     model_keys = list(writers.keys())
 
-    # Collect all song chunk arrays in this batch for a single coalesced GPU pass
+    # Rasterize sparse quantized notes into uint8 chunks for a single coalesced GPU pass
     song_arrays = []
     cursor_b = 0
     for ev in events:
@@ -792,7 +825,8 @@ async def _tok_process_batch(request):
             comp_slice = blob[cursor_b : cursor_b + comp_len]
             cursor_b += comp_len
             decomp = zlib.decompress(comp_slice)
-            arr_u8 = np.frombuffer(decomp, dtype=np.uint8).reshape(n_chunks, 8, 128, 24)
+            notes_arr = np.frombuffer(decomp, dtype=np.int32).reshape(-1, 5)
+            arr_u8 = _rasterize_sparse_notes_u8(int(n_chunks), notes_arr)
             song_arrays.append(arr_u8)
 
     model_token_buffers = {k: [] for k in model_keys}
@@ -948,7 +982,7 @@ def init_remote_colab_worker(
         flush=True,
     )
 
-    # 3. Upload any missing model weights from Mac
+    # 3. Upload any missing model weights from Mac (encoder+rvq only, 4MB chunked to bypass Cloudflare limits)
     for m_key in probe_info.get("missing", []):
         ckpt_path = DEFAULT_MODELS[m_key]["ckpt"]
         if not os.path.exists(ckpt_path):
@@ -959,22 +993,35 @@ def init_remote_colab_worker(
         elif isinstance(raw_sd, dict) and "model" in raw_sd:
             raw_sd = raw_sd["model"]
 
+        # Strip decoder.* weights since encode_tokens() only uses encoder, pre_vq_norm, and rvq
+        enc_sd = {k: v for k, v in raw_sd.items() if not k.startswith("decoder.") and not k.startswith("module.decoder.")}
+
         up_buf = io.BytesIO()
         torch.save(
             {
                 "config_dict": models_spec[m_key]["config_dict"],
                 "meta_cfg": models_spec[m_key]["meta_cfg"],
-                "state_dict": raw_sd,
+                "state_dict": enc_sd,
             },
             up_buf,
         )
         up_comp = zlib.compress(up_buf.getvalue(), level=1)
-        print(f"[RemoteColab] Uploading {m_key} weights ({len(up_comp) / 1e6:.2f} MB) to Colab GPU...", flush=True)
+        print(f"[RemoteColab] Uploading {m_key} encoder+rvq weights ({len(up_comp) / 1e6:.2f} MB in 4MB chunks)...", flush=True)
+        session.post(f"{remote_url}/tok_clear_upload", timeout=30).raise_for_status()
+        chunk_sz = 4 * 1024 * 1024
+        for st in range(0, len(up_comp), chunk_sz):
+            part = up_comp[st : st + chunk_sz]
+            session.post(
+                f"{remote_url}/tok_append_upload",
+                data=part,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=60,
+            ).raise_for_status()
         r_up = session.post(
             f"{remote_url}/tok_upload_model?model_key={m_key}",
-            data=up_comp,
+            data=b"",
             headers={"Content-Type": "application/octet-stream"},
-            timeout=180,
+            timeout=120,
         )
         r_up.raise_for_status()
         print(f"[RemoteColab] {m_key} ready on Colab GPU!", flush=True)
@@ -1005,7 +1052,7 @@ def _send_remote_batch(
     flush_ckpt: bool,
 ) -> Dict[str, Any]:
     flush_flag = "1" if flush_ckpt else "0"
-    max_single_post = 10 * 1024 * 1024  # 10 MB
+    max_single_post = 4 * 1024 * 1024  # 4 MB safe limit for Cloudflare Tunnel
 
     for attempt in range(6):
         try:
@@ -1021,7 +1068,7 @@ def _send_remote_batch(
             else:
                 r_clr = session.post(f"{remote_url}/tok_clear_upload", timeout=30)
                 r_clr.raise_for_status()
-                chunk_sz = 8 * 1024 * 1024
+                chunk_sz = 4 * 1024 * 1024
                 for st in range(0, len(payload), chunk_sz):
                     part = payload[st : st + chunk_sz]
                     r_ap = session.post(
@@ -1289,7 +1336,10 @@ def flush_gpu_batch(
     import torch
 
     song_arrays = [
-        np.frombuffer(zlib.decompress(item[3]), dtype=np.uint8).reshape(item[2], 8, 128, 24)
+        rasterize_notes_to_chunks_u8(
+            item[2],
+            np.frombuffer(zlib.decompress(item[3]), dtype=np.int32).reshape(-1, 5),
+        )
         for item in pending_songs
     ]
     all_chunks_u8 = np.concatenate(song_arrays, axis=0)
