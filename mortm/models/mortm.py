@@ -11,7 +11,7 @@ import loralib.layers as lora
 from .modules.progress import LearningProgress
 from .modules.config import MORTMArgs
 from .modules.layers import MORTMDecoder, PMA
-from flash_attn.bert_padding import pad_input, unpad_input
+from .modules.attention import pad_input, unpad_input
 
 from ..train.tokenizer import Tokenizer
 
@@ -41,7 +41,7 @@ class MORTM(nn.Module):
         _shared_lora = getattr(args, "use_shared_expert_lora", getattr(args, "use_shared_ffn_lora", False))
         print(f"Use LoRA Selection: Attention LoRA: {args.use_attn_lora}, Gate LoRA: {args.use_gate_lora}, FFN LoRA: {args.use_ffn_lora}, Shared Expert LoRA: {_shared_lora}")
 
-        self.decoder = MORTMDecoder(args, progress=progress)
+        self.decoder = MORTMDecoder(args, progress=progress).to(self.progress.get_device())
 
         print(f"Input Vocab Size:{args.vocab_size}")
         self.embedding: nn.Embedding = nn.Embedding(args.vocab_size, self.d_model, padding_idx=0).to(self.progress.get_device())
@@ -72,13 +72,14 @@ class MORTM(nn.Module):
             batch = None
             indices = cu_seqlens = max_s = used_seqlens = None
         #print("\n Seq_length is :",x.shape[0])
-        out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s,
-                           batch_size=batch, indices=indices, is_save_cache=is_save_cache)
+        with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+            out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens, max_seqlen=max_s,
+                               batch_size=batch, indices=indices, is_save_cache=is_save_cache)
         if padding_mask is not None:
             out = pad_input(out, indices, batch, tgt_len)
 
-        with torch.autocast(device_type="cuda", dtype=torch.float32):
-            score: Tensor = self.Wout(out)
+        with torch.autocast(device_type=out.device.type, enabled=False):
+            score: Tensor = self.Wout(out.to(self.Wout.weight.dtype)).float()
         return score
 
     @torch.inference_mode()
@@ -111,7 +112,7 @@ class MORTM(nn.Module):
         if print_log: print("--- Pre-fill Phase ---")
         prompt_padding_mask = (src != self.embedding.padding_idx)
         print(prompt_padding_mask, src)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=src.device.type, dtype=torch.bfloat16):
             logits = self.forward(src, padding_mask=prompt_padding_mask, is_causal=True, is_save_cache=True)
 
         last_token_logits = logits[:, -1, :]
@@ -127,7 +128,7 @@ class MORTM(nn.Module):
         while is_running:
             # 入力は直前に生成されたトークン (B, 1)
             input_tokens = next_tokens
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type=input_tokens.device.type, dtype=torch.bfloat16):
                 logits = self.forward(input_tokens, padding_mask=None, is_causal=True, is_save_cache=True)
 
             # next_tokens は (batch_size,) の形状を持つテンソル
@@ -325,7 +326,7 @@ class MORTM(nn.Module):
             input_mask = None
 
         # 2. モデルに`input_ids`を通して、各ステップのlogitsを取得
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=input_ids.device.type, dtype=torch.bfloat16):
             logits = self.forward(input_ids, padding_mask=input_mask, is_causal=True)
 
         reshaped_logits = logits.view(-1, self.args.vocab_size)
@@ -402,12 +403,12 @@ class ClassificationMORTM(MORTM):
         # pma_out_dim 既定は d_model*2 (従来=E3互換)。過学習抑制のため小さくも指定可(例: d_model)。
         pod = pma_out_dim if pma_out_dim is not None else self.d_model * 2
         self.pma_out_dim = pod
-        self.pma = PMA(self.d_model, pod)
+        self.pma = PMA(self.d_model, pod).to(self.progress.get_device())
         self.classifier = nn.Sequential(
             nn.Linear(pod, self.d_model // 2),
             nn.ReLU(),
             nn.Linear(self.d_model // 2, class_num),
-        )
+        ).to(self.progress.get_device())
 
     def forward(self, x, padding_mask=None, is_causal=False, is_save_cache=False):
         x: Tensor = self.embedding(x).to(dtype=torch.bfloat16)
@@ -419,10 +420,11 @@ class ClassificationMORTM(MORTM):
             batch = None
             indices = cu_seqlens = max_s = used_seqlens = None
 
-        out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens,
-                           max_seqlen=max_s, batch_size=batch, indices=indices,
-                           is_save_cache=is_save_cache)
+        with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+            out = self.decoder(tgt=x, tgt_is_causal=is_causal, cu_seqlens=cu_seqlens,
+                               max_seqlen=max_s, batch_size=batch, indices=indices,
+                               is_save_cache=is_save_cache)
 
-        pooled = self.pma(out, cu_seqlens)   # (batch, d_model*2)
-        cl = self.classifier(pooled)         # (batch, class_num)
-        return cl
+            pooled = self.pma(out, cu_seqlens)   # (batch, d_model*2)
+            cl = self.classifier(pooled)         # (batch, class_num)
+        return cl.float()

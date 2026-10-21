@@ -41,19 +41,34 @@ class MidiVision(nn.Module):
             decay=0.999,
         )
 
+        self.use_pre_vq_norm = getattr(args, "use_pre_vq_norm", True)
         self.decoder = ResNetDecoder(args)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        if any(k.startswith("vq.") for k in state_dict.keys()):
+            self.use_pre_vq_norm = False
+            state_dict = {
+                (k.replace("vq.", "rvq.", 1) if k.startswith("vq.") else k): v
+                for k, v in state_dict.items()
+            }
+        elif "use_pre_vq_norm" not in self.__dict__:
+            self.use_pre_vq_norm = True
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def forward(self, x: Tensor):
         z = self.encoder(x)
-        orig_shape = z.shape
-        # グループ単位で正規化: [..., encoder_wout] -> [..., vq_groups, codebook_dim] -> [..., encoder_wout]
-        z_norm = self.pre_vq_norm(
-            z.reshape(*orig_shape[:-1], self.vq_groups, self.codebook_dim)
-        ).reshape(orig_shape)
+        if getattr(self, "use_pre_vq_norm", True):
+            orig_shape = z.shape
+            # グループ単位で正規化: [..., encoder_wout] -> [..., vq_groups, codebook_dim] -> [..., encoder_wout]
+            z_norm = self.pre_vq_norm(
+                z.reshape(*orig_shape[:-1], self.vq_groups, self.codebook_dim)
+            ).reshape(orig_shape)
+        else:
+            z_norm = z
 
         x_q, tokens, commit_loss = self.rvq(z_norm)
         # GroupedResidualVQ の tokens は [groups, B, (S,), num_quantizers] で返るため
-        # [B, (S,), groups * num_quantizers] (例: [B, 8]) に整形する
+        # [B, (S,), groups * num_quantizers] (例: [B, 8] または [B, 16]) に整形する
         tokens = tokens.movedim(0, -2).flatten(-2)
         commit_loss = commit_loss.mean()
 

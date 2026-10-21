@@ -67,3 +67,4 @@ class MORTM5Args(MORTMArgs):
             self.vq_groups = 4 if data.get("vq_groups") is None else data["vq_groups"]
             self.encoder_layer = 2 if data.get("encoder_layer") is None else data["encoder_layer"]
             self.codebook_size = 1024 if data.get("codebook_size") is None else data["codebook_size"]
+            self.use_pre_vq_norm = True if data.get("use_pre_vq_norm") is None else bool(data["use_pre_vq_norm"])

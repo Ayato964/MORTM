@@ -12,13 +12,285 @@ from .config import MORTMArgs
 
 try:
     from flash_attn.flash_attn_interface import (
-        flash_attn_varlen_qkvpacked_func,
-        flash_attn_kvpacked_func,
-        flash_attn_varlen_kvpacked_func,
-        flash_attn_with_kvcache
+        flash_attn_varlen_qkvpacked_func as _cuda_flash_attn_varlen_qkvpacked_func,
+        flash_attn_kvpacked_func as _cuda_flash_attn_kvpacked_func,
+        flash_attn_varlen_kvpacked_func as _cuda_flash_attn_varlen_kvpacked_func,
+        flash_attn_with_kvcache as _cuda_flash_attn_with_kvcache,
     )
+    from flash_attn.bert_padding import (
+        pad_input as _cuda_pad_input,
+        unpad_input as _cuda_unpad_input,
+    )
+    _HAS_FLASH_ATTN = True
 except ImportError:
-    print("FlashAttention not found. Ensure it is installed for CUDA acceleration.")
+    _HAS_FLASH_ATTN = False
+
+
+def _get_default_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def unpad_input(hidden_states: Tensor, attention_mask: Tensor):
+    if _HAS_FLASH_ATTN and hidden_states.is_cuda:
+        return _cuda_unpad_input(hidden_states, attention_mask)
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = int(seqlens_in_batch.max().item()) if seqlens_in_batch.numel() > 0 else 0
+    cu_seqlens = torch.nn.functional.pad(
+        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+    )
+    unpadded = hidden_states.reshape(-1, *hidden_states.shape[2:])[indices]
+    return unpadded, indices, cu_seqlens, max_seqlen_in_batch, seqlens_in_batch
+
+
+def pad_input(hidden_states: Tensor, indices: Tensor, batch: int, seqlen: int) -> Tensor:
+    if _HAS_FLASH_ATTN and hidden_states.is_cuda:
+        return _cuda_pad_input(hidden_states, indices, batch, seqlen)
+    output = torch.zeros(
+        batch * seqlen,
+        *hidden_states.shape[1:],
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    output[indices] = hidden_states
+    return output.reshape(batch, seqlen, *hidden_states.shape[1:])
+
+
+def _build_alibi_bias(
+    q_len: int,
+    k_len: int,
+    alibi_slopes: Tensor,
+    causal: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    q_pos = torch.arange(k_len - q_len, k_len, device=device)[:, None]
+    k_pos = torch.arange(k_len, device=device)[None, :]
+    rel_pos = -torch.abs(q_pos - k_pos).to(torch.float32)
+    bias = alibi_slopes.to(device=device, dtype=torch.float32)[:, None, None] * rel_pos[None, :, :]
+    if causal:
+        causal_mask = k_pos > q_pos
+        bias = bias.masked_fill(causal_mask[None, :, :], float("-inf"))
+    return bias.unsqueeze(0).to(dtype)
+
+
+def flash_attn_varlen_qkvpacked_func(
+    qkv: Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[Tensor] = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    cu_seqlens: Optional[Tensor] = None,
+    max_seqlen: Optional[int] = None,
+) -> Tensor:
+    if _HAS_FLASH_ATTN and qkv.is_cuda:
+        return _cuda_flash_attn_varlen_qkvpacked_func(
+            qkv,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+        )
+    cu = cu_seqlens.detach().cpu().tolist()
+    outs = []
+    for i in range(len(cu) - 1):
+        s, e = int(cu[i]), int(cu[i + 1])
+        if e <= s:
+            continue
+        q_i, k_i, v_i = qkv[s:e].unbind(dim=1)
+        q_i = q_i.permute(1, 0, 2).unsqueeze(0)
+        k_i = k_i.permute(1, 0, 2).unsqueeze(0)
+        v_i = v_i.permute(1, 0, 2).unsqueeze(0)
+        L = e - s
+        if alibi_slopes is not None:
+            attn_mask = _build_alibi_bias(L, L, alibi_slopes, causal, qkv.device, qkv.dtype)
+            o_i = torch.nn.functional.scaled_dot_product_attention(
+                q_i, k_i, v_i, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=softmax_scale
+            )
+        else:
+            o_i = torch.nn.functional.scaled_dot_product_attention(
+                q_i, k_i, v_i, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
+            )
+        outs.append(o_i.squeeze(0).permute(1, 0, 2))
+    if not outs:
+        return torch.empty((0, qkv.shape[2], qkv.shape[3]), device=qkv.device, dtype=qkv.dtype)
+    return torch.cat(outs, dim=0)
+
+
+def flash_attn_varlen_kvpacked_func(
+    q: Tensor,
+    kv: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[Tensor] = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+) -> Tensor:
+    if _HAS_FLASH_ATTN and q.is_cuda:
+        return _cuda_flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+        )
+    cu_q = cu_seqlens_q.detach().cpu().tolist()
+    cu_k = cu_seqlens_k.detach().cpu().tolist()
+    outs = []
+    for i in range(len(cu_q) - 1):
+        sq, eq = int(cu_q[i]), int(cu_q[i + 1])
+        sk, ek = int(cu_k[i]), int(cu_k[i + 1])
+        if eq <= sq:
+            continue
+        if ek <= sk:
+            outs.append(torch.zeros((eq - sq, q.shape[1], q.shape[2]), device=q.device, dtype=q.dtype))
+            continue
+        q_i = q[sq:eq].permute(1, 0, 2).unsqueeze(0)
+        k_i, v_i = kv[sk:ek].unbind(dim=1)
+        k_i = k_i.permute(1, 0, 2).unsqueeze(0)
+        v_i = v_i.permute(1, 0, 2).unsqueeze(0)
+        Lq, Lk = eq - sq, ek - sk
+        if alibi_slopes is not None:
+            attn_mask = _build_alibi_bias(Lq, Lk, alibi_slopes, causal, q.device, q.dtype)
+            o_i = torch.nn.functional.scaled_dot_product_attention(
+                q_i, k_i, v_i, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=softmax_scale
+            )
+        else:
+            o_i = torch.nn.functional.scaled_dot_product_attention(
+                q_i, k_i, v_i, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
+            )
+        outs.append(o_i.squeeze(0).permute(1, 0, 2))
+    if not outs:
+        return torch.empty_like(q)
+    return torch.cat(outs, dim=0)
+
+
+def flash_attn_kvpacked_func(
+    q: Tensor,
+    kv: Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[Tensor] = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+) -> Tensor:
+    if _HAS_FLASH_ATTN and q.is_cuda:
+        return _cuda_flash_attn_kvpacked_func(
+            q,
+            kv,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+        )
+    k, v = kv.unbind(dim=2)
+    q_t = q.permute(0, 2, 1, 3)
+    k_t = k.permute(0, 2, 1, 3)
+    v_t = v.permute(0, 2, 1, 3)
+    if alibi_slopes is not None:
+        attn_mask = _build_alibi_bias(q.shape[1], k.shape[1], alibi_slopes, causal, q.device, q.dtype)
+        o_t = torch.nn.functional.scaled_dot_product_attention(
+            q_t, k_t, v_t, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=softmax_scale
+        )
+    else:
+        o_t = torch.nn.functional.scaled_dot_product_attention(
+            q_t, k_t, v_t, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
+        )
+    return o_t.permute(0, 2, 1, 3)
+
+
+def flash_attn_with_kvcache(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    k: Optional[Tensor] = None,
+    v: Optional[Tensor] = None,
+    rotary_cos: Optional[Tensor] = None,
+    rotary_sin: Optional[Tensor] = None,
+    cache_seqlens: Optional[Tensor] = None,
+    cache_batch_idx: Optional[Tensor] = None,
+    block_table: Optional[Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    rotary_interleaved: bool = True,
+    alibi_slopes: Optional[Tensor] = None,
+    num_splits: int = 0,
+) -> Tensor:
+    if _HAS_FLASH_ATTN and q.is_cuda:
+        return _cuda_flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            k=k,
+            v=v,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
+            block_table=block_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            rotary_interleaved=rotary_interleaved,
+            alibi_slopes=alibi_slopes,
+            num_splits=num_splits,
+        )
+    B, Sq, H, D = q.shape
+    outs = []
+    for i in range(B):
+        pos = int(cache_seqlens[i].item()) if cache_seqlens is not None else 0
+        if k is not None and v is not None:
+            k_cache[i, pos : pos + Sq] = k[i]
+            v_cache[i, pos : pos + Sq] = v[i]
+            end_pos = pos + Sq
+        else:
+            end_pos = pos
+        q_i = q[i].permute(1, 0, 2).unsqueeze(0)
+        k_i = k_cache[i, :end_pos].permute(1, 0, 2).unsqueeze(0)
+        v_i = v_cache[i, :end_pos].permute(1, 0, 2).unsqueeze(0)
+        if alibi_slopes is not None:
+            attn_mask = _build_alibi_bias(Sq, end_pos, alibi_slopes, causal and Sq > 1, q.device, q.dtype)
+            o_i = torch.nn.functional.scaled_dot_product_attention(
+                q_i, k_i, v_i, attn_mask=attn_mask, dropout_p=0.0, is_causal=False, scale=softmax_scale
+            )
+        else:
+            o_i = torch.nn.functional.scaled_dot_product_attention(
+                q_i, k_i, v_i, dropout_p=0.0, is_causal=(causal and Sq > 1), scale=softmax_scale
+            )
+        outs.append(o_i.squeeze(0).permute(1, 0, 2))
+    return torch.stack(outs, dim=0)
 
 # ==========================================
 # Helper Functions (RoPE / ALiBi)
@@ -56,7 +328,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
         # cos/sinを [Batch, 1, 1, Dim] に変形
         # これで Batch次元同士が正しく対応し、Heads次元にブロードキャストされます
         cos = cos.unsqueeze(1).unsqueeze(1)
-        sin = sin.unsqueeze(1).unsqueeze(1)
+        sin = cos_sin_expand = sin.unsqueeze(1).unsqueeze(1)
     else:
         # Prefill時: qは [Total, Heads, Dim]
         # cos/sinを [Total, 1, Dim] に変形
@@ -82,17 +354,17 @@ class RotaryEmbedding(nn.Module):
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_position_embeddings = seq_len
         t = torch.arange(self.max_position_embeddings, device=device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
+        freqs = torch.outer(t, self.inv_freq.to(device))
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
     def forward(self, x, seq_len=None):
-        if seq_len > self.max_position_embeddings:
-            self._set_cos_sin_cache(seq_len, x.device, x.dtype)
+        if seq_len > self.max_position_embeddings or self.cos_cached.device != x.device:
+            self._set_cos_sin_cache(max(seq_len, self.max_position_embeddings), x.device, x.dtype)
         return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
+            self.cos_cached[:seq_len].to(device=x.device, dtype=x.dtype),
+            self.sin_cached[:seq_len].to(device=x.device, dtype=x.dtype),
         )
 
 # ==========================================
@@ -156,7 +428,7 @@ class FlashSelfAttentionM(nn.Module):
         self.kv_cache: Optional[Tuple[Tensor, Tensor]] = None
         self.cache_seqlens: Optional[Tensor] = None
 
-        device = progress.get_device() if progress else torch.device("cuda")
+        device = progress.get_device() if progress else _get_default_device()
 
         # RoPE / ALiBi の初期化
         if self.args.use_rope:
@@ -165,7 +437,11 @@ class FlashSelfAttentionM(nn.Module):
             self.alibi_slopes = None
         else:
             # print("FlashSelfAttentionM: Using ALiBi")
-            self.alibi_slopes = torch.tensor(get_alibi_slopes(args.num_heads), dtype=torch.float32, device=device)
+            self.register_buffer(
+                "alibi_slopes",
+                torch.tensor(get_alibi_slopes(args.num_heads), dtype=torch.float32, device=device),
+                persistent=False,
+            )
             self.rotary_emb = None
 
     def _init_kv_cache(self, batch_size, device, dtype):
