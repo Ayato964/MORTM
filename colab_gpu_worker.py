@@ -114,14 +114,16 @@ class MidiVision(nn.Module):
         super().__init__()
         self.encoder = ResNetEncoder(args)
         self.vq_groups = getattr(args, "vq_groups", 4)
+        self.num_quantizers = getattr(args, "encoder_layer", 2)
         self.codebook_dim = args.encoder_wout // self.vq_groups
         self.codebook_size = getattr(args, "codebook_size", 1024)
+        self.token_offset = getattr(args, "token_offset", 3)
         self.pre_vq_norm = nn.LayerNorm(self.codebook_dim, elementwise_affine=False)
         self.rvq = GroupedResidualVQ(
             dim=args.encoder_wout,
             groups=self.vq_groups,
             codebook_dim=self.codebook_dim,
-            num_quantizers=args.encoder_layer,
+            num_quantizers=self.num_quantizers,
             codebook_size=self.codebook_size,
             sync_codebook=False,
             threshold_ema_dead_code=0.05,
@@ -130,14 +132,44 @@ class MidiVision(nn.Module):
             kmeans_iters=10,
             decay=0.999,
         )
+        self.use_pre_vq_norm = getattr(args, "use_pre_vq_norm", True)
         self.decoder = ResNetDecoder(args)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        if any(k.startswith("vq.") for k in state_dict.keys()):
+            self.use_pre_vq_norm = False
+            state_dict = {
+                (k.replace("vq.", "rvq.", 1) if k.startswith("vq.") else k): v
+                for k, v in state_dict.items()
+            }
+        elif "use_pre_vq_norm" not in self.__dict__:
+            self.use_pre_vq_norm = True
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    def _format_rvq_tokens(self, tokens: torch.Tensor, include_offset: bool = True) -> torch.Tensor:
+        offset_base = getattr(self, "token_offset", 3) if include_offset else 0
+        group_offsets = (
+            torch.arange(self.vq_groups, device=tokens.device, dtype=tokens.dtype)
+            * self.codebook_size
+            + offset_base
+        )
+        return (tokens.movedim(0, -1) + group_offsets).flatten(-2)
+
+    @torch.inference_mode()
+    def encode_tokens(self, x: torch.Tensor, include_offset: bool = True) -> torch.Tensor:
+        z = self.encoder(x)
+        if getattr(self, "use_pre_vq_norm", True):
+            orig_shape = z.shape
+            z = self.pre_vq_norm(z.reshape(*orig_shape[:-1], self.vq_groups, self.codebook_dim)).reshape(orig_shape)
+        _, tokens, _ = self.rvq(z)
+        return self._format_rvq_tokens(tokens, include_offset=include_offset)
 
     def forward(self, x: torch.Tensor):
         z = self.encoder(x)
         orig_shape = z.shape
         z_norm = self.pre_vq_norm(z.reshape(*orig_shape[:-1], self.vq_groups, self.codebook_dim)).reshape(orig_shape)
         x_q, tokens, commit_loss = self.rvq(z_norm)
-        tokens = tokens.movedim(0, -2).flatten(-2)
+        tokens = self._format_rvq_tokens(tokens, include_offset=True)
         commit_loss = commit_loss.mean()
         out = self.decoder(x_q)
         return out, tokens, commit_loss
