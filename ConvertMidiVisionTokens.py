@@ -699,6 +699,8 @@ async def _tok_probe_models(request):
     })
 
 
+torch.backends.cudnn.benchmark = True
+
 _ONSET_LUT = np.rint(
     np.clip(
         np.float32(0.5) + np.float32(0.5) * (np.arange(128, dtype=np.float32) / np.float32(127.0)),
@@ -707,6 +709,8 @@ _ONSET_LUT = np.rint(
     )
     * np.float32(254.0)
 ).astype(np.uint8)
+
+_ONSET_LUT_GPU = torch.tensor(_ONSET_LUT, device=DEVICE, dtype=torch.uint8)
 
 
 def _rasterize_sparse_notes_u8(num_chunks: int, notes_arr: np.ndarray) -> np.ndarray:
@@ -728,6 +732,69 @@ def _rasterize_sparse_notes_u8(num_chunks: int, notes_arr: np.ndarray) -> np.nda
     )
     del flat_u8
     return chunks_u8
+
+
+def _rasterize_batch_u8_gpu(total_chunks: int, all_notes_gpu: torch.Tensor) -> torch.Tensor:
+    total_steps = total_chunks * 24
+    flat_u8 = torch.zeros((8, total_steps, 128), device=DEVICE, dtype=torch.uint8)
+    if len(all_notes_gpu) > 0:
+        slots = all_notes_gpu[:, 0]
+        starts = all_notes_gpu[:, 1]
+        ends = all_notes_gpu[:, 2]
+        pitches = all_notes_gpu[:, 3]
+        vels = all_notes_gpu[:, 4]
+
+        onset_chs = slots * 2
+        flat_idx_onset = onset_chs * (total_steps * 128) + starts * 128 + pitches
+        flat_u8.view(-1).scatter_reduce_(0, flat_idx_onset, _ONSET_LUT_GPU[vels], reduce="amax", include_self=True)
+
+        diff = torch.zeros((4, total_steps + 1, 128), device=DEVICE, dtype=torch.int32)
+        flat_idx_s = slots * ((total_steps + 1) * 128) + starts * 128 + pitches
+        flat_idx_e = slots * ((total_steps + 1) * 128) + ends * 128 + pitches
+        ones = torch.ones_like(flat_idx_s, dtype=torch.int32)
+        diff.view(-1).index_add_(0, flat_idx_s, ones)
+        diff.view(-1).index_add_(0, flat_idx_e, -ones)
+        active = diff.cumsum(dim=1)[:, :-1, :] > 0
+        flat_u8[1::2].masked_fill_(active, 254)
+        del diff, active
+    return flat_u8.reshape(8, total_chunks, 24, 128).permute(1, 0, 3, 2).contiguous()
+
+
+def _get_compiled_encoder(m_key: str, model):
+    comp_map = STATE.setdefault("tok_compiled_encoders", {})
+    if m_key not in comp_map:
+        comp_map[m_key] = torch.compile(model.encoder, mode="default")
+    return comp_map[m_key]
+
+
+@torch.inference_mode()
+def _encode_tokens_fast(m_key: str, model, x: torch.Tensor, static_bs: int) -> torch.Tensor:
+    real_n = x.shape[0]
+    if real_n < static_bs and DEVICE.type == "cuda":
+        pad_x = torch.zeros((static_bs, 8, 128, 24), device=x.device, dtype=x.dtype)
+        pad_x[:real_n].copy_(x)
+        x_in = pad_x
+    else:
+        x_in = x
+
+    if x_in.shape[0] == static_bs and DEVICE.type == "cuda":
+        c_enc = _get_compiled_encoder(m_key, model)
+        z = c_enc(x_in)
+    else:
+        z = model.encoder(x_in)
+
+    if real_n < x_in.shape[0]:
+        z = z[:real_n]
+
+    if getattr(model, "use_pre_vq_norm", True):
+        orig_shape = z.shape
+        z = model.pre_vq_norm(z.reshape(*orig_shape[:-1], model.vq_groups, model.codebook_dim)).reshape(orig_shape)
+    _, tokens, _ = model.rvq(z)
+    offset_base = getattr(model, "token_offset", RVQ_TOKEN_OFFSET)
+    group_offsets = (
+        torch.arange(model.vq_groups, device=tokens.device, dtype=tokens.dtype) * model.codebook_size + offset_base
+    )
+    return (tokens.movedim(0, -1) + group_offsets).flatten(-2)
 
 
 async def _tok_upload_model(request):
@@ -755,6 +822,7 @@ async def _tok_upload_model(request):
 
     STATE.setdefault("tok_models", {})[m_key] = m
     STATE.setdefault("tok_metas", {})[m_key] = meta_cfg
+    STATE.setdefault("tok_compiled_encoders", {}).pop(m_key, None)
     return JSONResponse({"status": "uploaded_and_loaded", "model_key": m_key, "device": str(DEVICE)})
 
 
@@ -829,51 +897,68 @@ async def _tok_process_batch(request):
     writers = STATE["tok_writers"]
     model_keys = list(writers.keys())
 
-    # Streamingly rasterize and run GPU forward in windows of gpu_batch_chunks to keep Colab RAM < 200MB even for 500-song batches
-    model_token_buffers = {k: [] for k in model_keys}
-    staged_arrays = []
+    model_token_buffers_gpu = {k: [] for k in model_keys}
+    staged_notes = []
     staged_chunks = 0
+    rast_window_chunks = gpu_batch_chunks * 8
 
-    def _flush_staged_to_gpu():
+    def _flush_staged_notes_to_gpu():
         nonlocal staged_chunks
-        if not staged_arrays:
+        if staged_chunks == 0:
             return
-        cat_u8 = np.concatenate(staged_arrays, axis=0)
-        staged_arrays.clear()
+        if staged_notes:
+            all_notes_np = np.concatenate(staged_notes, axis=0)
+            staged_notes.clear()
+            all_notes_gpu = torch.from_numpy(all_notes_np).to(device=DEVICE, dtype=torch.long)
+        else:
+            all_notes_gpu = torch.empty((0, 5), device=DEVICE, dtype=torch.long)
+
+        cat_u8_gpu = _rasterize_batch_u8_gpu(staged_chunks, all_notes_gpu)
+        del all_notes_gpu
+        n_c = staged_chunks
         staged_chunks = 0
-        n_c = len(cat_u8)
+
         with torch.inference_mode():
             for st in range(0, n_c, gpu_batch_chunks):
                 en = min(st + gpu_batch_chunks, n_c)
-                sub_u8 = torch.from_numpy(cat_u8[st:en]).to(device=DEVICE, non_blocking=True)
-                x = sub_u8.to(dtype=torch.float32).div_(254.0)
+                x = cat_u8_gpu[st:en].to(dtype=torch.float32).div_(254.0)
                 with torch.amp.autocast(device_type=DEVICE.type, dtype=torch.bfloat16, enabled=(DEVICE.type == "cuda")):
                     for m_key in model_keys:
-                        toks = tok_models[m_key].encode_tokens(x, include_offset=True)
-                        toks_u16 = toks.to(dtype=torch.int32).cpu().numpy().astype(np.uint16)
-                        model_token_buffers[m_key].append(toks_u16)
-        del cat_u8
+                        toks = _encode_tokens_fast(m_key, tok_models[m_key], x, gpu_batch_chunks)
+                        model_token_buffers_gpu[m_key].append(toks.to(dtype=torch.int32))
+                del x
+        del cat_u8_gpu
 
     cursor_b = 0
     for ev in events:
         if ev[0] == "song":
             _tag, _midx, _mpath, n_chunks, comp_len = ev
+            n_chunks = int(n_chunks)
             comp_slice = blob[cursor_b : cursor_b + comp_len]
             cursor_b += comp_len
             decomp = zlib.decompress(comp_slice)
             notes_arr = np.frombuffer(decomp, dtype=np.int32).reshape(-1, 5)
-            arr_u8 = _rasterize_sparse_notes_u8(int(n_chunks), notes_arr)
-            staged_arrays.append(arr_u8)
-            staged_chunks += int(n_chunks)
-            if staged_chunks >= gpu_batch_chunks * 2:
-                _flush_staged_to_gpu()
+            if len(notes_arr) > 0:
+                shifted = notes_arr.copy()
+                step_off = staged_chunks * 24
+                shifted[:, 1] += step_off
+                shifted[:, 2] += step_off
+                staged_notes.append(shifted)
+            staged_chunks += n_chunks
+            if staged_chunks >= rast_window_chunks:
+                _flush_staged_notes_to_gpu()
 
-    _flush_staged_to_gpu()
+    _flush_staged_notes_to_gpu()
 
     full_tokens_map = {
-        m_key: (np.concatenate(model_token_buffers[m_key], axis=0) if model_token_buffers[m_key] else None)
+        m_key: (
+            torch.cat(model_token_buffers_gpu[m_key], dim=0).cpu().numpy().astype(np.uint16)
+            if model_token_buffers_gpu[m_key]
+            else None
+        )
         for m_key in model_keys
     }
+    del model_token_buffers_gpu
 
     chunk_cursor = 0
     for ev in events:
@@ -1190,7 +1275,7 @@ def _bounded_midi_iter(tasks: List[Tuple[int, str, int]], num_workers: int, pool
             yield _midi_worker(t)
         return
 
-    max_in_flight = max(16, num_workers * 4)
+    max_in_flight = max(64, num_workers * 16)
     in_flight = deque()
     next_pos = 0
     n_tasks = len(tasks)
@@ -1369,7 +1454,7 @@ class MidiVisionTokenizer:
 
         if self.num_workers > 0:
             mp_ctx = mp.get_context("spawn")
-            pool = mp_ctx.Pool(processes=self.num_workers, maxtasksperchild=250)
+            pool = mp_ctx.Pool(processes=self.num_workers, maxtasksperchild=2000)
         else:
             pool = None
 
@@ -1552,7 +1637,7 @@ class MidiVisionTokenizer:
 
         if self.num_workers > 0:
             mp_ctx = mp.get_context("spawn")
-            pool = mp_ctx.Pool(processes=self.num_workers, maxtasksperchild=250)
+            pool = mp_ctx.Pool(processes=self.num_workers, maxtasksperchild=2000)
         else:
             pool = None
 
