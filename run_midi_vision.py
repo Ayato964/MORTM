@@ -234,6 +234,8 @@ class MidiVisionTrainSet(AbstractTrainSet):
         use_wandb: bool = True,
         project_name: str = "MORTM5_MidiVision",
         run_name: Optional[str] = None,
+        wandb_id: Optional[str] = None,
+        initial_step: int = 0,
     ):
         self.args = args
         self.t_args = t_args
@@ -242,7 +244,7 @@ class MidiVisionTrainSet(AbstractTrainSet):
 
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
-        device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+        device = torch.device(f"cuda:{self.local_rank}") if torch.cuda.is_available() else progress.get_device()
 
         # 1. モデル構築
         model = MidiVision(args)
@@ -286,7 +288,7 @@ class MidiVisionTrainSet(AbstractTrainSet):
         if self.local_rank == 0 and use_wandb:
             try:
                 import wandb
-                wandb.init(
+                wandb_kwargs = dict(
                     project=project_name,
                     name=run_name,
                     config={
@@ -295,12 +297,16 @@ class MidiVisionTrainSet(AbstractTrainSet):
                     },
                     reinit=True,
                 )
+                if wandb_id is not None:
+                    wandb_kwargs["id"] = wandb_id
+                    wandb_kwargs["resume"] = "allow"
+                wandb.init(**wandb_kwargs)
                 self.wandb = wandb
-                print(f"[MidiVision] wandb 連携完了: project='{project_name}', run='{run_name}'")
+                print(f"[MidiVision] wandb 連携完了: project='{project_name}', run='{run_name}' (id={wandb.run.id})")
             except Exception as e:
                 print(f"[MidiVision] wandb 無効化 ({e})。TensorBoard のみで記録を継続します。")
                 self.wandb = None
-        self.global_step = 0
+        self.global_step = initial_step
 
     def get_synced_tokens(self) -> int:
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -374,7 +380,7 @@ class MidiVisionTrainSet(AbstractTrainSet):
 
     def epoch_fc(self, model, pack, progress):
         """Inner Loader の 1 バッチ順伝播"""
-        device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+        device = torch.device(f"cuda:{self.local_rank}") if torch.cuda.is_available() else progress.get_device()
         # pre_processing は 254倍の uint8 で保持しているので GPU 上で float に戻す。
         x = pack[0].to(device, non_blocking=True)  # [B, 8, 128, 24] uint8
         if x.dtype == torch.uint8:
@@ -573,9 +579,17 @@ def main():
             use_wandb=False,
         )
 
-        directory, filenames = find_files(args.data_dir, '.mid')
-        print(f"Found {len(filenames)} MIDI files in {args.data_dir}")
-        if len(filenames) == 0:
+        if args.data_dir.endswith(".json") and os.path.exists(args.data_dir):
+            with open(args.data_dir, "r") as f:
+                all_paths = json.load(f)
+            print(f"Loaded {len(all_paths)} MIDI files from manifest {args.data_dir}")
+            test_paths = all_paths[:4]
+        else:
+            directory, filenames = find_files(args.data_dir, '.mid')
+            print(f"Found {len(filenames)} MIDI files in {args.data_dir}")
+            test_paths = _paths_from_dir_files(directory[:4], filenames[:4])
+
+        if len(test_paths) == 0:
             print("[Warning] No MIDI files found, using synthetic batch.")
             dummy_x = torch.zeros((4, 8, m_args.roll_h, m_args.roll_w))
             dummy_x[:, 1, 60, :12] = 1.0  # Dummy note
@@ -587,7 +601,7 @@ def main():
             print("Dry run passed successfully with synthetic batch!")
             return
 
-        test_pack = [_paths_from_dir_files(directory[:4], filenames[:4])]
+        test_pack = [test_paths]
         ds = trainer.pre_processing(test_pack, progress)
         print(f"Preprocessed chunks: {len(ds)}, item shape: {ds[0][0].shape}")
         loader = DataLoader(ds, batch_size=min(4, len(ds)), shuffle=False)
@@ -607,6 +621,17 @@ def main():
     t_args = TrainArgs(args.train_config)
     progress = _DefaultLearningProgress()
 
+    ckpt_path = os.path.join(args.save_dir, f"{m_args.name}.{args.version}.checkpoint.pt")
+    wandb_id = None
+    initial_step = 0
+    if os.path.exists(ckpt_path):
+        try:
+            header = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            wandb_id = header.get("wandb_run_id")
+            initial_step = int(header.get("optimizer_step", 0))
+        except Exception:
+            pass
+
     trainer = MidiVisionTrainSet(
         args=m_args,
         t_args=t_args,
@@ -616,6 +641,8 @@ def main():
         use_wandb=args.use_wandb,
         project_name=args.project_name,
         run_name=args.version,
+        wandb_id=wandb_id,
+        initial_step=initial_step,
     )
 
     # データソースの準備: .json またはディレクトリからマニフェストを作成

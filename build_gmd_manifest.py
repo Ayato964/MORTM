@@ -2,10 +2,27 @@ import os
 import json
 import random
 
+LOCAL_GMD_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "data", "GMD", "training"))
+
 GMD_DIRS = [
-    ("/mnt/nvme0n1p3/MIDIdatasets/GMD/training/all-instruments-with-drums", "all-instruments-with-drums"),
-    ("/mnt/nvme0n1p3/MIDIdatasets/GMD/training/no-drums", "no-drums"),
-    ("/mnt/nvme0n1p3/MIDIdatasets/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/training-V1.1-80%/drums-only", "drums-only"),
+    (
+        os.path.join(LOCAL_GMD_ROOT, "all-instruments-with-drums")
+        if os.path.exists(os.path.join(LOCAL_GMD_ROOT, "all-instruments-with-drums"))
+        else "/mnt/nvme0n1p3/MIDIdatasets/GMD/training/all-instruments-with-drums",
+        "all-instruments-with-drums",
+    ),
+    (
+        os.path.join(LOCAL_GMD_ROOT, "no-drums")
+        if os.path.exists(os.path.join(LOCAL_GMD_ROOT, "no-drums"))
+        else "/mnt/nvme0n1p3/MIDIdatasets/GMD/training/no-drums",
+        "no-drums",
+    ),
+    (
+        os.path.join(LOCAL_GMD_ROOT, "drums-only")
+        if os.path.exists(os.path.join(LOCAL_GMD_ROOT, "drums-only"))
+        else "/mnt/nvme0n1p3/MIDIdatasets/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/training-V1.1-80%/drums-only",
+        "drums-only",
+    ),
 ]
 
 OUT_DIR = "data/gmd"
@@ -19,8 +36,10 @@ SEED = 42
 def collect_midi_files(directory):
     midi_files = []
     for root, _, files in os.walk(directory):
+        if "__MACOSX" in root:
+            continue
         for f in files:
-            if f.lower().endswith(('.mid', '.midi')):
+            if not f.startswith("._") and f.lower().endswith(('.mid', '.midi')):
                 midi_files.append(os.path.join(root, f))
     return sorted(midi_files)
 

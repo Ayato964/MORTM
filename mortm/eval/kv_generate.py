@@ -27,7 +27,7 @@ def kv_generate(model, prompt, tok, dev, max_measures, p=0.9, temperature=1.0, m
     src = torch.tensor(prompt, dtype=torch.long, device=dev).unsqueeze(0)  # [1, L]
     _reset_kv_cache(model)
     # --- prefill(padding_mask経路: 出力[1,L,V]) ---
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    with torch.autocast(device_type=src.device.type, dtype=torch.bfloat16):
         logits = model.forward(src, padding_mask=(src != 0), is_causal=True, is_save_cache=True)
     nxt = model.top_p_sampling(logits[:, -1, :], p=p, temperature=temperature)
     nid = int(nxt.flatten()[0])
@@ -42,7 +42,7 @@ def kv_generate(model, prompt, tok, dev, max_measures, p=0.9, temperature=1.0, m
         gen.append(nid)
         # --- decode(padding_mask=None経路: 入力は1D[1], 出力[1,V]) ---
         step_in = torch.tensor([nid], dtype=torch.long, device=dev)  # 1D
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=step_in.device.type, dtype=torch.bfloat16):
             logits = model.forward(step_in, padding_mask=None, is_causal=True, is_save_cache=True)  # [1,V]
         nxt = model.top_p_sampling(logits[-1:], p=p, temperature=temperature)
         nid = int(nxt.flatten()[0])
@@ -73,7 +73,7 @@ def kv_generate_batch(model, prompts, tok, dev, max_measures_list, p=0.9, temper
     
     # 1. Prefill
     prompt_padding_mask = (src != 0)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    with torch.autocast(device_type=src.device.type, dtype=torch.bfloat16):
         logits = model.forward(src, padding_mask=prompt_padding_mask, is_causal=True, is_save_cache=True)
         
     # 各バッチの最後のロジットを取り出す [B, V]
@@ -117,7 +117,7 @@ def kv_generate_batch(model, prompts, tok, dev, max_measures_list, p=0.9, temper
         # 2. Decode Step
         step_in = torch.tensor(step_toks, dtype=torch.long, device=dev)  # [B] (1D tensor)
         
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=step_in.device.type, dtype=torch.bfloat16):
             logits = model.forward(step_in, padding_mask=None, is_causal=True, is_save_cache=True)  # [B, V] or [B, 1, V]
             
         nxt = model.top_p_sampling(logits.squeeze(1) if logits.dim() == 3 else logits, p=p, temperature=temperature)  # [B]

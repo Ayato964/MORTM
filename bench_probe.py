@@ -18,8 +18,8 @@ from mortm.models.mortm import ClassificationMORTM, MORTM
 from mortm.models.modules.config import MORTMArgs
 from mortm.models.modules.progress import LearningProgress
 from mortm.models.modules.layers import AttentionPool
+from mortm.models.modules.attention import pad_input, unpad_input
 from eval_analysis_acc import macro_f1
-from flash_attn.bert_padding import pad_input, unpad_input
 
 
 class AttnPoolClassifier(nn.Module):

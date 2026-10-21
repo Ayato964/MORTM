@@ -11,13 +11,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from flash_attn.bert_padding import pad_input, unpad_input
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mortm.train.tokenizer import Tokenizer, get_token_converter_pro, TO_MUSIC
 from mortm.models.mortm import MORTM
+from mortm.models.modules.attention import pad_input, unpad_input
 from mortm.models.modules.config import MORTMArgs
 from mortm.models.modules.progress import LearningProgress
 

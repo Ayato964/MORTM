@@ -49,7 +49,8 @@ class AbstractTrainSet:
         self.optimizer = optimizer
         self.t_args = t_args
         self.calc_val_loss_tokens = calc_val_loss_tokens
-        self.all_tokens = torch.tensor(0, device="cuda", dtype=torch.long)
+        _dev = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        self.all_tokens = torch.tensor(0, device=_dev, dtype=torch.long)
         self.last_val_calc_tokens = 0
         self.args = m_args
 
@@ -126,7 +127,8 @@ class AbstractTrainSet:
             progress.step_optimizer(self.optimizer, self.model, accumulation_steps)
             if self.scheduler is not None:
                 self.scheduler.step()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return return_loss
 
