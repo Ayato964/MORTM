@@ -496,6 +496,8 @@ class _RemoteWriterState:
         self.offsets_list = []
         self.pending_bin_buf = bytearray()
         self.pending_manifest_lines = []
+        self._bin_fp = None
+        self._bytes_since_sync = 0
 
         if resume and self.state_path.exists() and self.tokens_bin_path.exists() and self.offsets_npy_path.exists():
             with open(self.state_path, "r", encoding="utf-8") as f:
@@ -506,34 +508,73 @@ class _RemoteWriterState:
             self.total_chunks = int(state["total_chunks"])
             self.total_tokens = int(state["total_tokens"])
 
+            expected_bytes = self.total_tokens * 2
+            actual_bytes = os.path.getsize(self.tokens_bin_path)
+
+            if bool(state.get("completed", False)) and actual_bytes == expected_bytes:
+                return
+
             loaded_offsets = np.load(self.offsets_npy_path)
             if loaded_offsets.ndim != 2 or loaded_offsets.shape[1] != 2 or len(loaded_offsets) < self.valid_songs:
                 raise RuntimeError(f"[{self.model_key}/{self.split}] Resume offsets mismatch.")
             loaded_offsets = loaded_offsets[: self.valid_songs]
+
+            need_rollback = actual_bytes < expected_bytes
+            if need_rollback:
+                actual_tokens = actual_bytes // 2
+                ends = loaded_offsets[:, 0] + loaded_offsets[:, 1]
+                valid_in_bin = int(np.searchsorted(ends, actual_tokens, side="right"))
+                loaded_offsets = loaded_offsets[:valid_in_bin]
+                self.valid_songs = valid_in_bin
+                self.total_tokens = int(ends[valid_in_bin - 1]) if valid_in_bin > 0 else 0
+                tokens_per_chunk = int(self.meta_cfg["vq_groups"]) * int(self.meta_cfg["vq_layers"])
+                self.total_chunks = self.total_tokens // tokens_per_chunk
+                expected_bytes = self.total_tokens * 2
+
             if self.valid_songs > 0:
                 expected_end_tok = int(loaded_offsets[-1, 0] + loaded_offsets[-1, 1])
                 if expected_end_tok != self.total_tokens:
                     raise RuntimeError(f"[{self.model_key}/{self.split}] Resume total_tokens mismatch.")
             self.offsets_list = [(int(r[0]), int(r[1])) for r in loaded_offsets]
 
-            expected_bytes = self.total_tokens * 2
-            actual_bytes = os.path.getsize(self.tokens_bin_path)
-            if actual_bytes < expected_bytes:
-                raise RuntimeError(f"[{self.model_key}/{self.split}] tokens.bin truncated ({actual_bytes} < {expected_bytes}).")
             if actual_bytes > expected_bytes:
                 with open(self.tokens_bin_path, "r+b") as bf:
                     bf.truncate(expected_bytes)
 
-            if self.manifest_path.exists():
+            if need_rollback and self.manifest_path.exists():
                 lines = []
                 with open(self.manifest_path, "r", encoding="utf-8") as mf:
                     for _ in range(self.valid_songs):
                         line = mf.readline()
                         if not line:
-                            raise RuntimeError(f"[{self.model_key}/{self.split}] manifest.jsonl truncated.")
+                            break
                         lines.append(line)
+                if len(lines) < self.valid_songs:
+                    self.valid_songs = len(lines)
+                    loaded_offsets = loaded_offsets[: self.valid_songs]
+                    self.offsets_list = self.offsets_list[: self.valid_songs]
+                    self.total_tokens = int(loaded_offsets[-1, 0] + loaded_offsets[-1, 1]) if self.valid_songs > 0 else 0
+                    tokens_per_chunk = int(self.meta_cfg["vq_groups"]) * int(self.meta_cfg["vq_layers"])
+                    self.total_chunks = self.total_tokens // tokens_per_chunk
+                    expected_bytes = self.total_tokens * 2
+                    with open(self.tokens_bin_path, "r+b") as bf:
+                        bf.truncate(expected_bytes)
+                if self.valid_songs > 0:
+                    last_rec = json.loads(lines[-1])
+                    self.next_midi_idx = int(last_rec["midi_idx"]) + 1
+                    self.skipped_songs = max(0, self.next_midi_idx - self.valid_songs)
+                else:
+                    self.next_midi_idx = 0
+                    self.skipped_songs = 0
                 with open(self.manifest_path, "w", encoding="utf-8") as mf:
                     mf.writelines(lines)
+                tmp_offsets = str(self.offsets_npy_path) + ".tmp.npy"
+                np.save(tmp_offsets, np.asarray(self.offsets_list, dtype=np.int64) if self.offsets_list else np.zeros((0, 2), dtype=np.int64))
+                os.replace(tmp_offsets, self.offsets_npy_path)
+                tmp_state = str(self.state_path) + ".tmp"
+                with open(tmp_state, "w", encoding="utf-8") as sf:
+                    json.dump(self.get_state_dict(completed=False), sf, indent=2, ensure_ascii=False)
+                os.replace(tmp_state, self.state_path)
         else:
             with open(self.tokens_bin_path, "wb"):
                 pass
@@ -598,11 +639,19 @@ class _RemoteWriterState:
 
     def flush_checkpoint(self, completed: bool = False) -> dict:
         if self.pending_bin_buf:
-            with open(self.tokens_bin_path, "ab") as bf:
-                bf.write(self.pending_bin_buf)
-                bf.flush()
-                os.fsync(bf.fileno())
+            if self._bin_fp is None:
+                self._bin_fp = open(self.tokens_bin_path, "ab")
+            self._bin_fp.write(self.pending_bin_buf)
+            self._bin_fp.flush()
+            os.fsync(self._bin_fp.fileno())
+            self._bytes_since_sync += len(self.pending_bin_buf)
             self.pending_bin_buf.clear()
+
+        if completed or self._bytes_since_sync >= 512 * 1024 * 1024:
+            if self._bin_fp is not None:
+                self._bin_fp.close()
+                self._bin_fp = None
+                self._bytes_since_sync = 0
 
         if self.pending_manifest_lines:
             with open(self.manifest_path, "a", encoding="utf-8") as mf:
@@ -626,6 +675,7 @@ class _RemoteWriterState:
             json.dump(state, sf, indent=2, ensure_ascii=False)
         os.replace(tmp_state, self.state_path)
         return state
+
 
 
 def _clean_sd(sd):
@@ -991,12 +1041,19 @@ async def _tok_process_batch(request):
 
 
 async def _tok_finish_split(request):
+    import shutil
     writers = STATE.get("tok_writers", {})
     states_out = {}
     sizes_mb = {}
     for m_key, w in writers.items():
         states_out[m_key] = w.flush_checkpoint(completed=True)
-        sizes_mb[m_key] = round(os.path.getsize(w.tokens_bin_path) / (1024 * 1024), 2)
+        sz_bytes = os.path.getsize(w.tokens_bin_path)
+        sizes_mb[m_key] = round(sz_bytes / (1024 * 1024), 2)
+        if str(w.tokens_bin_path).startswith("/content/drive") and sz_bytes > 500 * 1024 * 1024:
+            local_bak = f"/content/{m_key}_{w.split}_tokens_complete.bin"
+            shutil.copyfile(w.tokens_bin_path, local_bak)
+            fresh_drv = w.out_dir / f"{w.split}_tokens_complete.bin"
+            shutil.copyfile(local_bak, fresh_drv)
     return JSONResponse({"status": "completed", "states": states_out, "sizes_mb": sizes_mb})
 
 
@@ -1171,7 +1228,7 @@ class RemoteColabClient:
                 "resume": resume,
                 "require_drive": self.require_drive,
             },
-            timeout=60,
+            timeout=300,
         )
         if r_init.status_code != 200:
             raise RuntimeError(f"Failed to initialize split '{split}' on Colab ({self.remote_url}): {r_init.text}")
