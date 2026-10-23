@@ -4,7 +4,7 @@ with open('README.md', 'r', encoding='utf-8-sig') as f:
     long_description = f.read()
 setup(
     name='mortm',
-    version='5.0.0b1',
+    version='5.0.0b2',
     author='Nagoshi Takaaki',
     author_email='nagoshi@kthrlab.jp',
     description='旋律生成、コード推定、マルチタスクな音楽生成を行うライブラリ (MORTM5 Beta)',
@@ -14,13 +14,26 @@ setup(
     packages=find_packages(include=['mortm', 'mortm.*']),
     install_requires=[
         'torch',
+        'torchaudio',
         'numpy',
         'einops',
         'loralib',
+        'vector-quantize-pytorch',
+        'pretty_midi',
+        'mido',
+        'music21',
+        'midi2audio',
+        'soundfile',
+        'fonttools',
+        'matplotlib',
+        'tensorboard',
+        'wandb',
         'tqdm',
+        'google-api-python-client',
+        'google-auth-oauthlib',
+        'httplib2',
     ],
     extras_require={
-        'midi': ['pretty_midi', 'symusic', 'miditoolkit', 'scipy'],
         'flash': ['flash_attn'],
     },
     classifiers=[

@@ -8,12 +8,12 @@ colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b1 B
 
 【Google Colab での起動手順】
 1. ランタイムを GPU (A100 / L4 / T4) に設定し、以下を実行:
-   !pip install -q --pre -U mortm fastapi uvicorn pycloudflared
+   !pip install -q --pre -U "mortm==5.0.0b1" vector-quantize-pytorch pretty_midi mido fastapi uvicorn pycloudflared
 2. Google Drive をマウント (トークンデータやチェックポイントを Drive に置く場合):
    from google.colab import drive
    drive.mount('/content/drive')
 3. サーバースクリプトを起動して Cloudflare Tunnel URL を取得:
-   !wget -q -O colab_gpu_worker.py https://raw.githubusercontent.com/Ayato964/MORTM/main/colab_gpu_worker.py
+   !wget -q -O colab_gpu_worker.py https://raw.githubusercontent.com/Ayato964/MORTM/mortm5-tokenizer-mac/colab_gpu_worker.py
    !nohup python3 -u colab_gpu_worker.py > worker.log 2>&1 &
    !sleep 5 && cat worker.log
 """

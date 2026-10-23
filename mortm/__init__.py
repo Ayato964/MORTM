@@ -1,8 +1,8 @@
 """
-MORTM: Music Oriented Transformer Model (v5.0.0b1 Beta)
+MORTM: Music Oriented Transformer Model (v5.0.0b2 Beta)
 """
 
-__version__ = "5.0.0b1"
+__version__ = "5.0.0b2"
 
 from .models.modules.config import (
     MORTMArgs,
