@@ -4,18 +4,31 @@ with open('README.md', 'r', encoding='utf-8-sig') as f:
     long_description = f.read()
 setup(
     name='mortm',
-    version='4.9',
+    version='5.0.0b1',
     author='Nagoshi Takaaki',
     author_email='nagoshi@kthrlab.jp',
-    description='旋律生成、コード推定、マルチタスクな音楽生成を行うライブラリ',
+    description='旋律生成、コード推定、マルチタスクな音楽生成を行うライブラリ (MORTM5 Beta)',
     long_description=long_description,
     long_description_content_type='text/markdown',
     url='https://github.com/Ayato964',
-    packages=find_packages(),
+    packages=find_packages(include=['mortm', 'mortm.*']),
+    install_requires=[
+        'torch',
+        'numpy',
+        'einops',
+        'loralib',
+        'tqdm',
+    ],
+    extras_require={
+        'midi': ['pretty_midi', 'symusic', 'miditoolkit', 'scipy'],
+        'flash': ['flash_attn'],
+    },
     classifiers=[
+        'Development Status :: 4 - Beta',
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: MIT License',
         'Operating System :: OS Independent',
     ],
-    python_requires='>=3.0',
+    python_requires='>=3.10',
 )
+

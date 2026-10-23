@@ -289,6 +289,115 @@ def _choose_slots(notes: list[Note]) -> tuple[list[Note], list[SlotInfo], dict[t
     return selected_notes, slots, lane_to_slot
 
 
+def slots_to_slot_codes(slots: Iterable[SlotInfo]) -> np.ndarray:
+    """
+    SlotInfo のリスト (長さ4) を slots.npy 用の int16 配列 [4] に変換する。
+      - Slot 0 (Drums): note_count > 0 なら 128、空なら -1
+      - Slot 1..3 (Melodic): note_count > 0 なら MIDI Program (0..127)、空なら -1
+    """
+    slot_list = list(slots)
+    codes = np.full(MAX_TRACKS, -1, dtype=np.int16)
+    for idx, info in enumerate(slot_list[:MAX_TRACKS]):
+        if info.note_count <= 0:
+            codes[idx] = -1
+        elif idx == 0 or info.is_drum:
+            codes[idx] = 128
+        else:
+            codes[idx] = int(np.clip(info.program, 0, 127))
+    return codes
+
+
+def slot_codes_to_slots(slot_codes: Iterable[int]) -> list[SlotInfo]:
+    """
+    スロットコード列 [4] (-1: 空, 0..127: Program, 128: Drums) から
+    MIDI 復元用の SlotInfo リスト (長さ4) を構築する。
+    """
+    codes = [int(c) for c in slot_codes]
+    while len(codes) < MAX_TRACKS:
+        codes.append(-1)
+
+    slots: list[SlotInfo] = []
+    for idx in range(MAX_TRACKS):
+        c = codes[idx]
+        if idx == 0:
+            active = (c == 128 or c >= 0)
+            slots.append(
+                SlotInfo(
+                    slot=0,
+                    is_drum=True,
+                    program=0,
+                    name="drums" if active else "empty_0",
+                    source_track=0 if active else None,
+                    source_channel=DRUM_MIDI_CHANNEL if active else None,
+                    note_count=1 if active else 0,
+                )
+            )
+        else:
+            active = (0 <= c <= 127)
+            prog = int(c) if active else 0
+            slots.append(
+                SlotInfo(
+                    slot=idx,
+                    is_drum=False,
+                    program=prog,
+                    name=f"inst_{prog}_slot_{idx}" if active else f"empty_{idx}",
+                    source_track=idx if active else None,
+                    source_channel=(idx - 1) if active else None,
+                    note_count=1 if active else 0,
+                )
+            )
+    return slots
+
+
+def slot_codes_to_roll_meta(slot_codes: Iterable[int], ticks_per_beat: int = 480) -> RollMeta:
+    """スロットコード列 [4] から chunks_to_midi 用の RollMeta を生成する。"""
+    return RollMeta(
+        ticks_per_beat=ticks_per_beat,
+        steps_per_bar=STEPS_PER_BAR,
+        beats_per_bar=BEATS_PER_BAR,
+        max_tracks=MAX_TRACKS,
+        features_per_track=FEATURES_PER_TRACK,
+        slots=slot_codes_to_slots(slot_codes),
+    )
+
+
+def extract_slot_codes_from_midi(path: str | Path) -> np.ndarray:
+    """
+    MIDI ファイルから _choose_slots と完全に同一の決定論的ロジックで
+    4スロットの楽器コード配列 int16 [4] を高速抽出する（ピアノロール配列の確保を省略）。
+    """
+    mid = mido.MidiFile(str(path))
+    drum_count = 0
+    lane_counts: dict[tuple[int, int, int], int] = defaultdict(int)
+
+    for track_idx, track in enumerate(mid.tracks):
+        programs = [0] * 16
+        for msg in track:
+            t = msg.type
+            if t == "program_change":
+                programs[msg.channel] = msg.program
+            elif t == "note_on" and msg.velocity > 0:
+                ch = msg.channel
+                if ch == DRUM_MIDI_CHANNEL:
+                    drum_count += 1
+                else:
+                    lane_counts[(track_idx, ch, programs[ch])] += 1
+
+    ranked = sorted(
+        lane_counts.items(),
+        key=lambda kv: (-kv[1], kv[0][0], kv[0][1], kv[0][2]),
+    )
+    chosen = ranked[: MAX_TRACKS - 1]
+
+    codes = np.full(MAX_TRACKS, -1, dtype=np.int16)
+    if drum_count > 0:
+        codes[0] = 128
+    for slot_idx, ((_, _, program), count) in enumerate(chosen, start=1):
+        if count > 0:
+            codes[slot_idx] = int(np.clip(program, 0, 127))
+    return codes
+
+
 def midi_to_roll(path: str | Path) -> tuple[np.ndarray, RollMeta]:
     """
     Encode MIDI to normalized float32 piano-roll.
@@ -603,6 +712,12 @@ def _notes_to_midi(notes: list[tuple[int, int, int, int, int]], meta: RollMeta, 
 
     for slot in range(MAX_TRACKS):
         slot_info = meta.slots[slot]
+        if (
+            slot_info.source_track is None
+            and slot_info.note_count == 0
+            and str(slot_info.name).startswith("empty_")
+        ):
+            continue
         if slot != 0 and not by_slot.get(slot) and slot_info.note_count == 0:
             continue
 
@@ -665,10 +780,12 @@ def roll_to_midi(roll: np.ndarray, meta: RollMeta, output_path: str | Path) -> N
 
 
 def chunks_to_midi(chunks: np.ndarray, meta: RollMeta, output_path: str | Path) -> None:
-    """Decode training chunks directly back to a quantized MIDI file (supports any chunk count / time signature)."""
+    """Decode training chunks directly back to a quantized MIDI file (supports [N, 8, 24, 128] or MidiVision [N, 8, 128, 24])."""
+    if chunks.ndim == 4 and chunks.shape[1:] == (TOTAL_CHANNELS, 128, CHUNK_STEPS):
+        chunks = chunks.transpose(0, 1, 3, 2)
     if chunks.ndim != 4 or chunks.shape[1:] != (TOTAL_CHANNELS, CHUNK_STEPS, 128):
         raise ValueError(
-            f"Expected [chunks, {TOTAL_CHANNELS}, {CHUNK_STEPS}, 128], got {chunks.shape}."
+            f"Expected [chunks, {TOTAL_CHANNELS}, {CHUNK_STEPS}, 128] or [chunks, {TOTAL_CHANNELS}, 128, {CHUNK_STEPS}], got {chunks.shape}."
         )
     flat = chunks.transpose(1, 0, 2, 3).reshape(TOTAL_CHANNELS, -1, 128)
     notes = _flat_to_quantized_notes(flat)

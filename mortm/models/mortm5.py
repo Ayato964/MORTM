@@ -1,11 +1,25 @@
 from torch import nn
 from .modules.layers import *
-from .modules.config import PAD_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID, RVQ_TOKEN_OFFSET
+from .modules.config import (
+    PAD_TOKEN_ID,
+    BOS_TOKEN_ID,
+    EOS_TOKEN_ID,
+    RVQ_TOKEN_OFFSET,
+    INST_PROGRAM_OFFSET,
+    INST_DRUMS_TOKEN_ID,
+    INST_EMPTY_TOKEN_ID,
+    INST_RVQ_TOKEN_OFFSET,
+    NUM_SLOT_TOKENS,
+    SLOT_CODE_DRUMS,
+    SLOT_CODE_EMPTY,
+    slot_code_to_token_id,
+    token_id_to_slot_code,
+)
 from .modules.attention import pad_input, unpad_input, _get_default_device
 from vector_quantize_pytorch import GroupedResidualVQ
-
 import torch.distributed as dist
-from typing import Optional
+from typing import Optional, Sequence, Tuple, Union
+import numpy as np
 
 
 class MidiVision(nn.Module):
@@ -90,9 +104,10 @@ class MidiVision(nn.Module):
         return self._format_rvq_tokens(tokens, include_offset=include_offset)
 
     @torch.inference_mode()
-    def decode_tokens(self, tokens: Tensor) -> Tensor:
+    def decode_tokens(self, tokens: Tensor, token_offset: Optional[int] = None) -> Tensor:
         """
         離散トークン列からピアノロールロジット [N_chunks, 8, 128, 24] を復元する。
+        separate_rvq_layers=False (G*K) と True (L*G*K) の両方のトークン列をそのままデコード可能。
         対応入力形状 (L = num_quantizers, G = vq_groups):
           - 1D: [N_chunks * L * G]
           - 2D: [N_chunks, L * G], [B, N_chunks * L * G], または [N_chunks * L, G]
@@ -126,7 +141,7 @@ class MidiVision(nn.Module):
 
         tokens = tokens.reshape(-1, num_q, self.vq_groups)
 
-        offset_base = getattr(self, "token_offset", RVQ_TOKEN_OFFSET)
+        offset_base = int(token_offset) if token_offset is not None else getattr(self, "token_offset", RVQ_TOKEN_OFFSET)
         if offset_base > 0:
             shifted = torch.where(tokens >= offset_base, tokens - offset_base, tokens.clamp(min=0))
         else:
@@ -185,43 +200,65 @@ def _compute_model_params(model: nn.Module, args: MORTMArgs) -> Tuple[int, int]:
     return total_params, active_params
 
 
-class AblationTransformer1(nn.Module):
+class _BaseMORTM5Transformer(nn.Module):
     """
-    1トークンずつフラットに自己回帰するモデル。
-    語彙サイズ args.vocab_size (例: token_offset(3) + G * K) を全RVQレイヤーで共有する。
-    特殊トークン: <PAD>=0, <BOS>=1, <EOS>=2, RVQトークン=[3, 3 + G * K)。
+    MORTM5 下流自己回帰 Transformer (AblationTransformer1 / AblationTransformer2) の共通基底クラス。
+    8通りのアブレーション設定:
+      - Tokenizer: M3 (G=8, L=2) / M4 (G=4, L=4)
+      - Sequence Mode: Flat (AblationTransformer1) / Grouped Soft-Token (AblationTransformer2)
+      - RVQ Layer Vocabulary: Shared (G * K) / Separated (L * G * K)
+    および 4スロット楽器条件付け (use_instrument_tokens=True/False) を統一的に管理する。
     """
+
     def __init__(self, args: MORTM5Args, progress=None):
         super().__init__()
         self.args = args
         self.progress = progress
-        self.vq_groups = getattr(args, "vq_groups", 4)
-        self.codebook_size = getattr(args, "codebook_size", args.vocab_size // self.vq_groups)
-        self.rvq_vocab_size = self.vq_groups * self.codebook_size
-        self.token_offset = getattr(args, "token_offset", args.vocab_size - self.rvq_vocab_size)
+        self.vq_groups = int(getattr(args, "vq_groups", 4))
+        self.vq_layers = int(getattr(args, "vq_layers", getattr(args, "encoder_layer", 2)))
+        if self.vq_groups <= 0 or self.vq_layers <= 0:
+            raise ValueError(f"vq_groups ({self.vq_groups}) and vq_layers ({self.vq_layers}) must be positive.")
+        self.tokens_per_chunk = self.vq_groups * self.vq_layers
 
+        self.separate_rvq_layers = bool(getattr(args, "separate_rvq_layers", False))
+        self.use_instrument_tokens = bool(getattr(args, "use_instrument_tokens", False))
+        self.effective_layers = self.vq_layers if self.separate_rvq_layers else 1
+        self.num_rvq_buckets = self.effective_layers * self.vq_groups
+
+        default_codebook = max(1, (args.vocab_size - getattr(args, "token_offset", RVQ_TOKEN_OFFSET)) // self.num_rvq_buckets)
+        self.codebook_size = int(getattr(args, "codebook_size", default_codebook))
+        self.rvq_vocab_size = self.num_rvq_buckets * self.codebook_size
+
+        default_offset = (
+            INST_RVQ_TOKEN_OFFSET
+            if self.use_instrument_tokens
+            else max(0, args.vocab_size - self.rvq_vocab_size)
+        )
+        self.token_offset = int(getattr(args, "token_offset", default_offset))
+
+        if self.use_instrument_tokens and self.token_offset < INST_RVQ_TOKEN_OFFSET:
+            raise ValueError(
+                f"use_instrument_tokens=True requires token_offset >= {INST_RVQ_TOKEN_OFFSET}, "
+                f"got {self.token_offset}."
+            )
         if self.token_offset < 0 or args.vocab_size < self.token_offset + self.rvq_vocab_size:
             raise ValueError(
-                f"args.vocab_size ({args.vocab_size}) must be >= token_offset + vq_groups * codebook_size "
-                f"({self.token_offset} + {self.vq_groups} * {self.codebook_size} = {self.token_offset + self.rvq_vocab_size})."
+                f"args.vocab_size ({args.vocab_size}) must be >= token_offset + effective_layers * vq_groups * codebook_size "
+                f"({self.token_offset} + {self.effective_layers} * {self.vq_groups} * {self.codebook_size} = "
+                f"{self.token_offset + self.rvq_vocab_size})."
             )
 
-        device = (
-            progress.get_device()
-            if progress is not None
+    def _resolve_init_device(self) -> torch.device:
+        return (
+            self.progress.get_device()
+            if self.progress is not None
             else _get_default_device()
         )
-
-        pad_idx = PAD_TOKEN_ID if self.token_offset > 0 else None
-        self.embedding = nn.Embedding(args.vocab_size, args.d_model, padding_idx=pad_idx).to(device)
-        self.decoder = MORTMDecoder(args=args, progress=progress).to(device)
-        self.Wout = nn.Linear(args.d_model, args.vocab_size).to(device)
-        self.wout = self.Wout
 
     def get_param(self) -> Tuple[int, int]:
         return _compute_model_params(self, self.args)
 
-    def reset_kv_cache(self):
+    def reset_kv_cache(self) -> None:
         """全デコーダ層の自己注意KVキャッシュをクリアする。新しい系列の生成開始前に呼び出す。"""
         for layer in self.decoder.layers:
             attn = getattr(layer, "self_attention", None)
@@ -234,6 +271,216 @@ class AblationTransformer1(nn.Module):
             len(self.decoder.layers) > 0
             and getattr(self.decoder.layers[0].self_attention, "kv_cache", None) is not None
         )
+
+    def _slot_codes_to_token_list(
+        self, slot_codes: Optional[Union[Sequence[int], np.ndarray, Tensor]] = None
+    ) -> list[int]:
+        if slot_codes is None:
+            default_codes = [SLOT_CODE_DRUMS, 0, SLOT_CODE_EMPTY, SLOT_CODE_EMPTY]
+            return [slot_code_to_token_id(c) for c in default_codes]
+        if isinstance(slot_codes, Tensor):
+            codes_list = [int(x) for x in slot_codes.detach().cpu().reshape(-1).tolist()]
+        elif isinstance(slot_codes, np.ndarray):
+            codes_list = [int(x) for x in slot_codes.reshape(-1).tolist()]
+        else:
+            codes_list = [int(x) for x in slot_codes]
+        if len(codes_list) != NUM_SLOT_TOKENS:
+            raise ValueError(f"Expected {NUM_SLOT_TOKENS} slot_codes, got {len(codes_list)}: {codes_list}")
+        return [slot_code_to_token_id(c) for c in codes_list]
+
+    def extract_slot_codes(self, seq: Tensor) -> Optional[np.ndarray]:
+        """
+        生成系列またはデータセット系列から 4 スロットの楽器コード [4] (int16: 128=Drums, 0..127=Program, -1=Empty) を抽出する。
+        楽器トークンが含まれない場合は None を返す。
+        """
+        flat = seq.detach().cpu().reshape(-1).tolist()
+        inst_tokens = [
+            int(t) for t in flat
+            if INST_PROGRAM_OFFSET <= int(t) <= INST_EMPTY_TOKEN_ID and int(t) < self.token_offset
+        ]
+        if not inst_tokens:
+            return None
+        # Grouped モードでは各スロットトークンが G 個ずつ連続するため縮約する
+        if isinstance(self, AblationTransformer2) and len(inst_tokens) >= NUM_SLOT_TOKENS * self.vq_groups:
+            slot_toks = [inst_tokens[i * self.vq_groups] for i in range(NUM_SLOT_TOKENS)]
+        elif len(inst_tokens) >= NUM_SLOT_TOKENS:
+            slot_toks = inst_tokens[:NUM_SLOT_TOKENS]
+        else:
+            return None
+        return np.asarray([token_id_to_slot_code(t) for t in slot_toks], dtype=np.int16)
+
+    def extract_rvq_tokens(self, seq: Tensor, target_token_offset: int = RVQ_TOKEN_OFFSET) -> Tensor:
+        """
+        系列テンソルから特殊トークン (<PAD>, <BOS>, <EOS>, <INST_...>) を除去し、
+        MidiVision.decode_tokens にそのまま渡せる標準 RVQ トークン列 (target_token_offset + g * K + k) を抽出する。
+        separate_rvq_layers=True / False および use_instrument_tokens=True / False の全モードに対応。
+        """
+        flat = seq.reshape(-1).to(dtype=torch.long)
+        rvq_only = flat[flat >= self.token_offset]
+        if rvq_only.numel() == 0 or rvq_only.numel() % self.tokens_per_chunk != 0:
+            raise ValueError(
+                f"Extracted RVQ token count ({rvq_only.numel()}) must be a positive multiple of "
+                f"tokens_per_chunk ({self.tokens_per_chunk})."
+            )
+        u = rvq_only - self.token_offset
+        local_k = u % self.codebook_size
+        # [N_chunks, L, G]
+        local_k_3d = local_k.reshape(-1, self.vq_layers, self.vq_groups)
+        group_offsets = (
+            torch.arange(self.vq_groups, device=seq.device, dtype=torch.long) * self.codebook_size
+            + int(target_token_offset)
+        )
+        return (local_k_3d + group_offsets).reshape(-1)
+
+    @staticmethod
+    def _sample_from_logits(
+        logits: Tensor,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ) -> Tensor:
+        """[..., V] のロジットからサンプリングまたは greedy 選択を行い [...] のインデックスを返す。"""
+        if temperature <= 0.0:
+            return torch.argmax(logits, dim=-1)
+        scaled = logits / float(temperature)
+        if top_k > 0 and top_k < scaled.size(-1):
+            topk_vals, _ = torch.topk(scaled, k=top_k, dim=-1)
+            min_topk = topk_vals[..., -1, None]
+            scaled = torch.where(scaled < min_topk, torch.full_like(scaled, float("-inf")), scaled)
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(scaled, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_remove = cumulative_probs > float(top_p)
+            sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+            sorted_remove[..., 0] = False
+            remove_mask = torch.zeros_like(scaled, dtype=torch.bool).scatter(-1, sorted_indices, sorted_remove)
+            scaled = scaled.masked_fill(remove_mask, float("-inf"))
+        probs = torch.softmax(scaled, dim=-1)
+        flat_probs = probs.reshape(-1, probs.size(-1))
+        sampled = torch.multinomial(flat_probs, num_samples=1).reshape(probs.shape[:-1])
+        return sampled
+
+
+class AblationTransformer1(_BaseMORTM5Transformer):
+    """
+    1トークンずつフラットに自己回帰するモデル (Flat Autoregressive Transformer)。
+    - separate_rvq_layers=False の場合: 語彙サイズ = token_offset + G * K (全RVQレイヤー共有)
+    - separate_rvq_layers=True  の場合: 語彙サイズ = token_offset + L * G * K (各RVQレイヤー独立)
+    - use_instrument_tokens=True の場合: token_offset = 133 (<BOS> 直後に4スロットの楽器トークンを配置)
+    """
+
+    def __init__(self, args: MORTM5Args, progress=None):
+        super().__init__(args=args, progress=progress)
+        device = self._resolve_init_device()
+
+        pad_idx = PAD_TOKEN_ID if self.token_offset > 0 else None
+        self.embedding = nn.Embedding(args.vocab_size, args.d_model, padding_idx=pad_idx).to(device)
+        self.decoder = MORTMDecoder(args=args, progress=progress).to(device)
+        self.Wout = nn.Linear(args.d_model, args.vocab_size).to(device)
+        self.wout = self.Wout
+
+    def build_prefix_tokens(
+        self,
+        slot_codes: Optional[Union[Sequence[int], np.ndarray, Tensor]] = None,
+        batch_size: int = 1,
+        device: Optional[torch.device] = None,
+    ) -> Tensor:
+        """<BOS> (+ use_instrument_tokens=True の場合は 4 スロット楽器トークン) の初期プレフィックス [B, prefix_len] を構築する。"""
+        if device is None:
+            device = self.embedding.weight.device
+        prefix = [BOS_TOKEN_ID]
+        if self.use_instrument_tokens:
+            prefix.extend(self._slot_codes_to_token_list(slot_codes))
+        t = torch.tensor(prefix, dtype=torch.long, device=device).unsqueeze(0)
+        return t.expand(batch_size, -1).contiguous()
+
+    def _apply_flat_grammar_mask(self, logits: Tensor, pos: int) -> Tensor:
+        """
+        フラット自己回帰ステップ pos (0-indexed, 予測対象トークンの系列内位置) における文法マスクを適用する。
+        """
+        masked = torch.full_like(logits, float("-inf"))
+        prefix_len = 1 + (NUM_SLOT_TOKENS if self.use_instrument_tokens else 0)
+
+        if self.use_instrument_tokens and 1 <= pos < prefix_len:
+            slot_idx = pos - 1
+            if slot_idx == 0:
+                masked[..., INST_DRUMS_TOKEN_ID] = logits[..., INST_DRUMS_TOKEN_ID]
+                masked[..., INST_EMPTY_TOKEN_ID] = logits[..., INST_EMPTY_TOKEN_ID]
+            else:
+                masked[..., INST_PROGRAM_OFFSET:INST_DRUMS_TOKEN_ID] = logits[..., INST_PROGRAM_OFFSET:INST_DRUMS_TOKEN_ID]
+                masked[..., INST_EMPTY_TOKEN_ID] = logits[..., INST_EMPTY_TOKEN_ID]
+            return masked
+
+        rvq_step = max(0, pos - prefix_len)
+        intra_chunk = rvq_step % self.tokens_per_chunk
+        layer_idx = intra_chunk // self.vq_groups
+        group_idx = intra_chunk % self.vq_groups
+        eff_layer = layer_idx if self.separate_rvq_layers else 0
+
+        low = self.token_offset + (eff_layer * self.vq_groups + group_idx) * self.codebook_size
+        high = low + self.codebook_size
+        masked[..., low:high] = logits[..., low:high]
+        return masked
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        num_chunks: int = 8,
+        prompt: Optional[Tensor] = None,
+        slot_codes: Optional[Union[Sequence[int], np.ndarray, Tensor]] = None,
+        batch_size: int = 1,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        append_eos: bool = True,
+    ) -> Tensor:
+        """
+        KVキャッシュと文法制約マスクを用いて num_chunks チャンク分のトークン系列 [B, S_total] を自己回帰生成する。
+        """
+        if num_chunks <= 0:
+            raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+        device = self.embedding.weight.device
+        if prompt is None:
+            seq = self.build_prefix_tokens(slot_codes=slot_codes, batch_size=batch_size, device=device)
+        else:
+            seq = prompt.to(device=device, dtype=torch.long)
+            if seq.dim() == 1:
+                seq = seq.unsqueeze(0)
+
+        prefix_len = 1 + (NUM_SLOT_TOKENS if self.use_instrument_tokens else 0)
+        target_total_len = prefix_len + num_chunks * self.tokens_per_chunk
+        if seq.size(1) >= target_total_len:
+            return seq
+
+        was_training = self.training
+        self.eval()
+        self.reset_kv_cache()
+        try:
+            # Prefill
+            logits = self.forward(seq, is_causal=True, is_save_cache=True)
+            next_logits = logits[:, -1, :]  # [B, V]
+
+            cur_pos = seq.size(1)
+            generated = [seq]
+            while cur_pos < target_total_len:
+                constrained = self._apply_flat_grammar_mask(next_logits, pos=cur_pos)
+                next_tok = self._sample_from_logits(
+                    constrained, temperature=temperature, top_k=top_k, top_p=top_p
+                ).unsqueeze(1)  # [B, 1]
+                generated.append(next_tok)
+                cur_pos += 1
+                if cur_pos < target_total_len:
+                    step_logits = self.forward(next_tok, is_causal=True, is_save_cache=True)
+                    next_logits = step_logits[:, -1, :]
+
+            if append_eos and self.token_offset > EOS_TOKEN_ID:
+                eos_col = torch.full((seq.size(0), 1), EOS_TOKEN_ID, dtype=torch.long, device=device)
+                generated.append(eos_col)
+            return torch.cat(generated, dim=1)
+        finally:
+            self.reset_kv_cache()
+            if was_training:
+                self.train()
 
     def forward(
         self,
@@ -318,38 +565,27 @@ class AblationTransformer1(nn.Module):
         return score
 
 
-class AblationTransformer2(nn.Module):
+class AblationTransformer2(_BaseMORTM5Transformer):
     """
-    同一RVQレイヤー内の G 個のグループトークンを1つのソフトトークンに集約して自己回帰するモデル。
+    同一RVQレイヤー内の G 個のグループトークンを1つのソフトトークンに集約して自己回帰するモデル (Grouped Soft-Token Transformer)。
     - 入力 x:
       * 3D `[B, S, G]` (または 2D フラット列 `[B, S * G]` を自動で `[B, S, G]` に変換)
       * 1ステップ KV-cache デコーディング時は `[B, G]` または `[B, 1, G]`
-      * 特殊トークン (`<PAD>=0`, `<BOS>=1`, `<EOS>=2`) はそのまま特殊Embedding ID `0..2` にマッピングし、
-        RVQトークンは各グループ g 専用の Embedding 領域 `[token_offset + g * K, token_offset + (g + 1) * K)` にマッピングする。
+      * 特殊トークン (`<PAD>=0`, `<BOS>=1`, `<EOS>=2`, `<INST_...>=3..132`) は特殊Embedding ID `[0, token_offset)` にマッピングし、
+        同一トークン G 個の反復和を `1 / G` スケーリング（平均）して分散 1.0 を維持する。
+      * RVQトークン (`>= token_offset`) は `(eff_layer * G + g)` 専用の領域にマッピングし、
+        独立な G 個のグループ埋め込みの和を `1 / sqrt(G)` スケーリングして分散 1.0 を維持する。
     - 出力 score:
-      * `[B, S, G, token_offset + K]` (1ステップで G 個のグループの分布を同時予測)
+      * `[B, S, G, group_vocab_size]` (ここで `group_vocab_size = token_offset + effective_layers * K`)
     """
+
     def __init__(self, args: MORTM5Args, progress=None):
-        super().__init__()
-        self.args = args
-        self.progress = progress
-        self.vq_groups = getattr(args, "vq_groups", 4)
-        self.codebook_size = getattr(args, "codebook_size", args.vocab_size // self.vq_groups)
-        self.rvq_vocab_size = self.vq_groups * self.codebook_size
-        self.token_offset = getattr(args, "token_offset", args.vocab_size - self.rvq_vocab_size)
+        super().__init__(args=args, progress=progress)
+        self.group_vocab_size = self.token_offset + self.effective_layers * self.codebook_size
+        self.rvq_emb_scale = float(self.vq_groups) ** -0.5
+        self.special_emb_scale = 1.0 / float(self.vq_groups)
 
-        if self.token_offset < 0 or args.vocab_size < self.token_offset + self.rvq_vocab_size:
-            raise ValueError(
-                f"args.vocab_size ({args.vocab_size}) must be >= token_offset + vq_groups * codebook_size "
-                f"({self.token_offset} + {self.vq_groups} * {self.codebook_size} = {self.token_offset + self.rvq_vocab_size})."
-            )
-
-        self.group_vocab_size = self.token_offset + self.codebook_size
-        device = (
-            progress.get_device()
-            if progress is not None
-            else _get_default_device()
-        )
+        device = self._resolve_init_device()
 
         self.register_buffer(
             "group_offsets",
@@ -363,48 +599,63 @@ class AblationTransformer2(nn.Module):
         self.Wout = nn.Linear(args.d_model, self.vq_groups * self.group_vocab_size).to(device)
         self.wout = self.Wout
 
-    def get_param(self) -> Tuple[int, int]:
-        return _compute_model_params(self, self.args)
-
-    def reset_kv_cache(self):
-        """全デコーダ層の自己注意KVキャッシュをクリアする。新しい系列の生成開始前に呼び出す。"""
-        for layer in self.decoder.layers:
-            attn = getattr(layer, "self_attention", None)
-            if attn is not None:
-                attn.kv_cache = None
-                attn.cache_seqlens = None
-
-    def _has_active_kv_cache(self) -> bool:
-        return (
-            len(self.decoder.layers) > 0
-            and getattr(self.decoder.layers[0].self_attention, "kv_cache", None) is not None
-        )
-
     def to_global_ids(self, x: Tensor) -> Tensor:
         """
-        [..., G] のトークンテンソルを Embedding テーブル上のインデックス (torch.long) に正規化する。
-        - 特殊トークン (<PAD>=0, <BOS>=1, <EOS>=2 等: x < token_offset) はそのまま [0, token_offset) を保持。
-        - RVQトークン (x >= token_offset) は各グループ専用領域 [token_offset + g*K, token_offset + (g+1)*K) に変換。
+        [..., G] のトークンテンソルを Embedding テーブル上のグローバルインデックス (torch.long) に正規化する。
+        - 特殊トークン (x < token_offset) はそのまま [0, token_offset) を保持。
+        - RVQトークン (x >= token_offset) は `token_offset + (eff_layer * G + g) * K + k` に正規化。
         """
         x = x.to(dtype=torch.long)
         offsets = self.group_offsets.to(device=x.device, dtype=torch.long)
+        layer_stride = self.vq_groups * self.codebook_size
+
         if self.token_offset > 0:
             is_rvq = x >= self.token_offset
-            local_k = (x.clamp(min=self.token_offset) - self.token_offset) % self.codebook_size
-            global_id = self.token_offset + local_k + offsets
+            u = x.clamp(min=self.token_offset) - self.token_offset
+            local_k = u % self.codebook_size
+            if self.separate_rvq_layers:
+                eff_layer = (u // layer_stride) % self.effective_layers
+                global_id = self.token_offset + eff_layer * layer_stride + offsets + local_k
+            else:
+                global_id = self.token_offset + offsets + local_k
             special_id = x.clamp(min=0)
             return torch.where(is_rvq, global_id, special_id)
         else:
-            local_k = x.clamp(min=0) % self.codebook_size
+            u = x.clamp(min=0)
+            local_k = u % self.codebook_size
+            if self.separate_rvq_layers:
+                eff_layer = (u // layer_stride) % self.effective_layers
+                return eff_layer * layer_stride + offsets + local_k
             return local_k + offsets
+
+    def _aggregate_group_embeddings(self, x: Tensor) -> Tensor:
+        """
+        [..., G] のトークン列を Embedding [..., G, d_model] に変換し、分散を 1.0 に保ちつつ [..., d_model] に集約する。
+        - RVQトークン (x >= token_offset): 独立な G 個のグループ埋め込みの和を 1 / sqrt(G) でスケーリング
+        - 特殊トークン (0 < x < token_offset): 同一トークン G 個の反復和を 1 / G でスケーリング (= 平均)
+        """
+        x_global = self.to_global_ids(x)
+        emb = self.embedding(x_global)  # [..., G, d_model]
+        if self.token_offset > 0:
+            is_rvq = (x >= self.token_offset).unsqueeze(-1)
+            scale = torch.where(
+                is_rvq,
+                emb.new_full((), self.rvq_emb_scale),
+                emb.new_full((), self.special_emb_scale),
+            )
+            emb = emb * scale
+        else:
+            emb = emb * self.rvq_emb_scale
+        return emb.sum(dim=-2)
 
     def to_local_targets(self, targets: Tensor, ignore_index: int = PAD_TOKEN_ID) -> Tensor:
         """
-        教師ラベルを出力ロジット `[..., G, group_vocab_size]` に対応するローカルクラスID `[..., G]` (値域 `[0, token_offset + K)`) に変換する。
+        教師ラベルを出力ロジット `[..., G, group_vocab_size]` に対応するローカルクラスID `[..., G]`
+        (値域 `[0, token_offset + effective_layers * K)`) に変換する。
         2D `[B, S * G]` が渡された場合は自動的に `[B, S, G]` に変換する。
         - パディング (<= 0): ignore_index
-        - 特殊トークン (0 < t < token_offset, i.e. <BOS>=1, <EOS>=2): そのまま 1, 2
-        - RVQトークン (t >= token_offset): token_offset + (t - token_offset) % K
+        - 特殊トークン (0 < t < token_offset): そのまま [1, token_offset)
+        - RVQトークン (t >= token_offset): token_offset + eff_layer * K + k
         """
         if targets.dim() == 2:
             if targets.size(1) % self.vq_groups != 0:
@@ -420,31 +671,183 @@ class AblationTransformer2(nn.Module):
             )
 
         targets = targets.to(dtype=torch.long)
+        layer_stride = self.vq_groups * self.codebook_size
+
         if self.token_offset > 0:
             is_pad = targets <= 0
             is_rvq = targets >= self.token_offset
-            local_k = self.token_offset + (targets.clamp(min=self.token_offset) - self.token_offset) % self.codebook_size
-            out = torch.where(is_rvq, local_k, targets.clamp(min=0))
+            u = targets.clamp(min=self.token_offset) - self.token_offset
+            local_k = u % self.codebook_size
+            if self.separate_rvq_layers:
+                eff_layer = (u // layer_stride) % self.effective_layers
+                local_cls = self.token_offset + eff_layer * self.codebook_size + local_k
+            else:
+                local_cls = self.token_offset + local_k
+            out = torch.where(is_rvq, local_cls, targets.clamp(min=0))
             return torch.where(is_pad, torch.full_like(targets, ignore_index), out)
         else:
             is_valid = targets >= 0
-            local_k = targets.clamp(min=0) % self.codebook_size
-            return torch.where(is_valid, local_k, torch.full_like(targets, ignore_index))
+            u = targets.clamp(min=0)
+            local_k = u % self.codebook_size
+            if self.separate_rvq_layers:
+                eff_layer = (u // layer_stride) % self.effective_layers
+                local_cls = eff_layer * self.codebook_size + local_k
+            else:
+                local_cls = local_k
+            return torch.where(is_valid, local_cls, torch.full_like(targets, ignore_index))
 
     def local_to_global_ids(self, local_ids: Tensor) -> Tensor:
         """
-        グループ別の予測クラスID `[..., G]` (値域 `[0, token_offset + K)`) を
-        グローバルID `[..., G]` (特殊トークン `0..2` または `token_offset + g*K + k`) に逆変換する。
+        グループ別の予測ローカルクラスID `[..., G]` (値域 `[0, token_offset + effective_layers * K)`) を
+        グローバルID `[..., G]` (特殊トークン `[0, token_offset)` または `token_offset + (eff_layer * G + g) * K + k`) に逆変換する。
         """
         local_ids = local_ids.to(dtype=torch.long)
         offsets = self.group_offsets.to(device=local_ids.device, dtype=torch.long)
+        layer_stride = self.vq_groups * self.codebook_size
+
         if self.token_offset > 0:
             is_rvq = local_ids >= self.token_offset
-            local_k = (local_ids.clamp(min=self.token_offset) - self.token_offset) % self.codebook_size
-            global_id = self.token_offset + local_k + offsets
+            v = local_ids.clamp(min=self.token_offset) - self.token_offset
+            local_k = v % self.codebook_size
+            if self.separate_rvq_layers:
+                eff_layer = (v // self.codebook_size) % self.effective_layers
+                global_id = self.token_offset + eff_layer * layer_stride + offsets + local_k
+            else:
+                global_id = self.token_offset + offsets + local_k
             return torch.where(is_rvq, global_id, local_ids.clamp(min=0))
         else:
-            return (local_ids.clamp(min=0) % self.codebook_size) + offsets
+            v = local_ids.clamp(min=0)
+            local_k = v % self.codebook_size
+            if self.separate_rvq_layers:
+                eff_layer = (v // self.codebook_size) % self.effective_layers
+                return eff_layer * layer_stride + offsets + local_k
+            return local_k + offsets
+
+    def build_prefix_tokens(
+        self,
+        slot_codes: Optional[Union[Sequence[int], np.ndarray, Tensor]] = None,
+        batch_size: int = 1,
+        device: Optional[torch.device] = None,
+    ) -> Tensor:
+        """
+        <BOS>*G (+ use_instrument_tokens=True の場合は [Slot0]*G .. [Slot3]*G) の初期プレフィックス
+        [B, prefix_soft_len, G] を構築する。
+        """
+        if device is None:
+            device = self.embedding.weight.device
+        prefix_tokens = [BOS_TOKEN_ID]
+        if self.use_instrument_tokens:
+            prefix_tokens.extend(self._slot_codes_to_token_list(slot_codes))
+        # [prefix_soft_len, G]
+        t = torch.tensor(prefix_tokens, dtype=torch.long, device=device).unsqueeze(-1).expand(-1, self.vq_groups)
+        return t.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+
+    def _apply_grouped_grammar_mask(self, logits: Tensor, soft_pos: int) -> Tensor:
+        """
+        ソフトトークン自己回帰ステップ soft_pos (0-indexed, 予測対象ソフトトークンの位置) における文法マスクを適用する。
+        logits: [B, G, group_vocab_size]
+        """
+        masked = torch.full_like(logits, float("-inf"))
+        prefix_soft_len = 1 + (NUM_SLOT_TOKENS if self.use_instrument_tokens else 0)
+
+        if self.use_instrument_tokens and 1 <= soft_pos < prefix_soft_len:
+            slot_idx = soft_pos - 1
+            if slot_idx == 0:
+                masked[..., INST_DRUMS_TOKEN_ID] = logits[..., INST_DRUMS_TOKEN_ID]
+                masked[..., INST_EMPTY_TOKEN_ID] = logits[..., INST_EMPTY_TOKEN_ID]
+            else:
+                masked[..., INST_PROGRAM_OFFSET:INST_DRUMS_TOKEN_ID] = logits[..., INST_PROGRAM_OFFSET:INST_DRUMS_TOKEN_ID]
+                masked[..., INST_EMPTY_TOKEN_ID] = logits[..., INST_EMPTY_TOKEN_ID]
+            return masked
+
+        rvq_soft_step = max(0, soft_pos - prefix_soft_len)
+        layer_idx = rvq_soft_step % self.vq_layers
+        eff_layer = layer_idx if self.separate_rvq_layers else 0
+
+        low = self.token_offset + eff_layer * self.codebook_size
+        high = low + self.codebook_size
+        masked[..., low:high] = logits[..., low:high]
+        return masked
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        num_chunks: int = 8,
+        prompt: Optional[Tensor] = None,
+        slot_codes: Optional[Union[Sequence[int], np.ndarray, Tensor]] = None,
+        batch_size: int = 1,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        append_eos: bool = True,
+        return_flat: bool = False,
+    ) -> Tensor:
+        """
+        KVキャッシュと文法制約マスクを用いて num_chunks チャンク分のソフトトークン系列
+        [B, S_soft, G] (return_flat=True の場合は [B, S_soft * G]) を自己回帰生成する。
+        """
+        if num_chunks <= 0:
+            raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+        device = self.embedding.weight.device
+        if prompt is None:
+            seq = self.build_prefix_tokens(slot_codes=slot_codes, batch_size=batch_size, device=device)
+        else:
+            seq = prompt.to(device=device, dtype=torch.long)
+            if seq.dim() == 2:
+                if seq.size(1) % self.vq_groups != 0:
+                    raise ValueError(
+                        f"2D prompt length ({seq.size(1)}) must be divisible by vq_groups ({self.vq_groups})."
+                    )
+                seq = seq.reshape(seq.size(0), seq.size(1) // self.vq_groups, self.vq_groups)
+            elif seq.dim() != 3 or seq.size(-1) != self.vq_groups:
+                raise ValueError(f"Expected prompt of shape [B, S, {self.vq_groups}], got {tuple(seq.shape)}.")
+
+        prefix_soft_len = 1 + (NUM_SLOT_TOKENS if self.use_instrument_tokens else 0)
+        target_soft_len = prefix_soft_len + num_chunks * self.vq_layers
+        if seq.size(1) >= target_soft_len:
+            return seq.reshape(seq.size(0), -1) if return_flat else seq
+
+        was_training = self.training
+        self.eval()
+        self.reset_kv_cache()
+        try:
+            # Prefill
+            logits = self.forward(seq, is_causal=True, is_save_cache=True)
+            next_logits = logits[:, -1, :, :]  # [B, G, group_vocab_size]
+
+            cur_soft_pos = seq.size(1)
+            generated = [seq]
+            while cur_soft_pos < target_soft_len:
+                constrained = self._apply_grouped_grammar_mask(next_logits, soft_pos=cur_soft_pos)
+                if self.use_instrument_tokens and 1 <= cur_soft_pos < prefix_soft_len:
+                    # 楽器スロットステップでは全 G グループで同一の楽器トークンを共有する
+                    inst_tok = self._sample_from_logits(
+                        constrained[:, 0, :], temperature=temperature, top_k=top_k, top_p=top_p
+                    )  # [B]
+                    next_global = inst_tok[:, None, None].expand(-1, 1, self.vq_groups).contiguous()
+                else:
+                    local_sampled = self._sample_from_logits(
+                        constrained, temperature=temperature, top_k=top_k, top_p=top_p
+                    )  # [B, G]
+                    next_global = self.local_to_global_ids(local_sampled).unsqueeze(1)  # [B, 1, G]
+
+                generated.append(next_global)
+                cur_soft_pos += 1
+                if cur_soft_pos < target_soft_len:
+                    step_logits = self.forward(next_global, is_causal=True, is_save_cache=True)
+                    next_logits = step_logits[:, -1, :, :]
+
+            if append_eos and self.token_offset > EOS_TOKEN_ID:
+                eos_soft = torch.full(
+                    (seq.size(0), 1, self.vq_groups), EOS_TOKEN_ID, dtype=torch.long, device=device
+                )
+                generated.append(eos_soft)
+            full_seq = torch.cat(generated, dim=1)
+            return full_seq.reshape(full_seq.size(0), -1) if return_flat else full_seq
+        finally:
+            self.reset_kv_cache()
+            if was_training:
+                self.train()
 
     def forward(
         self,
@@ -472,9 +875,8 @@ class AblationTransformer2(nn.Module):
             keep_seq_dim = (x.dim() == 3)
             if keep_seq_dim:
                 x = x.squeeze(1)  # [B, G]
-            x_global = self.to_global_ids(x)
-            # [B, G, d_model] -> [B, d_model] (2D で decoder に渡し残差ブロードキャスト事故を防止)
-            x_emb = self.embedding(x_global).sum(dim=-2).to(dtype=torch.bfloat16)
+            # [B, G] -> [B, d_model] (分散1.0正規化付き集約、2D で decoder に渡し残差ブロードキャスト事故を防止)
+            x_emb = self._aggregate_group_embeddings(x).to(dtype=torch.bfloat16)
             with torch.autocast(device_type=x_emb.device.type, dtype=torch.bfloat16):
                 out = self.decoder(
                     tgt=x_emb,
@@ -533,9 +935,8 @@ class AblationTransformer2(nn.Module):
         else:
             raise ValueError(f"Unsupported padding_mask shape: {tuple(padding_mask.shape)}.")
 
-        x_global = self.to_global_ids(x)
-        # [B, S, G] -> [B, S, G, d_model] -> グループ次元(-2)で合算して1つのソフトトークン [B, S, d_model] に集約
-        x_emb = self.embedding(x_global).sum(dim=-2).to(dtype=torch.bfloat16)
+        # [B, S, G] -> [B, S, d_model] (分散1.0正規化付きソフトトークン集約)
+        x_emb = self._aggregate_group_embeddings(x).to(dtype=torch.bfloat16)
 
         x_unpadded, indices, cu_seqlens, max_s, _ = unpad_input(x_emb, padding_mask)
 
@@ -556,3 +957,35 @@ class AblationTransformer2(nn.Module):
             # [B, S, G * group_vocab_size] -> [B, S, G, group_vocab_size] に分割し、Gグループ分のロジットを並列出力
             score = score.reshape(batch, tgt_len, self.vq_groups, self.group_vocab_size)
         return score
+
+
+ABLATION_MODEL_CONFIGS = {
+    "m3_flat_shared": "configs/models/mortm5/ablation/m3_flat_shared.json",
+    "m3_flat_separated": "configs/models/mortm5/ablation/m3_flat_separated.json",
+    "m3_grouped_shared": "configs/models/mortm5/ablation/m3_grouped_shared.json",
+    "m3_grouped_separated": "configs/models/mortm5/ablation/m3_grouped_separated.json",
+    "m4_flat_shared": "configs/models/mortm5/ablation/m4_flat_shared.json",
+    "m4_flat_separated": "configs/models/mortm5/ablation/m4_flat_separated.json",
+    "m4_grouped_shared": "configs/models/mortm5/ablation/m4_grouped_shared.json",
+    "m4_grouped_separated": "configs/models/mortm5/ablation/m4_grouped_separated.json",
+}
+
+
+def build_mortm5_ablation_model(
+    args: MORTM5Args | str | dict = "m4_grouped_shared",
+    progress=None,
+) -> _BaseMORTM5Transformer:
+    """
+    MORTM5Args (またはプリセット名 'm4_grouped_shared' / '#7'、設定辞書、JSONファイルパス) の
+    model_mode ("flat" or "grouped") に応じて AblationTransformer1 または AblationTransformer2 を構築するファクトリ関数。
+    """
+    if not isinstance(args, MORTM5Args):
+        args = MORTM5Args(args)
+    mode = getattr(args, "model_mode", "flat")
+    if mode == "flat":
+        return AblationTransformer1(args=args, progress=progress)
+    elif mode == "grouped":
+        return AblationTransformer2(args=args, progress=progress)
+    else:
+        raise ValueError(f"Unsupported args.model_mode: {mode}. Expected 'flat' or 'grouped'.")
+

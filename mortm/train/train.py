@@ -6,8 +6,14 @@ import random
 import time
 from typing import Optional
 
-import torchaudio
-import wandb
+try:
+    import torchaudio
+except ImportError:
+    torchaudio = None
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from einops import rearrange
 import numpy as np
 import gc
@@ -29,12 +35,26 @@ from torch.utils.data.dataset import Dataset
 
 from mortm.utils.messager import Messenger, _DefaultMessenger
 from mortm.models.modules.progress import LearningProgress, _DefaultLearningProgress
-from .datasets import MORTM_SEQDataset, ClassDataSets, PreLoadingDatasets, TensorDataset, PianoRollDataset
+from .datasets import (
+    MORTM_SEQDataset,
+    ClassDataSets,
+    PreLoadingDatasets,
+    TensorDataset,
+    PianoRollDataset,
+    MORTM5MemmapDataset,
+    MORTM5OuterDataset,
+    MORTM5WindowSubsetDataset,
+    MORTM5Collate,
+    mortm5_outer_collate_fn,
+)
 from mortm.models.mortm import MORTM, MORTMArgs
+from mortm.models.modules.config import MORTM5Args, PAD_TOKEN_ID
+from mortm.models.mortm5 import build_mortm5_ablation_model
 from mortm.models.modules.layers import MoE, Gate
 from mortm.utils.pianoroll_convert import *
 from .epoch import EpochObserver
 from .config import AbstractTrainSet, TrainArgs
+from .muon import build_muon_optimizer
 from .tokenizer import Tokenizer
 from .utils.loss import MusicEntropyLoss, MaskedCrossEntropyLoss
 
@@ -582,6 +602,242 @@ class MORTMTrainSet(AbstractTrainSet):
         return mask_x.to(x.device)
 
 
+class MORTM5TrainSet(AbstractTrainSet):
+    """
+    MORTM5 8-Way Ablation 下流自己回帰モデル (AblationTransformer1 / AblationTransformer2) 専用 Trainer。
+    AbstractTrainSet に準拠し、ハイブリッド Muon (MuonAdamW) オプティマイザと
+    現代的 Cosine / WSD-Cosine スケジューラを標準搭載する。
+    """
+
+    def __init__(
+        self,
+        args: Optional[MORTM5Args] = None,
+        t_args: Optional[TrainArgs] = None,
+        calc_val_loss_tokens: Optional[int] = None,
+        progress: Optional[LearningProgress] = None,
+        train_memmap_dataset: Optional[MORTM5MemmapDataset] = None,
+        val_memmap_dataset: Optional[MORTM5MemmapDataset] = None,
+        log_scale: bool = True,
+        project_name: Optional[str] = None,
+        config: Optional[str] = None,
+        load_directory: Optional[str] = None,
+        model_name: Optional[str] = None,
+        wandb_id: Optional[str] = None,
+        m_args: Optional[MORTM5Args] = None,
+        device: Optional[torch.device | str] = None,
+    ):
+        if args is None and m_args is not None:
+            args = m_args
+        if args is None:
+            args = MORTM5Args("m4_grouped_shared")
+        if t_args is None:
+            t_args = TrainArgs("muon_cos")
+        if calc_val_loss_tokens is None:
+            calc_val_loss_tokens = int(t_args.val_total_tokens)
+        if progress is None:
+            progress = _DefaultLearningProgress()
+
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            self.device = (
+                torch.device(f"cuda:{self.local_rank}")
+                if torch.cuda.is_available()
+                else progress.get_device()
+            )
+        self.train_memmap_dataset = train_memmap_dataset
+        self.val_memmap_dataset = val_memmap_dataset
+
+        model = build_mortm5_ablation_model(args=args, progress=progress).to(self.device)
+
+        if load_directory is not None and os.path.exists(load_directory):
+            sd = torch.load(load_directory, map_location=self.device, weights_only=False)
+            if isinstance(sd, dict) and "model_state_dict" in sd:
+                sd = sd["model_state_dict"]
+            model.load_state_dict(sd, strict=True)
+            if self.local_rank == 0:
+                print(f"[MORTM5TrainSet] Loaded pretrained weights from {load_directory}")
+
+        moes = [mod for mod in model.modules() if isinstance(mod, MoE)]
+        find_unused = bool(moes) and any(not mod.stacked for mod in moes)
+
+        if _is_dist_ready():
+            self.model = DDP(
+                model,
+                device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                find_unused_parameters=find_unused,
+            )
+            if self.local_rank == 0:
+                print(f"[DDP] MORTM5TrainSet initialized (find_unused_parameters={find_unused})")
+        else:
+            self.model = model
+
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        total_param, self.active_params = raw_model.get_param()
+
+        lr = float(t_args.lr_param) if t_args.lr_param is not None else 1e-3
+        opt_type = getattr(t_args, "optimizer_type", "muon").lower()
+        if opt_type == "adamw":
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=lr,
+                betas=getattr(t_args, "adamw_betas", (0.9, 0.95)),
+                weight_decay=getattr(t_args, "weight_decay", 0.1),
+            )
+            if self.local_rank == 0:
+                print(f"[MORTM5TrainSet] Optimizer: AdamW (lr={lr:.2e}, params={total_param:,})")
+        else:
+            optimizer = build_muon_optimizer(
+                self.model,
+                lr=lr,
+                weight_decay=getattr(t_args, "weight_decay", 0.1),
+                momentum=getattr(t_args, "momentum", 0.95),
+                nesterov=True,
+                ns_steps=getattr(t_args, "ns_steps", 5),
+                adjust_lr_fn=getattr(t_args, "adjust_lr_fn", "match_rms_adamw"),
+                adamw_betas=getattr(t_args, "adamw_betas", (0.9, 0.95)),
+                verbose=(self.local_rank == 0),
+            )
+
+        if self.local_rank == 0 and project_name:
+            try:
+                wandb_kwargs = {
+                    "project": project_name,
+                    "name": model_name,
+                    "reinit": True,
+                }
+                cfg_data = {}
+                if config is not None and os.path.exists(config):
+                    with open(config, "r") as f:
+                        cfg_data = json.load(f)
+                if log_scale:
+                    cfg_data["model_params"] = self.active_params
+                    cfg_data["total_params"] = total_param
+                    cfg_data["optimizer"] = opt_type
+                wandb_kwargs["config"] = cfg_data
+                if wandb_id is not None:
+                    wandb_kwargs["id"] = wandb_id
+                    wandb_kwargs["resume"] = "allow"
+                wandb.init(**wandb_kwargs)
+            except Exception as e:
+                print(f"[MORTM5TrainSet] W&B init skipped ({e}).")
+
+        super().__init__(
+            criterion=nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID).to(self.device),
+            optimizer=optimizer,
+            t_args=t_args,
+            m_args=args,
+            calc_val_loss_tokens=calc_val_loss_tokens,
+        )
+        self.all_tokens = torch.tensor(0, device=self.device, dtype=torch.long)
+        self.optimizer_steps = 0
+
+    def attach_datasets(
+        self,
+        train_memmap_dataset: MORTM5MemmapDataset,
+        val_memmap_dataset: MORTM5MemmapDataset,
+    ) -> None:
+        self.train_memmap_dataset = train_memmap_dataset
+        self.val_memmap_dataset = val_memmap_dataset
+
+    def pre_processing(self, pack, progress) -> Dataset:
+        """
+        _prefetched_outer_batches のバックグラウンドスレッド上で
+        1 Outer Batch 分のウィンドウを MORTM5MemmapDataset から先読みスライスする。
+        """
+        windows: list[Tensor] = []
+        for item in pack:
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                split_name, win_idx = item[0], int(item[1])
+                ds = self.val_memmap_dataset if split_name == "val" else self.train_memmap_dataset
+            else:
+                win_idx = int(item)
+                ds = self.train_memmap_dataset
+            if ds is None:
+                raise RuntimeError("MORTM5TrainSet memmap dataset is not attached.")
+            windows.append(ds[win_idx])
+        return MORTM5WindowSubsetDataset(windows)
+
+    def epoch_fc(self, model, pack, progress):
+        """
+        Inner Loader から渡されたミニバッチの順伝播を実行し (logits_2d, targets_1d) を返す。
+        - model_mode == "flat" (AblationTransformer1):
+            input_ids [B, S-1], targets [B, S-1] -> logits [B*(S-1), V], targets [B*(S-1)]
+        - model_mode == "grouped" (AblationTransformer2):
+            input_ids [B, S-G], targets [B, S-G] -> to_local_targets -> logits [B*T_soft*G, V_local], targets [B*T_soft*G]
+        """
+        if isinstance(pack, (tuple, list)) and len(pack) == 3:
+            input_ids, targets, padding_mask = pack
+            input_ids = input_ids.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+            padding_mask = padding_mask.to(self.device, non_blocking=True)
+        else:
+            seq = pack.to(self.device, non_blocking=True)
+            if self.args.model_mode == "grouped":
+                shift = self.args.vq_groups if seq.dim() == 2 else 1
+                input_ids = seq[:, :-shift].contiguous()
+                targets = seq[:, shift:].contiguous()
+                grouped_in = (
+                    input_ids.reshape(input_ids.size(0), -1, self.args.vq_groups)
+                    if input_ids.dim() == 2
+                    else input_ids
+                )
+                padding_mask = (grouped_in != PAD_TOKEN_ID).any(dim=-1)
+            else:
+                input_ids = seq[:, :-1].contiguous()
+                targets = seq[:, 1:].contiguous()
+                padding_mask = input_ids != PAD_TOKEN_ID
+
+        if model.training:
+            self.all_tokens += torch.sum(input_ids != PAD_TOKEN_ID)
+
+        raw_model = model.module if hasattr(model, "module") else model
+        if self.args.model_mode == "grouped":
+            target_flat = raw_model.to_local_targets(targets, ignore_index=PAD_TOKEN_ID).reshape(-1).long()
+        else:
+            target_flat = targets.reshape(-1).long()
+
+        logits: Tensor = model(x=input_ids, padding_mask=padding_mask, is_causal=True)
+        logits_flat = logits.reshape(-1, logits.size(-1)).to(device=self.device, dtype=torch.float32)
+        return logits_flat, target_flat
+
+    def view_logs(self, epoch, sum_epoch, seq_count, all_pac, mini_seq_count, mini_seq_pac, loss, lr, verif_loss, tokens):
+        progress_bar_with_minibatch(
+            self.local_rank,
+            epoch,
+            sum_epoch,
+            seq_count,
+            all_pac,
+            mini_seq_count,
+            mini_seq_pac,
+            loss,
+            lr,
+            verif_loss,
+            tokens,
+        )
+
+    def optional_logging(self, val_loss, step):
+        global_tokens = self.get_synced_tokens()
+        seq_steps = (
+            global_tokens // max(1, int(self.args.vq_groups))
+            if getattr(self.args, "model_mode", "flat") == "grouped"
+            else global_tokens
+        )
+
+        if self.local_rank == 0:
+            log_data = {
+                "axis/val_loss": val_loss,
+                "axis/tokens": global_tokens,
+                "axis/seq_steps": seq_steps,
+                "axis/flops": 6 * self.active_params * seq_steps,
+                "trainer/global_step": step,
+            }
+            if wandb.run is not None:
+                wandb.log(log_data)
+
+
 
 
 def _send_prediction_end_time(message, loader_len, begin_time, end_time,
@@ -893,10 +1149,10 @@ def get_inner_loader(dataset: Dataset, batch_size: int, collate_fn=None, dataset
 
     loader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=min(batch_size, max(1, len(dataset))),
         shuffle=True,
         collate_fn=collate_fn,
-        drop_last=True,
+        drop_last=(len(dataset) >= batch_size),
         num_workers=0,
     )
     return loader, None
@@ -1626,4 +1882,186 @@ def train_custom(trainer: AbstractTrainSet, t_args, root_directory, save_directo
 
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def _compute_exact_epoch_optimizer_steps(
+    train_loader: Optional[DataLoader] = None,
+    t_args: Optional[TrainArgs] = None,
+    *,
+    num_windows: Optional[int] = None,
+    big_batch_size: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    accumulation_steps: Optional[int] = None,
+) -> int:
+    if num_windows is not None:
+        dataset_len = int(num_windows)
+        big_bs = max(1, int(big_batch_size or 2048))
+        inner_bs = max(1, int(batch_size or 32))
+        accum = max(1, int(accumulation_steps or 1))
+        num_outer = math.ceil(dataset_len / big_bs)
+        steps = 0
+        for o_idx in range(num_outer):
+            w_cnt = min(big_bs, dataset_len - o_idx * big_bs)
+            micro_cnt = math.ceil(w_cnt / inner_bs)
+            steps += math.ceil(micro_cnt / accum)
+        return max(1, steps)
+
+    assert train_loader is not None and t_args is not None
+    dataset_len = len(train_loader.dataset)
+    world_size = dist.get_world_size() if _is_dist_ready() else 1
+    samples_per_rank = math.ceil(dataset_len / max(1, world_size))
+    big_bs = max(1, int(t_args.big_batch_size))
+    inner_bs = max(1, int(t_args.batch_size))
+    accum = max(1, int(t_args.accumulation_steps))
+
+    full_outers = samples_per_rank // big_bs
+    rem_samples = samples_per_rank % big_bs
+
+    inner_per_full_outer = (big_bs // inner_bs) if big_bs >= inner_bs else (1 if big_bs > 0 else 0)
+    steps_per_full_outer = inner_per_full_outer // accum
+    epoch_steps = full_outers * steps_per_full_outer
+
+    if rem_samples > 0:
+        inner_rem = (rem_samples // inner_bs) if rem_samples >= inner_bs else 1
+        epoch_steps += inner_rem // accum
+
+    return max(1, epoch_steps * max(1, int(t_args.num_epochs)))
+
+
+
+def train_mortm5(
+    model_config: str | dict | MORTM5Args,
+    train_config: str | dict | TrainArgs,
+    token_directory: str,
+    save_directory: str,
+    version: str,
+    message: Messenger = _DefaultMessenger(),
+    load_model_directory: Optional[str] = None,
+    progress: LearningProgress = _DefaultLearningProgress(),
+    log_scale: bool = True,
+    project_name: Optional[str] = None,
+    seed: int = 42,
+    resume: bool = True,
+    resume_checkpoint_path: Optional[str] = None,
+    stride: Optional[int] = None,
+    val_stride: Optional[int] = None,
+):
+    """
+    MORTM5 8-Way Ablation 下流自己回帰モデル (AblationTransformer1 / AblationTransformer2) の
+    分散学習エントリ関数 (`train_mortm` の MORTM5 版)。
+    """
+    if not dist.is_initialized() and "WORLD_SIZE" in os.environ:
+        default_backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=os.environ.get("MORTM_DDP_BACKEND", default_backend))
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    os.makedirs(save_directory, exist_ok=True)
+    args = model_config if isinstance(model_config, MORTM5Args) else MORTM5Args(json_directory=model_config)
+    t_args = train_config if isinstance(train_config, TrainArgs) else TrainArgs(json_directory=train_config)
+
+    # MORTM5 では特に指定がない限り Muon を標準オプティマイザとする
+    raw_train_cfg = getattr(t_args, "_raw_config", {})
+    if "optimizer" not in raw_train_cfg:
+        t_args.optimizer_type = "muon"
+
+    train_memmap_ds = MORTM5MemmapDataset.from_split_dir(
+        token_dir=token_directory,
+        split="train",
+        args=args,
+        stride_chunks=stride,
+    )
+    val_memmap_ds = MORTM5MemmapDataset.from_split_dir(
+        token_dir=token_directory,
+        split="val",
+        args=args,
+        stride_chunks=val_stride,
+    )
+
+    train_outer_ds = MORTM5OuterDataset(train_memmap_ds)
+    val_outer_ds = MORTM5OuterDataset(val_memmap_ds)
+
+    train_loader, val_loader = get_data_loader(
+        t_args,
+        (train_outer_ds, val_outer_ds),
+        shuffle=t_args.shuffle,
+        collate_fn=mortm5_outer_collate_fn,
+    )
+
+    # スケジューラの total_steps 自動校正 (auto_total_steps=True または total_steps<=0 の場合)
+    sched_cfg = t_args.scheduler if isinstance(t_args.scheduler, dict) else {}
+    auto_steps = bool(sched_cfg.get("auto_total_steps", False)) or int(sched_cfg.get("total_steps", 0)) <= 0
+    if auto_steps:
+        computed_total_steps = _compute_exact_epoch_optimizer_steps(train_loader, t_args)
+        sched_cfg["total_steps"] = computed_total_steps
+        if local_rank == 0:
+            print(
+                f"[MORTM5 Schedule] Auto-computed total_steps={computed_total_steps} "
+                f"(outer_batches={len(train_loader)}, epochs={t_args.num_epochs})"
+            )
+
+    model_name = f"{args.name}.{version}"
+    effective_ckpt_path = (
+        resume_checkpoint_path
+        if resume_checkpoint_path is not None
+        else f"{save_directory}/{model_name}.checkpoint.pt"
+    )
+    wandb_id = None
+    if resume and os.path.exists(effective_ckpt_path):
+        try:
+            header = torch.load(effective_ckpt_path, map_location="cpu", weights_only=False)
+            wandb_id = header.get("wandb_run_id")
+        except Exception:
+            pass
+
+    trainer = MORTM5TrainSet(
+        args=args,
+        t_args=t_args,
+        calc_val_loss_tokens=t_args.val_total_tokens,
+        progress=progress,
+        train_memmap_dataset=train_memmap_ds,
+        val_memmap_dataset=val_memmap_ds,
+        log_scale=log_scale,
+        project_name=project_name,
+        config=model_config,
+        load_directory=load_model_directory,
+        model_name=version,
+        wandb_id=wandb_id,
+    )
+
+    today_date = datetime.date.today().strftime("%Y%m%d")
+    coll_fn = MORTM5Collate(
+        mode=args.model_mode,
+        vq_groups=args.vq_groups,
+        pad_token_id=PAD_TOKEN_ID,
+    )
+
+    model = _train(
+        args,
+        t_args,
+        save_directory,
+        trainer,
+        message=message,
+        version=version,
+        today_date=today_date,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        coll_fn=coll_fn,
+        progress=progress,
+        resume=resume,
+        resume_checkpoint_path=effective_ckpt_path,
+    )
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+    return model
 

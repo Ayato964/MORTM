@@ -1,0 +1,31 @@
+{
+  "optimizer": "muon",
+  "lr_param": 0.001,
+  "weight_decay": 0.1,
+  "momentum": 0.95,
+  "ns_steps": 5,
+  "adjust_lr_fn": "match_rms_adamw",
+  "adamw_betas": [0.9, 0.95],
+  "big_batch_size": 2048,
+  "batch_size": 32,
+  "accumulation_steps": 2,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 50000000,
+  "train_dataset_split": 0.99,
+  "shuffle": true,
+  "checkpoint_percents": [
+    25,
+    50,
+    75,
+    100
+  ],
+  "scheduler": {
+    "type": "cos",
+    "warmup_ratio": 0.05,
+    "min_lr_ratio": 0.1,
+    "total_steps": 17500,
+    "auto_total_steps": true
+  },
+  "_note": "MORTM5 85M Ablation (#1-#8): torch.optim.Muon (adjust_lr_fn=match_rms_adamw) + AdamW, Linear Warmup (5%) + Cosine Decay (min_lr_ratio=0.1, auto_total_steps=true)"
+}

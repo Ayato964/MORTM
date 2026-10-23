@@ -298,7 +298,16 @@ class TensorDataset(Dataset):
         self.seq = patch_list
 
 
-from mortm.models.modules.config import PAD_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID, RVQ_TOKEN_OFFSET
+from mortm.models.modules.config import (
+    PAD_TOKEN_ID,
+    BOS_TOKEN_ID,
+    EOS_TOKEN_ID,
+    RVQ_TOKEN_OFFSET,
+    INST_RVQ_TOKEN_OFFSET,
+    NUM_SLOT_TOKENS,
+    MORTM5Args,
+    slot_code_to_token_id,
+)
 
 
 class PPODataset(Dataset):
@@ -333,15 +342,23 @@ class PPODataset(Dataset):
 
 class MORTM5MemmapDataset(Dataset):
     """
-    MidiVision (M3 / M4) でトークン化されたフラットバイナリ (.bin + _offsets.npy) を
+    MidiVision (M3 / M4) でトークン化されたフラットバイナリ (.bin + _offsets.npy [+ _slots.npy]) を
     高速かつ省メモリに読み込む Dataset クラス。
 
+    8通りのアブレーション設定および4スロット楽器条件付けに完全対応:
     - mode="flat":
         AblationTransformer1 用。1トークン単位の自己回帰。
-        シーケンス先頭に [BOS] (1個)、末尾に [EOS] (1個) を付与する。
+        先頭に [BOS] (+ 楽器トークン4個 [Slot0..Slot3])、末尾に [EOS] を付与する。
     - mode="grouped":
         AblationTransformer2 用。vq_groups (G) トークンを1ソフトトークンとして束ねる自己回帰。
-        シーケンス長が常に G の倍数になるよう、先頭に [BOS] * G、末尾に [EOS] * G を付与する。
+        シーケンス長が常に G の倍数になるよう、先頭に [BOS]*G (+ [Slot0]*G .. [Slot3]*G)、末尾に [EOS]*G を付与する。
+    - separate_rvq_layers:
+        False の場合は全 RVQ レイヤーで語彙 (G * K) を共有。
+        True の場合は .bin を再トークン化することなく、オンザフライでレイヤー l ごとに l * G * K を加算し、
+        全 RVQ レイヤー独立語彙 (L * G * K) に変換する。
+    - use_instrument_tokens:
+        True の場合、各ウィンドウの先頭 (<BOS> の直後) に 4 スロットの楽器条件付けトークンを付与し、
+        RVQ トークンのオフセットを INST_RVQ_TOKEN_OFFSET (133) にシフトする。
     """
 
     def __init__(
@@ -350,11 +367,17 @@ class MORTM5MemmapDataset(Dataset):
         offsets_npy_path: str,
         vq_groups: int = 8,
         vq_layers: int = 2,
+        codebook_size: int = 2048,
         max_chunks: int = 128,
         min_chunks: int = 8,
         stride_chunks: Optional[int] = None,
         mode: str = "flat",
         bos_eos_mode: str = "always",
+        separate_rvq_layers: bool = False,
+        use_instrument_tokens: bool = False,
+        slots_npy_path: Optional[str] = None,
+        token_offset: Optional[int] = None,
+        raw_bin_offset: int = RVQ_TOKEN_OFFSET,
         pad_token_id: int = PAD_TOKEN_ID,
         bos_token_id: int = BOS_TOKEN_ID,
         eos_token_id: int = EOS_TOKEN_ID,
@@ -369,8 +392,12 @@ class MORTM5MemmapDataset(Dataset):
         self.offsets_npy_path = os.path.abspath(offsets_npy_path)
         self.vq_groups = int(vq_groups)
         self.vq_layers = int(vq_layers)
-        if self.vq_groups <= 0 or self.vq_layers <= 0:
-            raise ValueError(f"vq_groups ({self.vq_groups}) and vq_layers ({self.vq_layers}) must be positive.")
+        self.codebook_size = int(codebook_size)
+        if self.vq_groups <= 0 or self.vq_layers <= 0 or self.codebook_size <= 0:
+            raise ValueError(
+                f"vq_groups ({self.vq_groups}), vq_layers ({self.vq_layers}), and "
+                f"codebook_size ({self.codebook_size}) must be positive."
+            )
         self.tokens_per_chunk = self.vq_groups * self.vq_layers
 
         self.max_chunks = int(max_chunks)
@@ -383,32 +410,59 @@ class MORTM5MemmapDataset(Dataset):
             )
         self.mode = mode
         self.bos_eos_mode = bos_eos_mode
+        self.separate_rvq_layers = bool(separate_rvq_layers)
+        self.use_instrument_tokens = bool(use_instrument_tokens)
+        self.raw_bin_offset = int(raw_bin_offset)
+
+        if token_offset is None:
+            self.token_offset = INST_RVQ_TOKEN_OFFSET if self.use_instrument_tokens else RVQ_TOKEN_OFFSET
+        else:
+            self.token_offset = int(token_offset)
+
+        if self.use_instrument_tokens and self.token_offset < INST_RVQ_TOKEN_OFFSET:
+            raise ValueError(
+                f"use_instrument_tokens=True requires token_offset >= {INST_RVQ_TOKEN_OFFSET}, "
+                f"got {self.token_offset}."
+            )
 
         self.pad_token_id = int(pad_token_id)
         self.bos_token_id = int(bos_token_id)
         self.eos_token_id = int(eos_token_id)
+
+        if self.tokens_bin_path.endswith("_tokens.bin"):
+            complete_alt = self.tokens_bin_path[: -len("_tokens.bin")] + "_tokens_complete.bin"
+            if os.path.exists(complete_alt):
+                if not os.path.exists(self.tokens_bin_path) or os.path.getsize(complete_alt) > os.path.getsize(self.tokens_bin_path):
+                    self.tokens_bin_path = complete_alt
 
         if not os.path.exists(self.tokens_bin_path):
             raise FileNotFoundError(f"Tokens binary file not found: {self.tokens_bin_path}")
         if not os.path.exists(self.offsets_npy_path):
             raise FileNotFoundError(f"Offsets npy file not found: {self.offsets_npy_path}")
 
-        # もし隣接する {split}_state.json が存在すれば、vq_groups / vq_layers の設定不一致を検出する
-        if self.tokens_bin_path.endswith("_tokens.bin"):
-            candidate_state_path = self.tokens_bin_path[: -len("_tokens.bin")] + "_state.json"
-            if os.path.exists(candidate_state_path):
-                with open(candidate_state_path, "r", encoding="utf-8") as sf:
-                    state_meta = json.load(sf)
-                meta_g = state_meta.get("vq_groups")
-                meta_l = state_meta.get("vq_layers")
-                if (meta_g is not None and int(meta_g) != self.vq_groups) or (
-                    meta_l is not None and int(meta_l) != self.vq_layers
-                ):
-                    raise ValueError(
-                        f"Tokenizer metadata mismatch for {self.tokens_bin_path}: "
-                        f"state.json has (vq_groups={meta_g}, vq_layers={meta_l}), "
-                        f"but MORTM5MemmapDataset was initialized with (vq_groups={self.vq_groups}, vq_layers={self.vq_layers})."
-                    )
+        # もし隣接する {split}_state.json が存在すれば、vq_groups / vq_layers / codebook_size の設定不一致を検出する
+        for suffix in ("_tokens.bin", "_tokens_complete.bin"):
+            if self.tokens_bin_path.endswith(suffix):
+                candidate_state_path = self.tokens_bin_path[: -len(suffix)] + "_state.json"
+                if os.path.exists(candidate_state_path):
+                    with open(candidate_state_path, "r", encoding="utf-8") as sf:
+                        state_meta = json.load(sf)
+                    meta_g = state_meta.get("vq_groups")
+                    meta_l = state_meta.get("vq_layers")
+                    meta_k = state_meta.get("codebook_size")
+                    if (
+                        (meta_g is not None and int(meta_g) != self.vq_groups)
+                        or (meta_l is not None and int(meta_l) != self.vq_layers)
+                        or (meta_k is not None and int(meta_k) != self.codebook_size)
+                    ):
+                        raise ValueError(
+                            f"Tokenizer metadata mismatch for {self.tokens_bin_path}: "
+                            f"state.json has (vq_groups={meta_g}, vq_layers={meta_l}, codebook_size={meta_k}), "
+                            f"but MORTM5MemmapDataset was initialized with "
+                            f"(vq_groups={self.vq_groups}, vq_layers={self.vq_layers}, codebook_size={self.codebook_size})."
+                        )
+                    if "token_offset" in state_meta and raw_bin_offset == RVQ_TOKEN_OFFSET:
+                        self.raw_bin_offset = int(state_meta["token_offset"])
 
         # shape: [N_songs, 2] -> (start_token_offset, num_tokens)
         self.offsets = np.load(self.offsets_npy_path)
@@ -436,13 +490,176 @@ class MORTM5MemmapDataset(Dataset):
                     f"but offsets require at least {required_tokens} tokens."
                 )
 
+        # スロット楽器コード [N_songs, 4] のロードおよび楽器トークンIDへの事前変換
+        self.slots_npy_path: Optional[str] = None
+        self.slots: Optional[np.ndarray] = None
+        self.slot_token_ids: Optional[np.ndarray] = None
+
+        if slots_npy_path is not None:
+            self.slots_npy_path = os.path.abspath(slots_npy_path)
+            if not os.path.exists(self.slots_npy_path):
+                raise FileNotFoundError(f"Slots npy file not found: {self.slots_npy_path}")
+        elif self.offsets_npy_path.endswith("_offsets.npy"):
+            candidate_slots = self.offsets_npy_path[: -len("_offsets.npy")] + "_slots.npy"
+            if os.path.exists(candidate_slots):
+                self.slots_npy_path = candidate_slots
+
+        if self.slots_npy_path is not None:
+            loaded_slots = np.load(self.slots_npy_path)
+            if loaded_slots.ndim != 2 or loaded_slots.shape[1] != NUM_SLOT_TOKENS:
+                raise ValueError(
+                    f"Expected slots array of shape [N, {NUM_SLOT_TOKENS}], got {loaded_slots.shape} in {self.slots_npy_path}"
+                )
+            if len(loaded_slots) < len(self.offsets):
+                raise ValueError(
+                    f"Slots array length ({len(loaded_slots)}) < offsets length ({len(self.offsets)}) in {self.slots_npy_path}"
+                )
+            self.slots = np.asarray(loaded_slots[: len(self.offsets)], dtype=np.int16)
+        elif self.use_instrument_tokens:
+            # フォールバック: 隣接する {split}_manifest.jsonl に slots フィールドが含まれていれば復元する
+            manifest_slots = self._try_load_slots_from_manifest()
+            if manifest_slots is not None:
+                self.slots = manifest_slots
+            else:
+                raise FileNotFoundError(
+                    f"use_instrument_tokens=True requires a '{os.path.basename(self.offsets_npy_path).replace('_offsets.npy', '_slots.npy')}' "
+                    f"file (or 'slots' field in manifest.jsonl) alongside {self.offsets_npy_path}. "
+                    f"Run ConvertMidiVisionTokens.py with --build_slots_only to generate it."
+                )
+
+        if self.slots is not None:
+            self.slot_token_ids = np.empty((len(self.slots), NUM_SLOT_TOKENS), dtype=np.int64)
+            for s_idx in range( len(self.slots)):
+                for col in range(NUM_SLOT_TOKENS):
+                    self.slot_token_ids[s_idx, col] = slot_code_to_token_id(int(self.slots[s_idx, col]))
+
+        # 1チャンク (L * G トークン) 内の各位置に加算するシフト量を事前計算 (O(1) ベクトル加算用)
+        offset_shift = self.token_offset - self.raw_bin_offset
+        layer_ids = np.arange(self.vq_layers, dtype=np.int64)[:, None]  # [L, 1]
+        layer_shift = (
+            layer_ids * (self.vq_groups * self.codebook_size)
+            if self.separate_rvq_layers
+            else np.zeros_like(layer_ids)
+        )
+        self._intra_chunk_shift = (
+            np.broadcast_to(offset_shift + layer_shift, (self.vq_layers, self.vq_groups))
+            .reshape(1, self.tokens_per_chunk)
+            .copy()
+        )
+        self._needs_token_shift = bool(np.any(self._intra_chunk_shift != 0))
+
         self._memmap: Optional[np.memmap] = None
         self.windows: np.ndarray = self._build_windows()
+
+    @classmethod
+    def from_args(
+        cls,
+        args: MORTM5Args,
+        tokens_bin_path: str,
+        offsets_npy_path: str,
+        slots_npy_path: Optional[str] = None,
+        max_chunks: int = 128,
+        min_chunks: int = 8,
+        stride_chunks: Optional[int] = None,
+        bos_eos_mode: str = "always",
+    ) -> "MORTM5MemmapDataset":
+        """MORTM5Args の設定から整合性を保証して MORTM5MemmapDataset を生成するファクトリメソッド。"""
+        return cls(
+            tokens_bin_path=tokens_bin_path,
+            offsets_npy_path=offsets_npy_path,
+            vq_groups=args.vq_groups,
+            vq_layers=args.vq_layers,
+            codebook_size=args.codebook_size,
+            max_chunks=max_chunks,
+            min_chunks=min_chunks,
+            stride_chunks=stride_chunks,
+            mode=getattr(args, "model_mode", "flat"),
+            bos_eos_mode=bos_eos_mode,
+            separate_rvq_layers=getattr(args, "separate_rvq_layers", False),
+            use_instrument_tokens=getattr(args, "use_instrument_tokens", False),
+            slots_npy_path=slots_npy_path,
+            token_offset=args.token_offset,
+            pad_token_id=args.pad_token_id,
+            bos_token_id=args.bos_token_id,
+            eos_token_id=args.eos_token_id,
+        )
+
+    @classmethod
+    def from_split_dir(
+        cls,
+        token_dir: str,
+        split: str,
+        args: MORTM5Args,
+        max_chunks: Optional[int] = None,
+        min_chunks: int = 8,
+        stride_chunks: Optional[int] = None,
+        stride: Optional[int] = None,
+        bos_eos_mode: str = "always",
+    ) -> "MORTM5MemmapDataset":
+        """
+        ディレクトリ `token_dir` と `split` ("train" or "val") および `MORTM5Args` から
+        `max_chunks` を自動算出して `MORTM5MemmapDataset` を生成する。
+        """
+        if stride_chunks is None and stride is not None:
+            stride_chunks = stride
+        tokens_bin_path = os.path.join(token_dir, f"{split}_tokens.bin")
+        offsets_npy_path = os.path.join(token_dir, f"{split}_offsets.npy")
+        if not os.path.exists(offsets_npy_path):
+            alt_index = os.path.join(token_dir, f"{split}_index.npy")
+            if os.path.exists(alt_index):
+                offsets_npy_path = alt_index
+        slots_candidate = os.path.join(token_dir, f"{split}_slots.npy")
+        slots_npy_path = slots_candidate if os.path.exists(slots_candidate) else None
+
+        if max_chunks is None:
+            mode = getattr(args, "model_mode", "flat")
+            reserved_units = 2 + (NUM_SLOT_TOKENS if getattr(args, "use_instrument_tokens", False) else 0)
+            if mode == "grouped":
+                usable_soft = max(args.vq_layers, int(args.position_length) - reserved_units)
+                max_chunks = max(1, usable_soft // int(args.vq_layers))
+            else:
+                tok_per_chunk = int(args.vq_groups) * int(args.vq_layers)
+                usable_flat = max(tok_per_chunk, int(args.position_length) - reserved_units)
+                max_chunks = max(1, usable_flat // tok_per_chunk)
+
+        eff_min_chunks = min(int(min_chunks), int(max_chunks))
+        ds = cls.from_args(
+            args=args,
+            tokens_bin_path=tokens_bin_path,
+            offsets_npy_path=offsets_npy_path,
+            slots_npy_path=slots_npy_path,
+            max_chunks=max_chunks,
+            min_chunks=eff_min_chunks,
+            stride_chunks=stride_chunks,
+            bos_eos_mode=bos_eos_mode,
+        )
+        ds.split = split
+        return ds
+
+    def _try_load_slots_from_manifest(self) -> Optional[np.ndarray]:
+        if not self.offsets_npy_path.endswith("_offsets.npy"):
+            return None
+        manifest_path = self.offsets_npy_path[: -len("_offsets.npy")] + "_manifest.jsonl"
+        if not os.path.exists(manifest_path):
+            return None
+        slots_rows: List[List[int]] = []
+        with open(manifest_path, "r", encoding="utf-8") as mf:
+            for _ in range(len(self.offsets)):
+                line = mf.readline()
+                if not line:
+                    return None
+                rec = json.loads(line)
+                if "slots" not in rec or len(rec["slots"]) != NUM_SLOT_TOKENS:
+                    return None
+                slots_rows.append([int(x) for x in rec["slots"]])
+        if len(slots_rows) != len(self.offsets):
+            return None
+        return np.asarray(slots_rows, dtype=np.int16)
 
     def _build_windows(self) -> np.ndarray:
         """
         各楽曲の (start_offset, num_tokens) から学習ウィンドウ
-        (token_start, token_len, is_song_start, is_song_end) のテーブルを構築する。
+        (token_start, token_len, is_song_start, is_song_end, song_idx) のテーブルを構築する。
         """
         max_win_tokens = self.max_chunks * self.tokens_per_chunk
         min_win_tokens = self.min_chunks * self.tokens_per_chunk
@@ -457,7 +674,7 @@ class MORTM5MemmapDataset(Dataset):
                 continue
 
             if num_tokens <= max_win_tokens:
-                windows.append((start_offset, num_tokens, 1, 1))
+                windows.append((start_offset, num_tokens, 1, 1, song_idx))
                 continue
 
             pos = 0
@@ -468,13 +685,13 @@ class MORTM5MemmapDataset(Dataset):
                 win_len = min(max_win_tokens, rem)
                 is_first = 1 if pos == 0 else 0
                 is_last = 1 if (pos + win_len >= num_tokens) else 0
-                windows.append((start_offset + pos, win_len, is_first, is_last))
+                windows.append((start_offset + pos, win_len, is_first, is_last, song_idx))
                 if pos + win_len >= num_tokens:
                     break
                 pos += stride_tokens
 
         if len(windows) == 0:
-            return np.zeros((0, 4), dtype=np.int64)
+            return np.zeros((0, 5), dtype=np.int64)
         return np.asarray(windows, dtype=np.int64)
 
     def _get_memmap(self) -> np.memmap:
@@ -490,15 +707,27 @@ class MORTM5MemmapDataset(Dataset):
     def __len__(self) -> int:
         return len(self.windows)
 
+    def get_window_slot_codes(self, index: int) -> Optional[np.ndarray]:
+        """指定ウィンドウの楽曲に対応する 4 スロット楽器コード [4] (int16) を返す。"""
+        if self.slots is None:
+            return None
+        song_idx = int(self.windows[index, 4])
+        return self.slots[song_idx].copy()
+
     def __getitem__(self, index: int) -> Tensor:
         mmap = self._get_memmap()
-        token_start, token_len, is_first, is_last = self.windows[index]
+        token_start, token_len, is_first, is_last, song_idx = self.windows[index]
         raw_tokens = np.asarray(mmap[token_start : token_start + token_len], dtype=np.int64)
         if raw_tokens.size != token_len:
             raise RuntimeError(
                 f"Memmap slice length mismatch at [{token_start}:{token_start + token_len}]: "
                 f"expected {token_len}, got {raw_tokens.size}"
             )
+
+        if self._needs_token_shift:
+            raw_tokens = (
+                raw_tokens.reshape(-1, self.tokens_per_chunk) + self._intra_chunk_shift
+            ).reshape(-1)
 
         add_bos = (
             self.bos_eos_mode == "always"
@@ -513,12 +742,21 @@ class MORTM5MemmapDataset(Dataset):
         parts = []
         if add_bos:
             parts.append(np.full(unit_width, self.bos_token_id, dtype=np.int64))
+        if self.use_instrument_tokens:
+            if self.slot_token_ids is None:
+                raise RuntimeError("use_instrument_tokens=True but slot_token_ids is not initialized.")
+            slot_toks = self.slot_token_ids[song_idx]  # [4]
+            if unit_width == 1:
+                parts.append(slot_toks)
+            else:
+                parts.append(np.repeat(slot_toks, unit_width))
         parts.append(raw_tokens)
         if add_eos:
             parts.append(np.full(unit_width, self.eos_token_id, dtype=np.int64))
 
         seq = np.concatenate(parts, axis=0) if len(parts) > 1 else raw_tokens
         return torch.from_numpy(seq)
+
 
 
 def mortm5_collate_fn(
@@ -585,4 +823,72 @@ def mortm5_collate_fn(
         padding_mask = (grouped_inputs != pad_token_id).any(dim=-1)
 
     return input_ids, targets, padding_mask
+
+
+class MORTM5Collate:
+    """
+    DataLoader 用のシリアライズ可能な Collate ファンクタ。
+    mortm5_collate_fn に mode / vq_groups / pad_token_id を束縛する。
+    """
+
+    def __init__(self, mode: str = "flat", vq_groups: int = 8, pad_token_id: int = PAD_TOKEN_ID):
+        self.mode = mode
+        self.vq_groups = int(vq_groups)
+        self.pad_token_id = int(pad_token_id)
+
+    def __call__(self, batch: List[Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+        return mortm5_collate_fn(
+            batch,
+            mode=self.mode,
+            vq_groups=self.vq_groups,
+            pad_token_id=self.pad_token_id,
+        )
+
+
+class MORTM5OuterDataset(Dataset):
+    """
+    self_turing の 2段 DataLoader (Outer Loader -> _prefetched_outer_batches -> pre_processing -> Inner Loader)
+    に MORTM5MemmapDataset を適合させる軽量インデックス Dataset。
+
+    - Outer Loader は `big_batch_size` 個の `(split, window_idx)` タプルを 1 パックとして yield する。
+    - `src_list` プロパティを提供し、`save_path_json` との完全な互換性を保つ。
+    """
+
+    def __init__(self, memmap_dataset: MORTM5MemmapDataset, split: Optional[str] = None):
+        self.memmap_dataset = memmap_dataset
+        self.split = split or getattr(memmap_dataset, "split", "train")
+        paths = [str(memmap_dataset.tokens_bin_path), str(memmap_dataset.offsets_npy_path)]
+        if getattr(memmap_dataset, "slots_npy_path", None) is not None:
+            paths.append(str(memmap_dataset.slots_npy_path))
+        self.src_list = paths
+
+    def __len__(self) -> int:
+        return len(self.memmap_dataset)
+
+    def __getitem__(self, index: int) -> Tuple[str, int]:
+        return self.split, int(index)
+
+
+class MORTM5WindowSubsetDataset(Dataset):
+    """
+    MORTM5TrainSet.pre_processing がバックグラウンドスレッドで先読みした
+    1 Outer Batch 分のウィンドウ Tensor 群、または (MORTM5MemmapDataset, indices) サブセットを保持する Dataset。
+    """
+
+    def __init__(self, windows: List[Tensor] | Dataset, indices: Optional[List[int]] = None):
+        if indices is not None:
+            self.windows = [windows[int(i)] for i in indices]
+        else:
+            self.windows = list(windows)  # type: ignore
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, index: int) -> Tensor:
+        return self.windows[index]
+
+
+def mortm5_outer_collate_fn(batch: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    """Outer DataLoader 用 Collate 関数: (split, window_idx) のリストをそのまま返す。"""
+    return list(batch)
 
