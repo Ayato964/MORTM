@@ -15,7 +15,13 @@ from typing import Tuple, List
 import numpy as np
 
 from .attention import FlashSelfAttentionM, FlashCrossAttentionM, linear, flash_attn_varlen_kvpacked_func
-from .config import MORTMArgs, MORTM5Args
+from .config import (
+    MORTMArgs,
+    MORTM5Args,
+    RVQ_TOKEN_OFFSET,
+    INST_RVQ_TOKEN_OFFSET,
+    NUM_SLOT_TOKENS,
+)
 
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
@@ -370,6 +376,97 @@ class MILPool(nn.Module):
         bag = torch.stack(out)
         return (bag, s) if return_scores else bag
 
+
+class DecodeCodebookHead(nn.Module):
+    """
+    RVQレイヤーおよびグループごとに独立したコードブック射影ヘッド (L x G 個の Linear(d_model, codebook_size)) と、
+    特殊トークン (<PAD>, <BOS>, <EOS>, <INST_...>) 用の共有射影ヘッド (Linear(d_model, token_offset)) を一括管理するモジュール。
+
+    - 各ソフトトークン位置が予測すべき RVQ レイヤー l に応じて self.decode[l][0..G-1] のみをストライド・ルーティング適用し、
+      出力形状を [..., G, token_offset + codebook_size] (例: 133 + 2048 = 2,181) に保つ。
+    - 非対象レイヤーのヘッド計算を省略することで Wout / Softmax の計算量・VRAMを 1/L に削減し、
+      他レイヤーのコードブックへの偽の負勾配流入を防止する。
+    """
+
+    def __init__(self, args: MORTM5Args):
+        super().__init__()
+        self.d_model = int(args.d_model)
+        self.num_layer = int(getattr(args, "vq_layers", getattr(args, "encoder_layer", 2)))
+        self.num_group = int(getattr(args, "vq_groups", 4))
+        self.codebook_size = int(getattr(args, "codebook_size", 2048))
+        self.use_instrument_tokens = bool(getattr(args, "use_instrument_tokens", False))
+
+        default_offset = INST_RVQ_TOKEN_OFFSET if self.use_instrument_tokens else RVQ_TOKEN_OFFSET
+        self.token_offset = int(getattr(args, "token_offset", default_offset))
+        self.group_vocab_size = self.token_offset + self.codebook_size
+
+        self.special_decode = (
+            nn.Linear(self.d_model, self.token_offset) if self.token_offset > 0 else None
+        )
+        self.decode = nn.ModuleList([
+            nn.ModuleList([
+                nn.Linear(self.d_model, self.codebook_size)
+                for _ in range(self.num_group)
+            ])
+            for _ in range(self.num_layer)
+        ])
+
+    @property
+    def weight(self) -> Tensor:
+        return self.decode[0][0].weight
+
+    def forward(self, x: Tensor, start_pos: int = 0) -> Tensor:
+        squeeze_seq = (x.dim() == 2)
+        if squeeze_seq:
+            x = x.unsqueeze(1)
+        if x.dim() != 3:
+            raise ValueError(
+                f"DecodeCodebookHead expects 2D [B, D] or 3D [B, S, D] tensor, got {tuple(x.shape)}."
+            )
+
+        batch_size, seq_len, _ = x.shape
+        prefix_soft_len = 1 + (NUM_SLOT_TOKENS if self.use_instrument_tokens else 0)
+        first_rvq_input_pos = prefix_soft_len - 1
+        rvq_start = min(seq_len, max(0, first_rvq_input_pos - int(start_pos)))
+
+        codebook_logits = x.new_empty((batch_size, seq_len, self.num_group, self.codebook_size))
+
+        # 1. 楽器スロット予測区間 (pos < prefix_soft_len - 1): L0 ヘッドを割り当て
+        if rvq_start > 0:
+            x_pre = x[:, :rvq_start, :]
+            head_l0 = self.decode[0]
+            codebook_logits[:, :rvq_start, :, :] = torch.stack(
+                [head_l0[g](x_pre) for g in range(self.num_group)], dim=-2
+            )
+
+        # 2. RVQ予測区間 (pos >= prefix_soft_len - 1): 対象レイヤー l のヘッドのみをストライド適用
+        if rvq_start < seq_len:
+            first_pos_at_rvq_start = int(start_pos) + rvq_start
+            first_layer = max(0, first_pos_at_rvq_start - first_rvq_input_pos) % self.num_layer
+            for d in range(self.num_layer):
+                x_l = x[:, rvq_start + d :: self.num_layer, :]
+                if x_l.size(1) == 0:
+                    continue
+                layer_idx = (first_layer + d) % self.num_layer
+                head_l = self.decode[layer_idx]
+                codebook_logits[:, rvq_start + d :: self.num_layer, :, :] = torch.stack(
+                    [head_l[g](x_l) for g in range(self.num_group)], dim=-2
+                )
+
+        if self.special_decode is not None:
+            special_logits = (
+                self.special_decode(x)
+                .unsqueeze(-2)
+                .expand(-1, -1, self.num_group, -1)
+            )
+            out = torch.cat([special_logits, codebook_logits], dim=-1)
+        else:
+            out = codebook_logits
+
+        if squeeze_seq:
+            return out.squeeze(1)
+        return out
+        
 
 class DummyDecoder(nn.Module):
     def __init__(self):

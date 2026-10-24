@@ -576,12 +576,12 @@ class AblationTransformer2(_BaseMORTM5Transformer):
       * RVQトークン (`>= token_offset`) は `(eff_layer * G + g)` 専用の領域にマッピングし、
         独立な G 個のグループ埋め込みの和を `1 / sqrt(G)` スケーリングして分散 1.0 を維持する。
     - 出力 score:
-      * `[B, S, G, group_vocab_size]` (ここで `group_vocab_size = token_offset + effective_layers * K`)
+      * `[B, S, G, group_vocab_size]` (ここで `group_vocab_size = token_offset + K`)
     """
 
     def __init__(self, args: MORTM5Args, progress=None):
         super().__init__(args=args, progress=progress)
-        self.group_vocab_size = self.token_offset + self.effective_layers * self.codebook_size
+        self.group_vocab_size = self.token_offset + self.codebook_size
         self.rvq_emb_scale = float(self.vq_groups) ** -0.5
         self.special_emb_scale = 1.0 / float(self.vq_groups)
 
@@ -596,7 +596,10 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         pad_idx = PAD_TOKEN_ID if self.token_offset > 0 else None
         self.embedding = nn.Embedding(args.vocab_size, args.d_model, padding_idx=pad_idx).to(device)
         self.decoder = MORTMDecoder(args=args, progress=progress).to(device)
-        self.Wout = nn.Linear(args.d_model, self.vq_groups * self.group_vocab_size).to(device)
+        if self.separate_rvq_layers:
+            self.Wout = DecodeCodebookHead(args).to(device)
+        else:
+            self.Wout = nn.Linear(args.d_model, self.vq_groups * self.group_vocab_size).to(device)
         self.wout = self.Wout
 
     def to_global_ids(self, x: Tensor) -> Tensor:
@@ -651,11 +654,11 @@ class AblationTransformer2(_BaseMORTM5Transformer):
     def to_local_targets(self, targets: Tensor, ignore_index: int = PAD_TOKEN_ID) -> Tensor:
         """
         教師ラベルを出力ロジット `[..., G, group_vocab_size]` に対応するローカルクラスID `[..., G]`
-        (値域 `[0, token_offset + effective_layers * K)`) に変換する。
+        (値域 `[0, token_offset + K)`) に変換する。
         2D `[B, S * G]` が渡された場合は自動的に `[B, S, G]` に変換する。
         - パディング (<= 0): ignore_index
         - 特殊トークン (0 < t < token_offset): そのまま [1, token_offset)
-        - RVQトークン (t >= token_offset): token_offset + eff_layer * K + k
+        - RVQトークン (t >= token_offset): token_offset + k
         """
         if targets.dim() == 2:
             if targets.size(1) % self.vq_groups != 0:
@@ -671,34 +674,28 @@ class AblationTransformer2(_BaseMORTM5Transformer):
             )
 
         targets = targets.to(dtype=torch.long)
-        layer_stride = self.vq_groups * self.codebook_size
 
         if self.token_offset > 0:
             is_pad = targets <= 0
             is_rvq = targets >= self.token_offset
             u = targets.clamp(min=self.token_offset) - self.token_offset
             local_k = u % self.codebook_size
-            if self.separate_rvq_layers:
-                eff_layer = (u // layer_stride) % self.effective_layers
-                local_cls = self.token_offset + eff_layer * self.codebook_size + local_k
-            else:
-                local_cls = self.token_offset + local_k
+            local_cls = self.token_offset + local_k
             out = torch.where(is_rvq, local_cls, targets.clamp(min=0))
             return torch.where(is_pad, torch.full_like(targets, ignore_index), out)
         else:
             is_valid = targets >= 0
             u = targets.clamp(min=0)
             local_k = u % self.codebook_size
-            if self.separate_rvq_layers:
-                eff_layer = (u // layer_stride) % self.effective_layers
-                local_cls = eff_layer * self.codebook_size + local_k
-            else:
-                local_cls = local_k
-            return torch.where(is_valid, local_cls, torch.full_like(targets, ignore_index))
+            return torch.where(is_valid, local_k, torch.full_like(targets, ignore_index))
 
-    def local_to_global_ids(self, local_ids: Tensor) -> Tensor:
+    def local_to_global_ids(
+        self,
+        local_ids: Tensor,
+        layer_idx: Optional[int | Tensor] = None,
+    ) -> Tensor:
         """
-        グループ別の予測ローカルクラスID `[..., G]` (値域 `[0, token_offset + effective_layers * K)`) を
+        グループ別の予測ローカルクラスID `[..., G]` (値域 `[0, token_offset + K)`) を
         グローバルID `[..., G]` (特殊トークン `[0, token_offset)` または `token_offset + (eff_layer * G + g) * K + k`) に逆変換する。
         """
         local_ids = local_ids.to(dtype=torch.long)
@@ -710,7 +707,15 @@ class AblationTransformer2(_BaseMORTM5Transformer):
             v = local_ids.clamp(min=self.token_offset) - self.token_offset
             local_k = v % self.codebook_size
             if self.separate_rvq_layers:
-                eff_layer = (v // self.codebook_size) % self.effective_layers
+                if layer_idx is not None:
+                    eff_layer = layer_idx % self.effective_layers
+                    if isinstance(eff_layer, Tensor):
+                        eff_layer = eff_layer.to(device=local_ids.device, dtype=torch.long)
+                elif local_ids.dim() == 3:
+                    rvq_pos = (is_rvq.any(dim=-1).cumsum(dim=1) - 1).clamp(min=0)
+                    eff_layer = (rvq_pos % self.effective_layers).unsqueeze(-1)
+                else:
+                    eff_layer = (v // self.codebook_size) % self.effective_layers
                 global_id = self.token_offset + eff_layer * layer_stride + offsets + local_k
             else:
                 global_id = self.token_offset + offsets + local_k
@@ -719,7 +724,15 @@ class AblationTransformer2(_BaseMORTM5Transformer):
             v = local_ids.clamp(min=0)
             local_k = v % self.codebook_size
             if self.separate_rvq_layers:
-                eff_layer = (v // self.codebook_size) % self.effective_layers
+                if layer_idx is not None:
+                    eff_layer = layer_idx % self.effective_layers
+                    if isinstance(eff_layer, Tensor):
+                        eff_layer = eff_layer.to(device=local_ids.device, dtype=torch.long)
+                elif local_ids.dim() == 3:
+                    seq_idx = torch.arange(local_ids.size(1), device=local_ids.device, dtype=torch.long)
+                    eff_layer = (seq_idx % self.effective_layers).view(1, -1, 1)
+                else:
+                    eff_layer = (v // self.codebook_size) % self.effective_layers
                 return eff_layer * layer_stride + offsets + local_k
             return local_k + offsets
 
@@ -760,11 +773,7 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                 masked[..., INST_EMPTY_TOKEN_ID] = logits[..., INST_EMPTY_TOKEN_ID]
             return masked
 
-        rvq_soft_step = max(0, soft_pos - prefix_soft_len)
-        layer_idx = rvq_soft_step % self.vq_layers
-        eff_layer = layer_idx if self.separate_rvq_layers else 0
-
-        low = self.token_offset + eff_layer * self.codebook_size
+        low = self.token_offset
         high = low + self.codebook_size
         masked[..., low:high] = logits[..., low:high]
         return masked
@@ -829,7 +838,10 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                     local_sampled = self._sample_from_logits(
                         constrained, temperature=temperature, top_k=top_k, top_p=top_p
                     )  # [B, G]
-                    next_global = self.local_to_global_ids(local_sampled).unsqueeze(1)  # [B, 1, G]
+                    cur_layer_idx = max(0, cur_soft_pos - prefix_soft_len) % self.vq_layers
+                    next_global = self.local_to_global_ids(
+                        local_sampled, layer_idx=cur_layer_idx
+                    ).unsqueeze(1)  # [B, 1, G]
 
                 generated.append(next_global)
                 cur_soft_pos += 1
@@ -875,6 +887,9 @@ class AblationTransformer2(_BaseMORTM5Transformer):
             keep_seq_dim = (x.dim() == 3)
             if keep_seq_dim:
                 x = x.squeeze(1)  # [B, G]
+            attn0 = self.decoder.layers[0].self_attention
+            step_pos = int(attn0.cache_seqlens[0].item()) if attn0.cache_seqlens is not None else 0
+
             # [B, G] -> [B, d_model] (分散1.0正規化付き集約、2D で decoder に渡し残差ブロードキャスト事故を防止)
             x_emb = self._aggregate_group_embeddings(x).to(dtype=torch.bfloat16)
             with torch.autocast(device_type=x_emb.device.type, dtype=torch.bfloat16):
@@ -890,8 +905,11 @@ class AblationTransformer2(_BaseMORTM5Transformer):
             if keep_seq_dim:
                 out = out.unsqueeze(1)
             with torch.autocast(device_type=out.device.type, enabled=False):
-                score: Tensor = self.Wout(out.to(self.Wout.weight.dtype)).float()
-                score = score.reshape(*score.shape[:-1], self.vq_groups, self.group_vocab_size)
+                if isinstance(self.Wout, DecodeCodebookHead):
+                    score: Tensor = self.Wout(out.to(self.Wout.weight.dtype), start_pos=step_pos).float()
+                else:
+                    score = self.Wout(out.to(self.Wout.weight.dtype)).float()
+                    score = score.reshape(*score.shape[:-1], self.vq_groups, self.group_vocab_size)
             return score
 
         # Prefill / 学習 / 評価フェーズ
@@ -953,9 +971,12 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         out = pad_input(out, indices, batch, tgt_len)
 
         with torch.autocast(device_type=out.device.type, enabled=False):
-            score: Tensor = self.Wout(out.to(self.Wout.weight.dtype)).float()
-            # [B, S, G * group_vocab_size] -> [B, S, G, group_vocab_size] に分割し、Gグループ分のロジットを並列出力
-            score = score.reshape(batch, tgt_len, self.vq_groups, self.group_vocab_size)
+            if isinstance(self.Wout, DecodeCodebookHead):
+                score = self.Wout(out.to(self.Wout.weight.dtype), start_pos=0).float()
+            else:
+                score = self.Wout(out.to(self.Wout.weight.dtype)).float()
+                # [B, S, G * group_vocab_size] -> [B, S, G, group_vocab_size] に分割し、Gグループ分のロジットを並列出力
+                score = score.reshape(batch, tgt_len, self.vq_groups, self.group_vocab_size)
         return score
 
 

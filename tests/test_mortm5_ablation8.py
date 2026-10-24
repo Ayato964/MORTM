@@ -461,7 +461,9 @@ class TestMORTM5MuonAndTrainer:
             project_name=None,
             resume=True,
         )
-        ckpt_file = save_dir / f"{m_cfg['name']}.pytest_v1.checkpoint.pt"
+        from mortm.models.modules.config import resolve_ablation_subdir
+        ablation_subdir = resolve_ablation_subdir(m_cfg["name"])
+        ckpt_file = save_dir / ablation_subdir / f"{m_cfg['name']}.pytest_v1.checkpoint.pt"
         assert ckpt_file.exists()
         ckpt = torch.load(str(ckpt_file), map_location="cpu", weights_only=False)
         assert ckpt["optimizer_step"] == 2
@@ -485,7 +487,7 @@ class TestMORTM5MuonAndTrainer:
 
     def test_package_presets_and_dict_init_without_json_files(self):
         import mortm
-        assert mortm.__version__ == "5.0.0b1"
+        assert mortm.__version__.startswith("5.0.0")
 
         for idx, key in enumerate(mortm.MORTM5_ABLATION_PRESETS.keys(), start=1):
             a_by_key = mortm.MORTM5Args(key)
@@ -498,6 +500,70 @@ class TestMORTM5MuonAndTrainer:
         assert t_args.optimizer_type == "muon"
         t_roundtrip = mortm.TrainArgs(t_args.to_dict())
         assert t_roundtrip.lr_param == t_args.lr_param
+
+    def test_decode_codebook_head_routing_and_gradient_isolation(self):
+        from mortm.models.modules.layers import DecodeCodebookHead
+
+        # 1. Shared (#7) uses nn.Linear; Separated (#8) uses DecodeCodebookHead
+        args_shared = MORTM5Args("#7")
+        args_shared.d_model = 32
+        args_shared.d_layer = 1
+        args_shared.num_heads = 4
+        args_shared.dim_feedforward = 64
+        args_shared.codebook_size = 64
+        args_shared.recompute_vocab()
+        model_shared = AblationTransformer2(args_shared).to("cpu")
+        assert isinstance(model_shared.Wout, torch.nn.Linear)
+        assert not isinstance(model_shared.Wout, DecodeCodebookHead)
+
+        args_sep = MORTM5Args("#8")
+        args_sep.d_model = 32
+        args_sep.d_layer = 1
+        args_sep.num_heads = 4
+        args_sep.dim_feedforward = 64
+        args_sep.codebook_size = 64
+        args_sep.recompute_vocab()
+        model_sep = AblationTransformer2(args_sep).to("cpu")
+        assert isinstance(model_sep.Wout, DecodeCodebookHead)
+        assert model_sep.group_vocab_size == args_sep.token_offset + args_sep.codebook_size
+
+        # 2. Gradient isolation: loss at soft_pos predicting L2 (input pos = 4 + 2 = 6)
+        # must ONLY backprop into decode[2][0..3] and special_decode, leaving decode[0,1,3] untouched
+        prefix = model_sep.build_prefix_tokens(batch_size=2, device=torch.device("cpu"))  # [2, 5, 4]
+        rvq_steps = torch.full((2, 4, 4), args_sep.token_offset + 5, dtype=torch.long)
+        seq = torch.cat([prefix, rvq_steps], dim=1)  # [2, 9, 4], input positions 0..8
+        model_sep.zero_grad()
+        logits = model_sep(seq, is_causal=True)
+        assert logits.shape == (2, 9, 4, args_sep.token_offset + args_sep.codebook_size)
+
+        # Input pos = 6 (which is Chunk 0, L1) predicts Chunk 0, L2 (layer_idx = (6 - 4) % 4 = 2)
+        target_l2 = torch.full((2, 4), args_sep.token_offset + 10, dtype=torch.long)
+        loss_l2 = torch.nn.functional.cross_entropy(
+            logits[:, 6, :, :].reshape(-1, model_sep.group_vocab_size),
+            target_l2.reshape(-1),
+        )
+        loss_l2.backward()
+
+        assert model_sep.Wout.special_decode.weight.grad is not None
+        for l_idx in range(args_sep.vq_layers):
+            for g_idx in range(args_sep.vq_groups):
+                grad = model_sep.Wout.decode[l_idx][g_idx].weight.grad
+                if l_idx == 2:
+                    assert grad is not None and grad.abs().sum().item() > 0.0
+                else:
+                    assert grad is None or grad.abs().sum().item() == 0.0
+
+        # 3. Step-by-step KV-cache decoding logits must match full-sequence forward logits across all L0..L3
+        model_sep.eval()
+        with torch.no_grad():
+            full_logits = model_sep(seq, is_causal=True, is_save_cache=False)
+            model_sep.reset_kv_cache()
+            prefill_logits = model_sep(seq[:, :5, :], is_causal=True, is_save_cache=True)
+            assert torch.allclose(full_logits[:, :5, :, :], prefill_logits, atol=1e-4)
+            for pos in range(5, seq.size(1)):
+                step_logits = model_sep(seq[:, pos : pos + 1, :], is_causal=True, is_save_cache=True)
+                assert torch.allclose(full_logits[:, pos : pos + 1, :, :], step_logits, atol=1e-4)
+            model_sep.reset_kv_cache()
 
     def test_colab_hybrid_worker_endpoints_end_to_end(self, tmp_path):
         import asyncio
@@ -651,7 +717,7 @@ class TestMORTM5MuonAndTrainer:
                 return asyncio.run(worker.mortm5_validate(_DummyReq(query_params={"max_batches": str(max_batches)})))
 
             def save_checkpoint(
-                self, outer_idx, epoch, total_outer, val_loss, version, wandb_id="", prepare_download=False, milestone=""
+                self, outer_idx, epoch, total_outer, val_loss, version, ablation_id="", wandb_id="", prepare_download=False, milestone="", sync_drive=False
             ):
                 return asyncio.run(
                     worker.mortm5_save_ckpt(
@@ -662,9 +728,11 @@ class TestMORTM5MuonAndTrainer:
                                 "total_outer": str(total_outer),
                                 "val_loss": f"{val_loss:.6f}",
                                 "version": version,
+                                "ablation_id": ablation_id,
                                 "wandb_id": wandb_id,
                                 "prepare_download": "1" if prepare_download else "0",
                                 "milestone": milestone,
+                                "sync_drive": "1" if sync_drive else "0",
                             }
                         )
                     )
@@ -693,7 +761,8 @@ class TestMORTM5MuonAndTrainer:
         res_a = trainer_colab_mode.run(project_name=None)
         assert res_a["status"] == "completed"
         assert res_a["final_step"] == 2
-        assert (mac_save_dir / "MORTM5.e2e_colab_mode_step2.pth").is_file()
+        assert res_a["ablation_subdir"] == "7"
+        assert (mac_save_dir / "7" / "MORTM5.e2e_colab_mode_step2.pth").is_file()
 
         trainer_mac_mode = RemoteMORTM5HybridTrainer(
             client=_InProcessClient(),
@@ -710,10 +779,10 @@ class TestMORTM5MuonAndTrainer:
         res_b = trainer_mac_mode.run(project_name=None)
         assert res_b["status"] == "completed"
         assert res_b["final_step"] == 2
-        assert (mac_save_dir / "MORTM5.e2e_mac_stream_step2.pth").is_file()
+        assert (mac_save_dir / "7" / "MORTM5.e2e_mac_stream_step2.pth").is_file()
 
         # Resume Case 1: Resume from completed epoch (outer_idx=1, step=2 of 2) -> 0 extra steps, no UnboundLocalError
-        ckpt_step2 = os.path.join(worker._get_worker_dir(), "MORTM5.e2e_colab_mode.checkpoint.pt")
+        ckpt_step2 = os.path.join(worker._get_worker_dir(), "7", "MORTM5.e2e_colab_mode.checkpoint.pt")
         assert os.path.isfile(ckpt_step2)
         trainer_resume_done = RemoteMORTM5HybridTrainer(
             client=_InProcessClient(),

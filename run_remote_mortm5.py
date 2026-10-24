@@ -156,9 +156,11 @@ class RemoteColabMORTM5Client:
         total_outer: int,
         val_loss: float,
         version: str,
+        ablation_id: str = "",
         wandb_id: str = "",
         prepare_download: bool = False,
         milestone: str = "",
+        sync_drive: bool = False,
     ) -> Dict[str, Any]:
         q = urllib.parse.urlencode({
             "outer": outer_idx,
@@ -166,25 +168,67 @@ class RemoteColabMORTM5Client:
             "total_outer": total_outer,
             "val_loss": f"{val_loss:.6f}",
             "version": version,
+            "ablation_id": ablation_id,
             "wandb_id": wandb_id,
             "prepare_download": 1 if prepare_download else 0,
             "milestone": milestone,
+            "sync_drive": 1 if sync_drive else 0,
         })
         return self._request_json("POST", f"/mortm5/save_ckpt?{q}", payload={})
 
-    def download_prepared_checkpoint(self, total_bytes: int, chunk_bytes: int = 2 * 1024 * 1024) -> Dict[str, Any]:
+    def download_prepared_checkpoint(self, total_bytes: int, chunk_bytes: int = 2 * 1024 * 1024, retries: int = 8) -> Dict[str, Any]:
         parts: List[bytes] = []
         for start in range(0, total_bytes, chunk_bytes):
             end = min(total_bytes, start + chunk_bytes)
-            req = urllib.request.Request(
-                f"{self.base_url}/get_state_raw_chunk?start={start}&end={end}",
-                headers={"User-Agent": "MORTM5-Hybrid-Controller/5.0.0b1"},
-                method="GET",
-            )
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                parts.append(resp.read())
+            expected_len = end - start
+            chunk_data: Optional[bytes] = None
+            for attempt in range(retries):
+                try:
+                    req = urllib.request.Request(
+                        f"{self.base_url}/get_state_raw_chunk?start={start}&end={end}",
+                        headers={"User-Agent": "MORTM5-Hybrid-Controller/5.0.0b2"},
+                        method="GET",
+                    )
+                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                        data = resp.read()
+                    if len(data) != expected_len:
+                        raise IOError(f"Short read on chunk {start}..{end}: got {len(data)}, expected {expected_len}")
+                    chunk_data = data
+                    break
+                except Exception as e:
+                    if attempt + 1 >= retries:
+                        raise
+                    print(f"\n⚠️ [Download chunk {start}..{end} リトライ {attempt+1}/{retries}] {e}", flush=True)
+                    time.sleep(min(15.0, 2.0 * (attempt + 1)))
+            assert chunk_data is not None
+            parts.append(chunk_data)
         decomp = zlib.decompress(b"".join(parts))
         return torch.load(io.BytesIO(decomp), map_location="cpu", weights_only=False)
+
+
+_ABLATION_SUBDIR_MAP: Dict[str, str] = {
+    "#1": "1", "1": "1", "m3_flat_shared": "1", "mortm5_m3_flat_shared": "1",
+    "#2": "2", "2": "2", "m3_flat_separated": "2", "mortm5_m3_flat_separated": "2",
+    "#3": "3", "3": "3", "m4_flat_shared": "3", "mortm5_m4_flat_shared": "3",
+    "#4": "4", "4": "4", "m4_flat_separated": "4", "mortm5_m4_flat_separated": "4",
+    "#5": "5", "5": "5", "m3_grouped_shared": "5", "mortm5_m3_grouped_shared": "5",
+    "#6": "6", "6": "6", "m3_grouped_separated": "6", "mortm5_m3_grouped_separated": "6",
+    "#7": "7", "7": "7", "m4_grouped_shared": "7", "mortm5_m4_grouped_shared": "7",
+    "#8": "8", "8": "8", "m4_grouped_separated": "8", "mortm5_m4_grouped_separated": "8",
+}
+
+
+def resolve_ablation_subdir(model_name: str = "", ablation_id: str = "") -> str:
+    for raw in (ablation_id, model_name):
+        key = str(raw or "").strip().lower()
+        if not key:
+            continue
+        if key in _ABLATION_SUBDIR_MAP:
+            return _ABLATION_SUBDIR_MAP[key]
+        stripped = key.lstrip("#")
+        if stripped in {"1", "2", "3", "4", "5", "6", "7", "8"}:
+            return stripped
+    return "default"
 
 
 class RemoteMORTM5HybridTrainer:
@@ -197,9 +241,10 @@ class RemoteMORTM5HybridTrainer:
         t_args: TrainArgs,
         version: str,
         save_dir: str,
+        ablation_id: str = "",
         colab_split_dir: Optional[str] = None,
         mac_split_dir: Optional[str] = None,
-        stage_to_local: bool = True,
+        stage_to_local: bool = False,
         resume_ckpt_path: Optional[str] = None,
         download_ckpt_to_mac: bool = False,
         val_max_batches: int = 0,
@@ -209,7 +254,8 @@ class RemoteMORTM5HybridTrainer:
         self.m_args = m_args
         self.t_args = t_args
         self.version = version
-        self.save_dir = save_dir
+        self.ablation_subdir = resolve_ablation_subdir(model_name=m_args.name, ablation_id=ablation_id)
+        self.save_dir = os.path.join(save_dir, self.ablation_subdir)
         self.colab_split_dir = colab_split_dir
         self.mac_split_dir = mac_split_dir
         self.stage_to_local = stage_to_local
@@ -254,9 +300,12 @@ class RemoteMORTM5HybridTrainer:
         init_payload: Dict[str, Any] = {
             "model_config": self.m_args.to_dict(),
             "train_config": self.t_args.to_dict(),
+            "ablation_id": self.ablation_subdir,
             "colab_split_dir": self.colab_split_dir,
-            "stage_to_local": self.stage_to_local,
+            "stage_to_local": False,
             "resume_checkpoint_path": self.resume_ckpt_path,
+            "version": self.version,
+            "clean_old_checkpoints": (self.resume_ckpt_path is None),
         }
         if explicit_total_steps is not None:
             init_payload["total_steps"] = explicit_total_steps
@@ -273,12 +322,14 @@ class RemoteMORTM5HybridTrainer:
         total_steps = int(init_info["total_steps"])
         big_bs = max(1, int(self.t_args.big_batch_size))
         total_outer_batches = max(1, math.ceil(num_train_windows / big_bs))
+        drive_ckpt_dir = init_info.get("drive_ckpt_dir", f"/content/drive/MyDrive/MORTM5_checkpoints/{self.ablation_subdir}")
 
-        print(f"🚀 Initialized {init_info['model_class']} ({init_info['model_name']}) on Colab GPU:")
+        print(f"🚀 Initialized {init_info['model_class']} ({init_info['model_name']} | Ablation #{self.ablation_subdir}) on Colab GPU:")
         print(f"  - Mode / Vocab     : model_mode={init_info['model_mode']} | separate_rvq_layers={init_info['separate_rvq_layers']} | vocab_size={init_info['vocab_size']}")
         print(f"  - Parameters       : {init_info['total_params']:,} total (Muon: {init_info['muon_params']:,}, AdamW: {init_info['adamw_params']:,})")
         print(f"  - Dataset Windows  : train={num_train_windows:,} ({total_outer_batches:,} outer batches/epoch), val={init_info['val_windows']:,}")
         print(f"  - Total Opt Steps  : {total_steps:,} steps (Resumed at step={init_info['step']}, outer={init_info['outer_batch_idx']})")
+        print(f"  - Drive Save Dir   : {drive_ckpt_dir}")
         print("=" * 76)
 
         use_wandb = bool(project_name and wandb is not None and os.environ.get("WANDB_MODE") != "disabled")
@@ -290,6 +341,7 @@ class RemoteMORTM5HybridTrainer:
                 id=wandb_run_id,
                 resume="allow",
                 config={
+                    "ablation_id": self.ablation_subdir,
                     "model": self.m_args.to_dict(),
                     "train": self.t_args.to_dict(),
                     "colab_gpu": health_info.get("gpu_name"),
@@ -319,130 +371,168 @@ class RemoteMORTM5HybridTrainer:
             if current_step >= max(1, int(round(total_steps * (float(pct) / 100.0))))
         }
 
-        for epoch in range(start_epoch, max(1, int(self.t_args.num_epochs))):
-            rng = np.random.RandomState(self.seed + epoch)
-            if self.t_args.shuffle:
-                all_indices = rng.permutation(num_train_windows).tolist()
-            else:
-                all_indices = list(range(num_train_windows))
+        from mortm.train.epoch import EpochObserver
+        epoch_loss = EpochObserver(2500)
+        active_params = int(init_info.get("total_params", 0))
 
-            outer_start = start_outer if epoch == start_epoch else 0
-            pbar = tqdm(
-                range(outer_start, total_outer_batches),
-                initial=outer_start,
-                total=total_outer_batches,
-                desc=f"Epoch {epoch+1}/{self.t_args.num_epochs} [{self.version}]",
-            )
-
-            for outer_idx in pbar:
-                win_slice = all_indices[outer_idx * big_bs : (outer_idx + 1) * big_bs]
-                if not win_slice:
-                    continue
-
-                if self.colab_split_dir:
-                    self.client.start_outer_batch(outer_idx=outer_idx, epoch=epoch, window_indices=win_slice)
+        epoch = start_epoch
+        outer_idx = start_outer
+        try:
+            for epoch in range(start_epoch, max(1, int(self.t_args.num_epochs))):
+                rng = np.random.RandomState(self.seed + epoch)
+                if self.t_args.shuffle:
+                    all_indices = rng.permutation(num_train_windows).tolist()
                 else:
-                    assert self.mac_train_ds is not None
-                    samples = [self.mac_train_ds[idx] for idx in win_slice]
-                    batch_tensor = torch.nn.utils.rnn.pad_sequence(
-                        samples, batch_first=True, padding_value=PAD_TOKEN_ID
+                    all_indices = list(range(num_train_windows))
+
+                outer_start = start_outer if epoch == start_epoch else 0
+                pbar = tqdm(
+                    range(outer_start, total_outer_batches),
+                    initial=outer_start,
+                    total=total_outer_batches,
+                    desc=f"Epoch {epoch+1}/{self.t_args.num_epochs} [#{self.ablation_subdir} {self.version}]",
+                )
+
+                for outer_idx in pbar:
+                    win_slice = all_indices[outer_idx * big_bs : (outer_idx + 1) * big_bs]
+                    if not win_slice:
+                        continue
+
+                    if self.colab_split_dir:
+                        self.client.start_outer_batch(outer_idx=outer_idx, epoch=epoch, window_indices=win_slice)
+                    else:
+                        assert self.mac_train_ds is not None
+                        samples = [self.mac_train_ds[idx] for idx in win_slice]
+                        batch_tensor = torch.nn.utils.rnn.pad_sequence(
+                            samples, batch_first=True, padding_value=PAD_TOKEN_ID
+                        )
+                        self.client.upload_token_batch(batch_tensor)
+                        self.client.start_outer_batch(outer_idx=outer_idx, epoch=epoch, window_indices=None)
+
+                    cursor = 0
+                    while True:
+                        poll = self.client.poll_outer_batch(cursor)
+                        if poll.get("error"):
+                            raise RuntimeError(f"Colab GPU Worker Error on outer_batch {outer_idx}: {poll['error']}")
+
+                        for m in poll.get("results", []):
+                            epoch_loss.add(float(m["loss"]))
+                            pbar.set_postfix({
+                                "step": f"{m['step']}/{total_steps}",
+                                "loss": f"{epoch_loss.get():.4f}",
+                                "val": f"{last_val_loss:.4f}",
+                                "lr": f"{m['lr_muon']:.2e}",
+                                "tok": f"{m['all_tokens']/1e6:.1f}M",
+                            })
+
+                        cursor = int(poll.get("next_cursor", cursor))
+                        if poll.get("done"):
+                            break
+                        time.sleep(0.5)
+
+                    current_tokens = int(poll.get("all_tokens", 0))
+                    current_step = int(poll.get("step", 0))
+
+                    # マイルストーン判定
+                    milestone_tag = ""
+                    for pct in pct_list:
+                        target_step = max(1, int(round(total_steps * (float(pct) / 100.0))))
+                        if current_step >= target_step and int(pct) not in saved_milestones:
+                            saved_milestones.add(int(pct))
+                            milestone_tag = f"pct{int(pct)}"
+
+                    is_last_outer = (outer_idx + 1) == total_outer_batches
+                    should_validate = (
+                        (current_tokens - last_val_tokens) >= val_interval_tokens
+                        or is_last_outer
+                        or bool(milestone_tag)
                     )
-                    self.client.upload_token_batch(batch_tensor)
-                    self.client.start_outer_batch(outer_idx=outer_idx, epoch=epoch, window_indices=None)
 
-                cursor = 0
-                while True:
-                    poll = self.client.poll_outer_batch(cursor)
-                    if poll.get("error"):
-                        raise RuntimeError(f"Colab GPU Worker Error on outer_batch {outer_idx}: {poll['error']}")
+                    if should_validate:
+                        # 検証バッチを GPU で回している裏で Google Drive (1-8 サブディレクトリ) への保存を並列開始する
+                        ckpt_info = self.client.save_checkpoint(
+                            outer_idx=outer_idx,
+                            epoch=epoch,
+                            total_outer=total_outer_batches,
+                            val_loss=last_val_loss,
+                            version=self.version,
+                            ablation_id=self.ablation_subdir,
+                            wandb_id=w_id,
+                            prepare_download=bool(self.download_ckpt_to_mac and (milestone_tag or is_last_outer)),
+                            milestone=milestone_tag,
+                            sync_drive=is_last_outer,
+                        )
 
-                    for m in poll.get("results", []):
-                        pbar.set_postfix({
-                            "step": f"{m['step']}/{total_steps}",
-                            "loss": f"{m['loss']:.4f}",
-                            "ppl": f"{m['ppl']:.2f}",
-                            "lr": f"{m['lr_muon']:.2e}",
-                            "tok": f"{m['all_tokens']/1e6:.1f}M",
-                        })
+                        if not self.colab_split_dir and self.mac_val_ds is not None:
+                            val_samples = [self.mac_val_ds[i] for i in range(min(len(self.mac_val_ds), big_bs))]
+                            val_tensor = torch.nn.utils.rnn.pad_sequence(
+                                val_samples, batch_first=True, padding_value=PAD_TOKEN_ID
+                            )
+                            self.client.upload_token_batch(val_tensor)
+                        val_res = self.client.validate(max_batches=self.val_max_batches)
+                        last_val_loss = float(val_res.get("val_loss", 0.0))
+                        val_ppl = float(val_res.get("val_ppl", 1.0))
+                        last_val_tokens = current_tokens
+                        train_avg_loss = float(epoch_loss.get()) if len(epoch_loss.loss) > 0 else 0.0
+                        seq_steps = (
+                            current_tokens // max(1, int(self.m_args.vq_groups))
+                            if getattr(self.m_args, "model_mode", "flat") == "grouped"
+                            else current_tokens
+                        )
+                        print(
+                            f"\n📊 [Validation @ Step {current_step} | {current_tokens/1e6:.2f}M tokens] "
+                            f"train_loss={train_avg_loss:.4f} | val_loss={last_val_loss:.4f} | val_ppl={val_ppl:.2f}",
+                            flush=True,
+                        )
                         if use_wandb:
                             wandb.log(
                                 {
-                                    "train/loss": m["loss"],
-                                    "train/perplexity": m["ppl"],
-                                    "train/lr_muon": m["lr_muon"],
-                                    "train/lr_adamw": m["lr_adamw"],
-                                    "train/all_tokens": m["all_tokens"],
-                                    "train/outer_batch": outer_idx,
-                                    "train/epoch": epoch,
+                                    "axis/val_loss": last_val_loss,
+                                    "axis/tokens": current_tokens,
+                                    "axis/seq_steps": seq_steps,
+                                    "axis/flops": 6 * active_params * seq_steps,
+                                    "trainer/global_step": current_step,
+                                    "train/loss": train_avg_loss,
+                                    "val/loss": last_val_loss,
+                                    "val/perplexity": val_ppl,
                                 },
-                                step=m["step"],
+                                step=current_step,
                             )
 
-                    cursor = int(poll.get("next_cursor", cursor))
-                    if poll.get("done"):
-                        break
-                    time.sleep(0.5)
-
-                current_tokens = int(poll.get("all_tokens", 0))
-                current_step = int(poll.get("step", 0))
-
-                # 検証の実行判定
-                if (current_tokens - last_val_tokens) >= val_interval_tokens or (outer_idx + 1) == total_outer_batches:
-                    if not self.colab_split_dir and self.mac_val_ds is not None:
-                        val_samples = [self.mac_val_ds[i] for i in range(min(len(self.mac_val_ds), big_bs))]
-                        val_tensor = torch.nn.utils.rnn.pad_sequence(
-                            val_samples, batch_first=True, padding_value=PAD_TOKEN_ID
-                        )
-                        self.client.upload_token_batch(val_tensor)
-                    val_res = self.client.validate(max_batches=self.val_max_batches)
-                    last_val_loss = float(val_res.get("val_loss", 0.0))
-                    val_ppl = float(val_res.get("val_ppl", 1.0))
-                    last_val_tokens = current_tokens
-                    print(
-                        f"\n📊 [Validation @ Step {current_step} | {current_tokens/1e6:.2f}M tokens] "
-                        f"val_loss={last_val_loss:.4f} | val_ppl={val_ppl:.2f}",
-                        flush=True,
-                    )
-                    if use_wandb:
-                        wandb.log(
-                            {
-                                "val/loss": last_val_loss,
-                                "val/perplexity": val_ppl,
-                                "val/all_tokens": current_tokens,
-                            },
-                            step=current_step,
-                        )
-
-                # マイルストーン判定 & チェックポイント保存
-                milestone_tag = ""
-                for pct in pct_list:
-                    target_step = max(1, int(round(total_steps * (float(pct) / 100.0))))
-                    if current_step >= target_step and int(pct) not in saved_milestones:
-                        saved_milestones.add(int(pct))
-                        milestone_tag = f"pct{int(pct)}"
-
-                ckpt_info = self.client.save_checkpoint(
+                        if ckpt_info.get("download_bytes", 0) > 0:
+                            try:
+                                dl_data = self.client.download_prepared_checkpoint(int(ckpt_info["download_bytes"]))
+                                mac_pth = os.path.join(self.save_dir, f"MORTM5.{self.version}_step{current_step}.pth")
+                                torch.save(dl_data["model_state_dict"], mac_pth)
+                                print(f"\n💾 Downloaded model weights to Mac: {mac_pth}", flush=True)
+                            except Exception as dl_err:
+                                print(f"\n⚠️ [Mac Download Warning] Failed to download checkpoint to Mac (already saved on Google Drive): {dl_err}", flush=True)
+        except KeyboardInterrupt:
+            print(f"\n🛑 学習停止を検知しました。Google Drive ({drive_ckpt_dir}) へ最新チェックポイント (Step {current_step}) を保存しています...", flush=True)
+            try:
+                self.client.save_checkpoint(
                     outer_idx=outer_idx,
                     epoch=epoch,
                     total_outer=total_outer_batches,
                     val_loss=last_val_loss,
                     version=self.version,
+                    ablation_id=self.ablation_subdir,
                     wandb_id=w_id,
-                    prepare_download=bool(self.download_ckpt_to_mac and (milestone_tag or (outer_idx + 1) == total_outer_batches)),
-                    milestone=milestone_tag,
+                    prepare_download=False,
+                    milestone=f"stop_step{current_step}",
+                    sync_drive=True,
                 )
-                if ckpt_info.get("download_bytes", 0) > 0:
-                    dl_data = self.client.download_prepared_checkpoint(int(ckpt_info["download_bytes"]))
-                    mac_pth = os.path.join(self.save_dir, f"MORTM5.{self.version}_step{current_step}.pth")
-                    torch.save(dl_data["model_state_dict"], mac_pth)
-                    print(f"\n💾 Downloaded model weights to Mac: {mac_pth}", flush=True)
-
-        if use_wandb:
-            wandb.finish()
+                print(f"✅ Google Drive ({drive_ckpt_dir}) への保存が完了しました。", flush=True)
+            except Exception as save_err:
+                print(f"⚠️ 停止時のチェックポイント保存に失敗しました: {save_err}", flush=True)
+        finally:
+            if use_wandb:
+                wandb.finish()
 
         return {
             "status": "completed",
             "version": self.version,
+            "ablation_subdir": self.ablation_subdir,
             "final_step": current_step,
             "final_val_loss": last_val_loss,
         }
@@ -457,8 +547,8 @@ def parse_args() -> argparse.Namespace:
         "--ablation",
         type=str,
         default="m4_grouped_shared",
-        choices=list(MORTM5_ABLATION_PRESETS.keys()) + ["#1", "#2", "#3", "#4", "#5", "#6", "#7", "#8"],
-        help="学習するアブレーションモデル (#7 = m4_grouped_shared が既定)",
+        choices=list(MORTM5_ABLATION_PRESETS.keys()) + ["#1", "#2", "#3", "#4", "#5", "#6", "#7", "#8", "1", "2", "3", "4", "5", "6", "7", "8"],
+        help="学習するアブレーションモデル (#1〜#8 または 1〜8)",
     )
     parser.add_argument("--model-config", type=str, default=None, help="任意のモデル JSON パス (指定時は --ablation より優先)")
     parser.add_argument("--train-config", type=str, default="configs/train/mortm5/ablation_muon_cos.json", help="学習設定 JSON パスまたはプリセット名 ('muon_cos')")
@@ -466,7 +556,7 @@ def parse_args() -> argparse.Namespace:
         "--colab-split-dir",
         type=str,
         default=None,
-        help="Colab / Google Drive 上のトークンディレクトリ (例: /content/drive/MyDrive/MORTM5_tokens/m4_g4l4)",
+        help="Google Drive 上のトークンディレクトリ (例: /content/drive/MyDrive/MORTM5_tokens/m4_g4l4)",
     )
     parser.add_argument(
         "--mac-split-dir",
@@ -474,10 +564,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Mac ローカルのトークンディレクトリ (Colab 上にデータがない場合のストリーミング用)",
     )
-    parser.add_argument("--no-stage-local", action="store_true", help="Google Drive から Colab /content SSD への事前コピーを無効化する")
     parser.add_argument("--save-dir", type=str, default="out/mortm5_ablation", help="Mac 側のモデル保存先ディレクトリ")
     parser.add_argument("--version", type=str, default=None, help="チェックポイント・W&B のバージョン識別子")
-    parser.add_argument("--resume-ckpt", type=str, default=None, help="Colab/Drive 上の再開チェックポイントパス")
+    parser.add_argument("--resume-ckpt", type=str, default=None, help="Google Drive 上の再開チェックポイントパス")
     parser.add_argument("--download-ckpt", action="store_true", help="マイルストーン及び完了時に Mac 側へも重み (.pth) をダウンロードする")
     parser.add_argument("--project", type=str, default="MORTM5-Ablation", help="Weights & Biases プロジェクト名")
     parser.add_argument("--wandb-id", type=str, default=None, help="再開する W&B Run ID")
@@ -514,7 +603,7 @@ def main():
     if cli.epochs is not None:
         t_args.num_epochs = int(cli.epochs)
 
-    # 既定の Colab Drive パス自動補完 (--colab-split-dir も --mac-split-dir も未指定の場合)
+    # 既定の Google Drive パス自動補完 (--colab-split-dir も --mac-split-dir も未指定の場合)
     colab_split_dir = cli.colab_split_dir
     if not colab_split_dir and not cli.mac_split_dir:
         tok_key = m_args.tokenizer_key or ("m4_g4l4" if m_args.vq_groups == 4 else "m3_g8l2")
@@ -528,9 +617,10 @@ def main():
         t_args=t_args,
         version=version,
         save_dir=cli.save_dir,
+        ablation_id=cli.ablation,
         colab_split_dir=colab_split_dir,
         mac_split_dir=cli.mac_split_dir,
-        stage_to_local=not cli.no_stage_local,
+        stage_to_local=False,
         resume_ckpt_path=cli.resume_ckpt,
         download_ckpt_to_mac=cli.download_ckpt,
         val_max_batches=cli.val_max_batches,

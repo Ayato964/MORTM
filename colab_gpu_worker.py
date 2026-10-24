@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b1 Beta)
+colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b3 Beta)
 ===================================================================================
 モデルのアーキテクチャ (`MidiVision`, `AblationTransformer1`, `AblationTransformer2`,
 `MORTM5TrainSet`, `HybridMuonOptimizer`, `MORTM5MemmapDataset`) はすべて pip パッケージ
@@ -8,7 +8,7 @@ colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b1 B
 
 【Google Colab での起動手順】
 1. ランタイムを GPU (A100 / L4 / T4) に設定し、以下を実行:
-   !pip install -q --pre -U "mortm==5.0.0b1" vector-quantize-pytorch pretty_midi mido fastapi uvicorn pycloudflared
+   !pip install -q --pre -U "mortm==5.0.0b3" vector-quantize-pytorch pretty_midi mido fastapi uvicorn pycloudflared
 2. Google Drive をマウント (トークンデータやチェックポイントを Drive に置く場合):
    from google.colab import drive
    drive.mount('/content/drive')
@@ -18,6 +18,7 @@ colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b1 B
    !sleep 5 && cat worker.log
 """
 
+import copy
 import datetime
 import io
 import json
@@ -214,6 +215,39 @@ async def health():
 # ============================================================
 # 3. MORTM5 Autoregressive Transformer (Ablation #1-#8) Endpoints
 # ============================================================
+_DRIVE_SAVE_LOCK = threading.Lock()
+
+_ABLATION_SUBDIR_MAP: Dict[str, str] = {
+    "#1": "1", "1": "1", "m3_flat_shared": "1", "mortm5_m3_flat_shared": "1",
+    "#2": "2", "2": "2", "m3_flat_separated": "2", "mortm5_m3_flat_separated": "2",
+    "#3": "3", "3": "3", "m4_flat_shared": "3", "mortm5_m4_flat_shared": "3",
+    "#4": "4", "4": "4", "m4_flat_separated": "4", "mortm5_m4_flat_separated": "4",
+    "#5": "5", "5": "5", "m3_grouped_shared": "5", "mortm5_m3_grouped_shared": "5",
+    "#6": "6", "6": "6", "m3_grouped_separated": "6", "mortm5_m3_grouped_separated": "6",
+    "#7": "7", "7": "7", "m4_grouped_shared": "7", "mortm5_m4_grouped_shared": "7",
+    "#8": "8", "8": "8", "m4_grouped_separated": "8", "mortm5_m4_grouped_separated": "8",
+}
+
+
+def _resolve_ablation_subdir(model_name: str = "", ablation_id: str = "") -> str:
+    """アブレーション識別子 ('#1'〜'#8', '1'〜'8') またはモデル名から Google Drive サブディレクトリ名 ('1'〜'8') を返す。"""
+    for raw in (ablation_id, model_name):
+        key = str(raw or "").strip().lower()
+        if not key:
+            continue
+        if key in _ABLATION_SUBDIR_MAP:
+            return _ABLATION_SUBDIR_MAP[key]
+        stripped = key.lstrip("#")
+        if stripped in {"1", "2", "3", "4", "5", "6", "7", "8"}:
+            return stripped
+    return "default"
+
+
+def _get_drive_ckpt_dir(ablation_subdir: str) -> str:
+    base_dir = os.environ.get("MORTM5_DRIVE_CKPT_DIR", "/content/drive/MyDrive/MORTM5_checkpoints")
+    return os.path.join(base_dir, ablation_subdir) if ablation_subdir else base_dir
+
+
 def _get_worker_dir() -> str:
     """Colab 上では `/content`、ローカルテスト環境では `MORTM5_WORKER_DIR` または一時ディレクトリを返す。"""
     import tempfile
@@ -223,22 +257,6 @@ def _get_worker_dir() -> str:
     )
     os.makedirs(work_dir, exist_ok=True)
     return work_dir
-
-
-def _stage_split_dir_to_local(src_dir: str, dst_dir: str) -> str:
-    """Google Drive 上の .bin / .npy を Colab ローカル NVMe SSD (/content/...) に高速ステージングする。"""
-    os.makedirs(dst_dir, exist_ok=True)
-    for split in ("train", "val"):
-        for suffix in ("_tokens.bin", "_offsets.npy", "_slots.npy"):
-            fname = f"{split}{suffix}"
-            s_path = os.path.join(src_dir, fname)
-            d_path = os.path.join(dst_dir, fname)
-            if os.path.isfile(s_path):
-                if not os.path.isfile(d_path) or os.path.getsize(d_path) != os.path.getsize(s_path):
-                    print(f"[Stage] Copying {s_path} -> {d_path} ({os.path.getsize(s_path)/1e6:.1f} MB)...", flush=True)
-                    shutil.copy2(s_path, d_path + ".tmp")
-                    os.replace(d_path + ".tmp", d_path)
-    return dst_dir
 
 
 @app.post("/mortm5/init")
@@ -255,6 +273,14 @@ async def mortm5_init(request: Request):
         raw = await request.body()
         payload = torch.load(io.BytesIO(zlib.decompress(raw)), map_location="cpu", weights_only=False)
 
+    # 既存モデルが GPU メモリを占有している場合は先に解放する
+    if STATE.get("trainer") is not None or STATE.get("model") is not None:
+        STATE["trainer"] = None
+        STATE["model"] = None
+        STATE["optimizer"] = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     model_cfg = payload.get("model_config", "m4_grouped_shared")
     train_cfg = payload.get("train_config", "muon_cos")
     m_args = MORTM5Args(model_cfg)
@@ -262,9 +288,14 @@ async def mortm5_init(request: Request):
     if "optimizer" not in getattr(t_args, "_raw_config", {}):
         t_args.optimizer_type = "muon"
 
-    # Colab / Google Drive 上にトークンデータセットがある場合は MemmapDataset を構築
+    ablation_subdir = _resolve_ablation_subdir(
+        model_name=m_args.name,
+        ablation_id=str(payload.get("ablation_id", "")),
+    )
+    STATE["ablation_subdir"] = ablation_subdir
+
+    # 1エポック学習で二度と使わないトークン列のローカル SSD キャッシュは行わず、Google Drive から直接 Memmap 読み込みする
     colab_split_dir: Optional[str] = payload.get("colab_split_dir")
-    stage_to_local: bool = bool(payload.get("stage_to_local", True))
     stride: Optional[int] = payload.get("stride")
     val_stride: Optional[int] = payload.get("val_stride")
 
@@ -277,19 +308,13 @@ async def mortm5_init(request: Request):
                 status_code=400,
                 media_type="application/json",
             )
-        effective_dir = colab_split_dir
-        if stage_to_local and colab_split_dir.startswith("/content/drive"):
-            cache_name = os.path.basename(os.path.normpath(colab_split_dir))
-            local_cache_dir = os.path.join(_get_worker_dir(), "mortm5_tokens_cache", cache_name)
-            effective_dir = _stage_split_dir_to_local(colab_split_dir, local_cache_dir)
-
         train_ds = MORTM5MemmapDataset.from_split_dir(
-            token_dir=effective_dir, split="train", args=m_args, stride=stride
+            token_dir=colab_split_dir, split="train", args=m_args, stride=stride
         )
-        val_tokens_path = os.path.join(effective_dir, "val_tokens.bin")
+        val_tokens_path = os.path.join(colab_split_dir, "val_tokens.bin")
         if os.path.isfile(val_tokens_path):
             val_ds = MORTM5MemmapDataset.from_split_dir(
-                token_dir=effective_dir, split="val", args=m_args, stride=val_stride
+                token_dir=colab_split_dir, split="val", args=m_args, stride=val_stride
             )
 
     # MORTM5TrainSet (AblationTransformer1/2 + HybridMuonOptimizer + Cosine/WSD Scheduler) の構築
@@ -312,9 +337,16 @@ async def mortm5_init(request: Request):
 
     trainer.rebuild_scheduler(total_steps)
 
-    # チェックポイントの復元 (Colab/Drive 上のパス または ペイロード内の state_dict)
+    # チェックポイントの復元 (指定パス または Google Drive の 1-8 サブディレクトリ内チェックポイント)
     resumed_from: Optional[str] = None
     resume_ckpt_path: Optional[str] = payload.get("resume_checkpoint_path")
+    version_str = str(payload.get("version") or f"{m_args.name}_muon_cos").strip()
+    if resume_ckpt_path and not os.path.isfile(resume_ckpt_path):
+        # サブディレクトリ (1-8) 側および旧フラットディレクトリ側をフォールバック探索
+        cand_in_sub = os.path.join(_get_drive_ckpt_dir(ablation_subdir), os.path.basename(resume_ckpt_path))
+        if os.path.isfile(cand_in_sub):
+            resume_ckpt_path = cand_in_sub
+
     ckpt_data: Optional[Dict[str, Any]] = None
     if resume_ckpt_path and os.path.isfile(resume_ckpt_path):
         ckpt_data = torch.load(resume_ckpt_path, map_location="cpu", weights_only=False)
@@ -341,6 +373,17 @@ async def mortm5_init(request: Request):
         STATE["epoch"] = 0
         STATE["outer_batch_idx"] = 0
         STATE["verification_loss"] = 0.0
+        if bool(payload.get("clean_old_checkpoints", False)) and version_str:
+            prefix = f"MORTM5.{version_str}"
+            drive_ckpt_dir = _get_drive_ckpt_dir(ablation_subdir)
+            for target_dir in (_get_worker_dir(), drive_ckpt_dir):
+                if os.path.isdir(target_dir):
+                    for fname in os.listdir(target_dir):
+                        if fname.startswith(prefix) and fname.endswith((".pt", ".pth", ".tmp")):
+                            try:
+                                os.remove(os.path.join(target_dir, fname))
+                            except OSError:
+                                pass
 
     trainer.model.train()
     STATE["trainer"] = trainer
@@ -375,6 +418,8 @@ async def mortm5_init(request: Request):
         "mortm_version": getattr(mortm, "__version__", "unknown"),
         "device": str(DEVICE),
         "model_name": m_args.name,
+        "ablation_subdir": ablation_subdir,
+        "drive_ckpt_dir": _get_drive_ckpt_dir(ablation_subdir),
         "model_class": type(trainer.model).__name__,
         "model_mode": m_args.model_mode,
         "separate_rvq_layers": m_args.separate_rvq_layers,
@@ -675,8 +720,10 @@ async def mortm5_validate(request: Request):
 @app.post("/mortm5/save_ckpt")
 async def mortm5_save_ckpt(request: Request):
     """
-    MORTM5 チェックポイントを Colab SSD (`/content/...`) と Google Drive (`/content/drive/MyDrive/MORTM5_checkpoints/`)
-    にアトミック保存し、必要に応じて Mac 側へチャンク転送可能なバッファを構築する。
+    MORTM5 チェックポイントを Google Drive のアブレーション番号別サブディレクトリ
+    (`/content/drive/MyDrive/MORTM5_checkpoints/1/` 〜 `8/`) に直接保存する。
+    Google Drive マウント時は `/content` ローカル SSD への二重保存を行わず、
+    検証バッチ実行中にバックグラウンドスレッド（排他ロック付き）で Drive へ書き込む。
     """
     trainer: MORTM5TrainSet = STATE["trainer"]
     m_args: MORTM5Args = STATE["m_args"]
@@ -688,18 +735,20 @@ async def mortm5_save_ckpt(request: Request):
     val_loss = float(request.query_params.get("val_loss", "0.0"))
     w_id = request.query_params.get("wandb_id", "")
     version = request.query_params.get("version", m_args.name)
+    ablation_id = request.query_params.get("ablation_id", str(STATE.get("ablation_subdir", "")))
+    ablation_subdir = _resolve_ablation_subdir(model_name=m_args.name, ablation_id=ablation_id)
     prepare_download = int(request.query_params.get("prepare_download", "0"))
     milestone_tag = request.query_params.get("milestone", "")
+    sync_drive = int(request.query_params.get("sync_drive", "0"))
 
     step_now = int(STATE["step"])
     tokens_now = int(trainer.get_synced_tokens())
     cpu_model_sd = {k: v.detach().cpu() for k, v in trainer.model.state_dict().items()}
 
-    colab_path = os.path.join(_get_worker_dir(), f"MORTM5.{version}.checkpoint.pt")
     full_ckpt = {
         "model_state_dict": cpu_model_sd,
-        "optimizer_state_dict": trainer.optimizer.state_dict(),
-        "scheduler_state_dict": trainer.scheduler.state_dict() if trainer.scheduler is not None else None,
+        "optimizer_state_dict": copy.deepcopy(trainer.optimizer.state_dict()),
+        "scheduler_state_dict": copy.deepcopy(trainer.scheduler.state_dict()) if trainer.scheduler is not None else None,
         "epoch": epoch,
         "outer_batch_idx": outer_idx,
         "total_outer_batches": total_outer,
@@ -709,40 +758,61 @@ async def mortm5_save_ckpt(request: Request):
         "verification_loss": val_loss,
         "wandb_run_id": w_id,
         "model_name": m_args.name,
+        "ablation_subdir": ablation_subdir,
         "model_config": m_args.to_dict(),
         "train_config": t_args.to_dict(),
         "version": version,
         "mortm_version": getattr(mortm, "__version__", "unknown"),
         "timestamp": datetime.datetime.now().isoformat(),
     }
-    torch.save(full_ckpt, colab_path + ".tmp")
-    os.replace(colab_path + ".tmp", colab_path)
 
-    drive_mounted = os.path.exists("/content/drive/MyDrive")
+    drive_mounted = os.path.exists("/content/drive/MyDrive") or bool(os.environ.get("MORTM5_DRIVE_CKPT_DIR"))
+    drive_dir = _get_drive_ckpt_dir(ablation_subdir)
+    dst_ckpt_path = os.path.join(drive_dir, f"MORTM5.{version}.checkpoint.pt")
+
     if drive_mounted:
-        def _bg_save_mortm5_to_drive(src_path, model_sd, ver, o_idx, s_now, m_tag):
-            try:
-                drive_dir = "/content/drive/MyDrive/MORTM5_checkpoints"
-                os.makedirs(drive_dir, exist_ok=True)
-                dst_ckpt = os.path.join(drive_dir, f"MORTM5.{ver}.checkpoint.pt")
-                shutil.copy2(src_path, dst_ckpt + ".tmp")
-                os.replace(dst_ckpt + ".tmp", dst_ckpt)
+        def _write_to_drive_subdir(ckpt_obj, model_sd, target_dir, ver, s_now, m_tag):
+            with _DRIVE_SAVE_LOCK:
+                try:
+                    os.makedirs(target_dir, exist_ok=True)
+                    dst_ckpt = os.path.join(target_dir, f"MORTM5.{ver}.checkpoint.pt")
+                    tmp_ckpt = os.path.join(target_dir, f"MORTM5.{ver}.checkpoint.{s_now}.tmp")
+                    torch.save(ckpt_obj, tmp_ckpt)
+                    os.replace(tmp_ckpt, dst_ckpt)
 
-                dst_pth = os.path.join(drive_dir, f"MORTM5.{ver}_latest.pth")
-                torch.save(model_sd, dst_pth + ".tmp")
-                os.replace(dst_pth + ".tmp", dst_pth)
+                    dst_pth = os.path.join(target_dir, f"MORTM5.{ver}_latest.pth")
+                    tmp_pth = os.path.join(target_dir, f"MORTM5.{ver}_latest.{s_now}.tmp")
+                    torch.save(model_sd, tmp_pth)
+                    os.replace(tmp_pth, dst_pth)
 
-                if m_tag:
-                    ms_pth = os.path.join(drive_dir, f"MORTM5.{ver}_{m_tag}_step{s_now}.pth")
-                    shutil.copy2(dst_pth, ms_pth)
-            except Exception as e:
-                print(f"[Drive Save Warning] {e}", flush=True)
+                    if m_tag:
+                        ms_pth = os.path.join(target_dir, f"MORTM5.{ver}_{m_tag}_step{s_now}.pth")
+                        shutil.copy2(dst_pth, ms_pth)
+                except Exception as e:
+                    print(f"[Drive Save Error ({target_dir})] {e}", flush=True)
 
-        threading.Thread(
-            target=_bg_save_mortm5_to_drive,
-            args=(colab_path, cpu_model_sd, version, outer_idx, step_now, milestone_tag),
-            daemon=True,
-        ).start()
+        if sync_drive:
+            _write_to_drive_subdir(full_ckpt, cpu_model_sd, drive_dir, version, step_now, milestone_tag)
+        else:
+            threading.Thread(
+                target=_write_to_drive_subdir,
+                args=(full_ckpt, cpu_model_sd, drive_dir, version, step_now, milestone_tag),
+                daemon=True,
+            ).start()
+        saved_path = dst_ckpt_path
+        local_saved = False
+    else:
+        # ローカルテスト環境 (Google Drive 非マウント時のみ)
+        local_sub_dir = os.path.join(_get_worker_dir(), ablation_subdir)
+        os.makedirs(local_sub_dir, exist_ok=True)
+        local_ckpt = os.path.join(local_sub_dir, f"MORTM5.{version}.checkpoint.pt")
+        torch.save(full_ckpt, local_ckpt + ".tmp")
+        os.replace(local_ckpt + ".tmp", local_ckpt)
+        # 旧テスト互換のためルートにも配置
+        legacy_ckpt = os.path.join(_get_worker_dir(), f"MORTM5.{version}.checkpoint.pt")
+        shutil.copy2(local_ckpt, legacy_ckpt)
+        saved_path = local_ckpt
+        local_saved = True
 
     total_dl_bytes = 0
     if prepare_download:
@@ -763,7 +833,10 @@ async def mortm5_save_ckpt(request: Request):
 
     return {
         "status": "saved",
-        "colab_path": colab_path,
+        "colab_path": saved_path,
+        "drive_dir": drive_dir,
+        "ablation_subdir": ablation_subdir,
+        "local_saved": local_saved,
         "drive_saved": drive_mounted,
         "download_bytes": total_dl_bytes,
         "step": step_now,

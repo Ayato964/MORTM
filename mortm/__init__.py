@@ -1,13 +1,15 @@
 """
-MORTM: Music Oriented Transformer Model (v5.0.0b2 Beta)
+MORTM: Music Oriented Transformer Model (v5.0.0b3 Beta)
 """
 
-__version__ = "5.0.0b2"
+__version__ = "5.0.0b3"
 
 from .models.modules.config import (
     MORTMArgs,
     MORTM5Args,
     MORTM5_ABLATION_PRESETS,
+    ABLATION_SUBDIR_MAP,
+    resolve_ablation_subdir,
     PAD_TOKEN_ID,
     BOS_TOKEN_ID,
     EOS_TOKEN_ID,
@@ -21,6 +23,9 @@ from .models.modules.config import (
     SLOT_CODE_EMPTY,
     slot_code_to_token_id,
     token_id_to_slot_code,
+)
+from .models.modules.layers import (
+    DecodeCodebookHead,
 )
 from .models.mortm5 import (
     MidiVision,
@@ -60,6 +65,8 @@ __all__ = [
     "MORTMArgs",
     "MORTM5Args",
     "MORTM5_ABLATION_PRESETS",
+    "ABLATION_SUBDIR_MAP",
+    "resolve_ablation_subdir",
     "PAD_TOKEN_ID",
     "BOS_TOKEN_ID",
     "EOS_TOKEN_ID",
@@ -73,6 +80,7 @@ __all__ = [
     "SLOT_CODE_EMPTY",
     "slot_code_to_token_id",
     "token_id_to_slot_code",
+    "DecodeCodebookHead",
     "MidiVision",
     "AblationTransformer1",
     "AblationTransformer2",

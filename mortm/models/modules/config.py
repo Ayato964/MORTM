@@ -88,6 +88,32 @@ _MORTM5_PRESET_ALIASES: Dict[str, str] = {
     "8": "m4_grouped_separated",
 }
 
+_MORTM5_ABLATION_SUBDIR_MAP: Dict[str, str] = {
+    "#1": "1", "1": "1", "m3_flat_shared": "1", "mortm5_m3_flat_shared": "1",
+    "#2": "2", "2": "2", "m3_flat_separated": "2", "mortm5_m3_flat_separated": "2",
+    "#3": "3", "3": "3", "m3_grouped_shared": "3", "mortm5_m3_grouped_shared": "3",
+    "#4": "4", "4": "4", "m3_grouped_separated": "4", "mortm5_m3_grouped_separated": "4",
+    "#5": "5", "5": "5", "m4_flat_shared": "5", "mortm5_m4_flat_shared": "5",
+    "#6": "6", "6": "6", "m4_flat_separated": "6", "mortm5_m4_flat_separated": "6",
+    "#7": "7", "7": "7", "m4_grouped_shared": "7", "mortm5_m4_grouped_shared": "7",
+    "#8": "8", "8": "8", "m4_grouped_separated": "8", "mortm5_m4_grouped_separated": "8",
+}
+ABLATION_SUBDIR_MAP = _MORTM5_ABLATION_SUBDIR_MAP
+
+
+def resolve_ablation_subdir(model_name: str = "", ablation_id: str = "") -> str:
+    """アブレーション識別子 ('#1'〜'#8', '1'〜'8') またはモデル名から保存サブディレクトリ名 ('1'〜'8') を解決する。"""
+    for raw in (ablation_id, model_name):
+        key = str(raw or "").strip().lower()
+        if not key:
+            continue
+        if key in _MORTM5_ABLATION_SUBDIR_MAP:
+            return _MORTM5_ABLATION_SUBDIR_MAP[key]
+        stripped = key.lstrip("#")
+        if stripped in {"1", "2", "3", "4", "5", "6", "7", "8"}:
+            return stripped
+    return "default"
+
 
 def resolve_mortm_config_dict(source: Union[str, os.PathLike, Dict[str, Any]]) -> Dict[str, Any]:
     """辞書、内蔵アブレーションプリセット名 ('m4_grouped_shared' / '#7' 等)、または JSON パスから設定辞書を解決する。"""

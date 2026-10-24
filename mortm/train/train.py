@@ -1,8 +1,10 @@
+import copy
 import datetime
 import json
 import math
 import os
 import random
+import threading
 import time
 from typing import Optional
 
@@ -1633,6 +1635,47 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
 
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+
+                    # 検証バッチを GPU で計算している裏で、バックグラウンドスレッドにてチェックポイントを保存する
+                    bg_ckpt_future = None
+                    if local_rank == 0:
+                        raw_m_snap = model.module if hasattr(model, "module") else model
+                        cpu_sd_snap = {k: v.detach().cpu() for k, v in raw_m_snap.state_dict().items()}
+                        opt_sd_snap = copy.deepcopy(trainer.optimizer.state_dict())
+                        sched_sd_snap = copy.deepcopy(trainer.scheduler.state_dict()) if trainer.scheduler is not None else None
+                        all_tok_snap = trainer.all_tokens.item() if isinstance(trainer.all_tokens, Tensor) else int(trainer.all_tokens)
+                        last_val_tok_snap = trainer.last_val_calc_tokens
+                        w_id_snap = getattr(wandb.run, "id", None) if wandb.run is not None else None
+
+                        def _bg_write_ckpt():
+                            ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+                            os.makedirs(ckpt_dir, exist_ok=True)
+                            tmp_p = f"{checkpoint_path}.{optimizer_step}.tmp"
+                            torch.save(
+                                {
+                                    "model_state_dict": cpu_sd_snap,
+                                    "optimizer_state_dict": opt_sd_snap,
+                                    "scheduler_state_dict": sched_sd_snap,
+                                    "epoch": epoch,
+                                    "outer_batch_idx": count,
+                                    "total_outer_batches": len(train_loader),
+                                    "optimizer_step": optimizer_step,
+                                    "all_tokens": all_tok_snap,
+                                    "last_val_calc_tokens": last_val_tok_snap,
+                                    "verification_loss": verification_loss,
+                                    "rng_states": None,
+                                    "wandb_run_id": w_id_snap,
+                                    "model_name": model_name,
+                                    "version": version,
+                                    "timestamp": datetime.datetime.now().isoformat(),
+                                },
+                                tmp_p,
+                            )
+                            os.replace(tmp_p, checkpoint_path)
+
+                        bg_ckpt_future = threading.Thread(target=_bg_write_ckpt, daemon=True)
+                        bg_ckpt_future.start()
+
                     verification_loss = get_verification_loss(
                         model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn
                     )
@@ -1644,37 +1687,9 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                             optimizer_step
                         )
 
-                    # Validation 評価直後にもチェックポイントを上書き保存
-                    if local_rank == 0:
-                        _save_checkpoint(
-                            checkpoint_path,
-                            trainer,
-                            epoch=epoch,
-                            outer_batch_idx=count,
-                            total_outer_batches=len(train_loader),
-                            optimizer_step=optimizer_step,
-                            verification_loss=verification_loss,
-                            model_name=model_name,
-                            version=version,
-                        )
-
                     # MoEログの表示 & wandb記録
                     _print_moe_stats(model, optimizer_step, local_rank=local_rank)
                     trainer.optional_logging(verification_loss, optimizer_step)
-
-                # ビッグバッチ完了ごとにチェックポイントを上書き保存
-                if local_rank == 0:
-                    _save_checkpoint(
-                        checkpoint_path,
-                        trainer,
-                        epoch=epoch,
-                        outer_batch_idx=count,
-                        total_outer_batches=len(train_loader),
-                        optimizer_step=optimizer_step,
-                        verification_loss=verification_loss,
-                        model_name=model_name,
-                        version=version,
-                    )
 
             # エポック内のOuter Batchループ完了、次エポック用にリセット
             resume_outer_batch_idx = 0
@@ -1964,9 +1979,19 @@ def train_mortm5(
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
-    os.makedirs(save_directory, exist_ok=True)
     args = model_config if isinstance(model_config, MORTM5Args) else MORTM5Args(json_directory=model_config)
     t_args = train_config if isinstance(train_config, TrainArgs) else TrainArgs(json_directory=train_config)
+
+    # アブレーション番号 (1-8) ごとのサブディレクトリに保存先を分離
+    from mortm.models.modules.config import resolve_ablation_subdir
+    ablation_subdir = resolve_ablation_subdir(
+        model_name=args.name,
+        ablation_id=str(model_config) if isinstance(model_config, str) else "",
+    )
+    norm_save = os.path.normpath(save_directory)
+    if os.path.basename(norm_save) != ablation_subdir:
+        save_directory = os.path.join(save_directory, ablation_subdir)
+    os.makedirs(save_directory, exist_ok=True)
 
     # MORTM5 では特に指定がない限り Muon を標準オプティマイザとする
     raw_train_cfg = getattr(t_args, "_raw_config", {})
