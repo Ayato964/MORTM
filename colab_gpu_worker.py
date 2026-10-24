@@ -772,24 +772,58 @@ async def mortm5_save_ckpt(request: Request):
 
     if drive_mounted:
         def _write_to_drive_subdir(ckpt_obj, model_sd, target_dir, ver, s_now, m_tag):
+            import tempfile
             with _DRIVE_SAVE_LOCK:
+                os.makedirs(target_dir, exist_ok=True)
+                dst_pth = os.path.join(target_dir, f"MORTM5.{ver}_latest.pth")
+                dst_ckpt = os.path.join(target_dir, f"MORTM5.{ver}.checkpoint.pt")
+
+                # 1. 最優先: 推論・評価用の軽量モデル重み (_latest.pth, ~374MB) を最初に独立保存
+                tmp_local_pth = os.path.join(tempfile.gettempdir(), f"mortm5_{ver}_latest_{s_now}.pth.tmp")
                 try:
-                    os.makedirs(target_dir, exist_ok=True)
-                    dst_ckpt = os.path.join(target_dir, f"MORTM5.{ver}.checkpoint.pt")
-                    tmp_ckpt = os.path.join(target_dir, f"MORTM5.{ver}.checkpoint.{s_now}.tmp")
-                    torch.save(ckpt_obj, tmp_ckpt)
-                    os.replace(tmp_ckpt, dst_ckpt)
-
-                    dst_pth = os.path.join(target_dir, f"MORTM5.{ver}_latest.pth")
-                    tmp_pth = os.path.join(target_dir, f"MORTM5.{ver}_latest.{s_now}.tmp")
-                    torch.save(model_sd, tmp_pth)
-                    os.replace(tmp_pth, dst_pth)
-
+                    torch.save(model_sd, tmp_local_pth)
+                    shutil.copy2(tmp_local_pth, dst_pth)
                     if m_tag:
                         ms_pth = os.path.join(target_dir, f"MORTM5.{ver}_{m_tag}_step{s_now}.pth")
-                        shutil.copy2(dst_pth, ms_pth)
+                        try:
+                            shutil.copy2(dst_pth, ms_pth)
+                        except Exception as me:
+                            print(f"[Drive Milestone Save Warning ({target_dir})] {me}", flush=True)
                 except Exception as e:
-                    print(f"[Drive Save Error ({target_dir})] {e}", flush=True)
+                    print(f"[Drive Model Save Error ({target_dir})] {e}", flush=True)
+                    # Drive 書き込み失敗時は /content に退避してモデル消失を防止
+                    fallback_pth = os.path.join(_get_worker_dir(), f"MORTM5.{ver}_latest.pth")
+                    try:
+                        shutil.copy2(tmp_local_pth, fallback_pth)
+                    except Exception:
+                        pass
+                finally:
+                    if os.path.exists(tmp_local_pth):
+                        try:
+                            os.remove(tmp_local_pth)
+                        except OSError:
+                            pass
+
+                # 2. 再開用フルチェックポイント (.checkpoint.pt, ~1.15GB) を別ブロックで保存
+                tmp_local_ckpt = os.path.join(tempfile.gettempdir(), f"mortm5_{ver}_ckpt_{s_now}.pt.tmp")
+                try:
+                    torch.save(ckpt_obj, tmp_local_ckpt)
+                    shutil.copy2(tmp_local_ckpt, dst_ckpt)
+                except Exception as e:
+                    print(f"[Drive Full-Ckpt Save Warning ({target_dir})] {e} -> retrying without optimizer state", flush=True)
+                    try:
+                        lite_ckpt = dict(ckpt_obj)
+                        lite_ckpt["optimizer_state_dict"] = None
+                        torch.save(lite_ckpt, tmp_local_ckpt)
+                        shutil.copy2(tmp_local_ckpt, dst_ckpt)
+                    except Exception as e2:
+                        print(f"[Drive Lite-Ckpt Save Error ({target_dir})] {e2}", flush=True)
+                finally:
+                    if os.path.exists(tmp_local_ckpt):
+                        try:
+                            os.remove(tmp_local_ckpt)
+                        except OSError:
+                            pass
 
         if sync_drive:
             _write_to_drive_subdir(full_ckpt, cpu_model_sd, drive_dir, version, step_now, milestone_tag)
@@ -1023,25 +1057,27 @@ async def save_colab_ckpt(request: Request):
 
     drive_mounted = os.path.exists("/content/drive/MyDrive")
     if drive_mounted:
-        def _bg_save_to_drive(src_path, model_sd, ver, o_idx, s_now):
+        ablation_subdir = str(STATE.get("ablation_subdir", "") or "")
+        def _bg_save_to_drive(src_path, model_sd, ver, o_idx, s_now, sub_dir):
+            drive_dir = _get_drive_ckpt_dir(sub_dir) if sub_dir else "/content/drive/MyDrive/MORTM5_checkpoints"
+            os.makedirs(drive_dir, exist_ok=True)
+            dst_pth = os.path.join(drive_dir, f"MORTM5.{ver}_latest.pth")
+            dst_ckpt = os.path.join(drive_dir, f"MORTM5.{ver}.checkpoint.pt")
             try:
-                drive_dir = "/content/drive/MyDrive/MORTM5_checkpoints"
-                os.makedirs(drive_dir, exist_ok=True)
-                dst_ckpt = os.path.join(drive_dir, f"MORTM5.{ver}.checkpoint.pt")
-                shutil.copy2(src_path, dst_ckpt + ".tmp")
-                os.replace(dst_ckpt + ".tmp", dst_ckpt)
-                dst_pth = os.path.join(drive_dir, f"MORTM5.{ver}_latest.pth")
-                torch.save(model_sd, dst_pth + ".tmp")
-                os.replace(dst_pth + ".tmp", dst_pth)
-                if o_idx % 20 == 0 or o_idx in (215, 220, 256):
-                    ms_pth = os.path.join(drive_dir, f"MORTM5.{ver}_outer{o_idx}_step{s_now}.pth")
-                    shutil.copy2(dst_pth, ms_pth)
+                tmp_local_pth = src_path + ".latest.pth.tmp"
+                torch.save(model_sd, tmp_local_pth)
+                shutil.copy2(tmp_local_pth, dst_pth)
+                os.remove(tmp_local_pth)
             except Exception as e:
-                print(f"[Drive Save Warning] {e}", flush=True)
+                print(f"[Drive Model Save Warning] {e}", flush=True)
+            try:
+                shutil.copy2(src_path, dst_ckpt)
+            except Exception as e:
+                print(f"[Drive Ckpt Save Warning] {e}", flush=True)
 
         threading.Thread(
             target=_bg_save_to_drive,
-            args=(colab_path, cpu_model_sd, version, outer_idx, step_now),
+            args=(colab_path, cpu_model_sd, version, outer_idx, step_now, ablation_subdir),
             daemon=True,
         ).start()
         STATE["ckpt_meta"] = {
