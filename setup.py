@@ -12,6 +12,10 @@ setup(
     long_description_content_type='text/markdown',
     url='https://github.com/Ayato964',
     packages=find_packages(include=['mortm', 'mortm.*']),
+    include_package_data=True,
+    package_data={
+        'mortm.video': ['native/*.m', 'README.md'],
+    },
     install_requires=[
         'torch',
         'torchaudio',
@@ -26,6 +30,7 @@ setup(
         'soundfile',
         'fonttools',
         'matplotlib',
+        'Pillow',
         'tensorboard',
         'wandb',
         'tqdm',

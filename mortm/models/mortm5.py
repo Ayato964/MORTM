@@ -433,6 +433,11 @@ class AblationTransformer1(_BaseMORTM5Transformer):
         top_k: int = 0,
         top_p: float = 1.0,
         append_eos: bool = True,
+        repetition_penalty: float = 1.0,
+        repetition_window: int = 24,
+        fine_temperature: Optional[float] = None,
+        fine_top_k: Optional[int] = None,
+        fine_top_p: Optional[float] = None,
     ) -> Tensor:
         """
         KVキャッシュと文法制約マスクを用いて num_chunks チャンク分のトークン系列 [B, S_total] を自己回帰生成する。
@@ -452,6 +457,13 @@ class AblationTransformer1(_BaseMORTM5Transformer):
         if seq.size(1) >= target_total_len:
             return seq
 
+        recent_l0_by_group: list[list[Tensor]] = [[] for _ in range(self.vq_groups)]
+        if repetition_penalty > 1.0 and seq.size(1) > prefix_len:
+            for p_idx in range(prefix_len, seq.size(1)):
+                intra = (p_idx - prefix_len) % self.tokens_per_chunk
+                if intra < self.vq_groups:
+                    recent_l0_by_group[intra].append(seq[:, p_idx])
+
         was_training = self.training
         self.eval()
         self.reset_kv_cache()
@@ -464,9 +476,42 @@ class AblationTransformer1(_BaseMORTM5Transformer):
             generated = [seq]
             while cur_pos < target_total_len:
                 constrained = self._apply_flat_grammar_mask(next_logits, pos=cur_pos)
+                if cur_pos >= prefix_len:
+                    rvq_step = cur_pos - prefix_len
+                    intra_chunk = rvq_step % self.tokens_per_chunk
+                    layer_idx = intra_chunk // self.vq_groups
+                    group_idx = intra_chunk % self.vq_groups
+                    if layer_idx == 0:
+                        if repetition_penalty > 1.0 and recent_l0_by_group[group_idx]:
+                            win = recent_l0_by_group[group_idx][-max(1, int(repetition_window)) :]
+                            for b_i in range(constrained.size(0)):
+                                counts: dict[int, int] = {}
+                                for past_t in win:
+                                    tid = int(past_t[b_i].item())
+                                    counts[tid] = counts.get(tid, 0) + 1
+                                for tid, cnt in counts.items():
+                                    pen = float(repetition_penalty) ** min(cnt, 4)
+                                    val = constrained[b_i, tid]
+                                    constrained[b_i, tid] = val / pen if val > 0 else val * pen
+                        step_temp = temperature
+                        step_top_k = top_k
+                        step_top_p = top_p
+                    else:
+                        step_temp = fine_temperature if fine_temperature is not None else temperature
+                        step_top_k = fine_top_k if fine_top_k is not None else top_k
+                        step_top_p = fine_top_p if fine_top_p is not None else top_p
+                else:
+                    layer_idx = -1
+                    group_idx = -1
+                    step_temp = temperature
+                    step_top_k = top_k
+                    step_top_p = top_p
+
                 next_tok = self._sample_from_logits(
-                    constrained, temperature=temperature, top_k=top_k, top_p=top_p
+                    constrained, temperature=step_temp, top_k=step_top_k, top_p=step_top_p
                 ).unsqueeze(1)  # [B, 1]
+                if layer_idx == 0 and repetition_penalty > 1.0 and 0 <= group_idx < self.vq_groups:
+                    recent_l0_by_group[group_idx].append(next_tok.squeeze(1))
                 generated.append(next_tok)
                 cur_pos += 1
                 if cur_pos < target_total_len:
@@ -790,6 +835,11 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         top_p: float = 1.0,
         append_eos: bool = True,
         return_flat: bool = False,
+        repetition_penalty: float = 1.0,
+        repetition_window: int = 24,
+        fine_temperature: Optional[float] = None,
+        fine_top_k: Optional[int] = None,
+        fine_top_p: Optional[float] = None,
     ) -> Tensor:
         """
         KVキャッシュと文法制約マスクを用いて num_chunks チャンク分のソフトトークン系列
@@ -816,6 +866,12 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         if seq.size(1) >= target_soft_len:
             return seq.reshape(seq.size(0), -1) if return_flat else seq
 
+        recent_l0: list[Tensor] = []
+        if repetition_penalty > 1.0 and seq.size(1) > prefix_soft_len:
+            prompt_rvq_local = self.to_local_targets(seq[:, prefix_soft_len:, :])
+            for l0_pos in range(0, prompt_rvq_local.size(1), self.vq_layers):
+                recent_l0.append(prompt_rvq_local[:, l0_pos, :])
+
         was_training = self.training
         self.eval()
         self.reset_kv_cache()
@@ -835,10 +891,34 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                     )  # [B]
                     next_global = inst_tok[:, None, None].expand(-1, 1, self.vq_groups).contiguous()
                 else:
-                    local_sampled = self._sample_from_logits(
-                        constrained, temperature=temperature, top_k=top_k, top_p=top_p
-                    )  # [B, G]
                     cur_layer_idx = max(0, cur_soft_pos - prefix_soft_len) % self.vq_layers
+                    if cur_layer_idx == 0:
+                        if repetition_penalty > 1.0 and recent_l0:
+                            win = recent_l0[-max(1, int(repetition_window)) :]
+                            for b_i in range(constrained.size(0)):
+                                for g_i in range(self.vq_groups):
+                                    counts: dict[int, int] = {}
+                                    for past_t in win:
+                                        tid = int(past_t[b_i, g_i].item())
+                                        if tid >= self.token_offset:
+                                            counts[tid] = counts.get(tid, 0) + 1
+                                    for tid, cnt in counts.items():
+                                        pen = float(repetition_penalty) ** min(cnt, 4)
+                                        val = constrained[b_i, g_i, tid]
+                                        constrained[b_i, g_i, tid] = val / pen if val > 0 else val * pen
+                        step_temp = temperature
+                        step_top_k = top_k
+                        step_top_p = top_p
+                    else:
+                        step_temp = fine_temperature if fine_temperature is not None else temperature
+                        step_top_k = fine_top_k if fine_top_k is not None else top_k
+                        step_top_p = fine_top_p if fine_top_p is not None else top_p
+
+                    local_sampled = self._sample_from_logits(
+                        constrained, temperature=step_temp, top_k=step_top_k, top_p=step_top_p
+                    )  # [B, G]
+                    if cur_layer_idx == 0 and repetition_penalty > 1.0:
+                        recent_l0.append(local_sampled)
                     next_global = self.local_to_global_ids(
                         local_sampled, layer_idx=cur_layer_idx
                     ).unsqueeze(1)  # [B, 1, G]

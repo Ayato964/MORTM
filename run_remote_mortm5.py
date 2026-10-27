@@ -209,10 +209,10 @@ class RemoteColabMORTM5Client:
 _ABLATION_SUBDIR_MAP: Dict[str, str] = {
     "#1": "1", "1": "1", "m3_flat_shared": "1", "mortm5_m3_flat_shared": "1",
     "#2": "2", "2": "2", "m3_flat_separated": "2", "mortm5_m3_flat_separated": "2",
-    "#3": "3", "3": "3", "m4_flat_shared": "3", "mortm5_m4_flat_shared": "3",
-    "#4": "4", "4": "4", "m4_flat_separated": "4", "mortm5_m4_flat_separated": "4",
-    "#5": "5", "5": "5", "m3_grouped_shared": "5", "mortm5_m3_grouped_shared": "5",
-    "#6": "6", "6": "6", "m3_grouped_separated": "6", "mortm5_m3_grouped_separated": "6",
+    "#3": "3", "3": "3", "m3_grouped_shared": "3", "mortm5_m3_grouped_shared": "3",
+    "#4": "4", "4": "4", "m3_grouped_separated": "4", "mortm5_m3_grouped_separated": "4",
+    "#5": "5", "5": "5", "m4_flat_shared": "5", "mortm5_m4_flat_shared": "5",
+    "#6": "6", "6": "6", "m4_flat_separated": "6", "mortm5_m4_flat_separated": "6",
     "#7": "7", "7": "7", "m4_grouped_shared": "7", "mortm5_m4_grouped_shared": "7",
     "#8": "8", "8": "8", "m4_grouped_separated": "8", "mortm5_m4_grouped_separated": "8",
 }

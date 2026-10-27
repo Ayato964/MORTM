@@ -92,3 +92,20 @@ docs/E1_experiment_summary.md
 Bug_Report.md
 HANDOFF.md
 midivision_studio/
+
+# Frontend dependencies & secret material guardrails
+node_modules/
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+*serviceAccountKey*.json
+*credentials*.json
+*.pem
+*.key
+
+# Local-only interactive demo & compiled native video binary
+demo/
+tests/test_mortm5_demo.py
+mortm/video/native/rgba_to_mp4

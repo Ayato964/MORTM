@@ -60,6 +60,22 @@ from .train.train import (
     train_mortm5,
 )
 
+_LAZY_INFER_EXPORTS = {
+    "Mortm5SamplingConfig",
+    "Mortm5PromptEncoder",
+    "Mortm5MidiGenerator",
+    "parse_slot_spec",
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_INFER_EXPORTS:
+        from .utils import mortm5_infer
+
+        return getattr(mortm5_infer, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "__version__",
     "MORTMArgs",
@@ -101,4 +117,8 @@ __all__ = [
     "mortm5_outer_collate_fn",
     "MORTM5TrainSet",
     "train_mortm5",
+    "Mortm5SamplingConfig",
+    "Mortm5PromptEncoder",
+    "Mortm5MidiGenerator",
+    "parse_slot_spec",
 ]

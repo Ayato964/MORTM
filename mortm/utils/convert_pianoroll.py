@@ -928,4 +928,91 @@ def make_synthetic_test_midi(path: str | Path) -> None:
     mid.save(str(path))
 
 
+def extract_quantized_notes_and_slots(path: str | Path) -> tuple[int, np.ndarray, np.ndarray]:
+    """Extract total chunk count, quantized note rows int32 [N_notes, 5] (slot, start, end, pitch, velocity),
+    and 4-slot instrument codes int16 [4] from a MIDI file."""
+    mid = mido.MidiFile(str(path))
+    if mid.ticks_per_beat is None or mid.ticks_per_beat <= 0:
+        raise ValueError(f"Invalid ticks_per_beat={mid.ticks_per_beat} in {path}")
+    notes = extract_notes(mid)
+
+    ticks_per_step = (mid.ticks_per_beat * BEATS_PER_BAR) / STEPS_PER_BAR
+    selected_notes, slots, lane_to_slot = _choose_slots(notes)
+    slot_codes = slots_to_slot_codes(slots)
+
+    encoded: list[tuple[int, int, int, int, int]] = []
+    max_end = 0
+
+    for note in selected_notes:
+        if note.is_drum:
+            slot = 0
+        else:
+            key = _lane_key(note)
+            slot = lane_to_slot.get(key)
+            if slot is None:
+                continue
+
+        start, end, pitch, velocity = _quantize_note(note, ticks_per_step)
+        if end <= 0 or start < 0 or pitch < 0 or pitch >= 128:
+            continue
+        encoded.append((slot, start, end, pitch, velocity))
+        if end > max_end:
+            max_end = end
+
+    num_chunks = max(1, (max_end + CHUNK_STEPS - 1) // CHUNK_STEPS)
+    total_steps = num_chunks * CHUNK_STEPS
+    if total_steps > MAX_TOTAL_STEPS:
+        raise MidiTooLongError(
+            f"total_steps={total_steps} exceeds MAX_TOTAL_STEPS={MAX_TOTAL_STEPS}; path={path}"
+        )
+
+    if len(encoded) == 0:
+        notes_arr = np.zeros((0, 5), dtype=np.int32)
+    else:
+        notes_arr = np.asarray(encoded, dtype=np.int32)
+    return num_chunks, notes_arr, slot_codes
+
+
+def rasterize_notes_to_chunks_u8(
+    num_chunks: int,
+    notes: Iterable[tuple[int, int, int, int, int]] | np.ndarray,
+) -> np.ndarray:
+    """Rasterize quantized note rows (slot, start, end, pitch, velocity) into
+    uint8 chunks [num_chunks, 8, 128, 24] with value range 0..254."""
+    if num_chunks <= 0:
+        raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+    total_steps = num_chunks * CHUNK_STEPS
+    flat_u8 = np.zeros((TOTAL_CHANNELS, total_steps, 128), dtype=np.uint8)
+    for slot, start, end, pitch, velocity in notes:
+        s_i = int(start)
+        e_i = int(end)
+        p_i = int(pitch)
+        if e_i <= s_i or s_i < 0 or s_i >= total_steps or not (0 <= p_i < 128):
+            continue
+        e_clamped = min(total_steps, e_i)
+        onset_ch = int(slot) * 2
+        sustain_ch = onset_ch + 1
+        onset_val = np.float32(0.5 + 0.5 * (float(velocity) / 127.0))
+        onset_u8 = np.uint8(np.rint(np.clip(onset_val, 0.0, 1.0) * np.float32(254.0)))
+        if onset_u8 > flat_u8[onset_ch, s_i, p_i]:
+            flat_u8[onset_ch, s_i, p_i] = onset_u8
+        flat_u8[sustain_ch, s_i:e_clamped, p_i] = 254
+
+    chunks_u8 = np.ascontiguousarray(
+        flat_u8.reshape(TOTAL_CHANNELS, num_chunks, CHUNK_STEPS, 128).transpose(1, 0, 3, 2)
+    )
+    del flat_u8
+    return chunks_u8
+
+
+def rasterize_notes_to_chunks_float(
+    num_chunks: int,
+    notes: Iterable[tuple[int, int, int, int, int]] | np.ndarray,
+) -> np.ndarray:
+    """Rasterize quantized note rows (slot, start, end, pitch, velocity) into
+    MidiVision float32 chunks [num_chunks, 8, 128, 24] with value range 0.0..1.0."""
+    chunks_u8 = rasterize_notes_to_chunks_u8(num_chunks, notes)
+    return chunks_u8.astype(np.float32) / np.float32(254.0)
+
+
 
