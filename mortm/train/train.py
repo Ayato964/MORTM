@@ -796,6 +796,7 @@ class MORTM5TrainSet(AbstractTrainSet):
             self.all_tokens += torch.sum(input_ids != PAD_TOKEN_ID)
 
         raw_model = model.module if hasattr(model, "module") else model
+        raw_model = getattr(raw_model, "_orig_mod", raw_model)
         if self.args.model_mode == "grouped":
             target_flat = raw_model.to_local_targets(targets, ignore_index=PAD_TOKEN_ID).reshape(-1).long()
         else:

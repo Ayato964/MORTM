@@ -528,10 +528,20 @@ class MORTM5MemmapDataset(Dataset):
                 )
 
         if self.slots is not None:
-            self.slot_token_ids = np.empty((len(self.slots), NUM_SLOT_TOKENS), dtype=np.int64)
-            for s_idx in range( len(self.slots)):
-                for col in range(NUM_SLOT_TOKENS):
-                    self.slot_token_ids[s_idx, col] = slot_code_to_token_id(int(self.slots[s_idx, col]))
+            slots_i64 = self.slots.astype(np.int64, copy=False)
+            valid_slots = (slots_i64 == -1) | ((slots_i64 >= 0) & (slots_i64 <= 128))
+            if not bool(np.all(valid_slots)):
+                bad_val = int(slots_i64[~valid_slots][0])
+                slot_code_to_token_id(bad_val)  # 既存の ValueError メッセージを送出
+            self.slot_token_ids = np.where(
+                slots_i64 == 128,
+                slot_code_to_token_id(128),
+                np.where(slots_i64 == -1, slot_code_to_token_id(-1), 3 + slots_i64),
+            ).astype(np.int64, copy=False)
+
+        self._unit_width = 1 if self.mode == "flat" else self.vq_groups
+        self._bos_arr = np.full(self._unit_width, self.bos_token_id, dtype=np.int64)
+        self._eos_arr = np.full(self._unit_width, self.eos_token_id, dtype=np.int64)
 
         # 1チャンク (L * G トークン) 内の各位置に加算するシフト量を事前計算 (O(1) ベクトル加算用)
         offset_shift = self.token_offset - self.raw_bin_offset
@@ -738,23 +748,32 @@ class MORTM5MemmapDataset(Dataset):
             or (self.bos_eos_mode == "song_boundary" and is_last == 1)
         )
 
-        unit_width = 1 if self.mode == "flat" else self.vq_groups
-        parts = []
-        if add_bos:
-            parts.append(np.full(unit_width, self.bos_token_id, dtype=np.int64))
-        if self.use_instrument_tokens:
+        unit_width = self._unit_width
+        bos_len = unit_width if add_bos else 0
+        inst_len = (NUM_SLOT_TOKENS * unit_width) if self.use_instrument_tokens else 0
+        eos_len = unit_width if add_eos else 0
+
+        if bos_len == 0 and inst_len == 0 and eos_len == 0:
+            return torch.from_numpy(np.ascontiguousarray(raw_tokens, dtype=np.int64))
+
+        seq = np.empty(bos_len + inst_len + token_len + eos_len, dtype=np.int64)
+        cursor = 0
+        if bos_len > 0:
+            seq[cursor : cursor + bos_len] = self._bos_arr
+            cursor += bos_len
+        if inst_len > 0:
             if self.slot_token_ids is None:
                 raise RuntimeError("use_instrument_tokens=True but slot_token_ids is not initialized.")
-            slot_toks = self.slot_token_ids[song_idx]  # [4]
+            slot_toks = self.slot_token_ids[song_idx]
             if unit_width == 1:
-                parts.append(slot_toks)
+                seq[cursor : cursor + inst_len] = slot_toks
             else:
-                parts.append(np.repeat(slot_toks, unit_width))
-        parts.append(raw_tokens)
-        if add_eos:
-            parts.append(np.full(unit_width, self.eos_token_id, dtype=np.int64))
-
-        seq = np.concatenate(parts, axis=0) if len(parts) > 1 else raw_tokens
+                seq[cursor : cursor + inst_len] = np.repeat(slot_toks, unit_width)
+            cursor += inst_len
+        seq[cursor : cursor + token_len] = raw_tokens
+        cursor += token_len
+        if eos_len > 0:
+            seq[cursor : cursor + eos_len] = self._eos_arr
         return torch.from_numpy(seq)
 
 

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b3 Beta)
+colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b4 Beta)
 ===================================================================================
 モデルのアーキテクチャ (`MidiVision`, `AblationTransformer1`, `AblationTransformer2`,
 `MORTM5TrainSet`, `HybridMuonOptimizer`, `MORTM5MemmapDataset`) はすべて pip パッケージ
 `mortm` (`pip install --pre -U mortm`) から直接呼び出します。
 
 【Google Colab での起動手順】
-1. ランタイムを GPU (A100 / L4 / T4) に設定し、以下を実行:
-   !pip install -q --pre -U "mortm==5.0.0b3" vector-quantize-pytorch pretty_midi mido fastapi uvicorn pycloudflared
+1. ランタイムを GPU (RTX PRO 6000 / A100 / L4) に設定し、以下を実行:
+   !pip install -q -U "git+https://github.com/Ayato964/MORTM.git@mortm5-tokenizer-mac" fastapi uvicorn pycloudflared
+   # (PyPI 公開版を使う場合: !pip install -q --pre -U "mortm==5.0.0b4" vector-quantize-pytorch pretty_midi mido fastapi uvicorn pycloudflared)
 2. Google Drive をマウント (トークンデータやチェックポイントを Drive に置く場合):
    from google.colab import drive
    drive.mount('/content/drive')
@@ -18,6 +19,8 @@ colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b3 B
    !sleep 5 && cat worker.log
 """
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import copy
 import datetime
 import io
@@ -25,16 +28,18 @@ import json
 import math
 import os
 import shutil
+import tempfile
 import threading
+import time
 import zlib
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
 try:
     from fastapi import FastAPI, Request, Response
     import uvicorn
@@ -69,11 +74,14 @@ from mortm import (
     MORTM5TrainSet,
     MORTM5MemmapDataset,
     MORTM5Collate,
-    MORTM5WindowSubsetDataset,
+    resolve_ablation_subdir,
 )
 from mortm.train.train import _compute_exact_epoch_optimizer_steps
 
 torch.set_float32_matmul_precision("high")
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 # ============================================================
@@ -213,34 +221,333 @@ async def health():
 
 
 # ============================================================
-# 3. MORTM5 Autoregressive Transformer (Ablation #1-#8) Endpoints
+# 3. MORTM5 Autoregressive Transformer (Ablation & SyMIc Main) Endpoints
 # ============================================================
 _DRIVE_SAVE_LOCK = threading.Lock()
-
-_ABLATION_SUBDIR_MAP: Dict[str, str] = {
-    "#1": "1", "1": "1", "m3_flat_shared": "1", "mortm5_m3_flat_shared": "1",
-    "#2": "2", "2": "2", "m3_flat_separated": "2", "mortm5_m3_flat_separated": "2",
-    "#3": "3", "3": "3", "m3_grouped_shared": "3", "mortm5_m3_grouped_shared": "3",
-    "#4": "4", "4": "4", "m3_grouped_separated": "4", "mortm5_m3_grouped_separated": "4",
-    "#5": "5", "5": "5", "m4_flat_shared": "5", "mortm5_m4_flat_shared": "5",
-    "#6": "6", "6": "6", "m4_flat_separated": "6", "mortm5_m4_flat_separated": "6",
-    "#7": "7", "7": "7", "m4_grouped_shared": "7", "mortm5_m4_grouped_shared": "7",
-    "#8": "8", "8": "8", "m4_grouped_separated": "8", "mortm5_m4_grouped_separated": "8",
-}
+_PREFETCH_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mortm5_prefetch")
 
 
 def _resolve_ablation_subdir(model_name: str = "", ablation_id: str = "") -> str:
-    """アブレーション識別子 ('#1'〜'#8', '1'〜'8') またはモデル名から Google Drive サブディレクトリ名 ('1'〜'8') を返す。"""
-    for raw in (ablation_id, model_name):
-        key = str(raw or "").strip().lower()
-        if not key:
-            continue
-        if key in _ABLATION_SUBDIR_MAP:
-            return _ABLATION_SUBDIR_MAP[key]
-        stripped = key.lstrip("#")
-        if stripped in {"1", "2", "3", "4", "5", "6", "7", "8"}:
-            return stripped
-    return "default"
+    """パッケージ `mortm.resolve_ablation_subdir` へ委譲し、#1-#8 および任意のカスタム実験IDを解決する。"""
+    return resolve_ablation_subdir(model_name=model_name, ablation_id=ablation_id)
+
+
+def _detach_state_to_cpu(obj: Any) -> Any:
+    """
+    Optimizer / Scheduler の state_dict 内に含まれる GPU Tensor をすべて再帰的に CPU へ退避する。
+    `copy.deepcopy` による GPU VRAM の倍増スパイクと、バックグラウンド保存スレッドからの CUDA ストリーム競合を完全に防ぐ。
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to(device="cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _detach_state_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_detach_state_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_detach_state_to_cpu(v) for v in obj)
+    return copy.deepcopy(obj)
+
+
+class LocalTokenStagingService:
+    """
+    Google Drive FUSE 上のトークンファイル (`*.bin`, `*.npy`, `*.json`) を Colab ローカル NVMe SSD へ
+    ストリーム転送・キャッシュし、数百万回のランダムシークによる I/O ボトルネックを解消するサービス。
+    """
+
+    _STAGE_EXTENSIONS: Tuple[str, ...] = (".bin", ".npy", ".json")
+    _SAFETY_MARGIN_BYTES: int = 8 * (1024 ** 3)  # 8 GiB safety headroom for checkpoints
+    _CHUNK_BYTES: int = 16 * 1024 * 1024         # 16 MiB sequential read/write buffer
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running = False
+        self._done = True
+        self._error: Optional[str] = None
+        self._src_dir: str = ""
+        self._local_dir: str = ""
+        self._copied_bytes: int = 0
+        self._total_bytes: int = 0
+        self._started_at: float = 0.0
+
+    @staticmethod
+    def _candidate_cache_roots() -> List[str]:
+        explicit = os.environ.get("MORTM5_LOCAL_CACHE_DIR", "").strip()
+        if explicit:
+            return [explicit]
+        roots = [os.path.join(tempfile.gettempdir(), "mortm5_token_cache")]
+        if os.path.isdir("/content"):
+            roots.append("/content/mortm5_token_cache")
+        return roots
+
+    @classmethod
+    def _list_stageable_files(cls, src_dir: str) -> List[Tuple[str, int]]:
+        entries: List[Tuple[str, int]] = []
+        if not os.path.isdir(src_dir):
+            return entries
+        for fname in sorted(os.listdir(src_dir)):
+            if not fname.lower().endswith(cls._STAGE_EXTENSIONS):
+                continue
+            fpath = os.path.join(src_dir, fname)
+            if os.path.isfile(fpath):
+                entries.append((fname, int(os.path.getsize(fpath))))
+        return entries
+
+    @staticmethod
+    def _subdir_key(src_dir: str) -> str:
+        norm = os.path.normpath(os.path.abspath(src_dir))
+        base = os.path.basename(norm) or "tokens"
+        parent = os.path.basename(os.path.dirname(norm))
+        return f"{parent}_{base}" if parent and parent not in ("", "/", "MyDrive") else base
+
+    def should_stage(self, src_dir: str, enabled: bool) -> bool:
+        if not enabled or not src_dir:
+            return False
+        if os.environ.get("MORTM5_FORCE_STAGE") == "1":
+            return True
+        norm = os.path.abspath(src_dir)
+        return norm.startswith("/content/drive/")
+
+    def resolve_cached_dir(self, src_dir: str) -> Optional[str]:
+        files = self._list_stageable_files(src_dir)
+        if not files:
+            return None
+        sub = self._subdir_key(src_dir)
+        for root in self._candidate_cache_roots():
+            cand = os.path.join(root, sub)
+            if not os.path.isdir(cand):
+                continue
+            if all(
+                os.path.isfile(os.path.join(cand, fn))
+                and os.path.getsize(os.path.join(cand, fn)) == sz
+                for fn, sz in files
+            ):
+                return cand
+        return None
+
+    def _select_target_dir(self, src_dir: str, files: List[Tuple[str, int]]) -> Tuple[Optional[str], int]:
+        sub = self._subdir_key(src_dir)
+        for root in self._candidate_cache_roots():
+            try:
+                os.makedirs(root, exist_ok=True)
+                cand = os.path.join(root, sub)
+                os.makedirs(cand, exist_ok=True)
+                needed = sum(
+                    sz
+                    for fn, sz in files
+                    if not (
+                        os.path.isfile(os.path.join(cand, fn))
+                        and os.path.getsize(os.path.join(cand, fn)) == sz
+                    )
+                )
+                free_bytes = int(shutil.disk_usage(cand).free)
+                if free_bytes >= needed + self._SAFETY_MARGIN_BYTES:
+                    return cand, needed
+            except OSError:
+                continue
+        return None, 0
+
+    def stage_sync(self, src_dir: str) -> str:
+        cached = self.resolve_cached_dir(src_dir)
+        if cached is not None:
+            return cached
+        files = self._list_stageable_files(src_dir)
+        if not files:
+            return src_dir
+        target_dir, _ = self._select_target_dir(src_dir, files)
+        if target_dir is None:
+            print(f"[TokenStage] Insufficient local SSD space -> falling back to direct FUSE read: {src_dir}", flush=True)
+            return src_dir
+
+        total_bytes = sum(sz for _, sz in files)
+        copied = 0
+        t0 = time.time()
+        for fname, expected_sz in files:
+            src_p = os.path.join(src_dir, fname)
+            dst_p = os.path.join(target_dir, fname)
+            if os.path.isfile(dst_p) and os.path.getsize(dst_p) == expected_sz:
+                copied += expected_sz
+                with self._lock:
+                    self._copied_bytes = copied
+                continue
+            tmp_p = dst_p + ".part"
+            with open(src_p, "rb") as fsrc, open(tmp_p, "wb") as fdst:
+                while True:
+                    buf = fsrc.read(self._CHUNK_BYTES)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+                    copied += len(buf)
+                    with self._lock:
+                        self._copied_bytes = copied
+            os.replace(tmp_p, dst_p)
+        dt = max(1e-3, time.time() - t0)
+        print(
+            f"[TokenStage] Staged {total_bytes / (1024**3):.2f} GiB to {target_dir} in {dt:.1f}s "
+            f"({(total_bytes / (1024**2)) / dt:.1f} MiB/s)",
+            flush=True,
+        )
+        return target_dir
+
+    def start_async(self, src_dir: str) -> Dict[str, Any]:
+        with self._lock:
+            if self._running and self._src_dir == src_dir:
+                return self.get_status_unlocked()
+
+        cached = self.resolve_cached_dir(src_dir)
+        files = self._list_stageable_files(src_dir)
+        total_bytes = sum(sz for _, sz in files)
+        if cached is not None:
+            with self._lock:
+                self._running = False
+                self._done = True
+                self._error = None
+                self._src_dir = src_dir
+                self._local_dir = cached
+                self._copied_bytes = total_bytes
+                self._total_bytes = total_bytes
+                self._started_at = time.time()
+                return self.get_status_unlocked()
+
+        with self._lock:
+            self._running = True
+            self._done = False
+            self._error = None
+            self._src_dir = src_dir
+            self._local_dir = src_dir
+            self._copied_bytes = 0
+            self._total_bytes = total_bytes
+            self._started_at = time.time()
+
+        def _bg():
+            try:
+                resolved = self.stage_sync(src_dir)
+                with self._lock:
+                    self._local_dir = resolved
+                    self._copied_bytes = self._total_bytes
+                    self._running = False
+                    self._done = True
+            except Exception as exc:
+                with self._lock:
+                    self._error = str(exc)
+                    self._local_dir = src_dir
+                    self._running = False
+                    self._done = True
+
+        threading.Thread(target=_bg, daemon=True, name="mortm5_stage").start()
+        return self.get_status()
+
+    def get_status_unlocked(self) -> Dict[str, Any]:
+        elapsed = max(1e-3, time.time() - self._started_at) if self._started_at > 0 else 0.0
+        mb_s = ((self._copied_bytes / (1024 ** 2)) / elapsed) if elapsed > 0 else 0.0
+        return {
+            "running": self._running,
+            "done": self._done,
+            "error": self._error,
+            "src_dir": self._src_dir,
+            "local_dir": self._local_dir,
+            "copied_bytes": int(self._copied_bytes),
+            "total_bytes": int(self._total_bytes),
+            "mb_per_sec": round(mb_s, 1),
+        }
+
+    def get_status(self) -> Dict[str, Any]:
+        with self._lock:
+            return self.get_status_unlocked()
+
+
+_STAGING_SERVICE = LocalTokenStagingService()
+
+
+class PrefetchedMicroBatchLoader:
+    """
+    常駐スレッドプール (`_PREFETCH_POOL`) を用いて Memmap からマイクロバッチ単位で遅延読み込み・Collate・PinMemory を先読みするイテレータ。
+    `DataLoader(num_workers>0)` のような Outer Batch 毎の `os.fork()` コストと、16,384 件一括ロードによる GPU 待機を完全に排除する。
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        indices: Sequence[int],
+        batch_size: int,
+        collate_fn: Callable[[List[torch.Tensor]], Any],
+        shuffle: bool = True,
+        pin_memory: bool = False,
+        prefetch_batches: int = 8,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = max(1, int(batch_size))
+        self.collate_fn = collate_fn
+        self.pin_memory = bool(pin_memory)
+        self.prefetch_batches = max(1, int(prefetch_batches))
+
+        idx_arr = np.asarray(indices, dtype=np.int64)
+        if shuffle and len(idx_arr) > 1:
+            idx_arr = idx_arr[np.random.permutation(len(idx_arr))]
+        self._batch_slices: List[np.ndarray] = [
+            idx_arr[pos : pos + self.batch_size]
+            for pos in range(0, len(idx_arr), self.batch_size)
+        ]
+
+    def __len__(self) -> int:
+        return len(self._batch_slices)
+
+    def _build_one(self, batch_idx_arr: np.ndarray) -> Any:
+        items = [self.dataset[int(i)] for i in batch_idx_arr]
+        packed = self.collate_fn(items)
+        if not self.pin_memory:
+            return packed
+        if isinstance(packed, tuple):
+            return tuple(t.pin_memory() if isinstance(t, torch.Tensor) else t for t in packed)
+        if isinstance(packed, torch.Tensor):
+            return packed.pin_memory()
+        return packed
+
+    def __iter__(self) -> Iterator[Any]:
+        total = len(self._batch_slices)
+        if total == 0:
+            return
+        queue: deque[Future] = deque()
+        next_submit = 0
+        while next_submit < min(total, self.prefetch_batches):
+            queue.append(_PREFETCH_POOL.submit(self._build_one, self._batch_slices[next_submit]))
+            next_submit += 1
+
+        while queue:
+            fut = queue.popleft()
+            if next_submit < total:
+                queue.append(_PREFETCH_POOL.submit(self._build_one, self._batch_slices[next_submit]))
+                next_submit += 1
+            yield fut.result()
+
+
+class ModelExecutionAdapter:
+    """
+    `trainer.model` 自体（およびその `state_dict()` キー構造）を一切汚染せずに、
+    任意の `torch.compile` 実行とエラー時の自動 Eager フォールバックを透過的に提供するアダプタ。
+    """
+
+    def __init__(self, base_model: nn.Module, enable_compile: bool = False) -> None:
+        self.base_model = base_model
+        self.compiled_model: Optional[nn.Module] = None
+        if enable_compile and hasattr(torch, "compile"):
+            try:
+                self.compiled_model = torch.compile(base_model, dynamic=True)
+            except Exception as exc:
+                print(f"[CompileFallback] torch.compile init skipped ({exc}); using eager mode.", flush=True)
+                self.compiled_model = None
+
+    @property
+    def is_compiled(self) -> bool:
+        return self.compiled_model is not None
+
+    def forward_epoch_fc(self, trainer: MORTM5TrainSet, pack: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.compiled_model is not None:
+            try:
+                return trainer.epoch_fc(self.compiled_model, pack, None)
+            except Exception as exc:
+                print(f"[CompileFallback] Runtime fallback to eager model ({exc}).", flush=True)
+                self.compiled_model = None
+        return trainer.epoch_fc(self.base_model, pack, None)
 
 
 def _get_drive_ckpt_dir(ablation_subdir: str) -> str:
@@ -250,13 +557,43 @@ def _get_drive_ckpt_dir(ablation_subdir: str) -> str:
 
 def _get_worker_dir() -> str:
     """Colab 上では `/content`、ローカルテスト環境では `MORTM5_WORKER_DIR` または一時ディレクトリを返す。"""
-    import tempfile
     work_dir = os.environ.get(
         "MORTM5_WORKER_DIR",
         "/content" if os.path.isdir("/content") else os.path.join(tempfile.gettempdir(), "mortm5_worker"),
     )
     os.makedirs(work_dir, exist_ok=True)
     return work_dir
+
+
+@app.post("/mortm5/start_stage")
+async def mortm5_start_stage(request: Request):
+    """Google Drive 上のトークンディレクトリをローカル NVMe SSD へ非同期ステージング開始する。"""
+    payload = await request.json()
+    colab_split_dir = str(payload.get("colab_split_dir") or "").strip()
+    if not colab_split_dir or not os.path.isdir(colab_split_dir):
+        return Response(
+            content=json.dumps({"error": f"colab_split_dir not found: {colab_split_dir}"}),
+            status_code=400,
+            media_type="application/json",
+        )
+    if not _STAGING_SERVICE.should_stage(colab_split_dir, enabled=True):
+        return {
+            "running": False,
+            "done": True,
+            "error": None,
+            "src_dir": colab_split_dir,
+            "local_dir": colab_split_dir,
+            "copied_bytes": 0,
+            "total_bytes": 0,
+            "mb_per_sec": 0.0,
+        }
+    return _STAGING_SERVICE.start_async(colab_split_dir)
+
+
+@app.get("/mortm5/poll_stage")
+async def mortm5_poll_stage():
+    """非同期トークンステージングの進捗状況を返す。"""
+    return _STAGING_SERVICE.get_status()
 
 
 @app.post("/mortm5/init")
@@ -276,6 +613,7 @@ async def mortm5_init(request: Request):
     # 既存モデルが GPU メモリを占有している場合は先に解放する
     if STATE.get("trainer") is not None or STATE.get("model") is not None:
         STATE["trainer"] = None
+        STATE["exec_adapter"] = None
         STATE["model"] = None
         STATE["optimizer"] = None
         if torch.cuda.is_available():
@@ -294,11 +632,13 @@ async def mortm5_init(request: Request):
     )
     STATE["ablation_subdir"] = ablation_subdir
 
-    # 1エポック学習で二度と使わないトークン列のローカル SSD キャッシュは行わず、Google Drive から直接 Memmap 読み込みする
     colab_split_dir: Optional[str] = payload.get("colab_split_dir")
+    stage_to_local: bool = bool(payload.get("stage_to_local", True))
+    use_torch_compile: bool = bool(payload.get("use_torch_compile", False))
     stride: Optional[int] = payload.get("stride")
     val_stride: Optional[int] = payload.get("val_stride")
 
+    effective_split_dir: Optional[str] = colab_split_dir
     train_ds: Optional[MORTM5MemmapDataset] = None
     val_ds: Optional[MORTM5MemmapDataset] = None
     if colab_split_dir:
@@ -308,13 +648,21 @@ async def mortm5_init(request: Request):
                 status_code=400,
                 media_type="application/json",
             )
+        cached_local = _STAGING_SERVICE.resolve_cached_dir(colab_split_dir)
+        if cached_local is not None:
+            effective_split_dir = cached_local
+        elif _STAGING_SERVICE.should_stage(colab_split_dir, enabled=stage_to_local):
+            effective_split_dir = _STAGING_SERVICE.stage_sync(colab_split_dir)
+
+        assert effective_split_dir is not None
         train_ds = MORTM5MemmapDataset.from_split_dir(
-            token_dir=colab_split_dir, split="train", args=m_args, stride=stride
+            token_dir=effective_split_dir, split="train", args=m_args, stride=stride
         )
-        val_tokens_path = os.path.join(colab_split_dir, "val_tokens.bin")
-        if os.path.isfile(val_tokens_path):
+        val_tokens_path = os.path.join(effective_split_dir, "val_tokens.bin")
+        val_complete_path = os.path.join(effective_split_dir, "val_tokens_complete.bin")
+        if os.path.isfile(val_tokens_path) or os.path.isfile(val_complete_path):
             val_ds = MORTM5MemmapDataset.from_split_dir(
-                token_dir=colab_split_dir, split="val", args=m_args, stride=val_stride
+                token_dir=effective_split_dir, split="val", args=m_args, stride=val_stride
             )
 
     # MORTM5TrainSet (AblationTransformer1/2 + HybridMuonOptimizer + Cosine/WSD Scheduler) の構築
@@ -337,12 +685,12 @@ async def mortm5_init(request: Request):
 
     trainer.rebuild_scheduler(total_steps)
 
-    # チェックポイントの復元 (指定パス または Google Drive の 1-8 サブディレクトリ内チェックポイント)
+    # チェックポイントの復元 (指定パス または Google Drive サブディレクトリ内チェックポイント)
     resumed_from: Optional[str] = None
+    resumed_big_bs: Optional[int] = None
     resume_ckpt_path: Optional[str] = payload.get("resume_checkpoint_path")
     version_str = str(payload.get("version") or f"{m_args.name}_muon_cos").strip()
     if resume_ckpt_path and not os.path.isfile(resume_ckpt_path):
-        # サブディレクトリ (1-8) 側および旧フラットディレクトリ側をフォールバック探索
         cand_in_sub = os.path.join(_get_drive_ckpt_dir(ablation_subdir), os.path.basename(resume_ckpt_path))
         if os.path.isfile(cand_in_sub):
             resume_ckpt_path = cand_in_sub
@@ -368,6 +716,9 @@ async def mortm5_init(request: Request):
         STATE["verification_loss"] = float(ckpt_data.get("verification_loss", 0.0))
         trainer.all_tokens.fill_(int(ckpt_data.get("all_tokens", 0)))
         trainer.last_val_calc_tokens = int(ckpt_data.get("last_val_calc_tokens", 0))
+        saved_t_cfg = ckpt_data.get("train_config")
+        if isinstance(saved_t_cfg, dict) and saved_t_cfg.get("big_batch_size") is not None:
+            resumed_big_bs = int(saved_t_cfg["big_batch_size"])
     else:
         STATE["step"] = 0
         STATE["epoch"] = 0
@@ -386,7 +737,9 @@ async def mortm5_init(request: Request):
                                 pass
 
     trainer.model.train()
+    exec_adapter = ModelExecutionAdapter(trainer.model, enable_compile=use_torch_compile)
     STATE["trainer"] = trainer
+    STATE["exec_adapter"] = exec_adapter
     STATE["model"] = trainer.model
     STATE["optimizer"] = trainer.optimizer
     STATE["criterion"] = trainer.criterion
@@ -420,6 +773,8 @@ async def mortm5_init(request: Request):
         "model_name": m_args.name,
         "ablation_subdir": ablation_subdir,
         "drive_ckpt_dir": _get_drive_ckpt_dir(ablation_subdir),
+        "effective_split_dir": effective_split_dir,
+        "compiled": exec_adapter.is_compiled,
         "model_class": type(trainer.model).__name__,
         "model_mode": m_args.model_mode,
         "separate_rvq_layers": m_args.separate_rvq_layers,
@@ -437,6 +792,7 @@ async def mortm5_init(request: Request):
         "all_tokens": int(trainer.get_synced_tokens()),
         "verification_loss": float(STATE.get("verification_loss", 0.0)),
         "resumed_from": resumed_from,
+        "resumed_big_batch_size": resumed_big_bs,
     }
 
 
@@ -454,33 +810,34 @@ def _run_mortm5_outer_batch_worker(
     epoch: int,
 ):
     """
-    Colab GPU 上で 1 Outer Batch (例: 2048 windows = 64 mini-batches = 32 Muon optimizer steps)
-    を実行するバックグラウンドワーカー。MORTM5TrainSet.epoch_fc を直接呼び出す。
+    Colab GPU 上で 1 Outer Batch を実行するバックグラウンドワーカー。
+    - PrefetchedMicroBatchLoader による遅延非同期先読み (fork なし・初期レイテンシゼロ)
+    - マイクロバッチごとの `.item()` GPU-CPU 同期を全廃し、オプティマイザ更新時にのみ1回読み出すゼロ同期ループ
     """
     try:
         trainer: MORTM5TrainSet = STATE["trainer"]
+        exec_adapter: Optional[ModelExecutionAdapter] = STATE.get("exec_adapter")
         t_args: TrainArgs = STATE["t_args"]
         collate_fn: MORTM5Collate = STATE["collate_fn"]
         model = trainer.model
         optimizer = trainer.optimizer
         scheduler = trainer.scheduler
-        criterion = trainer.criterion
         model.train()
 
         batch_size = max(1, int(t_args.batch_size))
         accum_steps = max(1, int(t_args.accumulation_steps))
         amp_dtype = torch.bfloat16 if DEVICE.type in ("cuda", "cpu") else torch.float16
 
-        # データソースの構築 (Mode A: Colab 上の MemmapDataset / Mode B: Mac からアップロードされたトークン配列)
+        # データソースの構築 (Mode A: Colab ローカル SSD 上の MemmapDataset / Mode B: Mac からアップロードされたトークン配列)
         if window_indices is not None and STATE.get("train_ds") is not None:
-            sub_ds = MORTM5WindowSubsetDataset(STATE["train_ds"], window_indices)
-            inner_loader = DataLoader(
-                sub_ds,
+            inner_loader = PrefetchedMicroBatchLoader(
+                dataset=STATE["train_ds"],
+                indices=window_indices,
                 batch_size=batch_size,
-                shuffle=True,
                 collate_fn=collate_fn,
-                num_workers=2 if DEVICE.type == "cuda" else 0,
+                shuffle=True,
                 pin_memory=(DEVICE.type == "cuda"),
+                prefetch_batches=8,
             )
             batches_iter = inner_loader
             total_micro_batches = len(inner_loader)
@@ -503,27 +860,31 @@ def _run_mortm5_outer_batch_worker(
             raise RuntimeError("Neither window_indices nor uploaded token tensor was provided.")
 
         optimizer.zero_grad(set_to_none=True)
-        accum_loss_sum = 0.0
+        accum_loss_gpu = torch.zeros((), device=DEVICE, dtype=torch.float32)
+        step_start_tokens_gpu = trainer.all_tokens.clone()
         accum_micro_count = 0
-        accum_valid_tokens = 0
 
         for b_idx, pack in enumerate(batches_iter):
-            tokens_before = int(trainer.get_synced_tokens())
             with torch.autocast(device_type=DEVICE.type, dtype=amp_dtype):
-                logits_flat, target_flat = trainer.epoch_fc(model, pack, None)
-            tokens_after = int(trainer.get_synced_tokens())
-            valid_tokens = max(0, tokens_after - tokens_before)
-            if int((target_flat != PAD_TOKEN_ID).sum().item()) == 0:
-                continue
+                if exec_adapter is not None:
+                    logits_flat, target_flat = exec_adapter.forward_epoch_fc(trainer, pack)
+                else:
+                    logits_flat, target_flat = trainer.epoch_fc(model, pack, None)
 
             is_last_micro = (b_idx + 1) == total_micro_batches
             will_step = ((accum_micro_count + 1) >= accum_steps) or is_last_micro
             effective_div = accum_steps if (accum_micro_count + 1) >= accum_steps else (accum_micro_count + 1)
 
             with torch.autocast(device_type=DEVICE.type, enabled=False):
-                raw_loss = criterion(logits_flat.float(), target_flat)
+                valid_tgt = (target_flat != PAD_TOKEN_ID).sum()
+                sum_loss = F.cross_entropy(
+                    logits_flat.float(),
+                    target_flat,
+                    ignore_index=PAD_TOKEN_ID,
+                    reduction="sum",
+                )
+                raw_loss = sum_loss / valid_tgt.clamp(min=1).to(dtype=torch.float32)
 
-            loss_val = float(raw_loss.detach().item())
             scaled_loss = raw_loss / float(effective_div if will_step and accum_micro_count == 0 else accum_steps)
             if will_step and (accum_micro_count + 1) < accum_steps and accum_micro_count > 0:
                 scaled_loss = raw_loss / float(accum_steps)
@@ -535,9 +896,8 @@ def _run_mortm5_outer_batch_worker(
                     if p.grad is not None:
                         p.grad.mul_(scale_fix)
 
-            accum_loss_sum += loss_val
+            accum_loss_gpu += raw_loss.detach()
             accum_micro_count += 1
-            accum_valid_tokens += valid_tokens
 
             if will_step:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -547,10 +907,16 @@ def _run_mortm5_outer_batch_worker(
                 optimizer.zero_grad(set_to_none=True)
 
                 STATE["step"] += 1
-                mean_step_loss = accum_loss_sum / max(1, accum_micro_count)
+                # Optimizer Step 境界で 1 回だけまとめて CPU へ同期読み出しする
+                step_toks_gpu = (trainer.all_tokens - step_start_tokens_gpu).clamp(min=0)
+                loss_sum_val, step_toks_val, total_toks_val = (
+                    accum_loss_gpu.item(),
+                    int(step_toks_gpu.item()),
+                    int(trainer.all_tokens.item()),
+                )
+                mean_step_loss = float(loss_sum_val) / max(1, accum_micro_count)
                 ppl = math.exp(min(20.0, mean_step_loss))
                 lr_muon, lr_adamw = _extract_lrs(optimizer)
-                total_toks_now = int(trainer.get_synced_tokens())
 
                 step_metric = {
                     "step": int(STATE["step"]),
@@ -560,20 +926,20 @@ def _run_mortm5_outer_batch_worker(
                     "ppl": ppl,
                     "lr_muon": lr_muon,
                     "lr_adamw": lr_adamw,
-                    "step_tokens": accum_valid_tokens,
-                    "all_tokens": total_toks_now,
+                    "step_tokens": step_toks_val,
+                    "all_tokens": total_toks_val,
                 }
                 STATE["mortm5_job_results"].append(step_metric)
                 if STATE["step"] % 20 == 0:
                     print(
                         f"[MORTM5 Step {STATE['step']}/{STATE['total_steps']}] "
                         f"Loss:{mean_step_loss:.4f} | PPL:{ppl:.2f} | "
-                        f"LR(Muon):{lr_muon:.2e} | Tokens:{total_toks_now/1e6:.2f}M",
+                        f"LR(Muon):{lr_muon:.2e} | Tokens:{total_toks_val/1e6:.2f}M",
                         flush=True,
                     )
-                accum_loss_sum = 0.0
+                accum_loss_gpu.zero_()
+                step_start_tokens_gpu.copy_(trainer.all_tokens)
                 accum_micro_count = 0
-                accum_valid_tokens = 0
 
         STATE["outer_batch_idx"] = int(outer_idx)
         STATE["epoch"] = int(epoch)
@@ -646,27 +1012,30 @@ async def mortm5_poll_outer_batch(request: Request):
 
 @app.post("/mortm5/validate")
 async def mortm5_validate(request: Request):
-    """Colab GPU 上で検証セット (`val_ds` またはアップロードされたトークン) の CrossEntropy 損失と PPL を計算する。"""
+    """Colab GPU 上で検証セット (`val_ds` またはアップロードされたトークン) の CrossEntropy 損失と PPL をゼロ同期ループで計算する。"""
     trainer: MORTM5TrainSet = STATE["trainer"]
+    exec_adapter: Optional[ModelExecutionAdapter] = STATE.get("exec_adapter")
     t_args: TrainArgs = STATE["t_args"]
     collate_fn: MORTM5Collate = STATE["collate_fn"]
     model = trainer.model
-    criterion = trainer.criterion
 
     max_batches = int(request.query_params.get("max_batches", "0"))
     amp_dtype = torch.bfloat16 if DEVICE.type in ("cuda", "cpu") else torch.float16
+    bs = max(1, int(t_args.batch_size))
 
     val_ds: Optional[MORTM5MemmapDataset] = STATE.get("val_ds")
     if val_ds is not None:
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=int(t_args.batch_size),
-            shuffle=False,
+        max_items = (max_batches * bs) if max_batches > 0 else len(val_ds)
+        val_indices = range(min(len(val_ds), max_items))
+        batches_iter: Any = PrefetchedMicroBatchLoader(
+            dataset=val_ds,
+            indices=val_indices,
+            batch_size=bs,
             collate_fn=collate_fn,
-            num_workers=2 if DEVICE.type == "cuda" else 0,
+            shuffle=False,
             pin_memory=(DEVICE.type == "cuda"),
+            prefetch_batches=8,
         )
-        batches_iter = val_loader
     elif STATE.get("upload_parts"):
         raw_comp = b"".join(STATE["upload_parts"])
         STATE["upload_parts"] = []
@@ -675,36 +1044,46 @@ async def mortm5_validate(request: Request):
         decomp = zlib.decompress(raw_comp[4 + header_len :])
         np_dtype = np.dtype(header.get("dtype", "int32"))
         arr = np.frombuffer(decomp, dtype=np_dtype).copy().reshape(header["shape"])
-        bs = int(t_args.batch_size)
         batches_iter = [torch.from_numpy(arr[i : i + bs]).to(dtype=torch.long) for i in range(0, len(arr), bs)]
     else:
         return {"val_loss": 0.0, "val_ppl": 1.0, "val_tokens": 0, "step": int(STATE["step"])}
 
     was_training = model.training
     model.eval()
-    loss_sum = 0.0
-    n_batches = 0
-    val_tokens = 0
+    acc_dtype = torch.float64 if DEVICE.type in ("cuda", "cpu") else torch.float32
+    loss_sum_gpu = torch.zeros((), device=DEVICE, dtype=acc_dtype)
+    n_valid_batches_gpu = torch.zeros((), device=DEVICE, dtype=torch.long)
+    val_tokens_gpu = torch.zeros((), device=DEVICE, dtype=torch.long)
 
     with torch.no_grad():
         for b_idx, pack in enumerate(batches_iter):
             if 0 < max_batches <= b_idx:
                 break
             with torch.autocast(device_type=DEVICE.type, dtype=amp_dtype):
-                logits_flat, target_flat = trainer.epoch_fc(model, pack, None)
-            valid = int((target_flat != PAD_TOKEN_ID).sum().item())
-            if valid == 0:
-                continue
+                if exec_adapter is not None:
+                    logits_flat, target_flat = exec_adapter.forward_epoch_fc(trainer, pack)
+                else:
+                    logits_flat, target_flat = trainer.epoch_fc(model, pack, None)
+            valid_cnt = (target_flat != PAD_TOKEN_ID).sum()
             with torch.autocast(device_type=DEVICE.type, enabled=False):
-                loss = criterion(logits_flat.float(), target_flat)
-            loss_sum += float(loss.item())
-            n_batches += 1
-            val_tokens += valid
+                sum_loss = F.cross_entropy(
+                    logits_flat.float(),
+                    target_flat,
+                    ignore_index=PAD_TOKEN_ID,
+                    reduction="sum",
+                )
+                batch_mean_loss = (sum_loss / valid_cnt.clamp(min=1).to(dtype=torch.float32)).to(dtype=acc_dtype)
+            has_valid = valid_cnt > 0
+            loss_sum_gpu += torch.where(has_valid, batch_mean_loss, torch.zeros_like(batch_mean_loss))
+            n_valid_batches_gpu += has_valid.to(dtype=torch.long)
+            val_tokens_gpu += valid_cnt
 
     if was_training:
         model.train()
 
-    val_loss = loss_sum / max(1, n_batches)
+    n_batches = int(n_valid_batches_gpu.item())
+    val_tokens = int(val_tokens_gpu.item())
+    val_loss = float(loss_sum_gpu.item()) / max(1, n_batches)
     val_ppl = math.exp(min(20.0, val_loss))
     trainer.last_val_calc_tokens = int(trainer.get_synced_tokens())
     return {
@@ -720,10 +1099,8 @@ async def mortm5_validate(request: Request):
 @app.post("/mortm5/save_ckpt")
 async def mortm5_save_ckpt(request: Request):
     """
-    MORTM5 チェックポイントを Google Drive のアブレーション番号別サブディレクトリ
-    (`/content/drive/MyDrive/MORTM5_checkpoints/1/` 〜 `8/`) に直接保存する。
-    Google Drive マウント時は `/content` ローカル SSD への二重保存を行わず、
-    検証バッチ実行中にバックグラウンドスレッド（排他ロック付き）で Drive へ書き込む。
+    MORTM5 チェックポイントを Google Drive のアブレーション/実験サブディレクトリに直接保存する。
+    Optimizer state も事前に CPU メモリへデタッチしてクローンするため、GPU VRAM スパイクや CUDA ストリーム競合が発生しない。
     """
     trainer: MORTM5TrainSet = STATE["trainer"]
     m_args: MORTM5Args = STATE["m_args"]
@@ -743,12 +1120,14 @@ async def mortm5_save_ckpt(request: Request):
 
     step_now = int(STATE["step"])
     tokens_now = int(trainer.get_synced_tokens())
-    cpu_model_sd = {k: v.detach().cpu() for k, v in trainer.model.state_dict().items()}
+    cpu_model_sd = {k: v.detach().to(device="cpu", copy=True) for k, v in trainer.model.state_dict().items()}
+    cpu_opt_sd = _detach_state_to_cpu(trainer.optimizer.state_dict())
+    cpu_sched_sd = _detach_state_to_cpu(trainer.scheduler.state_dict()) if trainer.scheduler is not None else None
 
     full_ckpt = {
         "model_state_dict": cpu_model_sd,
-        "optimizer_state_dict": copy.deepcopy(trainer.optimizer.state_dict()),
-        "scheduler_state_dict": copy.deepcopy(trainer.scheduler.state_dict()) if trainer.scheduler is not None else None,
+        "optimizer_state_dict": cpu_opt_sd,
+        "scheduler_state_dict": cpu_sched_sd,
         "epoch": epoch,
         "outer_batch_idx": outer_idx,
         "total_outer_batches": total_outer,

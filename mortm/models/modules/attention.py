@@ -1,3 +1,5 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Optional, Tuple
 import math
 import torch
@@ -26,6 +28,69 @@ except ImportError:
     _HAS_FLASH_ATTN = False
 
 
+@dataclass(frozen=True)
+class PackedVarlenLayout:
+    """Immutable value object encapsulating varlen packed sequence layout without GPU->CPU syncs."""
+
+    cu_seqlens: Tensor
+    max_seqlen: int
+    total_tokens: int
+
+    def __post_init__(self) -> None:
+        if self.max_seqlen < 0:
+            raise ValueError(f"max_seqlen must be >= 0, got {self.max_seqlen}")
+        if self.total_tokens < 0:
+            raise ValueError(f"total_tokens must be >= 0, got {self.total_tokens}")
+
+    @property
+    def batch_size(self) -> int:
+        return max(0, int(self.cu_seqlens.size(0)) - 1)
+
+    @property
+    def is_uniform(self) -> bool:
+        return (
+            self.total_tokens > 0
+            and self.max_seqlen > 0
+            and self.total_tokens == self.batch_size * self.max_seqlen
+        )
+
+    def seqlens(self, device: Optional[torch.device] = None) -> Tensor:
+        cu = self.cu_seqlens if device is None else self.cu_seqlens.to(device=device)
+        return (cu[1:] - cu[:-1]).to(dtype=torch.long)
+
+    def position_ids(self, device: torch.device) -> Tensor:
+        if self.total_tokens == 0:
+            return torch.empty((0,), device=device, dtype=torch.long)
+        if self.is_uniform:
+            return torch.arange(self.max_seqlen, device=device, dtype=torch.long).repeat(self.batch_size)
+        cu = self.cu_seqlens.to(device=device, dtype=torch.long)
+        seqlens = cu[1:] - cu[:-1]
+        starts = torch.repeat_interleave(
+            cu[:-1],
+            seqlens,
+            output_size=self.total_tokens,
+        )
+        return torch.arange(self.total_tokens, device=device, dtype=torch.long) - starts
+
+    def flat_padded_indices(self, device: torch.device) -> Tensor:
+        if self.total_tokens == 0:
+            return torch.empty((0,), device=device, dtype=torch.long)
+        cu = self.cu_seqlens.to(device=device, dtype=torch.long)
+        seqlens = cu[1:] - cu[:-1]
+        seq_ids = torch.repeat_interleave(
+            torch.arange(self.batch_size, device=device, dtype=torch.long),
+            seqlens,
+            output_size=self.total_tokens,
+        )
+        starts = torch.repeat_interleave(
+            cu[:-1],
+            seqlens,
+            output_size=self.total_tokens,
+        )
+        pos_ids = torch.arange(self.total_tokens, device=device, dtype=torch.long) - starts
+        return seq_ids * self.max_seqlen + pos_ids
+
+
 def _get_default_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -37,26 +102,47 @@ def _get_default_device() -> torch.device:
 def unpad_input(hidden_states: Tensor, attention_mask: Tensor):
     if _HAS_FLASH_ATTN and hidden_states.is_cuda:
         return _cuda_unpad_input(hidden_states, attention_mask)
+    batch_size, seqlen = hidden_states.shape[0], hidden_states.shape[1]
+    total_elems = batch_size * seqlen
+    if total_elems == 0:
+        cu_seqlens = torch.zeros(batch_size + 1, device=hidden_states.device, dtype=torch.int32)
+        seqlens_in_batch = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.int32)
+        indices = torch.empty((0,), device=hidden_states.device, dtype=torch.long)
+        return hidden_states.reshape(0, *hidden_states.shape[2:]), indices, cu_seqlens, 0, seqlens_in_batch
+
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    min_max = torch.stack([seqlens_in_batch.min(), seqlens_in_batch.max()]).tolist()
+    min_seqlen_in_batch, max_seqlen_in_batch = int(min_max[0]), int(min_max[1])
+
+    if min_seqlen_in_batch == seqlen:
+        indices = torch.arange(total_elems, device=hidden_states.device, dtype=torch.long)
+        cu_seqlens = torch.arange(
+            0, (batch_size + 1) * seqlen, step=seqlen, device=hidden_states.device, dtype=torch.int32
+        )
+        unpadded = hidden_states.reshape(total_elems, *hidden_states.shape[2:])
+        return unpadded, indices, cu_seqlens, seqlen, seqlens_in_batch
+
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = int(seqlens_in_batch.max().item()) if seqlens_in_batch.numel() > 0 else 0
     cu_seqlens = torch.nn.functional.pad(
         torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
     )
-    unpadded = hidden_states.reshape(-1, *hidden_states.shape[2:])[indices]
+    unpadded = hidden_states.reshape(total_elems, *hidden_states.shape[2:])[indices]
     return unpadded, indices, cu_seqlens, max_seqlen_in_batch, seqlens_in_batch
 
 
 def pad_input(hidden_states: Tensor, indices: Tensor, batch: int, seqlen: int) -> Tensor:
     if _HAS_FLASH_ATTN and hidden_states.is_cuda:
         return _cuda_pad_input(hidden_states, indices, batch, seqlen)
+    total_elems = batch * seqlen
+    if hidden_states.size(0) == total_elems and indices.numel() == total_elems:
+        return hidden_states.reshape(batch, seqlen, *hidden_states.shape[1:])
     output = torch.zeros(
-        batch * seqlen,
+        total_elems,
         *hidden_states.shape[1:],
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    output[indices] = hidden_states
+    output = output.index_put((indices,), hidden_states)
     return output.reshape(batch, seqlen, *hidden_states.shape[1:])
 
 
@@ -78,19 +164,41 @@ def _build_alibi_bias(
     return bias.unsqueeze(0).to(dtype)
 
 
-def flash_attn_varlen_qkvpacked_func(
-    qkv: Tensor,
-    dropout_p: float = 0.0,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
-    alibi_slopes: Optional[Tensor] = None,
-    deterministic: bool = False,
-    return_attn_probs: bool = False,
-    cu_seqlens: Optional[Tensor] = None,
-    max_seqlen: Optional[int] = None,
-) -> Tensor:
-    if _HAS_FLASH_ATTN and qkv.is_cuda:
+class VarlenQkvAttentionStrategy(ABC):
+    """Strategy interface for packed varlen QKV self-attention execution."""
+
+    @abstractmethod
+    def execute(
+        self,
+        qkv: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+        dropout_p: float = 0.0,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: Tuple[int, int] = (-1, -1),
+        alibi_slopes: Optional[Tensor] = None,
+        deterministic: bool = False,
+        return_attn_probs: bool = False,
+    ) -> Tensor: ...
+
+
+class CudaFlashVarlenQkvStrategy(VarlenQkvAttentionStrategy):
+    """Hardware-accelerated flash_attn CUDA C++ extension strategy."""
+
+    def execute(
+        self,
+        qkv: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+        dropout_p: float = 0.0,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: Tuple[int, int] = (-1, -1),
+        alibi_slopes: Optional[Tensor] = None,
+        deterministic: bool = False,
+        return_attn_probs: bool = False,
+    ) -> Tensor:
         return _cuda_flash_attn_varlen_qkvpacked_func(
             qkv,
             cu_seqlens=cu_seqlens,
@@ -103,30 +211,134 @@ def flash_attn_varlen_qkvpacked_func(
             deterministic=deterministic,
             return_attn_probs=return_attn_probs,
         )
-    cu = cu_seqlens.detach().cpu().tolist()
-    outs = []
-    for i in range(len(cu) - 1):
-        s, e = int(cu[i]), int(cu[i + 1])
-        if e <= s:
-            continue
-        q_i, k_i, v_i = qkv[s:e].unbind(dim=1)
-        q_i = q_i.permute(1, 0, 2).unsqueeze(0)
-        k_i = k_i.permute(1, 0, 2).unsqueeze(0)
-        v_i = v_i.permute(1, 0, 2).unsqueeze(0)
-        L = e - s
-        if alibi_slopes is not None:
-            attn_mask = _build_alibi_bias(L, L, alibi_slopes, causal, qkv.device, qkv.dtype)
-            o_i = torch.nn.functional.scaled_dot_product_attention(
-                q_i, k_i, v_i, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=softmax_scale
+
+
+class BatchedSdpaVarlenQkvStrategy(VarlenQkvAttentionStrategy):
+    """Zero-sync batched PyTorch 2.x SDPA (FlashAttention-2 / CuDNN) strategy."""
+
+    _MAX_DENSE_EXPANSION_RATIO: int = 4
+
+    def execute(
+        self,
+        qkv: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+        dropout_p: float = 0.0,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: Tuple[int, int] = (-1, -1),
+        alibi_slopes: Optional[Tensor] = None,
+        deterministic: bool = False,
+        return_attn_probs: bool = False,
+    ) -> Tensor:
+        total_tokens = int(qkv.size(0))
+        s_max = int(max_seqlen) if max_seqlen is not None else 0
+        layout = PackedVarlenLayout(cu_seqlens=cu_seqlens, max_seqlen=s_max, total_tokens=total_tokens)
+        n_heads, head_dim = int(qkv.size(2)), int(qkv.size(3))
+
+        if total_tokens == 0 or s_max == 0 or layout.batch_size == 0:
+            return torch.empty((0, n_heads, head_dim), device=qkv.device, dtype=qkv.dtype)
+
+        # Fast Path 1: Uniform sequence lengths (zero padding, zero scatter/gather, 1 fused SDPA kernel)
+        if layout.is_uniform and window_size == (-1, -1):
+            bsz = layout.batch_size
+            q, k, v = qkv.view(bsz, s_max, 3, n_heads, head_dim).unbind(dim=2)
+            q_t = q.transpose(1, 2)
+            k_t = k.transpose(1, 2)
+            v_t = v.transpose(1, 2)
+            if alibi_slopes is not None:
+                attn_mask = _build_alibi_bias(s_max, s_max, alibi_slopes, causal, qkv.device, qkv.dtype)
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q_t, k_t, v_t, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=softmax_scale
+                )
+            else:
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q_t, k_t, v_t, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
+                )
+            return out.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+
+        # Fast Path 2: Variable-length causal batch without ALiBi (right-padded causal invariance -> 1 fused SDPA kernel)
+        bsz = layout.batch_size
+        dense_tokens = bsz * s_max
+        if (
+            causal
+            and alibi_slopes is None
+            and window_size == (-1, -1)
+            and dense_tokens <= max(total_tokens * self._MAX_DENSE_EXPANSION_RATIO, 8192)
+        ):
+            flat_idx = layout.flat_padded_indices(qkv.device)
+            padded_qkv = qkv.new_zeros((dense_tokens, 3, n_heads, head_dim)).index_put((flat_idx,), qkv)
+            q, k, v = padded_qkv.view(bsz, s_max, 3, n_heads, head_dim).unbind(dim=2)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                dropout_p=dropout_p,
+                is_causal=True,
+                scale=softmax_scale,
             )
-        else:
-            o_i = torch.nn.functional.scaled_dot_product_attention(
-                q_i, k_i, v_i, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
-            )
-        outs.append(o_i.squeeze(0).permute(1, 0, 2))
-    if not outs:
-        return torch.empty((0, qkv.shape[2], qkv.shape[3]), device=qkv.device, dtype=qkv.dtype)
-    return torch.cat(outs, dim=0)
+            return out.transpose(1, 2).reshape(dense_tokens, n_heads, head_dim)[flat_idx]
+
+        # Fallback Path: Extreme sparse varlen / non-causal varlen / ALiBi varlen
+        cu = cu_seqlens.detach().cpu().tolist()
+        outs = []
+        for i in range(len(cu) - 1):
+            s, e = int(cu[i]), int(cu[i + 1])
+            if e <= s:
+                continue
+            q_i, k_i, v_i = qkv[s:e].unbind(dim=1)
+            q_i = q_i.permute(1, 0, 2).unsqueeze(0)
+            k_i = k_i.permute(1, 0, 2).unsqueeze(0)
+            v_i = v_i.permute(1, 0, 2).unsqueeze(0)
+            seq_l = e - s
+            if alibi_slopes is not None:
+                attn_mask = _build_alibi_bias(seq_l, seq_l, alibi_slopes, causal, qkv.device, qkv.dtype)
+                o_i = torch.nn.functional.scaled_dot_product_attention(
+                    q_i, k_i, v_i, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=softmax_scale
+                )
+            else:
+                o_i = torch.nn.functional.scaled_dot_product_attention(
+                    q_i, k_i, v_i, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
+                )
+            outs.append(o_i.squeeze(0).permute(1, 0, 2))
+        if not outs:
+            return torch.empty((0, n_heads, head_dim), device=qkv.device, dtype=qkv.dtype)
+        return torch.cat(outs, dim=0)
+
+
+_CUDA_FLASH_VARLEN_QKV_STRATEGY = CudaFlashVarlenQkvStrategy()
+_BATCHED_SDPA_VARLEN_QKV_STRATEGY = BatchedSdpaVarlenQkvStrategy()
+
+
+def flash_attn_varlen_qkvpacked_func(
+    qkv: Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[Tensor] = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    cu_seqlens: Optional[Tensor] = None,
+    max_seqlen: Optional[int] = None,
+) -> Tensor:
+    strategy: VarlenQkvAttentionStrategy = (
+        _CUDA_FLASH_VARLEN_QKV_STRATEGY
+        if (_HAS_FLASH_ATTN and qkv.is_cuda)
+        else _BATCHED_SDPA_VARLEN_QKV_STRATEGY
+    )
+    return strategy.execute(
+        qkv=qkv,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=int(max_seqlen) if max_seqlen is not None else 0,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+    )
 
 
 def flash_attn_varlen_kvpacked_func(
@@ -328,7 +540,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
         # cos/sinを [Batch, 1, 1, Dim] に変形
         # これで Batch次元同士が正しく対応し、Heads次元にブロードキャストされます
         cos = cos.unsqueeze(1).unsqueeze(1)
-        sin = cos_sin_expand = sin.unsqueeze(1).unsqueeze(1)
+        sin = sin.unsqueeze(1).unsqueeze(1)
     else:
         # Prefill時: qは [Total, Heads, Dim]
         # cos/sinを [Total, 1, Dim] に変形
@@ -360,11 +572,13 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
     def forward(self, x, seq_len=None):
-        if seq_len > self.max_position_embeddings or self.cos_cached.device != x.device:
-            self._set_cos_sin_cache(max(seq_len, self.max_position_embeddings), x.device, x.dtype)
+        req_len = int(seq_len) if seq_len is not None else int(x.shape[-2])
+        if req_len > self.max_position_embeddings or self.cos_cached.device != x.device:
+            new_max = max(req_len, self.max_position_embeddings * 2)
+            self._set_cos_sin_cache(new_max, x.device, x.dtype)
         return (
-            self.cos_cached[:seq_len].to(device=x.device, dtype=x.dtype),
-            self.sin_cached[:seq_len].to(device=x.device, dtype=x.dtype),
+            self.cos_cached[:req_len].to(device=x.device, dtype=x.dtype),
+            self.sin_cached[:req_len].to(device=x.device, dtype=x.dtype),
         )
 
 # ==========================================
@@ -444,14 +658,61 @@ class FlashSelfAttentionM(nn.Module):
             )
             self.rotary_emb = None
 
-    def _init_kv_cache(self, batch_size, device, dtype):
-        max_seq_len = self.args.position_length + 512
+    def _init_kv_cache(self, batch_size, device, dtype, min_capacity: int = 0):
+        max_seq_len = max(self.args.position_length + 512, int(min_capacity))
         shape = (batch_size, max_seq_len, self.args.num_heads, self.head_dim)
         self.kv_cache = (
             torch.zeros(shape, device=device, dtype=dtype),
             torch.zeros(shape, device=device, dtype=dtype)
         )
         self.cache_seqlens = torch.zeros(batch_size, device=device, dtype=torch.int32)
+
+    def _ensure_kv_cache_capacity(
+        self, batch_size: int, required_len: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        if (
+            self.kv_cache is None
+            or self.cache_seqlens is None
+            or self.kv_cache[0].shape[0] != batch_size
+            or self.kv_cache[0].device != device
+            or self.kv_cache[0].dtype != dtype
+        ):
+            self._init_kv_cache(batch_size, device, dtype, min_capacity=required_len)
+            return
+
+        cur_cap = int(self.kv_cache[0].shape[1])
+        if required_len <= cur_cap:
+            return
+
+        new_cap = max(int(required_len), cur_cap * 2)
+        new_shape = (batch_size, new_cap, self.args.num_heads, self.head_dim)
+        new_k = torch.zeros(new_shape, device=device, dtype=dtype)
+        new_v = torch.zeros(new_shape, device=device, dtype=dtype)
+        new_k[:, :cur_cap].copy_(self.kv_cache[0])
+        new_v[:, :cur_cap].copy_(self.kv_cache[1])
+        self.kv_cache = (new_k, new_v)
+
+    @torch.no_grad()
+    def _write_prefill_kv_cache(
+        self, k: Tensor, v: Tensor, layout: PackedVarlenLayout, batch_size: int
+    ) -> None:
+        eff_batch = int(batch_size) if batch_size is not None else layout.batch_size
+        self._ensure_kv_cache_capacity(eff_batch, layout.max_seqlen, k.device, k.dtype)
+        if layout.is_uniform and eff_batch == layout.batch_size:
+            s_len = layout.max_seqlen
+            self.kv_cache[0][:, :s_len] = k.view(eff_batch, s_len, self.args.num_heads, self.head_dim)
+            self.kv_cache[1][:, :s_len] = v.view(eff_batch, s_len, self.args.num_heads, self.head_dim)
+            self.cache_seqlens.fill_(s_len)
+            return
+
+        cu_list = layout.cu_seqlens.detach().cpu().tolist()
+        for i in range(eff_batch):
+            start, end = int(cu_list[i]), int(cu_list[i + 1])
+            l = end - start
+            if l > 0:
+                self.kv_cache[0][i, :l] = k[start:end]
+                self.kv_cache[1][i, :l] = v[start:end]
+            self.cache_seqlens[i] = l
 
     def forward(self, x: Tensor, is_causal=True, cu_seqlens=None, max_seqlen=None,
                 batch_size=None, indices=None, is_save_cache=False):
@@ -465,58 +726,43 @@ class FlashSelfAttentionM(nn.Module):
         if cu_seqlens is not None:
             # [Total_Tokens, Dim] -> [Total_Tokens, 3, Heads, HeadDim]
             qkv = self.qkv_block(q=x)
+            s_max = int(max_seqlen) if max_seqlen is not None else 0
+            layout = PackedVarlenLayout(
+                cu_seqlens=cu_seqlens,
+                max_seqlen=s_max,
+                total_tokens=int(x.size(0)),
+            )
 
             if self.args.use_rope:
                 q, k, v = qkv.unbind(1)
 
-                # Position IDs Gen
-                position_ids_list = []
-                for i in range(len(cu_seqlens) - 1):
-                    seq_len_i = cu_seqlens[i+1] - cu_seqlens[i]
-                    position_ids_list.append(torch.arange(0, seq_len_i, device=x.device, dtype=torch.long))
-                position_ids = torch.cat(position_ids_list)
+                # Zero-sync vectorized Position IDs Gen
+                position_ids = layout.position_ids(x.device)
 
                 # Apply RoPE (Safe float32)
-                cos, sin = self.rotary_emb(v, seq_len=max_seqlen)
+                cos, sin = self.rotary_emb(v, seq_len=s_max)
                 q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
                 qkv = torch.stack([q, k, v], dim=1)
 
                 # Cache Update (if needed)
                 if is_save_cache:
-                    if self.kv_cache is None or self.kv_cache[0].shape[0] != batch_size:
-                        self._init_kv_cache(batch_size, x.device, x.dtype)
-
-                    with torch.no_grad():
-                        for i in range(batch_size):
-                            start, end = cu_seqlens[i], cu_seqlens[i+1]
-                            l = end - start
-                            self.kv_cache[0][i, :l] = k[start:end]
-                            self.kv_cache[1][i, :l] = v[start:end]
-                            self.cache_seqlens[i] = l
+                    self._write_prefill_kv_cache(k, v, layout, batch_size)
 
                 out = flash_attn_varlen_qkvpacked_func(
                     qkv, dropout_p=(self.drop if self.training else 0.0), causal=is_causal,
-                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+                    cu_seqlens=cu_seqlens, max_seqlen=s_max
                 )
             else:
                 # ALiBi
                 out = flash_attn_varlen_qkvpacked_func(
                     qkv, dropout_p=(self.drop if self.training else 0.0), causal=is_causal,
-                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    cu_seqlens=cu_seqlens, max_seqlen=s_max,
                     alibi_slopes=self.alibi_slopes
                 )
                 if is_save_cache:
-                    if self.kv_cache is None or self.kv_cache[0].shape[0] != batch_size:
-                        self._init_kv_cache(batch_size, x.device, x.dtype)
                     _, k, v = qkv.unbind(1)
-                    with torch.no_grad():
-                        for i in range(batch_size):
-                            start, end = cu_seqlens[i], cu_seqlens[i+1]
-                            l = end - start
-                            self.kv_cache[0][i, :l] = k[start:end]
-                            self.kv_cache[1][i, :l] = v[start:end]
-                            self.cache_seqlens[i] = l
+                    self._write_prefill_kv_cache(k, v, layout, batch_size)
 
             # Prefill Output: [Total, Heads, Dim] -> [Total, Heads*Dim]
             # (Prefill時はもともと2次元[Total, Dim]で返すのが正解)
@@ -545,10 +791,14 @@ class FlashSelfAttentionM(nn.Module):
 
 
             if is_save_cache:
+                if self.cache_seqlens is None:
+                    self._init_kv_cache(q.size(0), q.device, k.dtype, min_capacity=q.size(1))
+                max_pos = int(self.cache_seqlens.max().item()) if self.cache_seqlens.numel() > 0 else 0
+                self._ensure_kv_cache_capacity(q.size(0), max_pos + q.size(1), q.device, k.dtype)
+
                 if self.args.use_rope:
                     position_ids = self.cache_seqlens.clone()
-                    max_pos = position_ids.max().item()
-                    cos, sin = self.rotary_emb(v, seq_len=max_pos + 1)
+                    cos, sin = self.rotary_emb(v, seq_len=max_pos + q.size(1))
 
                     # RoPE適用 (q, k はここで新しく計算されるため安全)
                     q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)

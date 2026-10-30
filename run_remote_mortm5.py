@@ -38,6 +38,7 @@ from mortm import (
     MORTM5MemmapDataset,
     MORTM5Collate,
     PAD_TOKEN_ID,
+    resolve_ablation_subdir,
 )
 from mortm.train.train import _compute_exact_epoch_optimizer_steps
 
@@ -121,6 +122,12 @@ class RemoteColabMORTM5Client:
 
     def health(self) -> Dict[str, Any]:
         return self._request_json("GET", "/health")
+
+    def start_stage(self, colab_split_dir: str) -> Dict[str, Any]:
+        return self._request_json("POST", "/mortm5/start_stage", payload={"colab_split_dir": colab_split_dir})
+
+    def poll_stage(self) -> Dict[str, Any]:
+        return self._request_json("GET", "/mortm5/poll_stage")
 
     def init_mortm5(self, init_payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._request_json("POST", "/mortm5/init", payload=init_payload)
@@ -206,31 +213,6 @@ class RemoteColabMORTM5Client:
         return torch.load(io.BytesIO(decomp), map_location="cpu", weights_only=False)
 
 
-_ABLATION_SUBDIR_MAP: Dict[str, str] = {
-    "#1": "1", "1": "1", "m3_flat_shared": "1", "mortm5_m3_flat_shared": "1",
-    "#2": "2", "2": "2", "m3_flat_separated": "2", "mortm5_m3_flat_separated": "2",
-    "#3": "3", "3": "3", "m3_grouped_shared": "3", "mortm5_m3_grouped_shared": "3",
-    "#4": "4", "4": "4", "m3_grouped_separated": "4", "mortm5_m3_grouped_separated": "4",
-    "#5": "5", "5": "5", "m4_flat_shared": "5", "mortm5_m4_flat_shared": "5",
-    "#6": "6", "6": "6", "m4_flat_separated": "6", "mortm5_m4_flat_separated": "6",
-    "#7": "7", "7": "7", "m4_grouped_shared": "7", "mortm5_m4_grouped_shared": "7",
-    "#8": "8", "8": "8", "m4_grouped_separated": "8", "mortm5_m4_grouped_separated": "8",
-}
-
-
-def resolve_ablation_subdir(model_name: str = "", ablation_id: str = "") -> str:
-    for raw in (ablation_id, model_name):
-        key = str(raw or "").strip().lower()
-        if not key:
-            continue
-        if key in _ABLATION_SUBDIR_MAP:
-            return _ABLATION_SUBDIR_MAP[key]
-        stripped = key.lstrip("#")
-        if stripped in {"1", "2", "3", "4", "5", "6", "7", "8"}:
-            return stripped
-    return "default"
-
-
 class RemoteMORTM5HybridTrainer:
     """Mac 側で全体の学習進行・検証・W&Bロギング・チェックポイントを統括するハイブリッドトレーナー。"""
 
@@ -244,8 +226,10 @@ class RemoteMORTM5HybridTrainer:
         ablation_id: str = "",
         colab_split_dir: Optional[str] = None,
         mac_split_dir: Optional[str] = None,
-        stage_to_local: bool = False,
+        stage_to_local: bool = True,
+        use_torch_compile: bool = False,
         resume_ckpt_path: Optional[str] = None,
+        resume_prev_big_batch_size: Optional[int] = None,
         download_ckpt_to_mac: bool = False,
         val_max_batches: int = 0,
         seed: int = 42,
@@ -259,7 +243,9 @@ class RemoteMORTM5HybridTrainer:
         self.colab_split_dir = colab_split_dir
         self.mac_split_dir = mac_split_dir
         self.stage_to_local = stage_to_local
+        self.use_torch_compile = use_torch_compile
         self.resume_ckpt_path = resume_ckpt_path
+        self.resume_prev_big_batch_size = resume_prev_big_batch_size
         self.download_ckpt_to_mac = download_ckpt_to_mac
         self.val_max_batches = val_max_batches
         self.seed = seed
@@ -297,12 +283,36 @@ class RemoteMORTM5HybridTrainer:
             )
             explicit_total_steps = max(1, steps_per_ep * max(1, int(self.t_args.num_epochs)))
 
+        if self.stage_to_local and self.colab_split_dir and self.colab_split_dir.startswith("/content/drive/"):
+            try:
+                st = self.client.start_stage(self.colab_split_dir)
+                if not st.get("done", True):
+                    print(f"📦 Staging tokens from Google Drive to Colab local NVMe SSD: {self.colab_split_dir}", flush=True)
+                    while not st.get("done", False):
+                        time.sleep(1.0)
+                        st = self.client.poll_stage()
+                        tot_b = max(1, int(st.get("total_bytes", 0)))
+                        cur_b = int(st.get("copied_bytes", 0))
+                        pct_s = 100.0 * cur_b / tot_b
+                        print(
+                            f"\r  -> {cur_b / (1024**3):.2f} / {tot_b / (1024**3):.2f} GiB "
+                            f"({pct_s:5.1f}%, {st.get('mb_per_sec', 0.0):.1f} MiB/s)",
+                            end="",
+                            flush=True,
+                        )
+                    print(f"\n✅ Local SSD staging ready: {st.get('local_dir')}", flush=True)
+                elif st.get("local_dir") and st.get("local_dir") != self.colab_split_dir:
+                    print(f"⚡ Using cached Colab local SSD tokens: {st.get('local_dir')}", flush=True)
+            except Exception as stage_err:
+                print(f"⚠️ [Stage Info] Async staging skipped ({stage_err}); delegating to /mortm5/init.", flush=True)
+
         init_payload: Dict[str, Any] = {
             "model_config": self.m_args.to_dict(),
             "train_config": self.t_args.to_dict(),
             "ablation_id": self.ablation_subdir,
             "colab_split_dir": self.colab_split_dir,
-            "stage_to_local": False,
+            "stage_to_local": bool(self.stage_to_local),
+            "use_torch_compile": bool(self.use_torch_compile),
             "resume_checkpoint_path": self.resume_ckpt_path,
             "version": self.version,
             "clean_old_checkpoints": (self.resume_ckpt_path is None),
@@ -352,12 +362,30 @@ class RemoteMORTM5HybridTrainer:
 
         current_step = int(init_info.get("step", 0))
         start_epoch = int(init_info.get("epoch", 0))
-        start_outer = int(init_info.get("outer_batch_idx", 0))
+        saved_outer = int(init_info.get("outer_batch_idx", 0))
+        resume_window_offset = 0
+        start_outer = saved_outer
         if init_info.get("resumed_from") and current_step > 0:
-            start_outer += 1
-            if start_outer >= total_outer_batches:
+            prev_big_bs = max(
+                1,
+                int(
+                    self.resume_prev_big_batch_size
+                    or init_info.get("resumed_big_batch_size")
+                    or big_bs
+                ),
+            )
+            resume_window_offset = min(num_train_windows, (saved_outer + 1) * prev_big_bs)
+            if resume_window_offset >= num_train_windows:
                 start_epoch += 1
                 start_outer = 0
+                resume_window_offset = 0
+            else:
+                start_outer = resume_window_offset // big_bs
+            print(
+                f"🔄 Resumed window offset: {resume_window_offset:,}/{num_train_windows:,} "
+                f"(prev_big_bs={prev_big_bs:,} -> new_big_bs={big_bs:,}, start_outer={start_outer}/{total_outer_batches})",
+                flush=True,
+            )
 
         last_val_tokens = int(init_info.get("all_tokens", 0))
         val_interval_tokens = max(1, int(self.t_args.val_total_tokens))
@@ -374,6 +402,12 @@ class RemoteMORTM5HybridTrainer:
         from mortm.train.epoch import EpochObserver
         epoch_loss = EpochObserver(2500)
         active_params = int(init_info.get("total_params", 0))
+        muon_params = int(init_info.get("muon_params", 0))
+        backbone_params = (
+            muon_params + (2 * int(self.m_args.d_layer) + 1) * int(self.m_args.d_model)
+            if muon_params > 0
+            else active_params
+        )
 
         epoch = start_epoch
         outer_idx = start_outer
@@ -394,7 +428,10 @@ class RemoteMORTM5HybridTrainer:
                 )
 
                 for outer_idx in pbar:
-                    win_slice = all_indices[outer_idx * big_bs : (outer_idx + 1) * big_bs]
+                    slice_start = outer_idx * big_bs
+                    if epoch == start_epoch and resume_window_offset > slice_start:
+                        slice_start = resume_window_offset
+                    win_slice = all_indices[slice_start : (outer_idx + 1) * big_bs]
                     if not win_slice:
                         continue
 
@@ -442,6 +479,8 @@ class RemoteMORTM5HybridTrainer:
                             milestone_tag = f"pct{int(pct)}"
 
                     is_last_outer = (outer_idx + 1) == total_outer_batches
+                    is_last_epoch = (epoch + 1) == max(1, int(self.t_args.num_epochs))
+                    is_final_batch = is_last_outer and is_last_epoch
                     should_validate = (
                         (current_tokens - last_val_tokens) >= val_interval_tokens
                         or is_last_outer
@@ -449,7 +488,7 @@ class RemoteMORTM5HybridTrainer:
                     )
 
                     if should_validate:
-                        # 検証バッチを GPU で回している裏で Google Drive (1-8 サブディレクトリ) への保存を並列開始する
+                        # 検証バッチを GPU で回している裏で Google Drive サブディレクトリへの保存を並列開始する
                         ckpt_info = self.client.save_checkpoint(
                             outer_idx=outer_idx,
                             epoch=epoch,
@@ -458,9 +497,9 @@ class RemoteMORTM5HybridTrainer:
                             version=self.version,
                             ablation_id=self.ablation_subdir,
                             wandb_id=w_id,
-                            prepare_download=bool(self.download_ckpt_to_mac and (milestone_tag or is_last_outer)),
+                            prepare_download=bool(self.download_ckpt_to_mac and (milestone_tag or is_final_batch)),
                             milestone=milestone_tag,
-                            sync_drive=is_last_outer,
+                            sync_drive=is_final_batch,
                         )
 
                         if not self.colab_split_dir and self.mac_val_ds is not None:
@@ -491,6 +530,7 @@ class RemoteMORTM5HybridTrainer:
                                     "axis/tokens": current_tokens,
                                     "axis/seq_steps": seq_steps,
                                     "axis/flops": 6 * active_params * seq_steps,
+                                    "axis/backbone_flops": 6 * backbone_params * seq_steps,
                                     "trainer/global_step": current_step,
                                     "train/loss": train_avg_loss,
                                     "val/loss": last_val_loss,
@@ -504,6 +544,9 @@ class RemoteMORTM5HybridTrainer:
                                 dl_data = self.client.download_prepared_checkpoint(int(ckpt_info["download_bytes"]))
                                 mac_pth = os.path.join(self.save_dir, f"MORTM5.{self.version}_step{current_step}.pth")
                                 torch.save(dl_data["model_state_dict"], mac_pth)
+                                if is_last_outer:
+                                    latest_pth = os.path.join(self.save_dir, f"MORTM5.{self.version}_latest.pth")
+                                    torch.save(dl_data["model_state_dict"], latest_pth)
                                 print(f"\n💾 Downloaded model weights to Mac: {mac_pth}", flush=True)
                             except Exception as dl_err:
                                 print(f"\n⚠️ [Mac Download Warning] Failed to download checkpoint to Mac (already saved on Google Drive): {dl_err}", flush=True)
@@ -540,15 +583,14 @@ class RemoteMORTM5HybridTrainer:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Mac <-> Google Colab Hybrid Trainer for MORTM5 8-Way Ablation Models"
+        description="Mac <-> Google Colab Hybrid Trainer for MORTM5 / SyMIc Models"
     )
     parser.add_argument("--url", type=str, required=True, help="Colab Cloudflare Tunnel URL (例: https://xxxx.trycloudflare.com)")
     parser.add_argument(
         "--ablation",
         type=str,
-        default="m4_grouped_shared",
-        choices=list(MORTM5_ABLATION_PRESETS.keys()) + ["#1", "#2", "#3", "#4", "#5", "#6", "#7", "#8", "1", "2", "3", "4", "5", "6", "7", "8"],
-        help="学習するアブレーションモデル (#1〜#8 または 1〜8)",
+        default=None,
+        help="学習するアブレーション識別子 (#1〜#8, 1〜8, または任意の実験タグ例: symic_g4l4_160m)",
     )
     parser.add_argument("--model-config", type=str, default=None, help="任意のモデル JSON パス (指定時は --ablation より優先)")
     parser.add_argument("--train-config", type=str, default="configs/train/mortm5/ablation_muon_cos.json", help="学習設定 JSON パスまたはプリセット名 ('muon_cos')")
@@ -567,7 +609,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-dir", type=str, default="out/mortm5_ablation", help="Mac 側のモデル保存先ディレクトリ")
     parser.add_argument("--version", type=str, default=None, help="チェックポイント・W&B のバージョン識別子")
     parser.add_argument("--resume-ckpt", type=str, default=None, help="Google Drive 上の再開チェックポイントパス")
+    parser.add_argument(
+        "--resume-prev-big-batch-size",
+        type=int,
+        default=None,
+        help="再開元チェックポイント保存時の big_batch_size (途中で big_batch_size を変更して再開する場合に指定)",
+    )
     parser.add_argument("--download-ckpt", action="store_true", help="マイルストーン及び完了時に Mac 側へも重み (.pth) をダウンロードする")
+    parser.add_argument("--no-stage-local", action="store_true", help="Google Drive から Colab ローカル NVMe SSD への事前ステージングを無効化する")
+    parser.add_argument("--compile", action="store_true", help="Colab GPU 上で torch.compile (dynamic=True, 自動Eagerフォールバック付) を有効化する")
     parser.add_argument("--project", type=str, default="MORTM5-Ablation", help="Weights & Biases プロジェクト名")
     parser.add_argument("--wandb-id", type=str, default=None, help="再開する W&B Run ID")
     parser.add_argument("--no-wandb", action="store_true", help="W&B ロギングを無効化する")
@@ -588,7 +638,8 @@ def main():
     if cli.no_wandb:
         os.environ["WANDB_MODE"] = "disabled"
 
-    m_source = cli.model_config if cli.model_config else cli.ablation
+    effective_ablation = cli.ablation if cli.ablation is not None else ("" if cli.model_config else "m4_grouped_shared")
+    m_source = cli.model_config if cli.model_config else effective_ablation
     m_args = MORTM5Args(m_source)
     t_args = TrainArgs(cli.train_config if os.path.isfile(cli.train_config) else "muon_cos")
 
@@ -617,11 +668,13 @@ def main():
         t_args=t_args,
         version=version,
         save_dir=cli.save_dir,
-        ablation_id=cli.ablation,
+        ablation_id=effective_ablation,
         colab_split_dir=colab_split_dir,
         mac_split_dir=cli.mac_split_dir,
-        stage_to_local=False,
+        stage_to_local=(not cli.no_stage_local),
+        use_torch_compile=bool(cli.compile),
         resume_ckpt_path=cli.resume_ckpt,
+        resume_prev_big_batch_size=cli.resume_prev_big_batch_size,
         download_ckpt_to_mac=cli.download_ckpt,
         val_max_batches=cli.val_max_batches,
         seed=cli.seed,

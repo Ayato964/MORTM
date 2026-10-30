@@ -1,0 +1,32 @@
+{
+  "optimizer": "muon",
+  "lr_param": 0.001,
+  "weight_decay": 0.1,
+  "momentum": 0.95,
+  "ns_steps": 5,
+  "adjust_lr_fn": "match_rms_adamw",
+  "adamw_betas": [0.9, 0.95],
+  "big_batch_size": 16384,
+  "batch_size": 128,
+  "accumulation_steps": 2,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 50000000,
+  "train_dataset_split": 0.99,
+  "shuffle": true,
+  "checkpoint_percents": [
+    25,
+    50,
+    75,
+    100
+  ],
+  "scheduler": {
+    "type": "wsd",
+    "warmup_ratio": 0.05,
+    "stable_ratio": 0.88,
+    "min_lr_ratio": 0.05,
+    "total_steps": 14610,
+    "auto_total_steps": true
+  },
+  "_note": "SyMIc Stage 3 Main Experiment (163.60M Backbone, 16-bar split, 256 segments = 4,096 bars/step): Muon (match_rms_adamw) + AdamW, WSD Scheduler (5% Warmup = 730 steps, 88% Stable = 12,856 steps at 1e-3, 7% Cosine Cooldown = 1,024 steps to 5e-5)"
+}

@@ -102,7 +102,8 @@ ABLATION_SUBDIR_MAP = _MORTM5_ABLATION_SUBDIR_MAP
 
 
 def resolve_ablation_subdir(model_name: str = "", ablation_id: str = "") -> str:
-    """アブレーション識別子 ('#1'〜'#8', '1'〜'8') またはモデル名から保存サブディレクトリ名 ('1'〜'8') を解決する。"""
+    """アブレーション識別子 ('#1'〜'#8', '1'〜'8') またはモデル名・カスタム実験IDから保存サブディレクトリ名を解決する。"""
+    import re
     for raw in (ablation_id, model_name):
         key = str(raw or "").strip().lower()
         if not key:
@@ -112,6 +113,15 @@ def resolve_ablation_subdir(model_name: str = "", ablation_id: str = "") -> str:
         stripped = key.lstrip("#")
         if stripped in {"1", "2", "3", "4", "5", "6", "7", "8"}:
             return stripped
+
+    for raw in (ablation_id, model_name):
+        raw_str = str(raw or "").strip()
+        if not raw_str or "/" in raw_str or "\\" in raw_str or raw_str.lower().endswith(".json"):
+            continue
+        stripped = raw_str.lower().lstrip("#")
+        safe = re.sub(r"[^a-z0-9_\-]+", "_", stripped).strip("_")
+        if safe:
+            return safe
     return "default"
 
 

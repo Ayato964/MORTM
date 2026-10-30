@@ -1,0 +1,32 @@
+{
+  "optimizer": "muon",
+  "lr_param": 0.001,
+  "weight_decay": 0.1,
+  "momentum": 0.95,
+  "ns_steps": 5,
+  "adjust_lr_fn": "match_rms_adamw",
+  "adamw_betas": [0.9, 0.95],
+  "big_batch_size": 16384,
+  "batch_size": 128,
+  "accumulation_steps": 2,
+  "num_epochs": 4,
+  "is_save_training_progress": true,
+  "val_total_tokens": 250000000,
+  "train_dataset_split": 0.99,
+  "shuffle": true,
+  "checkpoint_percents": [
+    25,
+    50,
+    75,
+    100
+  ],
+  "scheduler": {
+    "type": "wsd",
+    "warmup_steps": 730,
+    "stable_ratio": 0.90,
+    "min_lr_ratio": 0.02,
+    "total_steps": 58440,
+    "auto_total_steps": true
+  },
+  "_note": "SyMIc Stage 3 Main Experiment 4-Epoch Run (163.60M Backbone, 16-bar split, 256 segments = 4,096 bars/step, 58,440 total steps): Muon (match_rms_adamw) + AdamW, WSD Scheduler (730 warmup steps matching 1-epoch run + 90% = 52,596 stable steps at 1e-3 + final 5,114 cosine cooldown steps to 2e-5). Milestone checkpoints pct25/50/75/100 correspond to End of Epoch 1/2/3/4."
+}
