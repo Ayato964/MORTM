@@ -1,0 +1,32 @@
+{
+  "optimizer": "muon",
+  "lr_param": 0.001,
+  "weight_decay": 0.1,
+  "momentum": 0.95,
+  "ns_steps": 5,
+  "adjust_lr_fn": "match_rms_adamw",
+  "adamw_betas": [0.9, 0.95],
+  "big_batch_size": 16384,
+  "batch_size": 128,
+  "accumulation_steps": 2,
+  "max_micro_steps": 65536,
+  "max_steps": 3865,
+  "num_epochs": 1,
+  "is_save_training_progress": true,
+  "val_total_tokens": 50000000,
+  "train_dataset_split": 0.99,
+  "shuffle": true,
+  "checkpoint_percents": [
+    50,
+    100
+  ],
+  "scheduler": {
+    "type": "wsd",
+    "warmup_steps": 730,
+    "stable_steps": 2864,
+    "min_lr_ratio": 0.05,
+    "total_steps": 3865,
+    "auto_total_steps": false
+  },
+  "_note": "Multitrack-REMI Stage 3 Main Experiment Iso-FLOPs Run (C* = 1.704e18 Backbone FLOPs = 1,735,919,853 AR steps = 3,865 optimizer steps, matching 1-Epoch SyMIc-G4L4 compute): 730-step Warmup + 2,864-step Stable at 1e-3 (identical LR to remi_main_160m.json through step 3,594) + 271-step (7%) Cosine Cooldown to 5e-5."
+}

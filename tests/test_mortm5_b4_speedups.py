@@ -404,4 +404,4 @@ def test_symic_4ep_production_config_integrity():
     assert lr_lambda(730) == pytest.approx(1.0)
     assert lr_lambda(730 + stable_steps - 1) == pytest.approx(1.0)
     assert lr_lambda(58440) == pytest.approx(0.02)
-    assert mortm.__version__ == "5.0.0b4"
+    assert mortm.__version__ == "5.0.0b5"

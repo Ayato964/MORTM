@@ -49,6 +49,20 @@
 > - `Multitrack-REMI` に至っては3〜4トラック平均で **`2,220` ステップ（`4.29倍`）**、上位5%では **`5,098〜7,954` ステップ（`10〜15倍`）** に達する。一般的な固定コンテキスト窓（例：`2048` や `4096`）を設けた場合、アンサンブルの盛り上がりの最中でコンテキスト上限に達して楽曲構造が切断される。
 > - **`SyMIc-G4L4` は、どれほど重厚な4パート・トゥッティであっても常に厳密に `518` ステップ（`5` prefix + `512` RVQ + `1` EOS）で16小節を完結** させ、パディング率 `0%` で GPU TensorCore を100%稼働させる。
 
+### 2.2 GigaMIDI 全コーパス（`801,838` train 曲 = `3,740,025` セグメント / `4,950` val 曲 = `22,607` セグメント）における厳密実測トークン規模
+
+全コーパス変換済みの `out/mortm5_tokens/{m4_g4l4,octuple_mmt}` バイナリ（総音符数 `train`: `1,480,353,804` 音 / `val`: `10,341,117` 音、末尾短尺端数セグメントを含む全 `3,740,025` セグメント）から厳密計測した自己回帰ステップ数 $S_{\text{AR}} = L - 1$（`seq[:-1]` 入力長）およびバックボーン計算量 $C = 6 N_{\text{non-emb}} S_{\text{AR}}$（$N_{\text{non-emb}} = 163,603,456$）は以下の通りである：
+
+| 指標（GMD Full `train`: `3,740,025` segs） | **`SyMIc-G4L4` (提案)** | **`Octuple-MMT` (音符集約)** | **`Multitrack-REMI` (Flat)** |
+| :--- | :---: | :---: | :---: |
+| **1Epoch 総 AR ステップ数 $\sum S_{\text{AR}}$** | **`1,735,919,853` (`1.000×`)** | `1,499,053,929` (`0.864×`) | **`6,561,226,916` (`3.780×`)** |
+| **Validation 総 AR ステップ数（`22,607` segs）** | `10,427,187` (`1.000×`) | `10,454,152` (`1.003×`) | `45,382,530` (`4.352×`) |
+| **セグメント平均 $S_{\text{AR}}$ / 中央値 `p50`** | `464.15` / `517` | `400.81` / `320` | `1,754.33` / `1,435` |
+| **密集分位点 `p90` / `p95` / `p99` / `p99.9`** | `517` / `517` / `517` / `517` | `828` / `1,021` / `1,451` / `2,175` | `3,561` / `4,338` / `6,163` / `9,033` |
+| **最大セグメント長 `max`（Zero-Truncation）** | **`517`（完全有界）** | `79,991`（`154.7×` 膨張） | **`322,271`（`623.3×` 膨張）** |
+| **1Epoch 総 Backbone FLOPs ($6 N_{\text{non-emb}} S_{\text{AR}}$)** | **`1.70401 × 10¹⁸` FLOPs** | **`1.47150 × 10¹⁸` FLOPs** | **`6.44064 × 10¹⁸` FLOPs** |
+| **Iso-FLOPs 断面 ($C^* = 1.704 \times 10^{18}$ FLOPs)** | `14,610` steps (`100.0%` Ep) | `14,610` steps (`1.158` Ep 相当) | **`3,865` steps (`26.457%` tokens / `26.454%` steps)** |
+
 ---
 
 ## 3. 情報量と前処理の完全対称化（Zero-Confound Information Parity）
@@ -95,17 +109,17 @@
 
 | 項目 | **`SyMIc-G4L4` (提案)** | **`Octuple-MMT` (音符集約)** | **`Multitrack-REMI` (Flat)** |
 | :--- | :---: | :---: | :---: |
-| **設定JSON（予定）** | `configs/models/mortm5/symic_main/symic_g4l4_160m.json` | `configs/models/mortm5/symic_main/octuple_160m.json` | `configs/models/mortm5/symic_main/remi_160m.json` |
+| **設定JSON** | [`symic_g4l4_160m.json`](file:///Users/dayo/My_Projects/MORTM/configs/models/mortm5/symic_main/symic_g4l4_160m.json) | [`octuple_160m.json`](file:///Users/dayo/My_Projects/MORTM/configs/models/mortm5/symic_main/octuple_160m.json) | [`remi_160m.json`](file:///Users/dayo/My_Projects/MORTM/configs/models/mortm5/symic_main/remi_160m.json) |
 | **Transformer 層数 (`d_layer`)** | `12` | `12` | `12` |
 | **隠れ層次元 (`d_model`)** | `1024` | `1024` | `1024` |
 | **Attention ヘッド数 (`num_heads`)** | `16` (`head_dim = 64`) | `16` (`head_dim = 64`) | `16` (`head_dim = 64`) |
 | **SwiGLU 中間次元 (`dim_feedforward`)** | `3072` (`use_bias = False`) | `3072` (`use_bias = False`) | `3072` (`use_bias = False`) |
 | **正規化 / 位置符号化 / Dropout** | `RMSNorm` / 動的長 `RoPE` / `0.1` | `RMSNorm` / 動的長 `RoPE` / `0.1` | `RMSNorm` / 動的長 `RoPE` / `0.1` |
 | **Non-Embedding パラメータ数** | **`163,603,456` (`163.60M`)** | **`163,603,456` (`163.60M`)** | **`163,603,456` (`163.60M`)** |
-| **Embedding + Output Head パラメータ** | `67,414,149` (`67.41M`) | `~1,673,216` (`1.67M`) | `1,642,496` (`1.64M`) |
-| **Total パラメータ数** | `231,017,605` (`231.02M`) | `~165,276,672` (`165.28M`) | `165,245,952` (`165.25M`) |
-| **1Epoch 推定アクティブステップ数** | `~1.72B` (完全固定) | `~1.55B` (可変) | `~6.80B` (可変) |
-| **1Epoch 推定総 FLOPs (`6 N_non_emb S`)** | **`~1.69 × 10¹⁸` FLOPs** | **`~1.52 × 10¹⁸` FLOPs** | **`~6.67 × 10¹⁸` FLOPs** |
+| **Embedding + Output Head パラメータ** | `67,414,149` (`67.41M`) | `1,673,216` (`1.67M`) | `1,642,496` (`1.64M`) |
+| **Total パラメータ数** | `231,017,605` (`231.02M`) | `165,276,672` (`165.28M`) | `165,245,952` (`165.25M`) |
+| **1Epoch 実測 AR ステップ数 (`train`)** | **`1,735,919,853` (`1.74B`)** | **`1,499,053,929` (`1.50B`)** | **`6,561,226,916` (`6.56B`)** |
+| **1Epoch 実測総 FLOPs (`6 N_non_emb S`)** | **`1.704 × 10¹⁸` FLOPs** | **`1.472 × 10¹⁸` FLOPs** | **`6.441 × 10¹⁸` FLOPs** |
 
 ### 4.3 最適化・バッチ・チェックポイント統制条件
 - **オプティマイザ（[`HybridMuonOptimizer`](file:///Users/dayo/My_Projects/MORTM/mortm/train/muon.py)）**:
@@ -119,8 +133,8 @@
   - 全3モデルでセグメントのシャッフル順（`seed = 42`）を固定するため、**各ステップ $t$ でモデルが学習する256個の16小節セグメントは3モデル間で100%同一** となる。
   - `Multitrack-REMI` 等で長系列セグメントを含むマイクロバッチが来る場合は、動的トークン予算マイクロバッチ分割（勾配累積で厳密に256セグメントの平均勾配を計算）により VRAM 溢れを防ぎつつ数学的に同一の更新を行う。
 - **2つの公平比較断面（Iso-FLOPs & Iso-Corpus）の同時確保**:
-  1. **Iso-Corpus（同一楽曲露出量 = 1 Epoch 100% 完走点）**: 全3モデルが同一の80.2万曲・全16小節セグメントを1周学習し、WSD の最終 `1,024` steps クールダウンを完了した時点での直接比較。
-  2. **Iso-FLOPs（同一計算量予算 = $C^* \approx 1.69 \times 10^{18}$ FLOPs 断面）**: WSD スケジューラの特性（Hägele et al., NeurIPS 2024）を活かし、`Multitrack-REMI` が `SyMIc-G4L4` の 1 Epoch 完走 FLOPs $C^*$ に到達するタイミングに合わせて同率（`7%`）のクールダウン分岐を実行し、「同一 GPU 計算予算・同一クールダウン条件下での到達性能」も一切の不公平なく比較する（Dagan et al., ICML 2024 の2軸報告原則に準拠）。
+  1. **Iso-Corpus（同一楽曲露出量 = 1 Epoch 100% 完走点）**: 全3モデルが同一の80.2万曲・全16小節セグメントを1周学習し、WSD の最終 `1,024` steps クールダウンを完了した時点での直接比較（[`octuple_main_160m.json`](file:///Users/dayo/My_Projects/MORTM/configs/train/mortm5/octuple_main_160m.json), [`remi_main_160m.json`](file:///Users/dayo/My_Projects/MORTM/configs/train/mortm5/remi_main_160m.json)）。
+  2. **Iso-FLOPs（同一計算量予算 = $C^* = 1.704 \times 10^{18}$ FLOPs 断面）**: WSD スケジューラの特性（Hägele et al., NeurIPS 2024）を活かし、`Multitrack-REMI` が `SyMIc-G4L4` の 1 Epoch 完走 FLOPs $C^*$（トークン・FLOPs 比 `26.457%`）に到達する **`3,865` steps（ステップ比 `3,865 / 14,610 = 26.454%`）** に合わせて同率（`7%` = `271` steps）のクールダウンを実行する [`remi_main_160m_isoflops.json`](file:///Users/dayo/My_Projects/MORTM/configs/train/mortm5/remi_main_160m_isoflops.json) を整備し、「同一 GPU 計算予算・同一クールダウン条件下での到達性能」も一切の不公平なく比較する（なおリモート Outer-Batch 実行時の `pct24` マイルストーンは `step 3,520` 境界にてフル再開可能な `..._pct24_step3520.checkpoint.pt` を保存するため、`3,594` step までの定数プラトー内からそのまま `step 3,865` へ分岐可能。Dagan et al., ICML 2024 の2軸報告原則に準拠）。
 
 ---
 
@@ -165,13 +179,13 @@
 
 ## 6. 実装・実行ロードマップ
 
-- [ ] **Step 1：動的長 `RoPE` & 共通 `163.60M` モデル設定の整備**
-  - [`mortm/models/modules/attention.py`](file:///Users/dayo/My_Projects/MORTM/mortm/models/modules/attention.py) の `RoPE` キャッシュを任意系列長へ動的拡張可能にし、`SyMIc-G4L4` (`position_length=518`, 16小節分割)・`Octuple-MMT`・`Multitrack-REMI` の3モデル構成クラスと JSON 設定ファイル（`configs/models/mortm5/symic_main/`）を作成する。
-- [ ] **Step 2：`Multitrack-REMI` & `Octuple-MMT` トークナイザ・16小節アラインメント変換器の実装と検証**
-  - [`extract_quantized_notes_and_slots`](file:///Users/dayo/My_Projects/MORTM/mortm/utils/convert_pianoroll.py#L931-L973) 共通基盤上で両ベースラインのエンコーダ・デコーダを実装し、単体テスト（往復可逆性テスト・`m4_g4l4` との曲/16小節境界1対1一致テスト）を通過させる。
-  - Mac マルチコア処理で GMD 全 `801,838` train 曲 / `4,950` val 曲を一括変換し、memmap バイナリを出力する。
-- [ ] **Step 3：256セグメント同期データローダ & 動的マイクロバッチ学習ランナーの整備**
-  - 同一シャッフル順・`256 segments/step` 厳密一致・無制限窓長（`flash_attn_varlen` パディング除去）および `Iso-FLOPs` チェックポイント自動保存に対応した学習設定・ランナーを整備し、E2E スモークテストを実施する。
+- [x] **Step 1：動的長 `RoPE` & 共通 `163.60M` モデル設定の整備（完了）**
+  - [`mortm/models/modules/attention.py`](file:///Users/dayo/My_Projects/MORTM/mortm/models/modules/attention.py) の `RoPE` キャッシュを任意系列長へ動的拡張可能にし、`SyMIc-G4L4` (`position_length=518`, 16小節分割)・`Octuple-MMT`・`Multitrack-REMI` の3モデル構成クラスと JSON 設定ファイル（`configs/models/mortm5/symic_main/`）を作成済み。
+- [x] **Step 2：`Multitrack-REMI` & `Octuple-MMT` トークナイザ・16小節アラインメント変換器の実装と検証（完了）**
+  - [`extract_quantized_notes_and_slots`](file:///Users/dayo/My_Projects/MORTM/mortm/utils/convert_pianoroll.py#L931-L973) 共通基盤上で両ベースラインのエンコーダ・デコーダを実装し、単体テスト（往復可逆性・`m4_g4l4` との曲/16小節境界1対1一致・実GMD `val` 22,607セグメント整合テスト）を全件通過済み。
+  - Mac マルチコア処理で GMD 全 `801,838` train 曲 / `4,950` val 曲を一括変換して `out/mortm5_tokens/octuple_mmt` memmap バイナリを構築し、さらに `Multitrack-REMI` については追加ディスク消費ゼロのベクトル化 On-the-Fly 変換（および任意オフライン高速変換 `--from-octuple-dir`）を実装済み。
+- [x] **Step 3：256セグメント同期データローダ & 動的マイクロバッチ学習ランナーの整備（完了）**
+  - 同一シャッフル順・`256 segments/step` 厳密一致・無制限窓長（`flash_attn_varlen` パディング除去 + `grad_checkpoint_tokens = 16384` 自動 Activation Checkpointing）および `Iso-FLOPs`（`max_steps = 3865`）自動停止・Warm-Restart分岐保存に対応した学習設定・ランナーを整備し、全60件の自動検証スイートを通過済み。
 - [ ] **Step 4：再学習不要のメカニズム解析（§5.4-1, §5.4-2）の先行実行**
   - 本学習の並列期間中または前段で、`M4` 累積レイヤー定量表と `Soft-Token` 直交復元プローブを実行・記録する。
 - [ ] **Step 5：RTX PRO 6000 Blackwell における `163.60M` 3モデルの1 Epoch 本学習**

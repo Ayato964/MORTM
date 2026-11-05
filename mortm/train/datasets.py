@@ -4,7 +4,8 @@ Tokenizerで変換したシーケンスを全て保管します。
 import json
 import os.path
 import random
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -612,6 +613,15 @@ class MORTM5MemmapDataset(Dataset):
         """
         if stride_chunks is None and stride is not None:
             stride_chunks = stride
+        resolved_sym_dir = _resolve_symbolic_split_dir(token_dir, split)
+        segments_candidate = os.path.join(resolved_sym_dir, f"{split}_segments.npy")
+        if os.path.exists(segments_candidate):
+            return MORTM5SymbolicMemmapDataset.from_split_dir(  # type: ignore[return-value]
+                token_dir=resolved_sym_dir,
+                split=split,
+                args=args,
+                bos_eos_mode=bos_eos_mode,
+            )
         tokens_bin_path = os.path.join(token_dir, f"{split}_tokens.bin")
         offsets_npy_path = os.path.join(token_dir, f"{split}_offsets.npy")
         if not os.path.exists(offsets_npy_path):
@@ -704,9 +714,12 @@ class MORTM5MemmapDataset(Dataset):
             return np.zeros((0, 5), dtype=np.int64)
         return np.asarray(windows, dtype=np.int64)
 
-    def _get_memmap(self) -> np.memmap:
+    def _get_memmap(self) -> np.ndarray:
         if self._memmap is None:
-            self._memmap = np.memmap(self.tokens_bin_path, dtype=np.uint16, mode="r")
+            if os.path.getsize(self.tokens_bin_path) == 0:
+                self._memmap = np.zeros((0,), dtype=np.uint16)
+            else:
+                self._memmap = np.memmap(self.tokens_bin_path, dtype=np.uint16, mode="r")
         return self._memmap
 
     def __getstate__(self):
@@ -778,6 +791,334 @@ class MORTM5MemmapDataset(Dataset):
 
 
 
+def _resolve_symbolic_split_dir(token_dir: str, split: str) -> str:
+    """
+    `multitrack_remi` ディレクトリが未生成の場合でも、同階層の `octuple_mmt` が存在すれば
+    自動的にそちらへフォールバックし、追加ディスクゼロの On-the-Fly 変換を有効化する。
+    """
+    seg_cand = os.path.join(token_dir, f"{split}_segments.npy")
+    if os.path.exists(seg_cand):
+        return token_dir
+    norm_dir = os.path.normpath(token_dir)
+    base = os.path.basename(norm_dir).lower()
+    if base in ("multitrack_remi", "remi"):
+        sibling_oct = os.path.join(os.path.dirname(norm_dir), "octuple_mmt")
+        if os.path.exists(os.path.join(sibling_oct, f"{split}_segments.npy")):
+            return sibling_oct
+    return token_dir
+
+
+class MORTM5SymbolicMemmapDataset(Dataset):
+    """
+    `Octuple-MMT` および `Multitrack-REMI` 向けの、16小節非重複セグメント境界同期済みゼロコピー Memmap Dataset。
+    - `{split}_tokens.bin` (`uint16` flat body tokens: `octuple_mmt` または `multitrack_remi`)
+    - `{split}_segments.npy` (`int64 [N_segments, 6]`: `token_start, token_len, is_first, is_last, song_idx, num_chunks`)
+    - `{split}_slots.npy` (`int16 [N_songs, 4]`: 4スロット楽器コード)
+    - `{split}_offsets.npy` (`int64 [N_songs, 2]`: 任意・互換用)
+
+    `octuple_mmt` バイナリをそのまま指定して `mode="remi"` で開いた場合、追加ディスク容量ゼロで
+    セグメント単位の $O(M + B_{\\text{seg}})$ ベクトル化 On-the-Fly `Octuple -> REMI` 変換を自動実行する。
+    `MORTM5MemmapDataset` (`SyMIc-G4L4`) と全曲・全16小節セグメント境界が 1対1 完全一致 (`len(ds) == len(symic_ds)`) し、
+    `seed=42` シャッフル時に同一オプティマイザステップへ同一256セグメントが供給されることを保証する。
+    """
+
+    def __init__(
+        self,
+        tokens_bin_path: str,
+        segments_npy_path: str,
+        slots_npy_path: Optional[str] = None,
+        offsets_npy_path: Optional[str] = None,
+        mode: str = "octuple",
+        unit_width: int = 6,
+        bos_eos_mode: str = "always",
+        use_instrument_tokens: bool = True,
+        pad_token_id: int = PAD_TOKEN_ID,
+        bos_token_id: int = BOS_TOKEN_ID,
+        eos_token_id: int = EOS_TOKEN_ID,
+        tokenizer_key: Optional[str] = None,
+        source_format: str = "auto",
+        remi_transcoder: Optional[Any] = None,
+    ) -> None:
+        super().__init__()
+        if not os.path.exists(tokens_bin_path):
+            raise FileNotFoundError(f"Symbolic tokens binary file not found: {tokens_bin_path}")
+        if not os.path.exists(segments_npy_path):
+            raise FileNotFoundError(f"Symbolic segments index file not found: {segments_npy_path}")
+        if bos_eos_mode not in ("always", "song_boundary", "none"):
+            raise ValueError(f"bos_eos_mode must be 'always', 'song_boundary', or 'none', got {bos_eos_mode}")
+
+        self.tokens_bin_path = tokens_bin_path
+        self.segments_npy_path = segments_npy_path
+        self.offsets_npy_path = offsets_npy_path or segments_npy_path
+        self.slots_npy_path = slots_npy_path
+        self.mode = str(mode).strip().lower()
+        self.tokenizer_key = str(tokenizer_key).strip().lower() if tokenizer_key is not None else ""
+        self._unit_width = 1 if self.mode in ("flat", "remi") else max(1, int(unit_width))
+        self.bos_eos_mode = bos_eos_mode
+        self.use_instrument_tokens = bool(use_instrument_tokens)
+        self.pad_token_id = int(pad_token_id)
+        self.bos_token_id = int(bos_token_id)
+        self.eos_token_id = int(eos_token_id)
+        self.split = "train"
+
+        raw_segments = np.load(segments_npy_path)
+        if raw_segments.ndim != 2 or raw_segments.shape[1] < 5:
+            raise ValueError(
+                f"Expected segments.npy shape [N_segments, >=5], got {raw_segments.shape} from {segments_npy_path}"
+            )
+        self.segments = np.asarray(raw_segments, dtype=np.int64)
+        self.windows = self.segments  # MORTM5MemmapDataset 互換エイリアス
+
+        self._bin_num_tokens = os.path.getsize(tokens_bin_path) // 2
+        if len(self.segments) > 0:
+            ends = self.segments[:, 0] + self.segments[:, 1]
+            max_end = int(ends.max())
+            if max_end > self._bin_num_tokens:
+                raise ValueError(
+                    f"segments.npy references up to token {max_end}, exceeding {tokens_bin_path} ({self._bin_num_tokens})."
+                )
+
+        self._remi_transcoder: Optional[Any] = remi_transcoder
+        self.source_format = self._detect_source_format(source_format)
+        target_is_remi = self.mode == "remi" or self.tokenizer_key in ("remi", "multitrack_remi")
+        self.transcode_from_octuple: bool = (self.source_format == "octuple_mmt") and target_is_remi
+
+        if len(self.segments) > 0:
+            if self.source_format == "octuple_mmt":
+                oct_tuple_w = 6 if self.transcode_from_octuple else self._unit_width
+                if oct_tuple_w > 1 and np.any((self.segments[:, 1] % oct_tuple_w) != 0):
+                    raise ValueError(
+                        f"All Octuple segment token_len values must be divisible by {oct_tuple_w} in {segments_npy_path}."
+                    )
+            elif self._unit_width > 1 and np.any((self.segments[:, 1] % self._unit_width) != 0):
+                raise ValueError(
+                    f"All segment token_len values must be divisible by unit_width ({self._unit_width}) in {segments_npy_path}."
+                )
+
+        if self.transcode_from_octuple and self._remi_transcoder is None:
+            from mortm.utils.symbolic_tokenizers import MultitrackREMITokenizer
+
+            self._remi_transcoder = MultitrackREMITokenizer()
+
+        self.slots: Optional[np.ndarray] = None
+        self.slot_token_ids: Optional[np.ndarray] = None
+        if slots_npy_path is not None and os.path.exists(slots_npy_path):
+            raw_slots = np.load(slots_npy_path)
+            if raw_slots.ndim != 2 or raw_slots.shape[1] != NUM_SLOT_TOKENS:
+                raise ValueError(
+                    f"Expected slots shape [N_songs, {NUM_SLOT_TOKENS}], got {raw_slots.shape} from {slots_npy_path}"
+                )
+            self.slots = np.asarray(raw_slots, dtype=np.int16)
+
+        if self.use_instrument_tokens:
+            if self.slots is None:
+                raise FileNotFoundError(
+                    f"use_instrument_tokens=True requires `{os.path.basename(tokens_bin_path).replace('_tokens.bin', '_slots.npy')}`."
+                )
+            if len(self.segments) > 0 and int(self.segments[:, 4].max()) >= len(self.slots):
+                raise ValueError(
+                    f"segments song_idx max ({int(self.segments[:, 4].max())}) >= slots length ({len(self.slots)})."
+                )
+            flat_codes = self.slots.reshape(-1)
+            flat_tok_ids = np.array([slot_code_to_token_id(int(c)) for c in flat_codes], dtype=np.int64)
+            self.slot_token_ids = flat_tok_ids.reshape(len(self.slots), NUM_SLOT_TOKENS)
+
+        self._bos_arr = np.full(self._unit_width, self.bos_token_id, dtype=np.int64)
+        self._eos_arr = np.full(self._unit_width, self.eos_token_id, dtype=np.int64)
+        self._memmap: Optional[np.ndarray] = None
+
+    def _detect_source_format(self, requested: str) -> str:
+        norm = str(requested).strip().lower()
+        if norm in ("octuple", "octuple_mmt"):
+            return "octuple_mmt"
+        if norm in ("remi", "multitrack_remi"):
+            return "multitrack_remi"
+        if norm != "auto":
+            raise ValueError(
+                f"source_format must be 'auto', 'octuple_mmt', or 'multitrack_remi', got {requested!r}"
+            )
+
+        if self.tokens_bin_path.endswith("_tokens.bin"):
+            state_cand = self.tokens_bin_path[: -len("_tokens.bin")] + "_state.json"
+            if os.path.exists(state_cand):
+                try:
+                    with open(state_cand, "r", encoding="utf-8") as sf:
+                        st = json.load(sf)
+                    tk = str(st.get("tokenizer_key", "")).strip().lower()
+                    if tk in ("octuple", "octuple_mmt"):
+                        return "octuple_mmt"
+                    if tk in ("remi", "multitrack_remi"):
+                        return "multitrack_remi"
+                except Exception:
+                    pass
+
+        parent_name = os.path.basename(os.path.dirname(os.path.abspath(self.tokens_bin_path))).lower()
+        if parent_name in ("multitrack_remi", "remi"):
+            return "multitrack_remi"
+        if parent_name in ("octuple_mmt", "octuple"):
+            return "octuple_mmt"
+
+        if len(self.segments) == 0:
+            return "multitrack_remi" if self.mode in ("remi", "flat") else "octuple_mmt"
+        if np.any(self.segments[:, 1] == 0):
+            return "octuple_mmt"
+        if np.any((self.segments[:, 1] % 6) != 0):
+            return "multitrack_remi"
+
+        non_empty_idx = int(np.argmax(self.segments[:, 1] > 0))
+        t_start = int(self.segments[non_empty_idx, 0])
+        t_len = int(self.segments[non_empty_idx, 1])
+        if t_len >= 6 and self._bin_num_tokens >= t_start + 3:
+            probe_mm = np.memmap(self.tokens_bin_path, dtype=np.uint16, mode="r")
+            tok2 = int(probe_mm[t_start + 2])
+            del probe_mm
+            tok_off = int(getattr(getattr(self._remi_transcoder, "vocab_spec", None), "token_offset", 133))
+            # Disjoint invariant: Octuple raw[2] is <SLOT> >= tok_off + 208; REMI raw[2] <= tok_off + 196.
+            return "octuple_mmt" if tok2 >= (tok_off + 200) else "multitrack_remi"
+
+        return "multitrack_remi" if self.mode == "remi" else "octuple_mmt"
+
+    @classmethod
+    def from_split_dir(
+        cls,
+        token_dir: str,
+        split: str,
+        args: MORTM5Args,
+        bos_eos_mode: str = "always",
+    ) -> "MORTM5SymbolicMemmapDataset":
+        resolved_dir = _resolve_symbolic_split_dir(token_dir, split)
+        tokens_bin_path = os.path.join(resolved_dir, f"{split}_tokens.bin")
+        segments_npy_path = os.path.join(resolved_dir, f"{split}_segments.npy")
+        offsets_cand = os.path.join(resolved_dir, f"{split}_offsets.npy")
+        slots_cand = os.path.join(resolved_dir, f"{split}_slots.npy")
+
+        remi_transcoder = None
+        if getattr(args, "model_mode", "octuple") == "remi":
+            from mortm.utils.symbolic_tokenizers import MultitrackREMITokenizer, REMIVocabSpec
+
+            attr_sizes = tuple(int(s) for s in getattr(args, "remi_attr_sizes", (1, 192, 4, 128, 312, 32)))
+            tok_off = int(getattr(args, "token_offset", 133))
+            remi_transcoder = MultitrackREMITokenizer(
+                vocab_spec=REMIVocabSpec(token_offset=tok_off, attr_sizes=attr_sizes)
+            )
+
+        ds = cls(
+            tokens_bin_path=tokens_bin_path,
+            segments_npy_path=segments_npy_path,
+            slots_npy_path=slots_cand if os.path.exists(slots_cand) else None,
+            offsets_npy_path=offsets_cand if os.path.exists(offsets_cand) else None,
+            mode=getattr(args, "model_mode", "octuple"),
+            unit_width=int(getattr(args, "step_unit_width", 6)),
+            bos_eos_mode=bos_eos_mode,
+            use_instrument_tokens=bool(getattr(args, "use_instrument_tokens", True)),
+            pad_token_id=int(getattr(args, "pad_token_id", PAD_TOKEN_ID)),
+            bos_token_id=int(getattr(args, "bos_token_id", BOS_TOKEN_ID)),
+            eos_token_id=int(getattr(args, "eos_token_id", EOS_TOKEN_ID)),
+            tokenizer_key=getattr(args, "tokenizer_key", None),
+            remi_transcoder=remi_transcoder,
+        )
+        ds.split = split
+        return ds
+
+    def _get_memmap(self) -> np.ndarray:
+        if self._memmap is None:
+            if self._bin_num_tokens == 0:
+                self._memmap = np.zeros((0,), dtype=np.uint16)
+            else:
+                self._memmap = np.memmap(self.tokens_bin_path, dtype=np.uint16, mode="r")
+        return self._memmap
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_memmap"] = None
+        return state
+
+    def __len__(self) -> int:
+        return len(self.segments)
+
+    def get_window_slot_codes(self, index: int) -> Optional[np.ndarray]:
+        if self.slots is None:
+            return None
+        song_idx = int(self.segments[index, 4])
+        return self.slots[song_idx].copy()
+
+    def get_segment_num_chunks(self, index: int) -> int:
+        if self.segments.shape[1] >= 6:
+            return int(self.segments[index, 5])
+        return 128
+
+    def __getitem__(self, index: int) -> Tensor:
+        row = self.segments[index]
+        token_start = int(row[0])
+        token_len = int(row[1])
+        is_first = int(row[2])
+        is_last = int(row[3])
+        song_idx = int(row[4])
+
+        if self.transcode_from_octuple:
+            assert self._remi_transcoder is not None
+            seg_chunks = int(row[5]) if self.segments.shape[1] >= 6 else 128
+            if token_len > 0:
+                mmap = self._get_memmap()
+                mmap_slice = mmap[token_start : token_start + token_len]
+                if mmap_slice.size != token_len:
+                    raise RuntimeError(
+                        f"Symbolic memmap slice mismatch at [{token_start}:{token_start + token_len}]: "
+                        f"expected {token_len}, got {mmap_slice.size}"
+                    )
+                body_tokens = self._remi_transcoder.transcode_octuple_body_to_remi(
+                    mmap_slice, num_chunks=seg_chunks, out_dtype=np.int64
+                )
+            else:
+                body_tokens = self._remi_transcoder.transcode_octuple_body_to_remi(
+                    np.zeros((0,), dtype=np.uint16), num_chunks=seg_chunks, out_dtype=np.int64
+                )
+        else:
+            if token_len > 0:
+                mmap = self._get_memmap()
+                body_tokens = np.asarray(mmap[token_start : token_start + token_len], dtype=np.int64)
+                if body_tokens.size != token_len:
+                    raise RuntimeError(
+                        f"Symbolic memmap slice mismatch at [{token_start}:{token_start + token_len}]: "
+                        f"expected {token_len}, got {body_tokens.size}"
+                    )
+            else:
+                body_tokens = np.zeros((0,), dtype=np.int64)
+
+        body_len = int(body_tokens.size)
+        add_bos = self.bos_eos_mode == "always" or (self.bos_eos_mode == "song_boundary" and is_first == 1)
+        add_eos = self.bos_eos_mode == "always" or (self.bos_eos_mode == "song_boundary" and is_last == 1)
+
+        unit_width = self._unit_width
+        bos_len = unit_width if add_bos else 0
+        inst_len = (NUM_SLOT_TOKENS * unit_width) if self.use_instrument_tokens else 0
+        eos_len = unit_width if add_eos else 0
+
+        if bos_len == 0 and inst_len == 0 and eos_len == 0:
+            return torch.from_numpy(np.ascontiguousarray(body_tokens, dtype=np.int64))
+
+        seq = np.empty(bos_len + inst_len + body_len + eos_len, dtype=np.int64)
+        cursor = 0
+        if bos_len > 0:
+            seq[cursor : cursor + bos_len] = self._bos_arr
+            cursor += bos_len
+        if inst_len > 0:
+            if self.slot_token_ids is None:
+                raise RuntimeError("use_instrument_tokens=True but slot_token_ids is not initialized.")
+            slot_toks = self.slot_token_ids[song_idx]
+            if unit_width == 1:
+                seq[cursor : cursor + inst_len] = slot_toks
+            else:
+                seq[cursor : cursor + inst_len] = np.repeat(slot_toks, unit_width)
+            cursor += inst_len
+        if body_len > 0:
+            seq[cursor : cursor + body_len] = body_tokens
+            cursor += body_len
+        if eos_len > 0:
+            seq[cursor : cursor + eos_len] = self._eos_arr
+        return torch.from_numpy(seq)
+
+
 def mortm5_collate_fn(
     batch: List[Tensor],
     mode: str = "flat",
@@ -785,31 +1126,32 @@ def mortm5_collate_fn(
     pad_token_id: int = PAD_TOKEN_ID,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
-    MORTM5MemmapDataset のミニバッチから (input_ids, targets, padding_mask) を作成する。
+    MORTM5 / Symbolic MemmapDataset のミニバッチから `(input_ids, targets, padding_mask)` を作成する。
 
-    - mode="flat" (AblationTransformer1):
+    - mode="flat" (AblationTransformer1) / mode="remi" (REMITransformer):
         shift = 1 トークン。
-        input_ids: [B, S - 1]
-        targets:   [B, S - 1]
-        padding_mask: [B, S - 1] (True = 有効トークン, False = PAD)
-    - mode="grouped" (AblationTransformer2):
-        shift = vq_groups (G) トークン (= 1 ソフトトークン)。
-        input_ids: [B, S - G]
-        targets:   [B, S - G]
-        padding_mask: [B, (S - G) // G] (True = 有効ソフトトークン, False = PAD)
+        input_ids: `[B, S_max - 1]`, targets: `[B, S_max - 1]`, padding_mask: `[B, S_max - 1]`
+    - mode="grouped" (AblationTransformer2) / mode="octuple" (OctupleTransformer):
+        shift = `unit_width` (`G` または `6`) フラットトークン (= 1 ソフトトークン/タプル)。
+        各系列ごとに `seq[:-shift]` と `seq[shift:]` を切り出してから右パディングするため、
+        可変長バッチでも短い系列の末尾 `<EOS>` が不要に `input_ids` に残留せず、
+        有効トークン数・損失・勾配がサブバッチ分割に対して厳密に不変となる。
     """
     from torch.nn.utils.rnn import pad_sequence
 
-    if mode not in ("flat", "grouped"):
-        raise ValueError(f"mode must be 'flat' or 'grouped', got {mode}")
+    norm_mode = str(mode).strip().lower()
+    if norm_mode not in ("flat", "grouped", "octuple", "remi"):
+        raise ValueError(f"mode must be 'flat', 'grouped', 'octuple', or 'remi', got {mode!r}")
     if not batch:
         raise ValueError("mortm5_collate_fn received an empty batch.")
 
-    vq_groups = int(vq_groups)
-    if vq_groups <= 0:
-        raise ValueError(f"vq_groups must be positive, got {vq_groups}")
+    unit_width = 1 if norm_mode in ("flat", "remi") else int(vq_groups)
+    if unit_width <= 0:
+        raise ValueError(f"unit_width (vq_groups) must be positive, got {unit_width}")
 
-    shift = 1 if mode == "flat" else vq_groups
+    shift = unit_width
+    in_list: List[Tensor] = []
+    tgt_list: List[Tensor] = []
     for idx, seq in enumerate(batch):
         if seq.dim() != 1:
             raise ValueError(f"Batch item {idx} must be a 1D tensor, got shape {tuple(seq.shape)}")
@@ -817,28 +1159,26 @@ def mortm5_collate_fn(
             raise ValueError(
                 f"Batch item {idx} length ({seq.numel()}) must be > shift ({shift}) for causal training."
             )
-        if mode == "grouped" and seq.numel() % vq_groups != 0:
+        if unit_width > 1 and seq.numel() % unit_width != 0:
             raise ValueError(
-                f"Batch item {idx} length ({seq.numel()}) is not divisible by vq_groups ({vq_groups}) in grouped mode."
+                f"Batch item {idx} length ({seq.numel()}) is not divisible by unit_width ({unit_width}) in {norm_mode} mode."
             )
+        in_list.append(seq[:-shift])
+        tgt_list.append(seq[shift:])
 
-    padded = pad_sequence(batch, batch_first=True, padding_value=pad_token_id)
+    input_ids = pad_sequence(in_list, batch_first=True, padding_value=pad_token_id).contiguous()
+    targets = pad_sequence(tgt_list, batch_first=True, padding_value=pad_token_id).contiguous()
 
-    if mode == "grouped" and padded.size(1) % vq_groups != 0:
-        rem = vq_groups - (padded.size(1) % vq_groups)
-        pad_tail = torch.full(
-            (padded.size(0), rem), pad_token_id, dtype=padded.dtype, device=padded.device
-        )
-        padded = torch.cat([padded, pad_tail], dim=1)
+    if unit_width > 1 and input_ids.size(1) % unit_width != 0:
+        rem = unit_width - (input_ids.size(1) % unit_width)
+        pad_tail = torch.full((input_ids.size(0), rem), pad_token_id, dtype=input_ids.dtype, device=input_ids.device)
+        input_ids = torch.cat([input_ids, pad_tail], dim=1)
+        targets = torch.cat([targets, pad_tail.clone()], dim=1)
 
-    input_ids = padded[:, :-shift].contiguous()
-    targets = padded[:, shift:].contiguous()
-
-    if mode == "flat":
+    if norm_mode in ("flat", "remi"):
         padding_mask = input_ids != pad_token_id
     else:
-        # ソフトトークン単位のマスク: [B, S_soft]
-        grouped_inputs = input_ids.reshape(input_ids.size(0), -1, vq_groups)
+        grouped_inputs = input_ids.reshape(input_ids.size(0), -1, unit_width)
         padding_mask = (grouped_inputs != pad_token_id).any(dim=-1)
 
     return input_ids, targets, padding_mask
@@ -847,7 +1187,7 @@ def mortm5_collate_fn(
 class MORTM5Collate:
     """
     DataLoader 用のシリアライズ可能な Collate ファンクタ。
-    mortm5_collate_fn に mode / vq_groups / pad_token_id を束縛する。
+    mortm5_collate_fn に mode / vq_groups (unit_width) / pad_token_id を束縛する。
     """
 
     def __init__(self, mode: str = "flat", vq_groups: int = 8, pad_token_id: int = PAD_TOKEN_ID):
@@ -864,16 +1204,103 @@ class MORTM5Collate:
         )
 
 
+@dataclass(frozen=True)
+class PackedOptimizerStep:
+    """
+    1 オプティマイザステップ（標準 256 セグメント = 4,096 小節）を動的トークンバジェットで分割パッキングした不変値オブジェクト。
+    `total_valid_targets` で各サブバッチの `sum_loss` を割ることで、サブバッチ数 `K` に依らず 256 セグメント全体の
+    厳密なグローバル平均 Cross-Entropy 損失および勾配と機械精度で一致する。
+    """
+
+    sub_batches: Tuple[Tuple[Tensor, Tensor, Tensor], ...]
+    total_valid_targets: int
+    num_sequences: int
+
+
+@dataclass(frozen=True)
+class DynamicStepBatchPacker:
+    """
+    可変長系列（`Octuple-MMT`, `Multitrack-REMI`）において、同一ステップに割り当てられた 256 セグメントを
+    一切切り詰めず（Zero Truncation）、系列長降順ソート + トークンバジェット制約 (`B_sub * S_sub <= max_micro_steps`)
+    で高密度サブバッチ群にパッキングする Strategy オブジェクト。
+    """
+
+    max_micro_steps: int
+    max_batch_size: int = 128
+    unit_width: int = 6
+    pad_token_id: int = PAD_TOKEN_ID
+
+    def __post_init__(self) -> None:
+        if self.max_micro_steps <= 0:
+            raise ValueError(f"max_micro_steps must be positive, got {self.max_micro_steps}")
+        if self.max_batch_size <= 0:
+            raise ValueError(f"max_batch_size must be positive, got {self.max_batch_size}")
+        if self.unit_width <= 0:
+            raise ValueError(f"unit_width must be positive, got {self.unit_width}")
+
+    def pack_sequences(
+        self,
+        sequences: Sequence[Tensor],
+        collate_fn: Callable[[List[Tensor]], Tuple[Tensor, Tensor, Tensor]],
+        pin_memory: bool = False,
+    ) -> PackedOptimizerStep:
+        if not sequences:
+            raise ValueError("DynamicStepBatchPacker.pack_sequences received empty sequences.")
+
+        shift = self.unit_width
+        sorted_seqs = sorted(sequences, key=lambda s: int(s.numel()), reverse=True)
+
+        total_valid_targets = 0
+        for s in sorted_seqs:
+            if s.numel() > shift:
+                total_valid_targets += int((s[shift:] != self.pad_token_id).sum().item())
+
+        sub_lists: List[List[Tensor]] = []
+        cur_group: List[Tensor] = []
+        cur_max_steps = 0
+
+        for seq in sorted_seqs:
+            seq_steps = max(1, (int(seq.numel()) - shift) // self.unit_width)
+            if not cur_group:
+                cur_group = [seq]
+                cur_max_steps = seq_steps
+                continue
+
+            cand_len = len(cur_group) + 1
+            cand_padded_steps = cand_len * cur_max_steps
+            if cand_len > self.max_batch_size or cand_padded_steps > self.max_micro_steps:
+                sub_lists.append(cur_group)
+                cur_group = [seq]
+                cur_max_steps = seq_steps
+            else:
+                cur_group.append(seq)
+
+        if cur_group:
+            sub_lists.append(cur_group)
+
+        packed_subs: List[Tuple[Tensor, Tensor, Tensor]] = []
+        for grp in sub_lists:
+            in_ids, tgts, pad_mask = collate_fn(grp)
+            if pin_memory:
+                in_ids = in_ids.pin_memory()
+                tgts = tgts.pin_memory()
+                pad_mask = pad_mask.pin_memory()
+            packed_subs.append((in_ids, tgts, pad_mask))
+
+        return PackedOptimizerStep(
+            sub_batches=tuple(packed_subs),
+            total_valid_targets=total_valid_targets,
+            num_sequences=len(sorted_seqs),
+        )
+
+
 class MORTM5OuterDataset(Dataset):
     """
     self_turing の 2段 DataLoader (Outer Loader -> _prefetched_outer_batches -> pre_processing -> Inner Loader)
-    に MORTM5MemmapDataset を適合させる軽量インデックス Dataset。
-
-    - Outer Loader は `big_batch_size` 個の `(split, window_idx)` タプルを 1 パックとして yield する。
-    - `src_list` プロパティを提供し、`save_path_json` との完全な互換性を保つ。
+    に MORTM5MemmapDataset / MORTM5SymbolicMemmapDataset を適合させる軽量インデックス Dataset。
     """
 
-    def __init__(self, memmap_dataset: MORTM5MemmapDataset, split: Optional[str] = None):
+    def __init__(self, memmap_dataset: Union[MORTM5MemmapDataset, MORTM5SymbolicMemmapDataset], split: Optional[str] = None):
         self.memmap_dataset = memmap_dataset
         self.split = split or getattr(memmap_dataset, "split", "train")
         paths = [str(memmap_dataset.tokens_bin_path), str(memmap_dataset.offsets_npy_path)]

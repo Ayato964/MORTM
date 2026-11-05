@@ -86,6 +86,12 @@ _MORTM5_PRESET_ALIASES: Dict[str, str] = {
     "7": "m4_grouped_shared",
     "#8": "m4_grouped_separated",
     "8": "m4_grouped_separated",
+    "symic": "symic_g4l4_160m",
+    "symic_160m": "symic_g4l4_160m",
+    "octuple": "octuple_160m",
+    "octuple_mmt": "octuple_160m",
+    "remi": "remi_160m",
+    "multitrack_remi": "remi_160m",
 }
 
 _MORTM5_ABLATION_SUBDIR_MAP: Dict[str, str] = {
@@ -97,36 +103,109 @@ _MORTM5_ABLATION_SUBDIR_MAP: Dict[str, str] = {
     "#6": "6", "6": "6", "m4_flat_separated": "6", "mortm5_m4_flat_separated": "6",
     "#7": "7", "7": "7", "m4_grouped_shared": "7", "mortm5_m4_grouped_shared": "7",
     "#8": "8", "8": "8", "m4_grouped_separated": "8", "mortm5_m4_grouped_separated": "8",
+    "symic": "symic_g4l4_160m", "symic_160m": "symic_g4l4_160m", "symic_g4l4_160m": "symic_g4l4_160m", "mortm5_symic_g4l4_160m": "symic_g4l4_160m",
+    "octuple": "octuple_160m", "octuple_mmt": "octuple_160m", "octuple_160m": "octuple_160m", "mortm5_octuple_mmt_160m": "octuple_160m",
+    "remi": "remi_160m", "multitrack_remi": "remi_160m", "remi_160m": "remi_160m",
+    "mortm5_remi_160m": "remi_160m", "mortm5_multitrack_remi_160m": "remi_160m",
 }
 ABLATION_SUBDIR_MAP = _MORTM5_ABLATION_SUBDIR_MAP
 
 
 def resolve_ablation_subdir(model_name: str = "", ablation_id: str = "") -> str:
-    """アブレーション識別子 ('#1'〜'#8', '1'〜'8') またはモデル名・カスタム実験IDから保存サブディレクトリ名を解決する。"""
+    """アブレーション識別子 ('#1'〜'#8', '1'〜'8') またはカスタム実験ID・モデル名から保存サブディレクトリ名を解決する。"""
     import re
     for raw in (ablation_id, model_name):
-        key = str(raw or "").strip().lower()
-        if not key:
+        raw_str = str(raw or "").strip()
+        if not raw_str or "/" in raw_str or "\\" in raw_str or raw_str.lower().endswith(".json"):
             continue
+        key = raw_str.lower()
         if key in _MORTM5_ABLATION_SUBDIR_MAP:
             return _MORTM5_ABLATION_SUBDIR_MAP[key]
         stripped = key.lstrip("#")
         if stripped in {"1", "2", "3", "4", "5", "6", "7", "8"}:
             return stripped
-
-    for raw in (ablation_id, model_name):
-        raw_str = str(raw or "").strip()
-        if not raw_str or "/" in raw_str or "\\" in raw_str or raw_str.lower().endswith(".json"):
-            continue
-        stripped = raw_str.lower().lstrip("#")
         safe = re.sub(r"[^a-z0-9_\-]+", "_", stripped).strip("_")
         if safe:
             return safe
     return "default"
 
 
+MORTM5_SYMIC_MAIN_PRESETS: Dict[str, Dict[str, Any]] = {
+    "symic_g4l4_160m": {
+        "name": "MORTM5_SyMIc_G4L4_160M",
+        "tokenizer_key": "m4_g4l4",
+        "model_mode": "grouped",
+        "separate_rvq_layers": True,
+        "use_instrument_tokens": True,
+        "token_offset": 133,
+        "vocab_size": 32901,
+        "vq_groups": 4,
+        "vq_layers": 4,
+        "encoder_layer": 4,
+        "encoder_wout": 128,
+        "codebook_size": 2048,
+        "d_model": 1024,
+        "d_layer": 12,
+        "num_heads": 16,
+        "dim_feedforward": 3072,
+        "dropout": 0.1,
+        "position_length": 518,
+        "norm_type": "rmsnorm",
+        "use_rope": True,
+        "use_silu": True,
+        "use_bias": False,
+        "use_moe_decoder": False,
+    },
+    "octuple_160m": {
+        "name": "MORTM5_Octuple_MMT_160M",
+        "tokenizer_key": "octuple_mmt",
+        "model_mode": "octuple",
+        "symbolic_vocab": True,
+        "tuple_size": 6,
+        "octuple_attr_sizes": [16, 192, 4, 128, 312, 32],
+        "use_instrument_tokens": True,
+        "token_offset": 133,
+        "vocab_size": 817,
+        "d_model": 1024,
+        "d_layer": 12,
+        "num_heads": 16,
+        "dim_feedforward": 3072,
+        "dropout": 0.1,
+        "position_length": 2048,
+        "grad_checkpoint_tokens": 16384,
+        "norm_type": "rmsnorm",
+        "use_rope": True,
+        "use_silu": True,
+        "use_bias": False,
+        "use_moe_decoder": False,
+    },
+    "remi_160m": {
+        "name": "MORTM5_Multitrack_REMI_160M",
+        "tokenizer_key": "multitrack_remi",
+        "model_mode": "remi",
+        "symbolic_vocab": True,
+        "remi_attr_sizes": [1, 192, 4, 128, 312, 32],
+        "use_instrument_tokens": True,
+        "token_offset": 133,
+        "vocab_size": 802,
+        "d_model": 1024,
+        "d_layer": 12,
+        "num_heads": 16,
+        "dim_feedforward": 3072,
+        "dropout": 0.1,
+        "position_length": 4096,
+        "grad_checkpoint_tokens": 16384,
+        "norm_type": "rmsnorm",
+        "use_rope": True,
+        "use_silu": True,
+        "use_bias": False,
+        "use_moe_decoder": False,
+    },
+}
+
+
 def resolve_mortm_config_dict(source: Union[str, os.PathLike, Dict[str, Any]]) -> Dict[str, Any]:
-    """辞書、内蔵アブレーションプリセット名 ('m4_grouped_shared' / '#7' 等)、または JSON パスから設定辞書を解決する。"""
+    """辞書、内蔵アブレーション/本実験プリセット名 ('m4_grouped_shared' / '#7' / 'octuple_160m' 等)、または JSON パスから設定辞書を解決する。"""
     if isinstance(source, dict):
         return copy.deepcopy(source)
     key = str(source).strip()
@@ -135,6 +214,8 @@ def resolve_mortm_config_dict(source: Union[str, os.PathLike, Dict[str, Any]]) -
         lower_key = _MORTM5_PRESET_ALIASES[lower_key]
     if lower_key in MORTM5_ABLATION_PRESETS and not os.path.isfile(key):
         return copy.deepcopy(MORTM5_ABLATION_PRESETS[lower_key])
+    if lower_key in MORTM5_SYMIC_MAIN_PRESETS and not os.path.isfile(key):
+        return copy.deepcopy(MORTM5_SYMIC_MAIN_PRESETS[lower_key])
     with open(source, "r") as f:
         return json.load(f)
 
@@ -183,6 +264,10 @@ class MORTMArgs:
 
         # デバッグ用: Trueにすると観察用Attentionに切り替わりweightを保存する
         self.debug_attention: bool = False
+        # 長系列マイクロバッチおよび外れ値 (Black MIDI 等) 向けの自動 Activation Checkpointing 発動閾値 (0 以下で無効)
+        self.grad_checkpoint_tokens: int = (
+            16384 if data.get("grad_checkpoint_tokens") is None else int(data["grad_checkpoint_tokens"])
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """設定を JSON シリアライズ可能な辞書として返す。"""
@@ -204,6 +289,8 @@ class MORTMArgs:
             "use_bias": bool(self.use_bias),
             "use_moe_decoder": bool(self.use_moe_decoder),
         })
+        if self.grad_checkpoint_tokens != 16384 or "grad_checkpoint_tokens" in out:
+            out["grad_checkpoint_tokens"] = int(self.grad_checkpoint_tokens)
         return out
 
 
@@ -221,6 +308,8 @@ INST_RVQ_TOKEN_OFFSET = 133      # 楽器トークン有効時の RVQ 開始オ�
 
 SLOT_CODE_DRUMS = 128            # slots.npy 内での Drums 識別コード
 SLOT_CODE_EMPTY = -1             # slots.npy 内での空スロット識別コード
+OCTUPLE_DEFAULT_ATTR_SIZES = (16, 192, 4, 128, 312, 32)  # (bar, pos, slot, pitch, dur, vel) = 684
+REMI_DEFAULT_ATTR_SIZES = (1, 192, 4, 128, 312, 32)      # (<BAR>, <POS>, <SLOT>, <PITCH>, <DUR>, <VEL>) = 669
 
 
 def slot_code_to_token_id(code: int) -> int:
@@ -289,8 +378,33 @@ class MORTM5Args(MORTMArgs):
             self.position_length = 4096
 
         self.model_mode: str = str(data.get("model_mode", "flat"))
-        if self.model_mode not in ("flat", "grouped"):
-            raise ValueError(f"model_mode must be 'flat' or 'grouped', got {self.model_mode}")
+        if self.model_mode not in ("flat", "grouped", "octuple", "remi"):
+            raise ValueError(
+                f"model_mode must be 'flat', 'grouped', 'octuple', or 'remi', got {self.model_mode}"
+            )
+
+        self.octuple_attr_sizes: tuple[int, ...] = tuple(
+            int(x) for x in data.get("octuple_attr_sizes", OCTUPLE_DEFAULT_ATTR_SIZES)
+        )
+        self.remi_attr_sizes: tuple[int, ...] = tuple(
+            int(x) for x in data.get("remi_attr_sizes", REMI_DEFAULT_ATTR_SIZES)
+        )
+        if self.model_mode == "octuple":
+            default_tuple_size = len(self.octuple_attr_sizes)
+        elif self.model_mode == "remi":
+            default_tuple_size = 1
+        else:
+            default_tuple_size = self.vq_groups
+        self.tuple_size: int = int(data.get("tuple_size", default_tuple_size))
+        if self.model_mode == "octuple" and data.get("vq_groups") is None:
+            self.vq_groups = self.tuple_size
+        self.symbolic_vocab: bool = bool(
+            data.get(
+                "symbolic_vocab",
+                self.model_mode in ("octuple", "remi")
+                or str(self.tokenizer_key or "").lower() in {"octuple", "octuple_mmt", "remi", "multitrack_remi"},
+            )
+        )
 
         self.separate_rvq_layers: bool = bool(data.get("separate_rvq_layers", False))
         self.use_instrument_tokens: bool = bool(
@@ -304,8 +418,42 @@ class MORTM5Args(MORTMArgs):
         )
         self.recompute_vocab()
 
+    @property
+    def step_unit_width(self) -> int:
+        if self.model_mode in ("flat", "remi"):
+            return 1
+        if self.model_mode == "octuple":
+            return int(self.tuple_size)
+        return int(self.vq_groups)
+
     def recompute_vocab(self) -> int:
-        """separate_rvq_layers / use_instrument_tokens の変更に応じて token_offset と vocab_size を再計算して返す。"""
+        """model_mode / separate_rvq_layers / use_instrument_tokens の変更に応じて token_offset と vocab_size を再計算して返す。"""
+        cur_mode = getattr(self, "model_mode", "flat")
+        if cur_mode in ("octuple", "remi"):
+            attr_tuple = (
+                getattr(self, "octuple_attr_sizes", OCTUPLE_DEFAULT_ATTR_SIZES)
+                if cur_mode == "octuple"
+                else getattr(self, "remi_attr_sizes", REMI_DEFAULT_ATTR_SIZES)
+            )
+            attr_sum = int(sum(int(s) for s in attr_tuple))
+            self.rvq_vocab_size = attr_sum
+            if getattr(self, "use_instrument_tokens", False):
+                self.token_offset = (
+                    max(INST_RVQ_TOKEN_OFFSET, int(self._explicit_token_offset))
+                    if getattr(self, "_explicit_token_offset", None) is not None
+                    else INST_RVQ_TOKEN_OFFSET
+                )
+            elif getattr(self, "_explicit_token_offset", None) is not None:
+                self.token_offset = int(self._explicit_token_offset)
+            else:
+                self.token_offset = RVQ_TOKEN_OFFSET
+            min_vocab = int(self.token_offset + attr_sum)
+            if getattr(self, "_explicit_vocab_size", None) is not None and int(self._explicit_vocab_size) >= min_vocab:
+                self.vocab_size = int(self._explicit_vocab_size)
+            else:
+                self.vocab_size = min_vocab
+            return self.vocab_size
+
         layer_factor = self.vq_layers if getattr(self, "separate_rvq_layers", False) else 1
         self.rvq_vocab_size = int(layer_factor * self.vq_groups * self.codebook_size)
 
@@ -322,7 +470,9 @@ class MORTM5Args(MORTMArgs):
         else:
             self.token_offset = RVQ_TOKEN_OFFSET
 
-        if (
+        if getattr(self, "symbolic_vocab", False) and getattr(self, "_explicit_vocab_size", None) is not None:
+            self.vocab_size = int(self._explicit_vocab_size)
+        elif (
             getattr(self, "_explicit_vocab_size", None) is not None
             and not getattr(self, "separate_rvq_layers", False)
             and not getattr(self, "use_instrument_tokens", False)
@@ -338,6 +488,7 @@ class MORTM5Args(MORTMArgs):
             "name": self.name,
             "tokenizer_key": self.tokenizer_key,
             "model_mode": self.model_mode,
+            "tuple_size": int(self.tuple_size),
             "separate_rvq_layers": bool(self.separate_rvq_layers),
             "use_instrument_tokens": bool(self.use_instrument_tokens),
             "token_offset": int(self.token_offset),
@@ -355,4 +506,10 @@ class MORTM5Args(MORTMArgs):
             "bottle_channel": int(self.bottle_channel),
             "use_pre_vq_norm": bool(self.use_pre_vq_norm),
         })
+        if self.model_mode == "octuple":
+            out["octuple_attr_sizes"] = [int(x) for x in self.octuple_attr_sizes]
+        if self.model_mode == "remi":
+            out["remi_attr_sizes"] = [int(x) for x in self.remi_attr_sizes]
+        if self.symbolic_vocab:
+            out["symbolic_vocab"] = True
         return out

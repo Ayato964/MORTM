@@ -21,6 +21,7 @@ from .config import (
     RVQ_TOKEN_OFFSET,
     INST_RVQ_TOKEN_OFFSET,
     NUM_SLOT_TOKENS,
+    OCTUPLE_DEFAULT_ATTR_SIZES,
 )
 
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
@@ -466,6 +467,66 @@ class DecodeCodebookHead(nn.Module):
         if squeeze_seq:
             return out.squeeze(1)
         return out
+
+
+class DecodeOctupleHead(nn.Module):
+    """
+    Octuple-MMT 用の 6属性独立射影 + 共有特殊トークン射影ヘッド。
+    - 1回の融合 GEMM `Linear(d_model, token_offset + sum(attr_sizes), bias=use_bias)` (例: 1024 -> 817) で
+      共有特殊ロジット `[..., token_offset]` と6属性それぞれの専用ロジット `[..., attr_sizes[m]]` を一括計算する。
+    - 出力テンソル形状は `[..., 6, token_offset + max(attr_sizes)]` (例: `[B, S, 6, 445]`) とし、
+      各属性 `m` の有効語彙数 `token_offset + attr_sizes[m]` を超える列を厳密に `-inf` でマスクすることで、
+      標準 `F.cross_entropy(..., ignore_index=PAD_TOKEN_ID)` が6属性それぞれの厳密な Softmax 正規化による
+      平均 Cross-Entropy 損失および勾配と機械精度で一致する。
+    """
+
+    def __init__(self, args: MORTM5Args):
+        super().__init__()
+        self.d_model = int(args.d_model)
+        self.attr_sizes: Tuple[int, ...] = tuple(
+            int(s) for s in getattr(args, "octuple_attr_sizes", OCTUPLE_DEFAULT_ATTR_SIZES)
+        )
+        self.tuple_size = len(self.attr_sizes)
+        self.use_instrument_tokens = bool(getattr(args, "use_instrument_tokens", False))
+        default_offset = INST_RVQ_TOKEN_OFFSET if self.use_instrument_tokens else RVQ_TOKEN_OFFSET
+        self.token_offset = int(getattr(args, "token_offset", default_offset))
+        self.total_attr_tokens = int(sum(self.attr_sizes))
+        self.total_vocab_size = self.token_offset + self.total_attr_tokens
+        self.max_attr_size = int(max(self.attr_sizes))
+        self.head_vocab_size = self.token_offset + self.max_attr_size
+        use_bias = bool(getattr(args, "use_bias", False))
+        self.proj = nn.Linear(self.d_model, self.total_vocab_size, bias=use_bias)
+
+    @property
+    def weight(self) -> Tensor:
+        return self.proj.weight
+
+    def forward(self, x: Tensor) -> Tensor:
+        squeeze_seq = x.dim() == 2
+        if squeeze_seq:
+            x = x.unsqueeze(1)
+        if x.dim() != 3:
+            raise ValueError(
+                f"DecodeOctupleHead expects 2D [B, D] or 3D [B, S, D] tensor, got {tuple(x.shape)}."
+            )
+
+        batch_size, seq_len, _ = x.shape
+        raw = self.proj(x)
+        out = raw.new_full(
+            (batch_size, seq_len, self.tuple_size, self.head_vocab_size),
+            float("-inf"),
+        )
+        if self.token_offset > 0:
+            out[:, :, :, : self.token_offset] = raw[:, :, None, : self.token_offset]
+
+        cur = self.token_offset
+        for m, sz in enumerate(self.attr_sizes):
+            out[:, :, m, self.token_offset : self.token_offset + sz] = raw[:, :, cur : cur + sz]
+            cur += sz
+
+        if squeeze_seq:
+            return out.squeeze(1)
+        return out
         
 
 class DummyDecoder(nn.Module):
@@ -481,6 +542,7 @@ class MORTMDecoder(nn.Module):
     def __init__(self, args: MORTMArgs, progress):
         super(MORTMDecoder, self).__init__()
         self.num_layer = args.d_layer
+        self.grad_checkpoint_tokens: int = int(getattr(args, "grad_checkpoint_tokens", 16384))
         self.layers = nn.ModuleList([MORTMDecoderLayer(args, i, progress) for i in range(self.num_layer)])
         if args.normalize_type == "tanh":
             self.norm = NormTanh(args.d_model)
@@ -494,17 +556,40 @@ class MORTMDecoder(nn.Module):
                 encoder_x: Tensor = None, cu_seqlens_k=None, max_seqlen_k=None) -> Tensor:
 
         output = tgt
+        use_ckpt = (
+            self.training
+            and torch.is_grad_enabled()
+            and not is_save_cache
+            and self.grad_checkpoint_tokens > 0
+            and output.size(0) > self.grad_checkpoint_tokens
+        )
         for mod in self.layers:
             mod: MORTMDecoderLayer
-            output = mod(
-                output,
-                tgt_is_causal=tgt_is_causal,
-                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                batch_size=batch_size, indices=indices, is_save_cache=is_save_cache,
-                encoder_x=encoder_x,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_k=max_seqlen_k
-            )
+            if use_ckpt:
+                output = torch.utils.checkpoint.checkpoint(
+                    mod,
+                    output,
+                    tgt_is_causal,
+                    cu_seqlens,
+                    max_seqlen,
+                    batch_size,
+                    indices,
+                    False,
+                    encoder_x,
+                    cu_seqlens_k,
+                    max_seqlen_k,
+                    use_reentrant=False,
+                )
+            else:
+                output = mod(
+                    output,
+                    tgt_is_causal=tgt_is_causal,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    batch_size=batch_size, indices=indices, is_save_cache=is_save_cache,
+                    encoder_x=encoder_x,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_k=max_seqlen_k
+                )
 
         return self.norm(output)
 

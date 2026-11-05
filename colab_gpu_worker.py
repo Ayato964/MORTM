@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b4 Beta)
+colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b5 Beta)
 ===================================================================================
 モデルのアーキテクチャ (`MidiVision`, `AblationTransformer1`, `AblationTransformer2`,
-`MORTM5TrainSet`, `HybridMuonOptimizer`, `MORTM5MemmapDataset`) はすべて pip パッケージ
-`mortm` (`pip install --pre -U mortm`) から直接呼び出します。
+`OctupleTransformer`, `REMITransformer`, `MORTM5TrainSet`, `HybridMuonOptimizer`, `MORTM5MemmapDataset`)
+はすべて pip パッケージ `mortm` (`pip install --pre -U mortm`) から直接呼び出します。
 
 【Google Colab での起動手順】
 1. ランタイムを GPU (RTX PRO 6000 / A100 / L4) に設定し、以下を実行:
    !pip install -q -U "git+https://github.com/Ayato964/MORTM.git@mortm5-tokenizer-mac" fastapi uvicorn pycloudflared
-   # (PyPI 公開版を使う場合: !pip install -q --pre -U "mortm==5.0.0b4" vector-quantize-pytorch pretty_midi mido fastapi uvicorn pycloudflared)
+   # (PyPI 公開版を使う場合: !pip install -q --pre -U "mortm==5.0.0b5" vector-quantize-pytorch pretty_midi mido fastapi uvicorn pycloudflared)
 2. Google Drive をマウント (トークンデータやチェックポイントを Drive に置く場合):
    from google.colab import drive
    drive.mount('/content/drive')
@@ -21,6 +21,7 @@ colab_gpu_worker.py — Google Colab FastAPI Remote GPU Worker (MORTM v5.0.0b4 B
 
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+import atexit
 import copy
 import datetime
 import io
@@ -33,7 +34,7 @@ import threading
 import time
 import zlib
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -70,12 +71,17 @@ from mortm import (
     MidiVision,
     AblationTransformer1,
     AblationTransformer2,
+    OctupleTransformer,
     build_mortm5_ablation_model,
     MORTM5TrainSet,
     MORTM5MemmapDataset,
+    MORTM5SymbolicMemmapDataset,
     MORTM5Collate,
+    DynamicStepBatchPacker,
+    PackedOptimizerStep,
     resolve_ablation_subdir,
 )
+from mortm.train.datasets import _resolve_symbolic_split_dir
 from mortm.train.train import _compute_exact_epoch_optimizer_steps
 
 torch.set_float32_matmul_precision("high")
@@ -224,7 +230,111 @@ async def health():
 # 3. MORTM5 Autoregressive Transformer (Ablation & SyMIc Main) Endpoints
 # ============================================================
 _DRIVE_SAVE_LOCK = threading.Lock()
+_LAST_DRIVE_SAVE_THREAD: Optional[threading.Thread] = None
+_ACTIVE_OUTER_THREAD: Optional[threading.Thread] = None
+_OUTER_STOP_EVENT = threading.Event()
 _PREFETCH_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mortm5_prefetch")
+
+
+def _flush_pending_drive_save(timeout: Optional[float] = None) -> None:
+    """進行中の非同期チェックポイント書き込みスレッドがあれば完了まで待機する。"""
+    global _LAST_DRIVE_SAVE_THREAD
+    t = _LAST_DRIVE_SAVE_THREAD
+    if t is not None and t.is_alive() and t is not threading.current_thread():
+        t.join(timeout=timeout)
+
+
+def _stop_active_outer_batch(timeout: Optional[float] = None) -> bool:
+    """実行中の Outer Batch GPU ワーカースレッドがあれば協調停止シグナルを送り、ステップ境界で完了するまで待機する。"""
+    global _ACTIVE_OUTER_THREAD
+    t = _ACTIVE_OUTER_THREAD
+    if t is None or t is threading.current_thread():
+        return False
+    if t.is_alive():
+        _OUTER_STOP_EVENT.set()
+        t.join(timeout=timeout)
+    if not t.is_alive():
+        _ACTIVE_OUTER_THREAD = None
+    return True
+
+
+atexit.register(_flush_pending_drive_save)
+atexit.register(_stop_active_outer_batch)
+
+
+def _resolve_resume_checkpoint_path(
+    raw_path: str,
+    ablation_subdir: str,
+    allow_weights_only: bool = False,
+) -> str:
+    """
+    指定された再開パス（絶対パスまたはベース名）を解決する。
+    重み専用 `.pth` が渡された場合（元 `.pth` が削除済みで `.checkpoint.pt` のみ残存する場合を含む）、
+    フル状態 `.checkpoint.pt` をローカル・Google Drive 検索ディレクトリ全体から最優先で自動解決する。
+    """
+    cand_paths: List[str] = []
+    if raw_path.endswith(".pth") and not allow_weights_only:
+        cand_paths.append(raw_path[:-4] + ".checkpoint.pt")
+    cand_paths.append(raw_path)
+
+    for p in cand_paths:
+        if os.path.isfile(p):
+            if p != raw_path:
+                print(
+                    f"[CheckpointUpgrade] Auto-upgraded weights-only {os.path.basename(raw_path)} "
+                    f"-> {os.path.basename(p)} to preserve Muon/AdamW & step state.",
+                    flush=True,
+                )
+            return p
+
+    search_dirs = (
+        _get_drive_ckpt_dir(ablation_subdir),
+        os.path.join(_get_worker_dir(), ablation_subdir),
+        _get_worker_dir(),
+    )
+    for p in cand_paths:
+        base = os.path.basename(p)
+        for s_dir in search_dirs:
+            joined = os.path.join(s_dir, base)
+            if os.path.isfile(joined):
+                if base != os.path.basename(raw_path):
+                    print(
+                        f"[CheckpointUpgrade] Auto-upgraded weights-only {os.path.basename(raw_path)} "
+                        f"-> {base} in {s_dir}.",
+                        flush=True,
+                    )
+                return joined
+    return raw_path
+
+
+def _sync_scheduler_to_step(
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[Any],
+    restored_step: int,
+    base_lr: float,
+    fallback_sched_sd: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Warm-Restart や別スケジュール (`14,610 -> 3,865` Iso-FLOPs 分岐等) での再開時に、
+    現在の `scheduler.lr_lambdas` と `base_lr` に基づいて `restored_step` 時点の学習率を厳密再計算する。
+    """
+    if scheduler is None:
+        return
+    step_i = max(0, int(restored_step))
+    if hasattr(scheduler, "lr_lambdas") and getattr(scheduler, "lr_lambdas", None):
+        base_lrs = [float(base_lr) for _ in optimizer.param_groups]
+        scheduler.base_lrs = list(base_lrs)
+        scheduler.last_epoch = step_i
+        new_lrs = [
+            b_lr * float(lmbda(step_i))
+            for b_lr, lmbda in zip(base_lrs, scheduler.lr_lambdas)
+        ]
+        for pg, lr_val, b_lr in zip(optimizer.param_groups, new_lrs, base_lrs):
+            pg["initial_lr"] = b_lr
+            pg["lr"] = lr_val
+        scheduler._last_lr = list(new_lrs)
+    elif fallback_sched_sd is not None:
+        scheduler.load_state_dict(fallback_sched_sd)
 
 
 def _resolve_ablation_subdir(model_name: str = "", ablation_id: str = "") -> str:
@@ -458,6 +568,30 @@ class LocalTokenStagingService:
 _STAGING_SERVICE = LocalTokenStagingService()
 
 
+def _make_outer_batch_rng(seed: int, epoch: int, outer_idx: int) -> np.random.RandomState:
+    mixed = (int(seed) * 1000003 + int(epoch) * 10007 + int(outer_idx)) & 0x7FFFFFFF
+    return np.random.RandomState(mixed)
+
+
+def _decode_uploaded_sequences(raw_comp: bytes, pad_token_id: int = PAD_TOKEN_ID) -> Tuple[Dict[str, Any], Any]:
+    header_len = int.from_bytes(raw_comp[:4], byteorder="big")
+    header = json.loads(raw_comp[4 : 4 + header_len].decode("utf-8"))
+    decomp = zlib.decompress(raw_comp[4 + header_len :])
+    np_dtype = np.dtype(header.get("dtype", "int32"))
+    if header.get("format") == "csr_1d":
+        lengths = [int(x) for x in header.get("lengths", [])]
+        flat = np.frombuffer(decomp, dtype=np_dtype)
+        seqs: List[torch.Tensor] = []
+        cur = 0
+        for ln in lengths:
+            nxt = cur + ln
+            seqs.append(torch.from_numpy(flat[cur:nxt].astype(np.int64, copy=True)))
+            cur = nxt
+        return header, seqs
+    arr = np.frombuffer(decomp, dtype=np_dtype).copy().reshape(header["shape"])
+    return header, arr
+
+
 class PrefetchedMicroBatchLoader:
     """
     常駐スレッドプール (`_PREFETCH_POOL`) を用いて Memmap からマイクロバッチ単位で遅延読み込み・Collate・PinMemory を先読みするイテレータ。
@@ -473,6 +607,7 @@ class PrefetchedMicroBatchLoader:
         shuffle: bool = True,
         pin_memory: bool = False,
         prefetch_batches: int = 8,
+        rng: Optional[np.random.RandomState] = None,
     ) -> None:
         self.dataset = dataset
         self.batch_size = max(1, int(batch_size))
@@ -482,7 +617,8 @@ class PrefetchedMicroBatchLoader:
 
         idx_arr = np.asarray(indices, dtype=np.int64)
         if shuffle and len(idx_arr) > 1:
-            idx_arr = idx_arr[np.random.permutation(len(idx_arr))]
+            perm = rng.permutation(len(idx_arr)) if rng is not None else np.random.permutation(len(idx_arr))
+            idx_arr = idx_arr[perm]
         self._batch_slices: List[np.ndarray] = [
             idx_arr[pos : pos + self.batch_size]
             for pos in range(0, len(idx_arr), self.batch_size)
@@ -512,12 +648,79 @@ class PrefetchedMicroBatchLoader:
             queue.append(_PREFETCH_POOL.submit(self._build_one, self._batch_slices[next_submit]))
             next_submit += 1
 
-        while queue:
-            fut = queue.popleft()
-            if next_submit < total:
-                queue.append(_PREFETCH_POOL.submit(self._build_one, self._batch_slices[next_submit]))
-                next_submit += 1
-            yield fut.result()
+        try:
+            while queue:
+                fut = queue.popleft()
+                if next_submit < total:
+                    queue.append(_PREFETCH_POOL.submit(self._build_one, self._batch_slices[next_submit]))
+                    next_submit += 1
+                yield fut.result()
+        finally:
+            while queue:
+                queue.popleft().cancel()
+
+
+class PrefetchedDynamicStepLoader:
+    """
+    可変長系列（`Octuple-MMT`, `Multitrack-REMI`）向けに、1オプティマイザステップ（標準 256 セグメント = 4,096 小節）単位で
+    `DynamicStepBatchPacker` を常駐スレッドプール上で先読み実行するイテレータ。
+    """
+
+    def __init__(
+        self,
+        dataset: Union[Dataset, Sequence[torch.Tensor]],
+        indices: Sequence[int],
+        step_segments: int,
+        packer: DynamicStepBatchPacker,
+        collate_fn: Callable[[List[torch.Tensor]], Any],
+        shuffle: bool = True,
+        pin_memory: bool = False,
+        prefetch_steps: int = 4,
+        rng: Optional[np.random.RandomState] = None,
+    ) -> None:
+        self.dataset = dataset
+        self.step_segments = max(1, int(step_segments))
+        self.packer = packer
+        self.collate_fn = collate_fn
+        self.pin_memory = bool(pin_memory)
+        self.prefetch_steps = max(1, int(prefetch_steps))
+
+        idx_arr = np.asarray(indices, dtype=np.int64)
+        if shuffle and len(idx_arr) > 1:
+            perm = rng.permutation(len(idx_arr)) if rng is not None else np.random.permutation(len(idx_arr))
+            idx_arr = idx_arr[perm]
+        self._step_slices: List[np.ndarray] = [
+            idx_arr[pos : pos + self.step_segments]
+            for pos in range(0, len(idx_arr), self.step_segments)
+        ]
+
+    def __len__(self) -> int:
+        return len(self._step_slices)
+
+    def _build_step(self, step_idx_arr: np.ndarray) -> PackedOptimizerStep:
+        items = [self.dataset[int(i)] for i in step_idx_arr]
+        return self.packer.pack_sequences(items, collate_fn=self.collate_fn, pin_memory=self.pin_memory)
+
+    def __iter__(self) -> Iterator[PackedOptimizerStep]:
+        total = len(self._step_slices)
+        if total == 0:
+            return
+        queue: deque[Future] = deque()
+        next_submit = 0
+        while next_submit < min(total, self.prefetch_steps):
+            queue.append(_PREFETCH_POOL.submit(self._build_step, self._step_slices[next_submit]))
+            next_submit += 1
+
+        try:
+            while queue:
+                fut = queue.popleft()
+                if next_submit < total:
+                    queue.append(_PREFETCH_POOL.submit(self._build_step, self._step_slices[next_submit]))
+                    next_submit += 1
+                yield fut.result()
+        finally:
+            while queue:
+                queue.popleft().cancel()
 
 
 class ModelExecutionAdapter:
@@ -565,11 +768,36 @@ def _get_worker_dir() -> str:
     return work_dir
 
 
+def _has_split_files(dir_path: str, split: str) -> bool:
+    if not dir_path or not os.path.isdir(dir_path):
+        return False
+    return any(
+        os.path.isfile(os.path.join(dir_path, fname))
+        for fname in (
+            f"{split}_segments.npy",
+            f"{split}_tokens.bin",
+            f"{split}_tokens_complete.bin",
+        )
+    )
+
+
+def _resolve_colab_symbolic_split_dir(path: str, split: str = "train") -> str:
+    """`multitrack_remi` 未作成時や空フォルダ時に、スプリット単位で同階層の `octuple_mmt` へ自動フォールバックする。"""
+    if not path:
+        return path
+    if _has_split_files(path, split):
+        return path
+    resolved = _resolve_symbolic_split_dir(path, split)
+    if _has_split_files(resolved, split):
+        return resolved
+    return path
+
+
 @app.post("/mortm5/start_stage")
 async def mortm5_start_stage(request: Request):
     """Google Drive 上のトークンディレクトリをローカル NVMe SSD へ非同期ステージング開始する。"""
     payload = await request.json()
-    colab_split_dir = str(payload.get("colab_split_dir") or "").strip()
+    colab_split_dir = _resolve_colab_symbolic_split_dir(str(payload.get("colab_split_dir") or "").strip(), split="train")
     if not colab_split_dir or not os.path.isdir(colab_split_dir):
         return Response(
             content=json.dumps({"error": f"colab_split_dir not found: {colab_split_dir}"}),
@@ -610,7 +838,9 @@ async def mortm5_init(request: Request):
         raw = await request.body()
         payload = torch.load(io.BytesIO(zlib.decompress(raw)), map_location="cpu", weights_only=False)
 
-    # 既存モデルが GPU メモリを占有している場合は先に解放する
+    # 実行中のバックグラウンド GPU スレッドがあれば先に安全停止してから既存モデルを解放する
+    _stop_active_outer_batch()
+    _flush_pending_drive_save()
     if STATE.get("trainer") is not None or STATE.get("model") is not None:
         STATE["trainer"] = None
         STATE["exec_adapter"] = None
@@ -632,7 +862,17 @@ async def mortm5_init(request: Request):
     )
     STATE["ablation_subdir"] = ablation_subdir
 
-    colab_split_dir: Optional[str] = payload.get("colab_split_dir")
+    raw_colab_split_dir: Optional[str] = payload.get("colab_split_dir")
+    colab_split_dir: Optional[str] = (
+        _resolve_colab_symbolic_split_dir(raw_colab_split_dir, split="train")
+        if raw_colab_split_dir
+        else None
+    )
+    colab_val_src_dir: Optional[str] = (
+        _resolve_colab_symbolic_split_dir(raw_colab_split_dir, split="val")
+        if raw_colab_split_dir
+        else None
+    )
     stage_to_local: bool = bool(payload.get("stage_to_local", True))
     use_torch_compile: bool = bool(payload.get("use_torch_compile", False))
     stride: Optional[int] = payload.get("stride")
@@ -658,11 +898,19 @@ async def mortm5_init(request: Request):
         train_ds = MORTM5MemmapDataset.from_split_dir(
             token_dir=effective_split_dir, split="train", args=m_args, stride=stride
         )
-        val_tokens_path = os.path.join(effective_split_dir, "val_tokens.bin")
-        val_complete_path = os.path.join(effective_split_dir, "val_tokens_complete.bin")
-        if os.path.isfile(val_tokens_path) or os.path.isfile(val_complete_path):
+        effective_val_dir = effective_split_dir
+        if colab_val_src_dir and os.path.isdir(colab_val_src_dir):
+            if os.path.abspath(colab_val_src_dir) != os.path.abspath(colab_split_dir):
+                cached_val = _STAGING_SERVICE.resolve_cached_dir(colab_val_src_dir)
+                if cached_val is not None:
+                    effective_val_dir = cached_val
+                elif _STAGING_SERVICE.should_stage(colab_val_src_dir, enabled=stage_to_local):
+                    effective_val_dir = _STAGING_SERVICE.stage_sync(colab_val_src_dir)
+                else:
+                    effective_val_dir = colab_val_src_dir
+        if effective_val_dir and _has_split_files(effective_val_dir, "val"):
             val_ds = MORTM5MemmapDataset.from_split_dir(
-                token_dir=effective_split_dir, split="val", args=m_args, stride=val_stride
+                token_dir=effective_val_dir, split="val", args=m_args, stride=val_stride
             )
 
     # MORTM5TrainSet (AblationTransformer1/2 + HybridMuonOptimizer + Cosine/WSD Scheduler) の構築
@@ -670,8 +918,16 @@ async def mortm5_init(request: Request):
 
     # total_steps の決定とスケジューラ再構築
     explicit_total_steps = payload.get("total_steps")
+    explicit_train_windows = payload.get("train_windows")
+    sched_cfg = t_args.scheduler if isinstance(t_args.scheduler, dict) else {}
+    auto_total_steps = bool(sched_cfg.get("auto_total_steps", True))
+    cfg_total_steps = int(sched_cfg.get("total_steps", 0) or 0)
+    max_steps_limit = max(0, int(getattr(t_args, "max_steps", 0) or 0))
+
     if explicit_total_steps is not None and int(explicit_total_steps) > 0:
         total_steps = int(explicit_total_steps)
+    elif (not auto_total_steps) and cfg_total_steps > 0:
+        total_steps = cfg_total_steps
     elif train_ds is not None:
         steps_per_epoch = _compute_exact_epoch_optimizer_steps(
             num_windows=len(train_ds),
@@ -680,49 +936,96 @@ async def mortm5_init(request: Request):
             accumulation_steps=int(t_args.accumulation_steps),
         )
         total_steps = max(1, steps_per_epoch * max(1, int(t_args.num_epochs)))
+        if max_steps_limit > 0:
+            total_steps = min(total_steps, max_steps_limit)
+    elif explicit_train_windows is not None and int(explicit_train_windows) > 0:
+        steps_per_epoch = _compute_exact_epoch_optimizer_steps(
+            num_windows=int(explicit_train_windows),
+            big_batch_size=int(t_args.big_batch_size),
+            batch_size=int(t_args.batch_size),
+            accumulation_steps=int(t_args.accumulation_steps),
+        )
+        total_steps = max(1, steps_per_epoch * max(1, int(t_args.num_epochs)))
+        if max_steps_limit > 0:
+            total_steps = min(total_steps, max_steps_limit)
     else:
-        total_steps = int(t_args.scheduler.get("total_steps", 17500))
+        total_steps = cfg_total_steps if cfg_total_steps > 0 else (max_steps_limit if max_steps_limit > 0 else 17500)
 
     trainer.rebuild_scheduler(total_steps)
 
     # チェックポイントの復元 (指定パス または Google Drive サブディレクトリ内チェックポイント)
+    _flush_pending_drive_save()
     resumed_from: Optional[str] = None
     resumed_big_bs: Optional[int] = None
+    resumed_perm_block_bs: Optional[int] = None
+    optimizer_restored: bool = False
+    allow_weights_only_resume: bool = bool(payload.get("allow_weights_only_resume", False))
     resume_ckpt_path: Optional[str] = payload.get("resume_checkpoint_path")
     version_str = str(payload.get("version") or f"{m_args.name}_muon_cos").strip()
-    if resume_ckpt_path and not os.path.isfile(resume_ckpt_path):
-        cand_in_sub = os.path.join(_get_drive_ckpt_dir(ablation_subdir), os.path.basename(resume_ckpt_path))
-        if os.path.isfile(cand_in_sub):
-            resume_ckpt_path = cand_in_sub
+    if resume_ckpt_path:
+        resume_ckpt_path = _resolve_resume_checkpoint_path(
+            raw_path=resume_ckpt_path,
+            ablation_subdir=ablation_subdir,
+            allow_weights_only=allow_weights_only_resume,
+        )
 
     ckpt_data: Optional[Dict[str, Any]] = None
     if resume_ckpt_path and os.path.isfile(resume_ckpt_path):
         ckpt_data = torch.load(resume_ckpt_path, map_location="cpu", weights_only=False)
         resumed_from = resume_ckpt_path
+    elif resume_ckpt_path:
+        return {"error": f"resume_checkpoint_path not found: {resume_ckpt_path}"}
     elif payload.get("model_state_dict") is not None:
         ckpt_data = payload
         resumed_from = "uploaded_payload"
 
     if ckpt_data is not None:
-        sd = ckpt_data.get("model_state_dict", ckpt_data)
+        has_opt_sd = isinstance(ckpt_data, dict) and ckpt_data.get("optimizer_state_dict") is not None
+        if resume_ckpt_path and not has_opt_sd and not allow_weights_only_resume:
+            return {
+                "error": (
+                    f"Warm-restart checkpoint '{resume_ckpt_path}' is missing optimizer_state_dict "
+                    f"(use the .checkpoint.pt file or set allow_weights_only_resume=True for cold weight init)."
+                )
+            }
+        sd = ckpt_data.get("model_state_dict", ckpt_data) if isinstance(ckpt_data, dict) else ckpt_data
         trainer.model.load_state_dict(sd, strict=True)
-        if ckpt_data.get("optimizer_state_dict") is not None:
+        if has_opt_sd:
             trainer.optimizer.load_state_dict(ckpt_data["optimizer_state_dict"])
-        if ckpt_data.get("scheduler_state_dict") is not None and trainer.scheduler is not None:
-            trainer.scheduler.load_state_dict(ckpt_data["scheduler_state_dict"])
-        STATE["step"] = int(ckpt_data.get("optimizer_step", ckpt_data.get("step", 0)))
-        STATE["epoch"] = int(ckpt_data.get("epoch", 0))
-        STATE["outer_batch_idx"] = int(ckpt_data.get("outer_batch_idx", 0))
-        STATE["verification_loss"] = float(ckpt_data.get("verification_loss", 0.0))
-        trainer.all_tokens.fill_(int(ckpt_data.get("all_tokens", 0)))
-        trainer.last_val_calc_tokens = int(ckpt_data.get("last_val_calc_tokens", 0))
-        saved_t_cfg = ckpt_data.get("train_config")
+            optimizer_restored = True
+        restored_step = int(ckpt_data.get("optimizer_step", ckpt_data.get("step", 0))) if isinstance(ckpt_data, dict) else 0
+        _sync_scheduler_to_step(
+            optimizer=trainer.optimizer,
+            scheduler=trainer.scheduler,
+            restored_step=restored_step,
+            base_lr=float(t_args.lr_param),
+            fallback_sched_sd=ckpt_data.get("scheduler_state_dict") if isinstance(ckpt_data, dict) else None,
+        )
+        STATE["step"] = restored_step
+        STATE["epoch"] = int(ckpt_data.get("epoch", 0)) if isinstance(ckpt_data, dict) else 0
+        STATE["outer_batch_idx"] = int(ckpt_data.get("outer_batch_idx", 0)) if isinstance(ckpt_data, dict) else 0
+        STATE["epoch_trained_windows"] = (
+            int(ckpt_data["epoch_trained_windows"])
+            if (isinstance(ckpt_data, dict) and ckpt_data.get("epoch_trained_windows") is not None)
+            else None
+        )
+        STATE["verification_loss"] = float(ckpt_data.get("verification_loss", 0.0)) if isinstance(ckpt_data, dict) else 0.0
+        trainer.all_tokens.fill_(int(ckpt_data.get("all_tokens", 0)) if isinstance(ckpt_data, dict) else 0)
+        trainer.last_val_calc_tokens = int(ckpt_data.get("last_val_calc_tokens", 0)) if isinstance(ckpt_data, dict) else 0
+        saved_t_cfg = ckpt_data.get("train_config") if isinstance(ckpt_data, dict) else None
         if isinstance(saved_t_cfg, dict) and saved_t_cfg.get("big_batch_size") is not None:
             resumed_big_bs = int(saved_t_cfg["big_batch_size"])
+        if isinstance(ckpt_data, dict) and ckpt_data.get("epoch_perm_block_bs") is not None:
+            resumed_perm_block_bs = int(ckpt_data["epoch_perm_block_bs"])
+        else:
+            resumed_perm_block_bs = resumed_big_bs
+        STATE["epoch_perm_block_bs"] = resumed_perm_block_bs or int(t_args.big_batch_size)
     else:
         STATE["step"] = 0
         STATE["epoch"] = 0
         STATE["outer_batch_idx"] = 0
+        STATE["epoch_trained_windows"] = 0
+        STATE["epoch_perm_block_bs"] = int(t_args.big_batch_size)
         STATE["verification_loss"] = 0.0
         if bool(payload.get("clean_old_checkpoints", False)) and version_str:
             prefix = f"MORTM5.{version_str}"
@@ -747,9 +1050,11 @@ async def mortm5_init(request: Request):
     STATE["t_args"] = t_args
     STATE["train_ds"] = train_ds
     STATE["val_ds"] = val_ds
+    STATE["seed"] = int(payload.get("seed", 42))
+    STATE["controller_pre_shuffles"] = bool(payload.get("controller_pre_shuffles", False))
     STATE["collate_fn"] = MORTM5Collate(
         mode=m_args.model_mode,
-        vq_groups=m_args.vq_groups,
+        vq_groups=m_args.step_unit_width,
         pad_token_id=PAD_TOKEN_ID,
     )
     STATE["total_steps"] = total_steps
@@ -789,10 +1094,13 @@ async def mortm5_init(request: Request):
         "step": STATE["step"],
         "epoch": STATE["epoch"],
         "outer_batch_idx": STATE["outer_batch_idx"],
+        "epoch_trained_windows": STATE.get("epoch_trained_windows"),
+        "optimizer_restored": optimizer_restored,
         "all_tokens": int(trainer.get_synced_tokens()),
         "verification_loss": float(STATE.get("verification_loss", 0.0)),
         "resumed_from": resumed_from,
         "resumed_big_batch_size": resumed_big_bs,
+        "resumed_epoch_perm_block_bs": resumed_perm_block_bs,
     }
 
 
@@ -808,6 +1116,7 @@ def _run_mortm5_outer_batch_worker(
     uploaded_comp: Optional[bytes],
     outer_idx: int,
     epoch: int,
+    pre_shuffled: bool = False,
 ):
     """
     Colab GPU 上で 1 Outer Batch を実行するバックグラウンドワーカー。
@@ -826,7 +1135,147 @@ def _run_mortm5_outer_batch_worker(
 
         batch_size = max(1, int(t_args.batch_size))
         accum_steps = max(1, int(t_args.accumulation_steps))
-        amp_dtype = torch.bfloat16 if DEVICE.type in ("cuda", "cpu") else torch.float16
+        max_micro_steps = max(0, int(getattr(t_args, "max_micro_steps", 0) or 0))
+        max_steps_limit = max(0, int(getattr(t_args, "max_steps", 0) or 0))
+        unit_width = max(1, int(getattr(STATE["m_args"], "step_unit_width", 1)))
+        effective_shuffle = bool(t_args.shuffle) and (not bool(pre_shuffled))
+        step_rng = _make_outer_batch_rng(seed=int(STATE.get("seed", 42)), epoch=epoch, outer_idx=outer_idx)
+        amp_dtype = torch.bfloat16
+        big_bs_cfg = max(1, int(t_args.big_batch_size))
+        if int(epoch) != int(STATE.get("epoch", 0)):
+            STATE["epoch_trained_windows"] = 0
+            STATE["epoch_perm_block_bs"] = big_bs_cfg
+        elif STATE.get("epoch_trained_windows") is None:
+            STATE["epoch_trained_windows"] = int(outer_idx) * big_bs_cfg
+        elif int(STATE.get("step", 0)) == 0 and int(outer_idx) > 0 and int(STATE.get("epoch_trained_windows") or 0) == 0:
+            STATE["epoch_trained_windows"] = int(outer_idx) * big_bs_cfg
+        STATE["epoch"] = int(epoch)
+
+        if max_micro_steps > 0:
+            packer = DynamicStepBatchPacker(
+                max_micro_steps=max_micro_steps,
+                max_batch_size=batch_size,
+                unit_width=unit_width,
+                pad_token_id=PAD_TOKEN_ID,
+            )
+            step_segments = batch_size * accum_steps
+            if window_indices is not None and STATE.get("train_ds") is not None:
+                step_loader = PrefetchedDynamicStepLoader(
+                    dataset=STATE["train_ds"],
+                    indices=window_indices,
+                    step_segments=step_segments,
+                    packer=packer,
+                    collate_fn=collate_fn,
+                    shuffle=effective_shuffle,
+                    pin_memory=(DEVICE.type == "cuda"),
+                    prefetch_steps=4,
+                    rng=step_rng,
+                )
+            elif uploaded_comp:
+                header, decoded = _decode_uploaded_sequences(uploaded_comp, pad_token_id=PAD_TOKEN_ID)
+                del uploaded_comp
+                if isinstance(decoded, list):
+                    seq_list = decoded
+                else:
+                    seq_list = [torch.from_numpy(decoded[i]).to(dtype=torch.long) for i in range(len(decoded))]
+                step_loader = PrefetchedDynamicStepLoader(
+                    dataset=seq_list,
+                    indices=list(range(len(seq_list))),
+                    step_segments=step_segments,
+                    packer=packer,
+                    collate_fn=collate_fn,
+                    shuffle=effective_shuffle,
+                    pin_memory=(DEVICE.type == "cuda"),
+                    prefetch_steps=4,
+                    rng=step_rng,
+                )
+            else:
+                raise RuntimeError("Neither window_indices nor uploaded token tensor was provided.")
+
+            optimizer.zero_grad(set_to_none=True)
+            step_loss_sum_gpu = torch.zeros((), device=DEVICE, dtype=torch.float32)
+            step_start_tokens_gpu = trainer.all_tokens.clone()
+
+            for step_pack in step_loader:
+                if _OUTER_STOP_EVENT.is_set() or (0 < max_steps_limit <= int(STATE["step"])):
+                    break
+                denom = float(max(1, int(step_pack.total_valid_targets)))
+                step_loss_sum_gpu.zero_()
+                aborted_mid_step = False
+                for sub_pack in step_pack.sub_batches:
+                    if _OUTER_STOP_EVENT.is_set():
+                        optimizer.zero_grad(set_to_none=True)
+                        trainer.all_tokens.copy_(step_start_tokens_gpu)
+                        aborted_mid_step = True
+                        break
+                    with torch.autocast(device_type=DEVICE.type, dtype=amp_dtype):
+                        if exec_adapter is not None:
+                            logits_flat, target_flat = exec_adapter.forward_epoch_fc(trainer, sub_pack)
+                        else:
+                            logits_flat, target_flat = trainer.epoch_fc(model, sub_pack, None)
+                    with torch.autocast(device_type=DEVICE.type, enabled=False):
+                        sum_loss = F.cross_entropy(
+                            logits_flat.float(),
+                            target_flat,
+                            ignore_index=PAD_TOKEN_ID,
+                            reduction="sum",
+                        )
+                        scaled_loss = sum_loss / denom
+                    scaled_loss.backward()
+                    step_loss_sum_gpu += sum_loss.detach()
+
+                if aborted_mid_step:
+                    break
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                STATE["step"] += 1
+                step_win_count = sum(
+                    int(sb[0].size(0) if isinstance(sb, (tuple, list)) else sb.size(0))
+                    for sb in step_pack.sub_batches
+                )
+                STATE["epoch_trained_windows"] = int(STATE.get("epoch_trained_windows") or 0) + step_win_count
+                step_toks_gpu = (trainer.all_tokens - step_start_tokens_gpu).clamp(min=0)
+                loss_sum_val, step_toks_val, total_toks_val = (
+                    float(step_loss_sum_gpu.item()),
+                    int(step_toks_gpu.item()),
+                    int(trainer.all_tokens.item()),
+                )
+                mean_step_loss = loss_sum_val / denom
+                ppl = math.exp(min(20.0, mean_step_loss))
+                lr_muon, lr_adamw = _extract_lrs(optimizer)
+
+                step_metric = {
+                    "step": int(STATE["step"]),
+                    "outer_idx": int(outer_idx),
+                    "epoch": int(epoch),
+                    "loss": mean_step_loss,
+                    "ppl": ppl,
+                    "lr_muon": lr_muon,
+                    "lr_adamw": lr_adamw,
+                    "step_tokens": step_toks_val,
+                    "all_tokens": total_toks_val,
+                }
+                STATE["mortm5_job_results"].append(step_metric)
+                if STATE["step"] % 20 == 0:
+                    print(
+                        f"[MORTM5 Step {STATE['step']}/{STATE['total_steps']}] "
+                        f"Loss:{mean_step_loss:.4f} | PPL:{ppl:.2f} | "
+                        f"LR(Muon):{lr_muon:.2e} | Tokens:{total_toks_val/1e6:.2f}M",
+                        flush=True,
+                    )
+                step_start_tokens_gpu.copy_(trainer.all_tokens)
+                if _OUTER_STOP_EVENT.is_set() or (0 < max_steps_limit <= int(STATE["step"])):
+                    break
+
+            STATE["outer_batch_idx"] = int(outer_idx)
+            STATE["epoch"] = int(epoch)
+            STATE["mortm5_job_done"] = True
+            return
 
         # データソースの構築 (Mode A: Colab ローカル SSD 上の MemmapDataset / Mode B: Mac からアップロードされたトークン配列)
         if window_indices is not None and STATE.get("train_ds") is not None:
@@ -835,25 +1284,31 @@ def _run_mortm5_outer_batch_worker(
                 indices=window_indices,
                 batch_size=batch_size,
                 collate_fn=collate_fn,
-                shuffle=True,
+                shuffle=effective_shuffle,
                 pin_memory=(DEVICE.type == "cuda"),
                 prefetch_batches=8,
+                rng=step_rng,
             )
-            batches_iter = inner_loader
+            batches_iter: Any = inner_loader
             total_micro_batches = len(inner_loader)
         elif uploaded_comp:
-            header_len = int.from_bytes(uploaded_comp[:4], byteorder="big")
-            header = json.loads(uploaded_comp[4 : 4 + header_len].decode("utf-8"))
-            decomp = zlib.decompress(uploaded_comp[4 + header_len :])
-            np_dtype = np.dtype(header.get("dtype", "int32"))
-            arr = np.frombuffer(decomp, dtype=np_dtype).copy().reshape(header["shape"])
-            del uploaded_comp, decomp
-            perm = np.random.permutation(len(arr))
-            arr = arr[perm]
-            micro_list = [
-                torch.from_numpy(arr[i : i + batch_size]).to(dtype=torch.long)
-                for i in range(0, len(arr), batch_size)
-            ]
+            header, decoded = _decode_uploaded_sequences(uploaded_comp, pad_token_id=PAD_TOKEN_ID)
+            del uploaded_comp
+            if isinstance(decoded, list):
+                if effective_shuffle and len(decoded) > 1:
+                    perm = step_rng.permutation(len(decoded)).tolist()
+                    decoded = [decoded[p] for p in perm]
+                micro_list: List[Any] = [
+                    collate_fn(decoded[i : i + batch_size]) for i in range(0, len(decoded), batch_size)
+                ]
+            else:
+                arr = decoded
+                if effective_shuffle and len(arr) > 1:
+                    arr = arr[step_rng.permutation(len(arr))]
+                micro_list = [
+                    torch.from_numpy(arr[i : i + batch_size]).to(dtype=torch.long)
+                    for i in range(0, len(arr), batch_size)
+                ]
             batches_iter = micro_list
             total_micro_batches = len(micro_list)
         else:
@@ -863,8 +1318,17 @@ def _run_mortm5_outer_batch_worker(
         accum_loss_gpu = torch.zeros((), device=DEVICE, dtype=torch.float32)
         step_start_tokens_gpu = trainer.all_tokens.clone()
         accum_micro_count = 0
+        accum_win_count = 0
 
         for b_idx, pack in enumerate(batches_iter):
+            if _OUTER_STOP_EVENT.is_set() or (0 < max_steps_limit <= int(STATE["step"])):
+                if accum_micro_count > 0:
+                    optimizer.zero_grad(set_to_none=True)
+                    trainer.all_tokens.copy_(step_start_tokens_gpu)
+                    accum_micro_count = 0
+                    accum_win_count = 0
+                break
+            pack_bsz = int(pack[0].size(0) if isinstance(pack, (tuple, list)) else pack.size(0))
             with torch.autocast(device_type=DEVICE.type, dtype=amp_dtype):
                 if exec_adapter is not None:
                     logits_flat, target_flat = exec_adapter.forward_epoch_fc(trainer, pack)
@@ -898,6 +1362,7 @@ def _run_mortm5_outer_batch_worker(
 
             accum_loss_gpu += raw_loss.detach()
             accum_micro_count += 1
+            accum_win_count += pack_bsz
 
             if will_step:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -907,6 +1372,8 @@ def _run_mortm5_outer_batch_worker(
                 optimizer.zero_grad(set_to_none=True)
 
                 STATE["step"] += 1
+                STATE["epoch_trained_windows"] = int(STATE.get("epoch_trained_windows") or 0) + accum_win_count
+                accum_win_count = 0
                 # Optimizer Step 境界で 1 回だけまとめて CPU へ同期読み出しする
                 step_toks_gpu = (trainer.all_tokens - step_start_tokens_gpu).clamp(min=0)
                 loss_sum_val, step_toks_val, total_toks_val = (
@@ -940,6 +1407,8 @@ def _run_mortm5_outer_batch_worker(
                 accum_loss_gpu.zero_()
                 step_start_tokens_gpu.copy_(trainer.all_tokens)
                 accum_micro_count = 0
+                if _OUTER_STOP_EVENT.is_set() or (0 < max_steps_limit <= int(STATE["step"])):
+                    break
 
         STATE["outer_batch_idx"] = int(outer_idx)
         STATE["epoch"] = int(epoch)
@@ -953,6 +1422,9 @@ def _run_mortm5_outer_batch_worker(
 
 @app.post("/mortm5/start_outer_batch")
 async def mortm5_start_outer_batch(request: Request):
+    global _ACTIVE_OUTER_THREAD
+    _stop_active_outer_batch()
+
     content_type = request.headers.get("content-type", "")
     body_json: Dict[str, Any] = {}
     if "application/json" in content_type:
@@ -961,6 +1433,11 @@ async def mortm5_start_outer_batch(request: Request):
     outer_idx = int(body_json.get("outer_idx", request.query_params.get("outer_idx", "0")))
     epoch = int(body_json.get("epoch", request.query_params.get("epoch", "0")))
     window_indices: Optional[List[int]] = body_json.get("window_indices")
+    caller_supplied_data = (window_indices is not None) or bool(STATE.get("upload_parts"))
+    if "pre_shuffled" in body_json and body_json["pre_shuffled"] is not None:
+        pre_shuffled = bool(body_json["pre_shuffled"])
+    else:
+        pre_shuffled = bool(STATE.get("controller_pre_shuffles", False)) and caller_supplied_data
 
     # window_indices が直接渡されず outer_idx & big_batch_size 指定の場合、Colab 側でスライス可能
     if window_indices is None and STATE.get("train_ds") is not None and not STATE.get("upload_parts"):
@@ -978,12 +1455,14 @@ async def mortm5_start_outer_batch(request: Request):
     STATE["mortm5_job_results"] = []
     STATE["mortm5_job_done"] = False
     STATE["mortm5_job_error"] = None
+    _OUTER_STOP_EVENT.clear()
 
     t = threading.Thread(
         target=_run_mortm5_outer_batch_worker,
-        args=(window_indices, uploaded_comp, outer_idx, epoch),
+        args=(window_indices, uploaded_comp, outer_idx, epoch, pre_shuffled),
         daemon=True,
     )
+    _ACTIVE_OUTER_THREAD = t
     t.start()
     return {
         "status": "started",
@@ -1013,6 +1492,7 @@ async def mortm5_poll_outer_batch(request: Request):
 @app.post("/mortm5/validate")
 async def mortm5_validate(request: Request):
     """Colab GPU 上で検証セット (`val_ds` またはアップロードされたトークン) の CrossEntropy 損失と PPL をゼロ同期ループで計算する。"""
+    _stop_active_outer_batch()
     trainer: MORTM5TrainSet = STATE["trainer"]
     exec_adapter: Optional[ModelExecutionAdapter] = STATE.get("exec_adapter")
     t_args: TrainArgs = STATE["t_args"]
@@ -1020,10 +1500,101 @@ async def mortm5_validate(request: Request):
     model = trainer.model
 
     max_batches = int(request.query_params.get("max_batches", "0"))
-    amp_dtype = torch.bfloat16 if DEVICE.type in ("cuda", "cpu") else torch.float16
+    amp_dtype = torch.bfloat16
     bs = max(1, int(t_args.batch_size))
+    max_micro_steps = max(0, int(getattr(t_args, "max_micro_steps", 0) or 0))
+    unit_width = max(1, int(getattr(STATE["m_args"], "step_unit_width", 1)))
 
     val_ds: Optional[MORTM5MemmapDataset] = STATE.get("val_ds")
+    if max_micro_steps > 0:
+        packer = DynamicStepBatchPacker(
+            max_micro_steps=max_micro_steps,
+            max_batch_size=bs,
+            unit_width=unit_width,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+        chunk_segs = bs * max(1, int(t_args.accumulation_steps))
+        if val_ds is not None:
+            max_items = (max_batches * bs) if max_batches > 0 else len(val_ds)
+            val_indices = list(range(min(len(val_ds), max_items)))
+            step_iter: Any = PrefetchedDynamicStepLoader(
+                dataset=val_ds,
+                indices=val_indices,
+                step_segments=chunk_segs,
+                packer=packer,
+                collate_fn=collate_fn,
+                shuffle=False,
+                pin_memory=(DEVICE.type == "cuda"),
+                prefetch_steps=4,
+            )
+        elif STATE.get("upload_parts"):
+            raw_comp = b"".join(STATE["upload_parts"])
+            STATE["upload_parts"] = []
+            _, decoded = _decode_uploaded_sequences(raw_comp, pad_token_id=PAD_TOKEN_ID)
+            seq_list = (
+                decoded
+                if isinstance(decoded, list)
+                else [torch.from_numpy(decoded[i]).to(dtype=torch.long) for i in range(len(decoded))]
+            )
+            if max_batches > 0:
+                seq_list = seq_list[: max_batches * bs]
+            step_iter = PrefetchedDynamicStepLoader(
+                dataset=seq_list,
+                indices=list(range(len(seq_list))),
+                step_segments=chunk_segs,
+                packer=packer,
+                collate_fn=collate_fn,
+                shuffle=False,
+                pin_memory=(DEVICE.type == "cuda"),
+                prefetch_steps=4,
+            )
+        else:
+            return {"val_loss": 0.0, "val_ppl": 1.0, "val_tokens": 0, "step": int(STATE["step"])}
+
+        was_training = model.training
+        model.eval()
+        acc_dtype = torch.float64 if DEVICE.type in ("cuda", "cpu") else torch.float32
+        total_loss_sum_gpu = torch.zeros((), device=DEVICE, dtype=acc_dtype)
+        val_tokens_gpu = torch.zeros((), device=DEVICE, dtype=torch.long)
+        n_subbatches = 0
+
+        with torch.no_grad():
+            for step_pack in step_iter:
+                for sub_pack in step_pack.sub_batches:
+                    with torch.autocast(device_type=DEVICE.type, dtype=amp_dtype):
+                        if exec_adapter is not None:
+                            logits_flat, target_flat = exec_adapter.forward_epoch_fc(trainer, sub_pack)
+                        else:
+                            logits_flat, target_flat = trainer.epoch_fc(model, sub_pack, None)
+                    valid_cnt = (target_flat != PAD_TOKEN_ID).sum()
+                    with torch.autocast(device_type=DEVICE.type, enabled=False):
+                        sum_loss = F.cross_entropy(
+                            logits_flat.float(),
+                            target_flat,
+                            ignore_index=PAD_TOKEN_ID,
+                            reduction="sum",
+                        )
+                    total_loss_sum_gpu += sum_loss.to(dtype=acc_dtype)
+                    val_tokens_gpu += valid_cnt
+                    n_subbatches += 1
+
+        if was_training:
+            model.train()
+
+        val_tokens = int(val_tokens_gpu.item())
+        val_loss = float(total_loss_sum_gpu.item()) / max(1, val_tokens)
+        val_ppl = math.exp(min(20.0, val_loss))
+        STATE["verification_loss"] = val_loss
+        trainer.last_val_calc_tokens = int(trainer.get_synced_tokens())
+        return {
+            "val_loss": val_loss,
+            "val_ppl": val_ppl,
+            "val_tokens": val_tokens,
+            "val_batches": n_subbatches,
+            "step": int(STATE["step"]),
+            "all_tokens": int(trainer.get_synced_tokens()),
+        }
+
     if val_ds is not None:
         max_items = (max_batches * bs) if max_batches > 0 else len(val_ds)
         val_indices = range(min(len(val_ds), max_items))
@@ -1039,19 +1610,20 @@ async def mortm5_validate(request: Request):
     elif STATE.get("upload_parts"):
         raw_comp = b"".join(STATE["upload_parts"])
         STATE["upload_parts"] = []
-        header_len = int.from_bytes(raw_comp[:4], byteorder="big")
-        header = json.loads(raw_comp[4 : 4 + header_len].decode("utf-8"))
-        decomp = zlib.decompress(raw_comp[4 + header_len :])
-        np_dtype = np.dtype(header.get("dtype", "int32"))
-        arr = np.frombuffer(decomp, dtype=np_dtype).copy().reshape(header["shape"])
-        batches_iter = [torch.from_numpy(arr[i : i + bs]).to(dtype=torch.long) for i in range(0, len(arr), bs)]
+        _, decoded = _decode_uploaded_sequences(raw_comp, pad_token_id=PAD_TOKEN_ID)
+        if max_batches > 0:
+            decoded = decoded[: max_batches * bs]
+        if isinstance(decoded, list):
+            batches_iter = [collate_fn(decoded[i : i + bs]) for i in range(0, len(decoded), bs)]
+        else:
+            batches_iter = [torch.from_numpy(decoded[i : i + bs]).to(dtype=torch.long) for i in range(0, len(decoded), bs)]
     else:
         return {"val_loss": 0.0, "val_ppl": 1.0, "val_tokens": 0, "step": int(STATE["step"])}
 
     was_training = model.training
     model.eval()
     acc_dtype = torch.float64 if DEVICE.type in ("cuda", "cpu") else torch.float32
-    loss_sum_gpu = torch.zeros((), device=DEVICE, dtype=acc_dtype)
+    total_loss_sum_gpu = torch.zeros((), device=DEVICE, dtype=acc_dtype)
     n_valid_batches_gpu = torch.zeros((), device=DEVICE, dtype=torch.long)
     val_tokens_gpu = torch.zeros((), device=DEVICE, dtype=torch.long)
 
@@ -1072,9 +1644,8 @@ async def mortm5_validate(request: Request):
                     ignore_index=PAD_TOKEN_ID,
                     reduction="sum",
                 )
-                batch_mean_loss = (sum_loss / valid_cnt.clamp(min=1).to(dtype=torch.float32)).to(dtype=acc_dtype)
             has_valid = valid_cnt > 0
-            loss_sum_gpu += torch.where(has_valid, batch_mean_loss, torch.zeros_like(batch_mean_loss))
+            total_loss_sum_gpu += sum_loss.to(dtype=acc_dtype)
             n_valid_batches_gpu += has_valid.to(dtype=torch.long)
             val_tokens_gpu += valid_cnt
 
@@ -1083,8 +1654,9 @@ async def mortm5_validate(request: Request):
 
     n_batches = int(n_valid_batches_gpu.item())
     val_tokens = int(val_tokens_gpu.item())
-    val_loss = float(loss_sum_gpu.item()) / max(1, n_batches)
+    val_loss = float(total_loss_sum_gpu.item()) / max(1, val_tokens)
     val_ppl = math.exp(min(20.0, val_loss))
+    STATE["verification_loss"] = val_loss
     trainer.last_val_calc_tokens = int(trainer.get_synced_tokens())
     return {
         "val_loss": val_loss,
@@ -1102,6 +1674,8 @@ async def mortm5_save_ckpt(request: Request):
     MORTM5 チェックポイントを Google Drive のアブレーション/実験サブディレクトリに直接保存する。
     Optimizer state も事前に CPU メモリへデタッチしてクローンするため、GPU VRAM スパイクや CUDA ストリーム競合が発生しない。
     """
+    # Ctrl+C 等の緊急保存時でも GPU ワーカースレッドが optimizer.step() の途中で競合しないよう先に安全停止・合流させる
+    _stop_active_outer_batch()
     trainer: MORTM5TrainSet = STATE["trainer"]
     m_args: MORTM5Args = STATE["m_args"]
     t_args: TrainArgs = STATE["t_args"]
@@ -1120,6 +1694,16 @@ async def mortm5_save_ckpt(request: Request):
 
     step_now = int(STATE["step"])
     tokens_now = int(trainer.get_synced_tokens())
+    same_worker_epoch = int(epoch) == int(STATE.get("epoch", 0))
+    ckpt_outer_idx = outer_idx if same_worker_epoch else 0
+    ckpt_epoch_trained_wins = (
+        STATE.get("epoch_trained_windows") if same_worker_epoch else 0
+    )
+    ckpt_epoch_perm_block_bs = (
+        STATE.get("epoch_perm_block_bs")
+        if same_worker_epoch
+        else max(1, int(t_args.big_batch_size))
+    )
     cpu_model_sd = {k: v.detach().to(device="cpu", copy=True) for k, v in trainer.model.state_dict().items()}
     cpu_opt_sd = _detach_state_to_cpu(trainer.optimizer.state_dict())
     cpu_sched_sd = _detach_state_to_cpu(trainer.scheduler.state_dict()) if trainer.scheduler is not None else None
@@ -1129,7 +1713,9 @@ async def mortm5_save_ckpt(request: Request):
         "optimizer_state_dict": cpu_opt_sd,
         "scheduler_state_dict": cpu_sched_sd,
         "epoch": epoch,
-        "outer_batch_idx": outer_idx,
+        "outer_batch_idx": ckpt_outer_idx,
+        "epoch_trained_windows": ckpt_epoch_trained_wins,
+        "epoch_perm_block_bs": ckpt_epoch_perm_block_bs,
         "total_outer_batches": total_outer,
         "optimizer_step": step_now,
         "all_tokens": tokens_now,
@@ -1148,16 +1734,22 @@ async def mortm5_save_ckpt(request: Request):
     drive_mounted = os.path.exists("/content/drive/MyDrive") or bool(os.environ.get("MORTM5_DRIVE_CKPT_DIR"))
     drive_dir = _get_drive_ckpt_dir(ablation_subdir)
     dst_ckpt_path = os.path.join(drive_dir, f"MORTM5.{version}.checkpoint.pt")
+    ms_ckpt_fname = (
+        f"MORTM5.{version}_{milestone_tag}_step{step_now}.checkpoint.pt"
+        if (milestone_tag and milestone_tag != "pct100")
+        else ""
+    )
+    milestone_ckpt_path: Optional[str] = None
 
     if drive_mounted:
-        def _write_to_drive_subdir(ckpt_obj, model_sd, target_dir, ver, s_now, m_tag):
+        def _write_to_drive_subdir(ckpt_obj, model_sd, target_dir, ver, s_now, m_tag, ms_ckpt_name):
             import tempfile
             with _DRIVE_SAVE_LOCK:
                 os.makedirs(target_dir, exist_ok=True)
                 dst_pth = os.path.join(target_dir, f"MORTM5.{ver}_latest.pth")
                 dst_ckpt = os.path.join(target_dir, f"MORTM5.{ver}.checkpoint.pt")
 
-                # 1. 最優先: 推論・評価用の軽量モデル重み (_latest.pth, ~374MB) を最初に独立保存
+                # 1. 最優先: 推論・評価用の軽量モデル重み (_latest.pth) を最初に独立保存
                 tmp_local_pth = os.path.join(tempfile.gettempdir(), f"mortm5_{ver}_latest_{s_now}.pth.tmp")
                 try:
                     torch.save(model_sd, tmp_local_pth)
@@ -1170,7 +1762,6 @@ async def mortm5_save_ckpt(request: Request):
                             print(f"[Drive Milestone Save Warning ({target_dir})] {me}", flush=True)
                 except Exception as e:
                     print(f"[Drive Model Save Error ({target_dir})] {e}", flush=True)
-                    # Drive 書き込み失敗時は /content に退避してモデル消失を防止
                     fallback_pth = os.path.join(_get_worker_dir(), f"MORTM5.{ver}_latest.pth")
                     try:
                         shutil.copy2(tmp_local_pth, fallback_pth)
@@ -1183,20 +1774,35 @@ async def mortm5_save_ckpt(request: Request):
                         except OSError:
                             pass
 
-                # 2. 再開用フルチェックポイント (.checkpoint.pt, ~1.15GB) を別ブロックで保存
+                # 2. 再開用フルチェックポイント (.checkpoint.pt) + 非100%マイルストーン分岐用フルチェックポイントを保存
                 tmp_local_ckpt = os.path.join(tempfile.gettempdir(), f"mortm5_{ver}_ckpt_{s_now}.pt.tmp")
                 try:
                     torch.save(ckpt_obj, tmp_local_ckpt)
                     shutil.copy2(tmp_local_ckpt, dst_ckpt)
+                    if ms_ckpt_name:
+                        ms_ckpt_dst = os.path.join(target_dir, ms_ckpt_name)
+                        shutil.copy2(tmp_local_ckpt, ms_ckpt_dst)
                 except Exception as e:
-                    print(f"[Drive Full-Ckpt Save Warning ({target_dir})] {e} -> retrying without optimizer state", flush=True)
+                    print(
+                        f"[Drive Full-Ckpt Save Error ({target_dir})] {e} -> preserving full checkpoint in local worker dir",
+                        flush=True,
+                    )
                     try:
-                        lite_ckpt = dict(ckpt_obj)
-                        lite_ckpt["optimizer_state_dict"] = None
-                        torch.save(lite_ckpt, tmp_local_ckpt)
-                        shutil.copy2(tmp_local_ckpt, dst_ckpt)
-                    except Exception as e2:
-                        print(f"[Drive Lite-Ckpt Save Error ({target_dir})] {e2}", flush=True)
+                        local_fb_dir = os.path.join(_get_worker_dir(), ablation_subdir)
+                        os.makedirs(local_fb_dir, exist_ok=True)
+                        if os.path.exists(tmp_local_ckpt):
+                            shutil.copy2(tmp_local_ckpt, os.path.join(local_fb_dir, f"MORTM5.{ver}.checkpoint.pt"))
+                            if ms_ckpt_name:
+                                shutil.copy2(tmp_local_ckpt, os.path.join(local_fb_dir, ms_ckpt_name))
+                        else:
+                            torch.save(ckpt_obj, os.path.join(local_fb_dir, f"MORTM5.{ver}.checkpoint.pt"))
+                            if ms_ckpt_name:
+                                shutil.copy2(
+                                    os.path.join(local_fb_dir, f"MORTM5.{ver}.checkpoint.pt"),
+                                    os.path.join(local_fb_dir, ms_ckpt_name),
+                                )
+                    except Exception as fb_err:
+                        print(f"[Local Full-Ckpt Fallback Error] {fb_err}", flush=True)
                 finally:
                     if os.path.exists(tmp_local_ckpt):
                         try:
@@ -1204,23 +1810,39 @@ async def mortm5_save_ckpt(request: Request):
                         except OSError:
                             pass
 
+        global _LAST_DRIVE_SAVE_THREAD
         if sync_drive:
-            _write_to_drive_subdir(full_ckpt, cpu_model_sd, drive_dir, version, step_now, milestone_tag)
+            _flush_pending_drive_save()
+            _write_to_drive_subdir(full_ckpt, cpu_model_sd, drive_dir, version, step_now, milestone_tag, ms_ckpt_fname)
         else:
-            threading.Thread(
+            _flush_pending_drive_save()
+            t_save = threading.Thread(
                 target=_write_to_drive_subdir,
-                args=(full_ckpt, cpu_model_sd, drive_dir, version, step_now, milestone_tag),
+                args=(full_ckpt, cpu_model_sd, drive_dir, version, step_now, milestone_tag, ms_ckpt_fname),
                 daemon=True,
-            ).start()
+            )
+            _LAST_DRIVE_SAVE_THREAD = t_save
+            t_save.start()
         saved_path = dst_ckpt_path
+        if ms_ckpt_fname:
+            milestone_ckpt_path = os.path.join(drive_dir, ms_ckpt_fname)
         local_saved = False
     else:
         # ローカルテスト環境 (Google Drive 非マウント時のみ)
         local_sub_dir = os.path.join(_get_worker_dir(), ablation_subdir)
         os.makedirs(local_sub_dir, exist_ok=True)
+        local_pth = os.path.join(local_sub_dir, f"MORTM5.{version}_latest.pth")
+        torch.save(cpu_model_sd, local_pth + ".tmp")
+        os.replace(local_pth + ".tmp", local_pth)
+        if milestone_tag:
+            ms_local_pth = os.path.join(local_sub_dir, f"MORTM5.{version}_{milestone_tag}_step{step_now}.pth")
+            shutil.copy2(local_pth, ms_local_pth)
         local_ckpt = os.path.join(local_sub_dir, f"MORTM5.{version}.checkpoint.pt")
         torch.save(full_ckpt, local_ckpt + ".tmp")
         os.replace(local_ckpt + ".tmp", local_ckpt)
+        if ms_ckpt_fname:
+            milestone_ckpt_path = os.path.join(local_sub_dir, ms_ckpt_fname)
+            shutil.copy2(local_ckpt, milestone_ckpt_path)
         # 旧テスト互換のためルートにも配置
         legacy_ckpt = os.path.join(_get_worker_dir(), f"MORTM5.{version}.checkpoint.pt")
         shutil.copy2(local_ckpt, legacy_ckpt)
@@ -1234,7 +1856,7 @@ async def mortm5_save_ckpt(request: Request):
             {
                 "model_state_dict": cpu_model_sd,
                 "optimizer_step": step_now,
-                "outer_batch_idx": outer_idx,
+                "outer_batch_idx": ckpt_outer_idx,
                 "all_tokens": tokens_now,
                 "verification_loss": val_loss,
             },
@@ -1247,13 +1869,14 @@ async def mortm5_save_ckpt(request: Request):
     return {
         "status": "saved",
         "colab_path": saved_path,
+        "milestone_ckpt_path": milestone_ckpt_path,
         "drive_dir": drive_dir,
         "ablation_subdir": ablation_subdir,
         "local_saved": local_saved,
         "drive_saved": drive_mounted,
         "download_bytes": total_dl_bytes,
         "step": step_now,
-        "outer": outer_idx,
+        "outer": ckpt_outer_idx,
         "tokens": tokens_now,
         "version": version,
     }

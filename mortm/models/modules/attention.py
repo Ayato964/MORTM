@@ -92,6 +92,9 @@ class PackedVarlenLayout:
 
 
 def _get_default_device() -> torch.device:
+    active_dev = torch.empty(0).device
+    if active_dev.type == "meta":
+        return active_dev
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -136,13 +139,22 @@ def pad_input(hidden_states: Tensor, indices: Tensor, batch: int, seqlen: int) -
     total_elems = batch * seqlen
     if hidden_states.size(0) == total_elems and indices.numel() == total_elems:
         return hidden_states.reshape(batch, seqlen, *hidden_states.shape[1:])
-    output = torch.zeros(
-        total_elems,
-        *hidden_states.shape[1:],
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    output = output.index_put((indices,), hidden_states)
+    if hidden_states.device.type != "meta":
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            output = torch.zeros(
+                total_elems,
+                *hidden_states.shape[1:],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            output = output.index_put((indices,), hidden_states)
+    else:
+        output = torch.empty(
+            total_elems,
+            *hidden_states.shape[1:],
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
     return output.reshape(batch, seqlen, *hidden_states.shape[1:])
 
 
@@ -553,32 +565,49 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
     return q_embed, k_embed
 
+_torch_compiler_disable = getattr(getattr(torch, "compiler", None), "disable", lambda fn: fn)
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
+        self.dim = int(dim)
+        self.max_position_embeddings = max(1, int(max_position_embeddings))
+        self.base = float(base)
+        inv_freq = self._compute_inv_freq(device=device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(max_position_embeddings, device=device, dtype=torch.get_default_dtype())
+        self._set_cos_sin_cache(self.max_position_embeddings, device=device, dtype=torch.get_default_dtype())
 
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_position_embeddings = seq_len
-        t = torch.arange(self.max_position_embeddings, device=device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq.to(device))
+    def _compute_inv_freq(self, device=None) -> Tensor:
+        exponent = torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / float(self.dim)
+        return 1.0 / (self.base ** exponent)
+
+    def _set_cos_sin_cache(self, seq_len: int, device, dtype):
+        self.max_position_embeddings = max(1, int(seq_len))
+        inv_freq_fp32 = self._compute_inv_freq(device=device)
+        self.register_buffer("inv_freq", inv_freq_fp32, persistent=False)
+        t = torch.arange(self.max_position_embeddings, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq_fp32)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+        self.register_buffer("cos_cached", emb.cos().to(dtype=dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype=dtype), persistent=False)
 
-    def forward(self, x, seq_len=None):
+    @_torch_compiler_disable
+    def forward(self, x: Tensor, seq_len: Optional[int] = None) -> Tuple[Tensor, Tensor]:
         req_len = int(seq_len) if seq_len is not None else int(x.shape[-2])
-        if req_len > self.max_position_embeddings or self.cos_cached.device != x.device:
-            new_max = max(req_len, self.max_position_embeddings * 2)
+        if req_len <= 0:
+            empty = x.new_empty((0, self.dim))
+            return empty, empty
+        if (
+            req_len > self.max_position_embeddings
+            or self.cos_cached.device != x.device
+            or self.cos_cached.dtype != x.dtype
+        ):
+            new_max = max(req_len, self.max_position_embeddings * 2 if req_len > self.max_position_embeddings else self.max_position_embeddings)
             self._set_cos_sin_cache(new_max, x.device, x.dtype)
         return (
-            self.cos_cached[:req_len].to(device=x.device, dtype=x.dtype),
-            self.sin_cached[:req_len].to(device=x.device, dtype=x.dtype),
+            self.cos_cached[:req_len],
+            self.sin_cached[:req_len],
         )
 
 # ==========================================

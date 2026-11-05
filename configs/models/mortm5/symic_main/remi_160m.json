@@ -1,0 +1,22 @@
+{
+  "name": "MORTM5_Multitrack_REMI_160M",
+  "tokenizer_key": "multitrack_remi",
+  "model_mode": "remi",
+  "symbolic_vocab": true,
+  "remi_attr_sizes": [1, 192, 4, 128, 312, 32],
+  "use_instrument_tokens": true,
+  "token_offset": 133,
+  "vocab_size": 802,
+  "d_model": 1024,
+  "d_layer": 12,
+  "num_heads": 16,
+  "dim_feedforward": 3072,
+  "dropout": 0.1,
+  "position_length": 4096,
+  "grad_checkpoint_tokens": 16384,
+  "norm_type": "rmsnorm",
+  "use_rope": true,
+  "use_silu": true,
+  "use_bias": false,
+  "use_moe_decoder": false
+}

@@ -1,0 +1,30 @@
+{
+  "optimizer": "muon",
+  "lr_param": 0.001,
+  "weight_decay": 0.1,
+  "momentum": 0.95,
+  "ns_steps": 5,
+  "adjust_lr_fn": "match_rms_adamw",
+  "adamw_betas": [0.9, 0.95],
+  "big_batch_size": 16384,
+  "batch_size": 128,
+  "accumulation_steps": 2,
+  "num_epochs": 2,
+  "is_save_training_progress": true,
+  "val_total_tokens": 250000000,
+  "train_dataset_split": 0.99,
+  "shuffle": true,
+  "checkpoint_percents": [
+    50,
+    100
+  ],
+  "scheduler": {
+    "type": "wsd",
+    "warmup_steps": 300,
+    "stable_ratio": 0.82,
+    "min_lr_ratio": 0.02,
+    "total_steps": 29220,
+    "auto_total_steps": true
+  },
+  "_note": "SyMIc Stage 3 320M Resume from pct50 (Step 29,220): 2 remaining epochs (29,220 steps) to complete 4-epoch dataset exposure. Short 300-step momentum warmup + 82% plateau at 1e-3 + final 5,200-step cosine cooldown to 2e-5."
+}

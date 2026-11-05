@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import datetime
 import json
@@ -6,7 +7,7 @@ import os
 import random
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import torchaudio
@@ -31,6 +32,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch import Tensor
 from torch.utils.data import DataLoader, random_split, Subset
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.dataset import Dataset
@@ -47,6 +49,7 @@ from .datasets import (
     MORTM5OuterDataset,
     MORTM5WindowSubsetDataset,
     MORTM5Collate,
+    DynamicStepBatchPacker,
     mortm5_outer_collate_fn,
 )
 from mortm.models.mortm import MORTM, MORTMArgs
@@ -120,6 +123,8 @@ def _allocate_counts(total_size: int, weights: list[int]) -> list[int]:
 def _set_loader_epoch(loader: DataLoader, epoch: int):
     if hasattr(loader, "sampler") and hasattr(loader.sampler, "set_epoch"):
         loader.sampler.set_epoch(epoch)
+    elif hasattr(loader, "sampler") and getattr(loader.sampler, "generator", None) is not None:
+        loader.sampler.generator.manual_seed(42 + int(epoch))
 
     if hasattr(loader, "batch_sampler") and hasattr(loader.batch_sampler, "set_epoch"):
         loader.batch_sampler.set_epoch(epoch)
@@ -777,12 +782,13 @@ class MORTM5TrainSet(AbstractTrainSet):
             padding_mask = padding_mask.to(self.device, non_blocking=True)
         else:
             seq = pack.to(self.device, non_blocking=True)
-            if self.args.model_mode == "grouped":
-                shift = self.args.vq_groups if seq.dim() == 2 else 1
+            unit_w = max(1, int(getattr(self.args, "step_unit_width", 1)))
+            if unit_w > 1:
+                shift = unit_w if seq.dim() == 2 else 1
                 input_ids = seq[:, :-shift].contiguous()
                 targets = seq[:, shift:].contiguous()
                 grouped_in = (
-                    input_ids.reshape(input_ids.size(0), -1, self.args.vq_groups)
+                    input_ids.reshape(input_ids.size(0), -1, unit_w)
                     if input_ids.dim() == 2
                     else input_ids
                 )
@@ -797,7 +803,9 @@ class MORTM5TrainSet(AbstractTrainSet):
 
         raw_model = model.module if hasattr(model, "module") else model
         raw_model = getattr(raw_model, "_orig_mod", raw_model)
-        if self.args.model_mode == "grouped":
+        if hasattr(raw_model, "format_training_targets"):
+            target_flat = raw_model.format_training_targets(targets, ignore_index=PAD_TOKEN_ID)
+        elif self.args.model_mode == "grouped":
             target_flat = raw_model.to_local_targets(targets, ignore_index=PAD_TOKEN_ID).reshape(-1).long()
         else:
             target_flat = targets.reshape(-1).long()
@@ -823,11 +831,8 @@ class MORTM5TrainSet(AbstractTrainSet):
 
     def optional_logging(self, val_loss, step):
         global_tokens = self.get_synced_tokens()
-        seq_steps = (
-            global_tokens // max(1, int(self.args.vq_groups))
-            if getattr(self.args, "model_mode", "flat") == "grouped"
-            else global_tokens
-        )
+        unit_w = max(1, int(getattr(self.args, "step_unit_width", 1)))
+        seq_steps = global_tokens // unit_w
 
         if self.local_rank == 0:
             log_data = {
@@ -1134,13 +1139,33 @@ def path_pack_collate_fn(batch):
     return paths, dataset_ids
 
 
-def get_inner_loader(dataset: Dataset, batch_size: int, collate_fn=None, dataset_batch_allocation: Optional[list[int]] = None):
+def _detach_state_to_cpu(obj: Any) -> Any:
+    if isinstance(obj, Tensor):
+        return obj.detach().to(device="cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _detach_state_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_detach_state_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_detach_state_to_cpu(v) for v in obj)
+    return copy.deepcopy(obj)
+
+
+def get_inner_loader(
+    dataset: Dataset,
+    batch_size: int,
+    collate_fn=None,
+    dataset_batch_allocation: Optional[list[int]] = None,
+    drop_last: Optional[bool] = None,
+    shuffle: bool = True,
+    generator: Optional[torch.Generator] = None,
+):
     if dataset_batch_allocation is not None:
         batch_sampler = MixedSequenceBatchSampler(
             dataset,
             batch_size=batch_size,
             dataset_batch_allocation=dataset_batch_allocation,
-            shuffle=True,
+            shuffle=shuffle,
         )
         loader = DataLoader(
             dataset,
@@ -1150,13 +1175,15 @@ def get_inner_loader(dataset: Dataset, batch_size: int, collate_fn=None, dataset
         )
         return loader, batch_sampler
 
+    effective_drop_last = (len(dataset) >= batch_size) if drop_last is None else bool(drop_last)
     loader = DataLoader(
         dataset,
         batch_size=min(batch_size, max(1, len(dataset))),
-        shuffle=True,
+        shuffle=shuffle,
         collate_fn=collate_fn,
-        drop_last=(len(dataset) >= batch_size),
+        drop_last=effective_drop_last,
         num_workers=0,
+        generator=generator,
     )
     return loader, None
 
@@ -1201,13 +1228,16 @@ def get_data_loader(t_args: TrainArgs, mortm_dataset: tuple | Dataset, shuffle=T
             collate_fn=outer_collate_fn,
         )
     else:
+        use_local_shuffle = (train_sampler is None and bool(shuffle))
+        outer_gen = torch.Generator().manual_seed(42) if use_local_shuffle else None
         train_loader = DataLoader(
             train_dataset,
             batch_size=t_args.big_batch_size,
             sampler=train_sampler,
-            shuffle=(train_sampler is None and shuffle),
+            shuffle=use_local_shuffle,
             num_workers=0,
             collate_fn=outer_collate_fn,
+            generator=outer_gen,
         )
 
     val_loader = DataLoader(
@@ -1226,6 +1256,103 @@ def get_verification_loss(model: nn.Module, val_loader: DataLoader, criterion: n
     model.eval()
 
     device = torch.device(f"cuda:{trainer.local_rank}") if torch.cuda.is_available() else progress.get_device()
+
+    if isinstance(trainer, MORTM5TrainSet):
+        acc_dtype = torch.float64 if device.type in ("cuda", "cpu") else torch.float32
+        val_loss_sum = torch.zeros((), device=device, dtype=acc_dtype)
+        val_valid_tokens = torch.zeros((), device=device, dtype=torch.long)
+        effective_coll_fn = coll_fn or MORTM5Collate(
+            mode=trainer.args.model_mode,
+            vq_groups=trainer.args.step_unit_width,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+        max_micro_steps = max(0, int(getattr(train_args, "max_micro_steps", 0) or 0))
+        bs = max(1, int(train_args.batch_size))
+        unit_width = max(1, int(getattr(trainer.args, "step_unit_width", 1)))
+        packer = (
+            DynamicStepBatchPacker(
+                max_micro_steps=max_micro_steps,
+                max_batch_size=bs,
+                unit_width=unit_width,
+                pad_token_id=PAD_TOKEN_ID,
+            )
+            if max_micro_steps > 0
+            else None
+        )
+        chunk_segs = bs * max(1, int(train_args.accumulation_steps))
+
+        with torch.no_grad():
+            for pack in val_loader:
+                pre_processing_dataset: Dataset = trainer.pre_processing(pack, progress)
+                n_items = len(pre_processing_dataset)
+                if n_items == 0:
+                    del pre_processing_dataset, pack
+                    gc.collect()
+                    continue
+
+                if packer is not None:
+                    for pos in range(0, n_items, chunk_segs):
+                        items = [pre_processing_dataset[i] for i in range(pos, min(n_items, pos + chunk_segs))]
+                        step_pack = packer.pack_sequences(
+                            items,
+                            collate_fn=effective_coll_fn,
+                            pin_memory=(device.type == "cuda"),
+                        )
+                        for sub_pack in step_pack.sub_batches:
+                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                                logits_flat, target_flat = trainer.epoch_fc(model, sub_pack, progress)
+                            valid_cnt = (target_flat != PAD_TOKEN_ID).sum()
+                            with torch.autocast(device_type=device.type, enabled=False):
+                                sum_loss = F.cross_entropy(
+                                    logits_flat.float(),
+                                    target_flat,
+                                    ignore_index=PAD_TOKEN_ID,
+                                    reduction="sum",
+                                )
+                            val_loss_sum += sum_loss.to(dtype=acc_dtype)
+                            val_valid_tokens += valid_cnt
+                            del sub_pack, logits_flat, target_flat, sum_loss
+                else:
+                    inner_loader, inner_sampler = get_inner_loader(
+                        pre_processing_dataset,
+                        bs,
+                        effective_coll_fn,
+                        dataset_batch_allocation=train_args.dataset_batch_allocation,
+                        drop_last=False,
+                        shuffle=False,
+                    )
+                    if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
+                        inner_sampler.set_epoch(0)
+
+                    for pack2 in inner_loader:
+                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                            logits_flat, target_flat = trainer.epoch_fc(model, pack2, progress)
+                        valid_cnt = (target_flat != PAD_TOKEN_ID).sum()
+                        with torch.autocast(device_type=device.type, enabled=False):
+                            sum_loss = F.cross_entropy(
+                                logits_flat.float(),
+                                target_flat,
+                                ignore_index=PAD_TOKEN_ID,
+                                reduction="sum",
+                            )
+                        val_loss_sum += sum_loss.to(dtype=acc_dtype)
+                        val_valid_tokens += valid_cnt
+                        del pack2, logits_flat, target_flat, sum_loss
+                    del inner_loader, inner_sampler
+
+                del pre_processing_dataset, pack
+                gc.collect()
+
+        if _is_dist_ready():
+            dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_valid_tokens, op=dist.ReduceOp.SUM)
+
+        model.train()
+        total_toks = int(val_valid_tokens.item())
+        if total_toks <= 0:
+            return 0.0
+        return float(val_loss_sum.item()) / float(total_toks)
+
     val_loss = torch.tensor(0.0, device=device)
     all_count = torch.tensor(0.0, device=device)
 
@@ -1284,6 +1411,7 @@ def _save_checkpoint(
     model_name: str,
     version: str,
     wandb_run_id: Optional[str] = None,
+    inner_step_idx: int = 0,
 ):
     """
     トレーニングの全状態（モデル重み、Optimizer、Scheduler、ウォームアップ・ステップ数、
@@ -1309,8 +1437,9 @@ def _save_checkpoint(
         "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": trainer.optimizer.state_dict(),
         "scheduler_state_dict": trainer.scheduler.state_dict() if trainer.scheduler is not None else None,
-        "epoch": epoch,
-        "outer_batch_idx": outer_batch_idx,
+        "epoch": int(epoch),
+        "outer_batch_idx": int(outer_batch_idx),
+        "inner_step_idx": int(inner_step_idx),
         "total_outer_batches": total_outer_batches,
         "optimizer_step": optimizer_step,
         "all_tokens": all_tokens_val,
@@ -1339,25 +1468,51 @@ def _load_checkpoint(
     チェックポイントファイルから全状態を復元する。
     モデル重み、Optimizer、Scheduler（ウォームアップ数含む）、トークン数、ステップ数、乱数状態を復元。
     """
+    if checkpoint_path.endswith(".pth") and os.path.isfile(checkpoint_path[:-4] + ".checkpoint.pt"):
+        checkpoint_path = checkpoint_path[:-4] + ".checkpoint.pt"
+
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
+        raise RuntimeError(
+            f"Checkpoint '{checkpoint_path}' is weights-only (missing 'model_state_dict' / 'optimizer_state_dict'); "
+            f"resume requires a full '.checkpoint.pt' file."
+        )
+    if ckpt.get("optimizer_state_dict") is None:
+        raise RuntimeError(
+            f"Checkpoint '{checkpoint_path}' has optimizer_state_dict=None; cannot warm-restart without optimizer state."
+        )
 
     # 1. モデル重みの復元
     raw_model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
     raw_model.load_state_dict(ckpt["model_state_dict"])
 
     # MoE Gate 内部の _flush_count カウンタを optimizer_step に同期
-    opt_step = ckpt.get("optimizer_step", 0)
+    opt_step = int(ckpt.get("optimizer_step", 0))
     for m in raw_model.modules():
         if hasattr(m, "_flush_count"):
             m._flush_count = opt_step
 
     # 2. Optimizer の復元
-    if "optimizer_state_dict" in ckpt and ckpt["optimizer_state_dict"] is not None:
-        trainer.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    trainer.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
-    # 3. Scheduler（ウォームアップ・ステップ進行）の復元
-    if trainer.scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
-        trainer.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    # 3. Scheduler（ウォームアップ・ステップ進行 & Warm-Restart 時の新スケジュール再評価）の復元
+    if trainer.scheduler is not None:
+        sched = trainer.scheduler
+        base_lr = float(getattr(trainer.t_args, "lr_param", 1e-3))
+        if hasattr(sched, "lr_lambdas") and getattr(sched, "lr_lambdas", None):
+            base_lrs = [base_lr for _ in trainer.optimizer.param_groups]
+            sched.base_lrs = list(base_lrs)
+            sched.last_epoch = opt_step
+            new_lrs = [
+                b_lr * float(lmbda(opt_step))
+                for b_lr, lmbda in zip(base_lrs, sched.lr_lambdas)
+            ]
+            for pg, lr_val, b_lr in zip(trainer.optimizer.param_groups, new_lrs, base_lrs):
+                pg["initial_lr"] = b_lr
+                pg["lr"] = lr_val
+            sched._last_lr = list(new_lrs)
+        elif ckpt.get("scheduler_state_dict") is not None:
+            sched.load_state_dict(ckpt["scheduler_state_dict"])
 
     # 4. カウンタ・トークン数の復元
     if isinstance(trainer.all_tokens, Tensor):
@@ -1459,41 +1614,58 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
     verification_loss = 0.0
     start_epoch = 0
     resume_outer_batch_idx = 0
+    resume_inner_step_idx = 0
 
     device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else progress.get_device()
-    checkpoint_path = resume_checkpoint_path if resume_checkpoint_path is not None else f"{save_directory}/{model_name}.checkpoint.pt"
+    checkpoint_path = f"{save_directory}/{model_name}.checkpoint.pt"
+    explicit_external_ckpt = (
+        resume_checkpoint_path is not None
+        and os.path.abspath(resume_checkpoint_path) != os.path.abspath(checkpoint_path)
+    )
+    load_ckpt_path = checkpoint_path
+    if explicit_external_ckpt and not os.path.exists(checkpoint_path):
+        load_ckpt_path = resume_checkpoint_path
+        if load_ckpt_path.endswith(".pth") and os.path.isfile(load_ckpt_path[:-4] + ".checkpoint.pt"):
+            load_ckpt_path = load_ckpt_path[:-4] + ".checkpoint.pt"
 
     # チェックポイント存在確認とDDPプロセス間共有
     has_checkpoint = False
-    if resume:
+    should_check_ckpt = bool(resume) or explicit_external_ckpt
+    if should_check_ckpt:
         if local_rank == 0:
-            has_checkpoint = os.path.exists(checkpoint_path)
+            has_checkpoint = os.path.isfile(load_ckpt_path)
         if _is_dist_ready():
             obj = [has_checkpoint]
             dist.broadcast_object_list(obj, src=0)
             has_checkpoint = obj[0]
+        if explicit_external_ckpt and not os.path.exists(checkpoint_path) and not has_checkpoint:
+            raise FileNotFoundError(
+                f"Explicit resume_checkpoint_path not found: {resume_checkpoint_path} (resolved: {load_ckpt_path})"
+            )
 
     if has_checkpoint:
         if local_rank == 0:
-            print(f"\033[32m[Checkpoint]\033[0m チェックポイントを検出しました: {checkpoint_path}")
-        ckpt = _load_checkpoint(checkpoint_path, trainer, device)
-        start_epoch = ckpt.get("epoch", 0)
-        resume_outer_batch_idx = ckpt.get("outer_batch_idx", 0)
-        optimizer_step = ckpt.get("optimizer_step", 0)
+            print(f"\033[32m[Checkpoint]\033[0m チェックポイントを検出しました: {load_ckpt_path}")
+        ckpt = _load_checkpoint(load_ckpt_path, trainer, device)
+        start_epoch = int(ckpt.get("epoch", 0))
+        resume_outer_batch_idx = int(ckpt.get("outer_batch_idx", 0))
+        resume_inner_step_idx = int(ckpt.get("inner_step_idx", 0))
+        optimizer_step = int(ckpt.get("optimizer_step", 0))
         trainer.optimizer_steps = optimizer_step
-        verification_loss = ckpt.get("verification_loss", 0.0)
+        verification_loss = float(ckpt.get("verification_loss", 0.0))
 
         # 前エポックの全Outer Batchが完了している場合は次エポックから開始
         if resume_outer_batch_idx >= len(train_loader):
             start_epoch += 1
             resume_outer_batch_idx = 0
+            resume_inner_step_idx = 0
 
         if local_rank == 0:
             total_outer = ckpt.get("total_outer_batches", len(train_loader))
             tokens = ckpt.get("all_tokens", 0)
             print(
                 f"\033[32m[Resume 完了]\033[0m Epoch: {start_epoch + 1}/{train_args.num_epochs}, "
-                f"Outer Batch: {resume_outer_batch_idx}/{total_outer}, "
+                f"Outer Batch: {resume_outer_batch_idx}/{total_outer} (inner_step={resume_inner_step_idx}), "
                 f"Optimizer Step: {optimizer_step}, "
                 f"Tokens: {_format_large_count(tokens)}, "
                 f"Val Loss: {verification_loss:.4f}"
@@ -1505,16 +1677,73 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
     # 学習開始前（チェックポイント復元直後）に現在のMoEルーティング統計を表示
     _print_moe_stats(model, optimizer_step, local_rank=local_rank)
 
+    is_mortm5_global = isinstance(trainer, MORTM5TrainSet)
+    max_steps_global = max(0, int(getattr(train_args, "max_steps", 0) or 0)) if is_mortm5_global else 0
+
     for epoch in range(start_epoch, train_args.num_epochs):
+        if 0 < max_steps_global <= optimizer_step:
+            break
         _set_loader_epoch(train_loader, epoch)
         _set_loader_epoch(val_loader, epoch)
 
         try:
             count = 0
             epoch_loss = EpochObserver(1000)
+            last_bg_ckpt_thread: Optional[threading.Thread] = None
+            is_mortm5 = is_mortm5_global
+            max_micro_steps = max(0, int(getattr(train_args, "max_micro_steps", 0) or 0)) if is_mortm5 else 0
+            max_steps_limit = max_steps_global
+            stopped_early_by_max_steps = False
+            next_resume_outer_idx = resume_outer_batch_idx if epoch == start_epoch else 0
+            next_resume_inner_idx = resume_inner_step_idx if epoch == start_epoch else 0
+            validated_at_current_step = False
+            effective_coll_fn = (
+                coll_fn
+                if coll_fn is not None
+                else (
+                    MORTM5Collate(
+                        mode=trainer.args.model_mode,
+                        vq_groups=trainer.args.step_unit_width,
+                        pad_token_id=PAD_TOKEN_ID,
+                    )
+                    if is_mortm5
+                    else None
+                )
+            )
+
+            def _maybe_save_pct_checkpoint(
+                opt_step: int,
+                cur_ep: int,
+                ms_outer_idx: int,
+                ms_inner_idx: int,
+            ) -> None:
+                _pcts = getattr(train_args, "checkpoint_percents", None)
+                _tot = train_args.scheduler.get("total_steps") if isinstance(train_args.scheduler, dict) else None
+                if _pcts and _tot and (trainer.local_rank == 0):
+                    for _p in _pcts:
+                        if opt_step == max(1, int(round(_p / 100.0 * _tot))):
+                            raw_m = model.module if hasattr(model, "module") else model
+                            torch.save(
+                                raw_m.state_dict(),
+                                f"{save_directory}/{model_name}.ckpt_p{_p}.pth",
+                            )
+                            if int(_p) < 100:
+                                _save_checkpoint(
+                                    f"{save_directory}/{model_name}.ckpt_p{_p}.checkpoint.pt",
+                                    trainer,
+                                    epoch=cur_ep,
+                                    outer_batch_idx=ms_outer_idx,
+                                    total_outer_batches=len(train_loader),
+                                    optimizer_step=opt_step,
+                                    verification_loss=verification_loss,
+                                    model_name=model_name,
+                                    version=version,
+                                    inner_step_idx=ms_inner_idx,
+                                )
+                            print(f"[fullFT] checkpoint saved at {_p}% (step {opt_step}/{_tot})", flush=True)
 
             model.train()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             if local_rank == 0:
                 _print_epoch_summary(epoch, train_args, train_loader, optimizer_step)
@@ -1524,93 +1753,283 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
             for pack_idx, pack, pre_processing_dataset in _prefetched_outer_batches(
                 train_loader, trainer, progress, skip_until=_skip_until
             ):
+                if 0 < max_steps_limit <= optimizer_step:
+                    stopped_early_by_max_steps = True
+                    break
                 count = pack_idx + 1
+                validated_at_current_step = False
+                next_resume_outer_idx = pack_idx + 1
+                next_resume_inner_idx = 0
 
                 begin_time = time.time()
 
-                # 空でも continue せず _sync_min_loader_length に必ず参加する。
-                # 一方のランクだけが continue すると dist.all_reduce がズレて NCCL デッドロックになる。
-                if len(pre_processing_dataset) > 0:
-                    inner_loader, inner_sampler = get_inner_loader(
-                        pre_processing_dataset,
-                        train_args.batch_size,
-                        coll_fn,
-                        dataset_batch_allocation=train_args.dataset_batch_allocation,
+                if is_mortm5 and max_micro_steps > 0:
+                    bs = max(1, int(train_args.batch_size))
+                    accum_steps = max(1, int(train_args.accumulation_steps))
+                    step_segments = bs * accum_steps
+                    unit_width = max(1, int(getattr(trainer.args, "step_unit_width", 1)))
+                    packer = DynamicStepBatchPacker(
+                        max_micro_steps=max_micro_steps,
+                        max_batch_size=bs,
+                        unit_width=unit_width,
+                        pad_token_id=PAD_TOKEN_ID,
                     )
-                    local_len = len(inner_loader)
-                else:
-                    inner_loader = iter([])
-                    inner_sampler = None
-                    local_len = 0
+                    n_local_segs = len(pre_processing_dataset)
+                    local_steps = math.ceil(n_local_segs / step_segments) if n_local_segs > 0 else 0
+                    synced_steps = _sync_min_loader_length(local_steps, device)
 
-                if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
-                    inner_sampler.set_epoch(epoch)
-
-                synced_len = _sync_min_loader_length(local_len, device)
-
-                mini_c = 0
-
-                for pack2 in inner_loader:
-                    if mini_c >= synced_len:
-                        break
-
-                    mini_c += 1
-                    all_count += 1
-
-                    is_step_optimizer = (mini_c % train_args.accumulation_steps == 0)
-
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                        r_pack = trainer.epoch_fc(model, pack2, progress)
-                        loss = trainer.backward(
-                            train_args.accumulation_steps,
-                            is_step_optimizer,
-                            progress,
-                            train_args.lr_param,
-                            *r_pack
+                    if bool(train_args.shuffle) and n_local_segs > 1:
+                        step_rng = np.random.RandomState(
+                            (42 * 1000003 + epoch * 10007 + pack_idx * 97 + local_rank) & 0x7FFFFFFF
                         )
+                        idx_arr = step_rng.permutation(n_local_segs)
+                    else:
+                        idx_arr = np.arange(n_local_segs, dtype=np.int64)
 
-                    if is_step_optimizer:
+                    inner_skip = (
+                        resume_inner_step_idx
+                        if (epoch == start_epoch and pack_idx == resume_outer_batch_idx)
+                        else 0
+                    )
+
+                    for s_idx in range(synced_steps):
+                        if s_idx < inner_skip:
+                            continue
+                        if 0 < max_steps_limit <= optimizer_step:
+                            next_resume_outer_idx = pack_idx
+                            next_resume_inner_idx = s_idx
+                            stopped_early_by_max_steps = True
+                            break
+                        slice_idx = idx_arr[s_idx * step_segments : (s_idx + 1) * step_segments]
+                        items = [pre_processing_dataset[int(i)] for i in slice_idx]
+                        step_pack = packer.pack_sequences(
+                            items,
+                            collate_fn=effective_coll_fn,
+                            pin_memory=(device.type == "cuda"),
+                        )
+                        all_count += len(step_pack.sub_batches)
+
+                        acc_dtype = torch.float64 if device.type in ("cuda", "cpu") else torch.float32
+                        if _is_dist_ready():
+                            vt_t = torch.tensor(
+                                float(step_pack.total_valid_targets), device=device, dtype=acc_dtype
+                            )
+                            dist.all_reduce(vt_t, op=dist.ReduceOp.SUM)
+                            global_valid_targets = max(1.0, float(vt_t.item()))
+                            local_denom = max(1e-8, global_valid_targets / float(max(1, world_size)))
+                        else:
+                            global_valid_targets = max(1.0, float(step_pack.total_valid_targets))
+                            local_denom = global_valid_targets
+
+                        step_loss_sum = torch.zeros((), device=device, dtype=acc_dtype)
+                        n_subs = len(step_pack.sub_batches)
+                        for sub_i, sub_pack in enumerate(step_pack.sub_batches):
+                            sync_ctx = (
+                                model.no_sync()
+                                if (_is_dist_ready() and hasattr(model, "no_sync") and sub_i + 1 < n_subs)
+                                else contextlib.nullcontext()
+                            )
+                            with sync_ctx:
+                                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                                    logits_flat, target_flat = trainer.epoch_fc(model, sub_pack, progress)
+                                with torch.autocast(device_type=device.type, enabled=False):
+                                    sum_loss = F.cross_entropy(
+                                        logits_flat.float(),
+                                        target_flat,
+                                        ignore_index=PAD_TOKEN_ID,
+                                        reduction="sum",
+                                    )
+                                    scaled_loss = sum_loss / local_denom
+                                scaled_loss.backward()
+                            step_loss_sum += sum_loss.detach().to(dtype=acc_dtype)
+                            del sub_pack, logits_flat, target_flat, sum_loss, scaled_loss
+
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        if scheduler is not None:
+                            scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+
                         optimizer_step += 1
                         trainer.optimizer_steps = optimizer_step
+                        validated_at_current_step = False
+                        if (s_idx + 1) >= synced_steps:
+                            next_resume_outer_idx = pack_idx + 1
+                            next_resume_inner_idx = 0
+                        else:
+                            next_resume_outer_idx = pack_idx
+                            next_resume_inner_idx = s_idx + 1
+                        _maybe_save_pct_checkpoint(
+                            optimizer_step,
+                            epoch,
+                            next_resume_outer_idx,
+                            next_resume_inner_idx,
+                        )
 
-                        # §9.1/E2: total_steps の指定%時点でフルFT途中チェックポイントを保存(opt-in)。
-                        _pcts = getattr(train_args, "checkpoint_percents", None)
-                        _tot = train_args.scheduler.get("total_steps") if isinstance(train_args.scheduler, dict) else None
-                        if _pcts and _tot and (trainer.local_rank == 0):
-                            for _p in _pcts:
-                                if optimizer_step == max(1, int(round(_p / 100.0 * _tot))):
-                                    raw_m = model.module if hasattr(model, "module") else model
-                                    torch.save(
-                                        raw_m.state_dict(),
-                                        f"{save_directory}/{model_name}.ckpt_p{_p}.pth",
-                                    )
-                                    print(f"[fullFT] checkpoint saved at {_p}% (step {optimizer_step}/{_tot})", flush=True)
+                        if _is_dist_ready():
+                            dist.all_reduce(step_loss_sum, op=dist.ReduceOp.SUM)
+                        avg_loss = float(step_loss_sum.item()) / global_valid_targets
+                        epoch_loss.add(avg_loss)
 
-                    reduced_loss = reduce_tensor(loss, op=dist.ReduceOp.SUM) if _is_dist_ready() else loss.detach()
-                    avg_loss = (reduced_loss / world_size).item() if _is_dist_ready() else reduced_loss.item()
+                        current_tokens = trainer.get_synced_tokens()
+                        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else train_args.lr_param
+                        trainer.view_logs(
+                            epoch,
+                            train_args.num_epochs,
+                            count,
+                            len(train_loader),
+                            s_idx + 1,
+                            max(1, synced_steps),
+                            epoch_loss.get(),
+                            current_lr,
+                            verification_loss,
+                            current_tokens,
+                        )
+                        del step_pack, items
+                        if 0 < max_steps_limit <= optimizer_step:
+                            stopped_early_by_max_steps = (next_resume_outer_idx < len(train_loader))
+                            break
 
-                    epoch_loss.add(avg_loss)
+                    del pre_processing_dataset, pack
+                    gc.collect()
+                else:
+                    # 空でも continue せず _sync_min_loader_length に必ず参加する。
+                    # 一方のランクだけが continue すると dist.all_reduce がズレて NCCL デッドロックになる。
+                    if len(pre_processing_dataset) > 0:
+                        inner_gen = torch.Generator()
+                        inner_gen.manual_seed(
+                            (42 * 1000003 + epoch * 10007 + pack_idx * 97 + local_rank) & 0x7FFFFFFF
+                        )
+                        inner_loader, inner_sampler = get_inner_loader(
+                            pre_processing_dataset,
+                            train_args.batch_size,
+                            effective_coll_fn,
+                            dataset_batch_allocation=train_args.dataset_batch_allocation,
+                            drop_last=(False if is_mortm5 else None),
+                            shuffle=(bool(train_args.shuffle) if is_mortm5 else True),
+                            generator=(inner_gen if is_mortm5 else None),
+                        )
+                        local_len = len(inner_loader)
+                    else:
+                        inner_loader = iter([])
+                        inner_sampler = None
+                        local_len = 0
 
-                    current_tokens = trainer.get_synced_tokens()
-                    current_lr = scheduler.get_last_lr()[0] if scheduler is not None else train_args.lr_param
+                    if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
+                        inner_sampler.set_epoch(epoch)
 
-                    trainer.view_logs(
-                        epoch,
-                        train_args.num_epochs,
-                        count,
-                        len(train_loader),
-                        mini_c,
-                        len(inner_loader),
-                        epoch_loss.get(),
-                        current_lr,
-                        verification_loss,
-                        current_tokens
+                    synced_len = _sync_min_loader_length(local_len, device)
+
+                    mini_c = 0
+                    opt_in_outer = 0
+                    accum_steps = max(1, int(train_args.accumulation_steps))
+                    total_opt_in_outer = math.ceil(synced_len / accum_steps) if synced_len > 0 else 0
+                    inner_skip_opt = (
+                        resume_inner_step_idx
+                        if (epoch == start_epoch and pack_idx == resume_outer_batch_idx)
+                        else 0
                     )
 
-                    del pack2, r_pack, loss, reduced_loss
+                    for pack2 in inner_loader:
+                        if mini_c >= synced_len:
+                            break
+                        if 0 < max_steps_limit <= optimizer_step:
+                            next_resume_outer_idx = pack_idx
+                            next_resume_inner_idx = opt_in_outer
+                            stopped_early_by_max_steps = True
+                            break
 
-                del inner_loader, inner_sampler, pre_processing_dataset, pack
-                gc.collect()
+                        mini_c += 1
+                        is_last_micro = is_mortm5 and (mini_c == synced_len)
+                        is_step_optimizer = (mini_c % accum_steps == 0) or is_last_micro
+                        if opt_in_outer < inner_skip_opt:
+                            if is_step_optimizer:
+                                opt_in_outer += 1
+                            continue
+
+                        all_count += 1
+                        rem_accum = mini_c % accum_steps
+
+                        if is_mortm5 and is_last_micro and rem_accum != 0:
+                            # Accumulate gradient first, rescale partial accumulation window cleanly, then step
+                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                                r_pack = trainer.epoch_fc(model, pack2, progress)
+                                loss = trainer.backward(
+                                    accum_steps,
+                                    False,
+                                    progress,
+                                    train_args.lr_param,
+                                    *r_pack,
+                                )
+                            if not (torch.isnan(loss) or torch.isinf(loss)):
+                                scale_fix = float(accum_steps) / float(rem_accum)
+                                for p in model.parameters():
+                                    if p.grad is not None:
+                                        p.grad.mul_(scale_fix)
+                                progress.step_optimizer(trainer.optimizer, trainer.model, rem_accum)
+                                if trainer.scheduler is not None:
+                                    trainer.scheduler.step()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                            else:
+                                trainer.optimizer.zero_grad()
+                        else:
+                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                                r_pack = trainer.epoch_fc(model, pack2, progress)
+                                loss = trainer.backward(
+                                    accum_steps,
+                                    is_step_optimizer,
+                                    progress,
+                                    train_args.lr_param,
+                                    *r_pack,
+                                )
+
+                        if is_step_optimizer:
+                            optimizer_step += 1
+                            opt_in_outer += 1
+                            trainer.optimizer_steps = optimizer_step
+                            validated_at_current_step = False
+                            if opt_in_outer >= total_opt_in_outer:
+                                next_resume_outer_idx = pack_idx + 1
+                                next_resume_inner_idx = 0
+                            else:
+                                next_resume_outer_idx = pack_idx
+                                next_resume_inner_idx = opt_in_outer
+                            _maybe_save_pct_checkpoint(
+                                optimizer_step,
+                                epoch,
+                                next_resume_outer_idx,
+                                next_resume_inner_idx,
+                            )
+
+                        reduced_loss = reduce_tensor(loss, op=dist.ReduceOp.SUM) if _is_dist_ready() else loss.detach()
+                        avg_loss = (reduced_loss / world_size).item() if _is_dist_ready() else reduced_loss.item()
+
+                        epoch_loss.add(avg_loss)
+
+                        current_tokens = trainer.get_synced_tokens()
+                        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else train_args.lr_param
+
+                        trainer.view_logs(
+                            epoch,
+                            train_args.num_epochs,
+                            count,
+                            len(train_loader),
+                            mini_c,
+                            len(inner_loader),
+                            epoch_loss.get(),
+                            current_lr,
+                            verification_loss,
+                            current_tokens,
+                        )
+
+                        del pack2, r_pack, loss, reduced_loss
+                        if 0 < max_steps_limit <= optimizer_step:
+                            stopped_early_by_max_steps = (next_resume_outer_idx < len(train_loader))
+                            break
+
+                    del inner_loader, inner_sampler, pre_processing_dataset, pack
+                    gc.collect()
 
                 end_time = time.time()
 
@@ -1637,33 +2056,51 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                    # 検証バッチを GPU で計算している裏で、バックグラウンドスレッドにてチェックポイントを保存する
-                    bg_ckpt_future = None
+                    verification_loss = get_verification_loss(
+                        model, val_loader, criterion, progress, trainer, train_args, coll_fn=effective_coll_fn
+                    )
+                    validated_at_current_step = True
+
                     if local_rank == 0:
+                        if last_bg_ckpt_thread is not None and last_bg_ckpt_thread.is_alive():
+                            last_bg_ckpt_thread.join()
+
                         raw_m_snap = model.module if hasattr(model, "module") else model
                         cpu_sd_snap = {k: v.detach().cpu() for k, v in raw_m_snap.state_dict().items()}
-                        opt_sd_snap = copy.deepcopy(trainer.optimizer.state_dict())
-                        sched_sd_snap = copy.deepcopy(trainer.scheduler.state_dict()) if trainer.scheduler is not None else None
-                        all_tok_snap = trainer.all_tokens.item() if isinstance(trainer.all_tokens, Tensor) else int(trainer.all_tokens)
+                        opt_sd_snap = _detach_state_to_cpu(trainer.optimizer.state_dict())
+                        sched_sd_snap = (
+                            _detach_state_to_cpu(trainer.scheduler.state_dict())
+                            if trainer.scheduler is not None
+                            else None
+                        )
+                        all_tok_snap = (
+                            trainer.all_tokens.item() if isinstance(trainer.all_tokens, Tensor) else int(trainer.all_tokens)
+                        )
                         last_val_tok_snap = trainer.last_val_calc_tokens
-                        w_id_snap = getattr(wandb.run, "id", None) if wandb.run is not None else None
+                        val_loss_snap = float(verification_loss)
+                        opt_step_snap = int(optimizer_step)
+                        outer_snap = int(next_resume_outer_idx)
+                        inner_snap = int(next_resume_inner_idx)
+                        epoch_snap = int(epoch)
+                        w_id_snap = getattr(wandb.run, "id", None) if (wandb is not None and wandb.run is not None) else None
 
                         def _bg_write_ckpt():
                             ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
                             os.makedirs(ckpt_dir, exist_ok=True)
-                            tmp_p = f"{checkpoint_path}.{optimizer_step}.tmp"
+                            tmp_p = f"{checkpoint_path}.{opt_step_snap}.tmp"
                             torch.save(
                                 {
                                     "model_state_dict": cpu_sd_snap,
                                     "optimizer_state_dict": opt_sd_snap,
                                     "scheduler_state_dict": sched_sd_snap,
-                                    "epoch": epoch,
-                                    "outer_batch_idx": count,
+                                    "epoch": epoch_snap,
+                                    "outer_batch_idx": outer_snap,
+                                    "inner_step_idx": inner_snap,
                                     "total_outer_batches": len(train_loader),
-                                    "optimizer_step": optimizer_step,
+                                    "optimizer_step": opt_step_snap,
                                     "all_tokens": all_tok_snap,
                                     "last_val_calc_tokens": last_val_tok_snap,
-                                    "verification_loss": verification_loss,
+                                    "verification_loss": val_loss_snap,
                                     "rng_states": None,
                                     "wandb_run_id": w_id_snap,
                                     "model_name": model_name,
@@ -1674,12 +2111,8 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                             )
                             os.replace(tmp_p, checkpoint_path)
 
-                        bg_ckpt_future = threading.Thread(target=_bg_write_ckpt, daemon=True)
-                        bg_ckpt_future.start()
-
-                    verification_loss = get_verification_loss(
-                        model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn
-                    )
+                        last_bg_ckpt_thread = threading.Thread(target=_bg_write_ckpt, daemon=True)
+                        last_bg_ckpt_thread.start()
 
                     if local_rank == 0 and writer is not None:
                         writer.add_scalars(
@@ -1692,18 +2125,56 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                     _print_moe_stats(model, optimizer_step, local_rank=local_rank)
                     trainer.optional_logging(verification_loss, optimizer_step)
 
+                if 0 < max_steps_limit <= optimizer_step:
+                    stopped_early_by_max_steps = (next_resume_outer_idx < len(train_loader))
+                    break
+
             # エポック内のOuter Batchループ完了、次エポック用にリセット
             resume_outer_batch_idx = 0
+            resume_inner_step_idx = 0
 
-            if not epoch1_end:
+            if stopped_early_by_max_steps:
+                if not validated_at_current_step:
+                    verification_loss = get_verification_loss(
+                        model, val_loader, criterion, progress, trainer, train_args, coll_fn=effective_coll_fn
+                    )
+                if local_rank == 0:
+                    if last_bg_ckpt_thread is not None and last_bg_ckpt_thread.is_alive():
+                        last_bg_ckpt_thread.join()
+                    if train_args.is_save_training_progress:
+                        torch.save(
+                            model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
+                            f"{save_directory}/{model_name}.train.step{optimizer_step}.{verification_loss:.4f}.pth"
+                        )
+                    _save_checkpoint(
+                        checkpoint_path,
+                        trainer,
+                        epoch=epoch,
+                        outer_batch_idx=next_resume_outer_idx,
+                        total_outer_batches=len(train_loader),
+                        optimizer_step=optimizer_step,
+                        verification_loss=verification_loss,
+                        model_name=model_name,
+                        version=version,
+                        inner_step_idx=next_resume_inner_idx,
+                    )
+                    _print_moe_stats(model, optimizer_step, local_rank=local_rank)
+                    trainer.optional_logging(verification_loss, optimizer_step)
+                break
+
+            if not epoch1_end and not validated_at_current_step:
                 epoch1_end = True
                 verification_loss = get_verification_loss(
-                    model, val_loader, criterion, progress, trainer, train_args, coll_fn=coll_fn
+                    model, val_loader, criterion, progress, trainer, train_args, coll_fn=effective_coll_fn
                 )
+            elif not epoch1_end:
+                epoch1_end = True
 
             sync_tokens = reduce_tensor(trainer.all_tokens, op=dist.ReduceOp.SUM).item() if _is_dist_ready() else trainer.all_tokens.item()
 
             if local_rank == 0:
+                if last_bg_ckpt_thread is not None and last_bg_ckpt_thread.is_alive():
+                    last_bg_ckpt_thread.join()
                 message.send_message(
                     f"{model_name}の途中経過について",
                     f"Epoch {epoch + 1}/{train_args.num_epochs}の結果は、{epoch_loss.get():.4f}でした。\n"
@@ -1728,10 +2199,14 @@ def self_turing(model_name, train_args: TrainArgs, save_directory, trainer: Abst
                     verification_loss=verification_loss,
                     model_name=model_name,
                     version=version,
+                    inner_step_idx=0,
                 )
 
                 _print_moe_stats(model, optimizer_step, local_rank=local_rank)
                 trainer.optional_logging(verification_loss, optimizer_step)
+
+            if 0 < max_steps_limit <= optimizer_step:
+                break
 
         except torch.cuda.OutOfMemoryError:
             if local_rank == 0:
@@ -1926,21 +2401,12 @@ def _compute_exact_epoch_optimizer_steps(
     dataset_len = len(train_loader.dataset)
     world_size = dist.get_world_size() if _is_dist_ready() else 1
     samples_per_rank = math.ceil(dataset_len / max(1, world_size))
-    big_bs = max(1, int(t_args.big_batch_size))
-    inner_bs = max(1, int(t_args.batch_size))
-    accum = max(1, int(t_args.accumulation_steps))
-
-    full_outers = samples_per_rank // big_bs
-    rem_samples = samples_per_rank % big_bs
-
-    inner_per_full_outer = (big_bs // inner_bs) if big_bs >= inner_bs else (1 if big_bs > 0 else 0)
-    steps_per_full_outer = inner_per_full_outer // accum
-    epoch_steps = full_outers * steps_per_full_outer
-
-    if rem_samples > 0:
-        inner_rem = (rem_samples // inner_bs) if rem_samples >= inner_bs else 1
-        epoch_steps += inner_rem // accum
-
+    epoch_steps = _compute_exact_epoch_optimizer_steps(
+        num_windows=samples_per_rank,
+        big_batch_size=int(t_args.big_batch_size),
+        batch_size=int(t_args.batch_size),
+        accumulation_steps=int(t_args.accumulation_steps),
+    )
     return max(1, epoch_steps * max(1, int(t_args.num_epochs)))
 
 
@@ -2027,6 +2493,8 @@ def train_mortm5(
     auto_steps = bool(sched_cfg.get("auto_total_steps", False)) or int(sched_cfg.get("total_steps", 0)) <= 0
     if auto_steps:
         computed_total_steps = _compute_exact_epoch_optimizer_steps(train_loader, t_args)
+        if getattr(t_args, "max_steps", 0) > 0:
+            computed_total_steps = min(computed_total_steps, int(t_args.max_steps))
         sched_cfg["total_steps"] = computed_total_steps
         if local_rank == 0:
             print(
@@ -2035,16 +2503,31 @@ def train_mortm5(
             )
 
     model_name = f"{args.name}.{version}"
+    default_ckpt_path = f"{save_directory}/{model_name}.checkpoint.pt"
+    resolved_resume_ckpt: Optional[str] = None
+    if resume_checkpoint_path is not None:
+        resolved_resume_ckpt = resume_checkpoint_path
+        if resolved_resume_ckpt.endswith(".pth") and os.path.isfile(resolved_resume_ckpt[:-4] + ".checkpoint.pt"):
+            resolved_resume_ckpt = resolved_resume_ckpt[:-4] + ".checkpoint.pt"
+        if (
+            os.path.abspath(resolved_resume_ckpt) != os.path.abspath(default_ckpt_path)
+            and not os.path.exists(default_ckpt_path)
+            and not os.path.isfile(resolved_resume_ckpt)
+        ):
+            raise FileNotFoundError(
+                f"Explicit resume_checkpoint_path not found: {resume_checkpoint_path} (resolved: {resolved_resume_ckpt})"
+            )
     effective_ckpt_path = (
-        resume_checkpoint_path
-        if resume_checkpoint_path is not None
-        else f"{save_directory}/{model_name}.checkpoint.pt"
+        resolved_resume_ckpt
+        if (resolved_resume_ckpt is not None and not os.path.exists(default_ckpt_path))
+        else default_ckpt_path
     )
     wandb_id = None
     if resume and os.path.exists(effective_ckpt_path):
         try:
             header = torch.load(effective_ckpt_path, map_location="cpu", weights_only=False)
-            wandb_id = header.get("wandb_run_id")
+            if isinstance(header, dict) and resolved_resume_ckpt is None:
+                wandb_id = header.get("wandb_run_id")
         except Exception:
             pass
 
@@ -2066,7 +2549,7 @@ def train_mortm5(
     today_date = datetime.date.today().strftime("%Y%m%d")
     coll_fn = MORTM5Collate(
         mode=args.model_mode,
-        vq_groups=args.vq_groups,
+        vq_groups=args.step_unit_width,
         pad_token_id=PAD_TOKEN_ID,
     )
 
@@ -2083,7 +2566,7 @@ def train_mortm5(
         coll_fn=coll_fn,
         progress=progress,
         resume=resume,
-        resume_checkpoint_path=effective_ckpt_path,
+        resume_checkpoint_path=resolved_resume_ckpt,
     )
 
     if dist.is_initialized():

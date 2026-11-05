@@ -78,6 +78,10 @@ class TrainArgs:
         # §9.1/E2: フルFT の途中チェックポイントを total_steps の指定%時点で保存する。
         # None(既定)なら従来どおり保存しない(E1 等に影響なし・opt-in)。
         self.checkpoint_percents: Optional[list] = data.get('checkpoint_percents')
+        # 可変長系列 (Octuple-MMT / Multitrack-REMI) 向けの動的トークンバジェット上限 (0 = 無効/固定バッチ)
+        self.max_micro_steps: int = max(0, int(data.get('max_micro_steps', 0) or 0))
+        # Iso-FLOPs 比較等でエポック途中の指定オプティマイザステップ数で厳密終了する上限 (0 = 無効/全エポック実行)
+        self.max_steps: int = max(0, int(data.get('max_steps', 0) or 0))
         dataset_batch_allocation = data.get('dataset_batch_allocation')
         self.dataset_batch_allocation: Optional[list[int]] = None
 
@@ -115,6 +119,10 @@ class TrainArgs:
             "checkpoint_percents": copy.deepcopy(self.checkpoint_percents),
             "scheduler": copy.deepcopy(self.scheduler),
         })
+        if self.max_micro_steps > 0 or "max_micro_steps" in out:
+            out["max_micro_steps"] = int(self.max_micro_steps)
+        if self.max_steps > 0 or "max_steps" in out:
+            out["max_steps"] = int(self.max_steps)
         if self.dataset_batch_allocation is not None:
             out["dataset_batch_allocation"] = list(self.dataset_batch_allocation)
         return out
