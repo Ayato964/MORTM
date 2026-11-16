@@ -288,6 +288,7 @@ class RemoteMORTM5HybridTrainer:
         mac_split_dir: Optional[str] = None,
         stage_to_local: bool = True,
         use_torch_compile: bool = False,
+        pretrained_ckpt_path: Optional[str] = None,
         resume_ckpt_path: Optional[str] = None,
         resume_prev_big_batch_size: Optional[int] = None,
         download_ckpt_to_mac: bool = False,
@@ -304,6 +305,7 @@ class RemoteMORTM5HybridTrainer:
         self.mac_split_dir = mac_split_dir
         self.stage_to_local = stage_to_local
         self.use_torch_compile = use_torch_compile
+        self.pretrained_ckpt_path = pretrained_ckpt_path
         self.resume_ckpt_path = resume_ckpt_path
         self.resume_prev_big_batch_size = resume_prev_big_batch_size
         self.download_ckpt_to_mac = download_ckpt_to_mac
@@ -390,6 +392,7 @@ class RemoteMORTM5HybridTrainer:
             "colab_split_dir": self.colab_split_dir,
             "stage_to_local": bool(self.stage_to_local),
             "use_torch_compile": bool(self.use_torch_compile),
+            "pretrained_checkpoint_path": self.pretrained_ckpt_path,
             "resume_checkpoint_path": self.resume_ckpt_path,
             "version": self.version,
             "seed": int(self.seed),
@@ -754,6 +757,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-dir", type=str, default="out/mortm5_ablation", help="Mac 側のモデル保存先ディレクトリ")
     parser.add_argument("--version", type=str, default=None, help="チェックポイント・W&B のバージョン識別子")
+    parser.add_argument(
+        "--pretrained-ckpt",
+        type=str,
+        default=None,
+        help="Step 0 から Depth Head 学習を開始する際の事前学習済みモデル重みパス (.pth / .checkpoint.pt)",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="embedding と 12層 decoder を Freeze し、Wout (depth_decoder + decode) のみを学習する",
+    )
     parser.add_argument("--resume-ckpt", type=str, default=None, help="Google Drive 上の再開チェックポイントパス")
     parser.add_argument(
         "--resume-prev-big-batch-size",
@@ -802,6 +816,9 @@ def main():
         t_args.num_epochs = int(cli.epochs)
     if cli.max_steps is not None:
         t_args.max_steps = max(0, int(cli.max_steps))
+    if cli.freeze_backbone:
+        t_args.freeze_backbone = True
+        m_args.freeze_backbone = True
 
     # 既定の Google Drive パス自動補完 (--colab-split-dir も --mac-split-dir も未指定の場合)
     colab_split_dir = cli.colab_split_dir
@@ -822,6 +839,7 @@ def main():
         mac_split_dir=cli.mac_split_dir,
         stage_to_local=(not cli.no_stage_local),
         use_torch_compile=bool(cli.compile),
+        pretrained_ckpt_path=cli.pretrained_ckpt,
         resume_ckpt_path=cli.resume_ckpt,
         resume_prev_big_batch_size=cli.resume_prev_big_batch_size,
         download_ckpt_to_mac=cli.download_ckpt,

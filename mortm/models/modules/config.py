@@ -251,6 +251,7 @@ class MORTMArgs:
         self.use_gate_bias = True if data.get('use_gate_bias') is None else data['use_gate_bias']
 
         self.normalize_type = "tanh" if data.get('norm_type') is None else data['norm_type']
+        self.layer_arc: str = "normal" if data.get("layer_arc") is None else str(data["layer_arc"])
 
         self.use_attn_lora: bool = False if data.get('use_attn_lora') is None else data['use_attn_lora']
         self.use_gate_lora: bool = False if data.get('use_gate_lora') is None else data['use_gate_lora']
@@ -288,6 +289,7 @@ class MORTMArgs:
             "use_silu": bool(self.use_silu),
             "use_bias": bool(self.use_bias),
             "use_moe_decoder": bool(self.use_moe_decoder),
+            "layer_arc": str(self.layer_arc),
         })
         if self.grad_checkpoint_tokens != 16384 or "grad_checkpoint_tokens" in out:
             out["grad_checkpoint_tokens"] = int(self.grad_checkpoint_tokens)
@@ -407,6 +409,8 @@ class MORTM5Args(MORTMArgs):
         )
 
         self.separate_rvq_layers: bool = bool(data.get("separate_rvq_layers", False))
+        self.depth_layers: int = int(data.get("depth_layers", 4))
+        self.freeze_backbone: bool = bool(data.get("freeze_backbone", False))
         self.use_instrument_tokens: bool = bool(
             data.get("use_instrument_tokens", data.get("token_offset") == INST_RVQ_TOKEN_OFFSET)
         )
@@ -512,4 +516,8 @@ class MORTM5Args(MORTMArgs):
             out["remi_attr_sizes"] = [int(x) for x in self.remi_attr_sizes]
         if self.symbolic_vocab:
             out["symbolic_vocab"] = True
+        if self.depth_layers != 4 or "depth_layers" in out:
+            out["depth_layers"] = int(self.depth_layers)
+        if self.freeze_backbone or "freeze_backbone" in out:
+            out["freeze_backbone"] = bool(self.freeze_backbone)
         return out

@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 import math
 from typing import Optional, Literal
@@ -397,9 +398,16 @@ class DecodeCodebookHead(nn.Module):
         self.codebook_size = int(getattr(args, "codebook_size", 2048))
         self.use_instrument_tokens = bool(getattr(args, "use_instrument_tokens", False))
 
+
         default_offset = INST_RVQ_TOKEN_OFFSET if self.use_instrument_tokens else RVQ_TOKEN_OFFSET
         self.token_offset = int(getattr(args, "token_offset", default_offset))
         self.group_vocab_size = self.token_offset + self.codebook_size
+        
+        q_args = deepcopy(args)
+        q_args.layer_arc = "q"
+        q_args.d_layer = int(getattr(args, "depth_layers", 4))
+        self.depth_decoder = MORTMDecoder(q_args)
+        self.register_buffer("_legacy_untrained_depth", torch.tensor(False), persistent=False)
 
         self.special_decode = (
             nn.Linear(self.d_model, self.token_offset) if self.token_offset > 0 else None
@@ -416,7 +424,12 @@ class DecodeCodebookHead(nn.Module):
     def weight(self) -> Tensor:
         return self.decode[0][0].weight
 
-    def forward(self, x: Tensor, start_pos: int = 0) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        start_pos: int = 0,
+        group_embs: Optional[Tensor] = None,
+    ) -> Tensor:
         squeeze_seq = (x.dim() == 2)
         if squeeze_seq:
             x = x.unsqueeze(1)
@@ -430,14 +443,69 @@ class DecodeCodebookHead(nn.Module):
         first_rvq_input_pos = prefix_soft_len - 1
         rvq_start = min(seq_len, max(0, first_rvq_input_pos - int(start_pos)))
 
-        codebook_logits = x.new_empty((batch_size, seq_len, self.num_group, self.codebook_size))
+        # Depth MORTM 入力系列の構築:
+        # 位置 0 にソフトトークン x ([B, S, 1, D])、位置 1..G-1 に x + 確定済みグループ埋め込み ([B, S, G-1, D]) を配置
+        if self.training and bool(self._legacy_untrained_depth):
+            self._legacy_untrained_depth.fill_(False)
+
+        if bool(self._legacy_untrained_depth) and not self.training:
+            x_depth = x.unsqueeze(2).expand(batch_size, seq_len, self.num_group, self.d_model).to(dtype=self.weight.dtype)
+        else:
+            if group_embs is None:
+                shifted_group_embs = x.new_zeros((batch_size, seq_len, self.num_group - 1, self.d_model))
+            else:
+                if squeeze_seq and group_embs.dim() == 3:
+                    group_embs = group_embs.unsqueeze(1)
+                if group_embs.dim() != 4 or group_embs.size(0) != batch_size or group_embs.size(1) != seq_len:
+                    raise ValueError(
+                        f"group_embs must have shape [B={batch_size}, S={seq_len}, G-1={self.num_group - 1}, D={self.d_model}], "
+                        f"got {tuple(group_embs.shape)}."
+                    )
+                if group_embs.size(2) == self.num_group:
+                    shifted_group_embs = group_embs[:, :, :-1, :].to(dtype=x.dtype)
+                elif group_embs.size(2) == self.num_group - 1:
+                    shifted_group_embs = group_embs.to(dtype=x.dtype)
+                else:
+                    raise ValueError(
+                        f"group_embs group dim must be {self.num_group - 1} (or {self.num_group}), got {group_embs.size(2)}."
+                    )
+
+            # [B, S, G, D] -> [B * S * G, D] にパックして長さ G の因果 Self-Attention を一括適用
+            # depth_decoder による更新差分 (depth_out - depth_seq) のみを x_base に残差加算することで、
+            # Step 0 (q_up == 0) で全グループ g=0..G-1 の状態が元のソフトトークン x と完全一致する。
+            x_base = x.unsqueeze(2).expand(batch_size, seq_len, self.num_group, self.d_model)
+            depth_seq = torch.cat([x.unsqueeze(2), x.unsqueeze(2) + shifted_group_embs], dim=2)
+            num_depth_seqs = batch_size * seq_len
+            depth_flat = depth_seq.reshape(num_depth_seqs * self.num_group, self.d_model).to(dtype=torch.bfloat16)
+            cu_seqlens = torch.arange(
+                0,
+                (num_depth_seqs + 1) * self.num_group,
+                step=self.num_group,
+                device=x.device,
+                dtype=torch.int32,
+            )
+            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                depth_out = self.depth_decoder(
+                    tgt=depth_flat,
+                    tgt_is_causal=True,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=self.num_group,
+                    batch_size=num_depth_seqs,
+                    is_save_cache=False,
+                )
+            depth_delta = depth_out.view(batch_size, seq_len, self.num_group, self.d_model) - depth_seq.to(
+                dtype=depth_out.dtype
+            )
+            x_depth = (x_base.to(dtype=self.weight.dtype) + depth_delta.to(dtype=self.weight.dtype))
+
+        codebook_logits = x_depth.new_empty((batch_size, seq_len, self.num_group, self.codebook_size))
 
         # 1. 楽器スロット予測区間 (pos < prefix_soft_len - 1): L0 ヘッドを割り当て
         if rvq_start > 0:
-            x_pre = x[:, :rvq_start, :]
+            x_pre = x_depth[:, :rvq_start, :, :]
             head_l0 = self.decode[0]
             codebook_logits[:, :rvq_start, :, :] = torch.stack(
-                [head_l0[g](x_pre) for g in range(self.num_group)], dim=-2
+                [head_l0[g](x_pre[:, :, g, :]) for g in range(self.num_group)], dim=-2
             )
 
         # 2. RVQ予測区間 (pos >= prefix_soft_len - 1): 対象レイヤー l のヘッドのみをストライド適用
@@ -445,21 +513,17 @@ class DecodeCodebookHead(nn.Module):
             first_pos_at_rvq_start = int(start_pos) + rvq_start
             first_layer = max(0, first_pos_at_rvq_start - first_rvq_input_pos) % self.num_layer
             for d in range(self.num_layer):
-                x_l = x[:, rvq_start + d :: self.num_layer, :]
+                x_l = x_depth[:, rvq_start + d :: self.num_layer, :, :]
                 if x_l.size(1) == 0:
                     continue
                 layer_idx = (first_layer + d) % self.num_layer
                 head_l = self.decode[layer_idx]
                 codebook_logits[:, rvq_start + d :: self.num_layer, :, :] = torch.stack(
-                    [head_l[g](x_l) for g in range(self.num_group)], dim=-2
+                    [head_l[g](x_l[:, :, g, :]) for g in range(self.num_group)], dim=-2
                 )
 
         if self.special_decode is not None:
-            special_logits = (
-                self.special_decode(x)
-                .unsqueeze(-2)
-                .expand(-1, -1, self.num_group, -1)
-            )
+            special_logits = self.special_decode(x_depth)
             out = torch.cat([special_logits, codebook_logits], dim=-1)
         else:
             out = codebook_logits
@@ -539,12 +603,18 @@ class DummyDecoder(nn.Module):
 
 
 class MORTMDecoder(nn.Module):
-    def __init__(self, args: MORTMArgs, progress):
+    def __init__(self, args: MORTMArgs, progress=None):
         super(MORTMDecoder, self).__init__()
         self.num_layer = args.d_layer
         self.grad_checkpoint_tokens: int = int(getattr(args, "grad_checkpoint_tokens", 16384))
-        self.layers = nn.ModuleList([MORTMDecoderLayer(args, i, progress) for i in range(self.num_layer)])
-        if args.normalize_type == "tanh":
+        self.layers = nn.ModuleList([(MORTMDecoderLayer(args, i, progress) if args.layer_arc == "normal" else QMORTMDecoderLayer(args, i, progress)) 
+        for i in range(self.num_layer)])
+            
+        if args.layer_arc != "normal":
+            # QMORTMDecoderLayer は正規化済み主幹ストリームに対して内部 Pre-Norm + q_up 残差加算を行うため、
+            # 最終層の再正規化による学習済みスケールの破壊を防ぐ。
+            self.norm = nn.Identity()
+        elif args.normalize_type == "tanh":
             self.norm = NormTanh(args.d_model)
         elif args.normalize_type == "layernorm":
             self.norm = LayerNorm(args.d_model, eps=1e-5, bias=True)
@@ -596,7 +666,7 @@ class MORTMDecoder(nn.Module):
 
 class MORTMDecoderLayer(nn.Module):
 
-    def __init__(self, args: MORTMArgs, layer_id, progress):
+    def __init__(self, args: MORTMArgs, layer_id, progress=None):
         super(MORTMDecoderLayer, self).__init__()
         self.n_head = args.num_heads
         self.args = args
@@ -674,7 +744,32 @@ class MORTMDecoderLayer(nn.Module):
         return self.dropout3(self.ffn(y))
 
 
+class QMORTMDecoderLayer(MORTMDecoderLayer):
+    def __init__(self, args: MORTMArgs, layer_id, progress=None):
+        q_args = deepcopy(args)
+        q_args.d_model = max(1, args.d_model // 4)
+        q_args.dim_feedforward = max(1, args.d_model // 4)
+        q_args.num_heads = max(1, args.num_heads // 4)
+        super().__init__(q_args, layer_id, progress)
 
+        self.q_down = nn.Linear(args.d_model, q_args.d_model)
+        self.q_up = nn.Linear(q_args.d_model, args.d_model)
+
+        nn.init.zeros_(self.q_up.weight)
+        nn.init.zeros_(self.q_up.bias)
+    
+
+    def forward(self,tgt: Tensor,tgt_is_causal: bool = False, cu_seqlens=None, max_seqlen=None, batch_size=None, indices=None, is_save_cache=False,
+                encoder_x: Tensor = None, cu_seqlens_k=None, max_seqlen_k=None)-> Tensor:
+        y = self.q_down(tgt)
+        y = super().forward(y, tgt_is_causal, cu_seqlens, max_seqlen, batch_size, indices, is_save_cache, encoder_x, cu_seqlens_k, max_seqlen_k)
+
+        return tgt + self.q_up(y)
+
+
+
+
+        
 class FFN(nn.Module):
 
     def __init__(self, d_model, ff_d, dropout):

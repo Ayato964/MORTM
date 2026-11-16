@@ -914,7 +914,21 @@ async def mortm5_init(request: Request):
             )
 
     # MORTM5TrainSet (AblationTransformer1/2 + HybridMuonOptimizer + Cosine/WSD Scheduler) の構築
-    trainer = MORTM5TrainSet(m_args=m_args, t_args=t_args, device=DEVICE)
+    pretrained_ckpt_path: Optional[str] = payload.get("pretrained_checkpoint_path")
+    if pretrained_ckpt_path:
+        pretrained_ckpt_path = _resolve_resume_checkpoint_path(
+            raw_path=str(pretrained_ckpt_path),
+            ablation_subdir=ablation_subdir,
+            allow_weights_only=True,
+        )
+        if not os.path.isfile(pretrained_ckpt_path):
+            return {"error": f"pretrained_checkpoint_path not found: {pretrained_ckpt_path}"}
+    trainer = MORTM5TrainSet(
+        m_args=m_args,
+        t_args=t_args,
+        load_directory=pretrained_ckpt_path,
+        device=DEVICE,
+    )
 
     # total_steps の決定とスケジューラ再構築
     explicit_total_steps = payload.get("total_steps")

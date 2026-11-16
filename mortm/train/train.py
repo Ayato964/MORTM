@@ -667,6 +667,19 @@ class MORTM5TrainSet(AbstractTrainSet):
             if self.local_rank == 0:
                 print(f"[MORTM5TrainSet] Loaded pretrained weights from {load_directory}")
 
+        if (
+            bool(getattr(t_args, "freeze_backbone", False))
+            or bool(getattr(args, "freeze_backbone", False))
+        ) and hasattr(model, "freeze_backbone"):
+            model.freeze_backbone()
+            if self.local_rank == 0:
+                trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                total_p = sum(p.numel() for p in model.parameters())
+                print(
+                    f"[MORTM5TrainSet] Froze backbone (embedding + decoder): "
+                    f"trainable_params={trainable_p:,} / total_params={total_p:,}"
+                )
+
         moes = [mod for mod in model.modules() if isinstance(mod, MoE)]
         find_unused = bool(moes) and any(not mod.stacked for mod in moes)
 
@@ -687,14 +700,16 @@ class MORTM5TrainSet(AbstractTrainSet):
         lr = float(t_args.lr_param) if t_args.lr_param is not None else 1e-3
         opt_type = getattr(t_args, "optimizer_type", "muon").lower()
         if opt_type == "adamw":
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(
-                self.model.parameters(),
+                trainable_params,
                 lr=lr,
                 betas=getattr(t_args, "adamw_betas", (0.9, 0.95)),
                 weight_decay=getattr(t_args, "weight_decay", 0.1),
             )
             if self.local_rank == 0:
-                print(f"[MORTM5TrainSet] Optimizer: AdamW (lr={lr:.2e}, params={total_param:,})")
+                n_train = sum(p.numel() for p in trainable_params)
+                print(f"[MORTM5TrainSet] Optimizer: AdamW (lr={lr:.2e}, trainable_params={n_train:,} / total={total_param:,})")
         else:
             optimizer = build_muon_optimizer(
                 self.model,
@@ -810,7 +825,15 @@ class MORTM5TrainSet(AbstractTrainSet):
         else:
             target_flat = targets.reshape(-1).long()
 
-        logits: Tensor = model(x=input_ids, padding_mask=padding_mask, is_causal=True)
+        if self.args.model_mode == "grouped":
+            logits: Tensor = model(
+                x=input_ids,
+                padding_mask=padding_mask,
+                is_causal=True,
+                targets=targets,
+            )
+        else:
+            logits = model(x=input_ids, padding_mask=padding_mask, is_causal=True)
         logits_flat = logits.reshape(-1, logits.size(-1)).to(device=self.device, dtype=torch.float32)
         return logits_flat, target_flat
 

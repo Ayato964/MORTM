@@ -82,6 +82,8 @@ class TrainArgs:
         self.max_micro_steps: int = max(0, int(data.get('max_micro_steps', 0) or 0))
         # Iso-FLOPs 比較等でエポック途中の指定オプティマイザステップ数で厳密終了する上限 (0 = 無効/全エポック実行)
         self.max_steps: int = max(0, int(data.get('max_steps', 0) or 0))
+        # Depth Transformer + OutHead のみを学習しメインバックボーンを固定するフラグ
+        self.freeze_backbone: bool = bool(data.get("freeze_backbone", False))
         dataset_batch_allocation = data.get('dataset_batch_allocation')
         self.dataset_batch_allocation: Optional[list[int]] = None
 
@@ -123,6 +125,8 @@ class TrainArgs:
             out["max_micro_steps"] = int(self.max_micro_steps)
         if self.max_steps > 0 or "max_steps" in out:
             out["max_steps"] = int(self.max_steps)
+        if self.freeze_backbone or "freeze_backbone" in out:
+            out["freeze_backbone"] = bool(self.freeze_backbone)
         if self.dataset_batch_allocation is not None:
             out["dataset_batch_allocation"] = list(self.dataset_batch_allocation)
         return out

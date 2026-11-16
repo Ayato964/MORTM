@@ -1,8 +1,8 @@
 """
-MORTM: Music Oriented Transformer Model (v5.0.0b5 Beta)
+MORTM: Music Oriented Transformer Model (v5.0.0b6 Beta)
 """
 
-__version__ = "5.0.0b5"
+__version__ = "5.0.0b6"
 
 from .models.modules.config import (
     MORTMArgs,
@@ -30,6 +30,7 @@ from .models.modules.config import (
 from .models.modules.layers import (
     DecodeCodebookHead,
     DecodeOctupleHead,
+    QMORTMDecoderLayer,
 )
 from .models.mortm5 import (
     MidiVision,

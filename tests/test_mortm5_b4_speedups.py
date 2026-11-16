@@ -404,4 +404,71 @@ def test_symic_4ep_production_config_integrity():
     assert lr_lambda(730) == pytest.approx(1.0)
     assert lr_lambda(730 + stable_steps - 1) == pytest.approx(1.0)
     assert lr_lambda(58440) == pytest.approx(0.02)
-    assert mortm.__version__ == "5.0.0b5"
+    assert mortm.__version__ == "5.0.0b6"
+
+
+def test_depth_transformer_qmortm_freeze_backbone_and_group_ar_generate():
+    import torch.nn.functional as F
+    from mortm.models.modules.layers import DecodeCodebookHead, QMORTMDecoderLayer
+    from mortm.train.muon import build_muon_optimizer
+
+    m_dict = MORTM5Args("symic_g4l4_160m").to_dict()
+    m_dict.update(
+        {
+            "d_model": 64,
+            "d_layer": 2,
+            "num_heads": 4,
+            "dim_feedforward": 128,
+            "depth_layers": 4,
+            "freeze_backbone": True,
+        }
+    )
+    args = MORTM5Args(m_dict)
+    model = mortm.AblationTransformer2(args)
+    assert isinstance(model.Wout, DecodeCodebookHead)
+    assert len(model.Wout.depth_decoder.layers) == 4
+    assert all(isinstance(layer, QMORTMDecoderLayer) for layer in model.Wout.depth_decoder.layers)
+
+    # Verify freeze_backbone: only Wout (depth_decoder + decode + special_decode) is trainable
+    trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
+    frozen_names = [n for n, p in model.named_parameters() if not p.requires_grad]
+    assert len(trainable_names) > 0 and len(frozen_names) > 0
+    assert all(n.startswith("Wout.") for n in trainable_names)
+    assert any(n.startswith("Wout.depth_decoder.") for n in trainable_names)
+    assert any(n.startswith("Wout.decode.") for n in trainable_names)
+
+    opt = build_muon_optimizer(model, lr=1e-3, verbose=False)
+    assert opt.muon is not None
+
+    dev = model.embedding.weight.device
+    prefix = model.build_prefix_tokens(batch_size=2, device=dev)
+    rvq_rand = torch.randint(model.token_offset, model.token_offset + 64, (2, 8, 4), device=dev)
+    full_seq = torch.cat([prefix, rvq_rand], dim=1)
+    inp = full_seq[:, :-1, :]
+    tgt = full_seq[:, 1:, :]
+
+    # Verify Step-0 exact logit identity: when q_up == 0, Depth Transformer logits with targets
+    # match the legacy bypass logits (without depth_decoder) to machine precision
+    model.eval()
+    with torch.no_grad():
+        model.Wout._legacy_untrained_depth.fill_(True)
+        legacy_logits = model(inp, is_causal=True, targets=tgt)
+        model.Wout._legacy_untrained_depth.fill_(False)
+        step0_depth_logits = model(inp, is_causal=True, targets=tgt)
+        assert torch.allclose(legacy_logits, step0_depth_logits, atol=1e-5)
+    model.train()
+
+    logits = model(inp, is_causal=True, targets=tgt)
+    target_flat = model.format_training_targets(tgt, ignore_index=mortm.PAD_TOKEN_ID)
+    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target_flat, ignore_index=mortm.PAD_TOKEN_ID)
+    loss.backward()
+    assert model.embedding.weight.grad is None
+    assert model.decoder.layers[0].self_attention.qkv_block.qkv_weight.weight.grad is None
+    assert model.Wout.depth_decoder.layers[0].q_up.weight.grad is not None
+    opt.step()
+    opt.zero_grad()
+
+    gen_out = model.generate(num_chunks=2, batch_size=2, temperature=0.95, fine_temperature=0.50)
+    assert gen_out.shape == (2, 5 + 8 + 1, 4)
+    assert int(gen_out[:, 5:-1, :].min().item()) >= model.token_offset
+

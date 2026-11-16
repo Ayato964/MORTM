@@ -8,6 +8,8 @@ from torch.optim import Optimizer
 
 def _is_embedding_or_head_param(name: str) -> bool:
     lowered = name.lower()
+    if "depth_decoder" in lowered:
+        return False
     non_muon_tokens = (
         "embedding",
         "embed_tokens",
@@ -37,14 +39,17 @@ class HybridMuonOptimizer(Optimizer):
 
     def __init__(
         self,
-        muon_optimizer: torch.optim.Muon,
+        muon_optimizer: Optional[torch.optim.Muon],
         adamw_optimizer: torch.optim.AdamW,
     ):
         self.muon = muon_optimizer
         self.adamw = adamw_optimizer
         self.defaults: Dict[str, Any] = {}
         self.state: Dict[Any, Any] = {}
-        self.param_groups = self.muon.param_groups + self.adamw.param_groups
+        self.param_groups = (
+            (self.muon.param_groups if self.muon is not None else [])
+            + self.adamw.param_groups
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -52,26 +57,32 @@ class HybridMuonOptimizer(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        self.muon.step()
+        if self.muon is not None:
+            self.muon.step()
         self.adamw.step()
         return loss
 
     def zero_grad(self, set_to_none: bool = True) -> None:
-        self.muon.zero_grad(set_to_none=set_to_none)
+        if self.muon is not None:
+            self.muon.zero_grad(set_to_none=set_to_none)
         self.adamw.zero_grad(set_to_none=set_to_none)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
-            "muon": self.muon.state_dict(),
+            "muon": self.muon.state_dict() if self.muon is not None else None,
             "adamw": self.adamw.state_dict(),
             "param_groups": self.param_groups,
         }
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         if "muon" in state_dict and "adamw" in state_dict:
-            self.muon.load_state_dict(state_dict["muon"])
+            if self.muon is not None and state_dict["muon"] is not None:
+                self.muon.load_state_dict(state_dict["muon"])
             self.adamw.load_state_dict(state_dict["adamw"])
-            self.param_groups = self.muon.param_groups + self.adamw.param_groups
+            self.param_groups = (
+                (self.muon.param_groups if self.muon is not None else [])
+                + self.adamw.param_groups
+            )
         else:
             super().load_state_dict(state_dict)
 
@@ -113,14 +124,18 @@ def build_muon_optimizer(
         else:
             adamw_nodecay_params.append(p)
 
-    muon_opt = torch.optim.Muon(
-        muon_params,
-        lr=lr,
-        weight_decay=weight_decay,
-        momentum=momentum,
-        nesterov=nesterov,
-        ns_steps=ns_steps,
-        adjust_lr_fn=adjust_lr_fn,
+    muon_opt = (
+        torch.optim.Muon(
+            muon_params,
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            adjust_lr_fn=adjust_lr_fn,
+        )
+        if muon_params
+        else None
     )
 
     adamw_groups = []

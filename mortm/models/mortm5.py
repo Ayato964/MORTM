@@ -165,8 +165,13 @@ class MidiVision(nn.Module):
 
 
 def _compute_model_params(model: nn.Module, args: MORTMArgs) -> Tuple[int, int]:
-    """総パラメータ数と推論時アクティブパラメータ数（MoE考慮）を返す。"""
+    """総パラメータ数と推論時アクティブパラメータ数（MoEおよびfreeze_backbone考慮）を返す。"""
     total_params = sum(p.numel() for p in model.parameters())
+    decoder = getattr(model, "decoder", None)
+    if decoder is not None and not any(p.requires_grad for p in decoder.parameters()):
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if trainable_params > 0:
+            return total_params, trainable_params
 
     if not getattr(args, "use_moe_decoder", False):
         return total_params, total_params
@@ -359,6 +364,17 @@ class _BaseMORTM5Transformer(nn.Module):
         return (local_k_3d + group_offsets).reshape(-1)
 
     @staticmethod
+    def _sanitize_logits_f32(logits_f32: Tensor, posinf_value: float) -> Tensor:
+        """
+        Replace `NaN` with `-inf` and `+inf` with `posinf_value` while strictly preserving `-inf`.
+        Avoids `torch.nan_to_num`, whose PyTorch 2.10 MPS Metal kernel maps `-inf` to `posinf`.
+        """
+        neg_inf = torch.full_like(logits_f32, float("-inf"))
+        pos_cap = torch.full_like(logits_f32, float(posinf_value))
+        no_nan = torch.where(torch.isnan(logits_f32), neg_inf, logits_f32)
+        return torch.where(no_nan == float("inf"), pos_cap, no_nan)
+
+    @staticmethod
     def _sample_from_logits(
         logits: Tensor,
         temperature: float = 1.0,
@@ -369,11 +385,9 @@ class _BaseMORTM5Transformer(nn.Module):
         if logits.numel() == 0:
             return torch.empty(logits.shape[:-1], dtype=torch.long, device=logits.device)
 
-        logits_f32 = logits.to(dtype=torch.float32)
+        logits_f32 = logits.contiguous().to(dtype=torch.float32)
         was_nan = torch.isnan(logits_f32)
-        clean_logits = torch.nan_to_num(
-            logits_f32, nan=float("-inf"), posinf=1.0e30, neginf=float("-inf")
-        )
+        clean_logits = _BaseMORTM5Transformer._sanitize_logits_f32(logits_f32, posinf_value=1.0e30)
         row_has_finite = torch.isfinite(clean_logits).any(dim=-1, keepdim=True)
         row_has_nan = was_nan.any(dim=-1, keepdim=True)
         nan_uniform = torch.where(
@@ -387,13 +401,14 @@ class _BaseMORTM5Transformer(nn.Module):
             torch.where(row_has_nan, nan_uniform, torch.zeros_like(clean_logits)),
         )
 
-        if float(temperature) <= 0.0:
+        temp_val = float(temperature)
+        if not (temp_val > 1.0e-6):
             return torch.argmax(base_logits, dim=-1)
 
         row_max = base_logits.amax(dim=-1, keepdim=True)
         shifted = base_logits - row_max
-        scaled = torch.nan_to_num(
-            shifted / float(temperature), nan=float("-inf"), posinf=0.0, neginf=float("-inf")
+        scaled = _BaseMORTM5Transformer._sanitize_logits_f32(
+            shifted / temp_val, posinf_value=0.0
         )
 
         if top_k > 0 and top_k < scaled.size(-1):
@@ -701,6 +716,66 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         else:
             self.Wout = nn.Linear(args.d_model, self.vq_groups * self.group_vocab_size).to(device)
         self.wout = self.Wout
+        if bool(getattr(args, "freeze_backbone", False)):
+            self.freeze_backbone()
+
+    def freeze_backbone(self) -> None:
+        """
+        Depth Transformer + OutHead (`self.Wout`) のみを学習し、
+        メインバックボーン (`self.embedding` および 12層 `self.decoder`) をすべて Freeze する。
+        """
+        for p in self.embedding.parameters():
+            p.requires_grad_(False)
+        for p in self.decoder.parameters():
+            p.requires_grad_(False)
+        for p in self.Wout.parameters():
+            p.requires_grad_(True)
+        if isinstance(self.Wout, DecodeCodebookHead):
+            self.Wout._legacy_untrained_depth.fill_(False)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        if isinstance(getattr(self, "Wout", None), DecodeCodebookHead):
+            depth_q_up_tensors = [
+                v
+                for k, v in state_dict.items()
+                if (k.startswith("Wout.depth_decoder.") or k.startswith("wout.depth_decoder."))
+                and k.endswith("q_up.weight")
+                and isinstance(v, Tensor)
+            ]
+            has_depth_keys = any(
+                k.startswith("Wout.depth_decoder.") or k.startswith("wout.depth_decoder.")
+                for k in state_dict.keys()
+            )
+            if not has_depth_keys:
+                inc = super().load_state_dict(state_dict, strict=False, assign=assign)
+                if strict:
+                    non_depth_missing = [
+                        k
+                        for k in inc.missing_keys
+                        if not (k.startswith("Wout.depth_decoder.") or k.startswith("wout.depth_decoder."))
+                    ]
+                    if non_depth_missing or inc.unexpected_keys:
+                        err_lines = ["Error(s) in loading state_dict for AblationTransformer2:"]
+                        if non_depth_missing:
+                            err_lines.append(f"\tMissing key(s) in state_dict: {non_depth_missing}")
+                        if inc.unexpected_keys:
+                            err_lines.append(f"\tUnexpected key(s) in state_dict: {inc.unexpected_keys}")
+                        raise RuntimeError("\n".join(err_lines))
+                self.Wout._legacy_untrained_depth.fill_(True)
+                return inc
+            all_q_up_zero = bool(depth_q_up_tensors) and all(
+                float(t.detach().abs().max().item()) == 0.0 for t in depth_q_up_tensors
+            )
+            self.Wout._legacy_untrained_depth.fill_(all_q_up_zero)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    def _extract_shifted_group_embeddings(self, target_tokens: Tensor) -> Tensor:
+        """
+        target_tokens `[B, S, G]` (または `[B, G]`) から Depth Transformer の位置 `1..G-1` に入力する
+        グループ `0..G-2` の埋め込み `[B, S, G-1, d_model]` を取得する。
+        """
+        global_ids = self.to_global_ids(target_tokens).clamp(min=0)
+        return self.embedding(global_ids[..., :-1])
 
     @property
     def step_unit_width(self) -> int:
@@ -885,6 +960,47 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         masked[..., low:high] = logits[..., low:high]
         return masked
 
+    def _forward_backbone_last_hidden(self, x: Tensor, is_prefill: bool) -> Tensor:
+        """
+        KVキャッシュを更新しつつメインバックボーン `self.decoder` を1ステップ（または Prefill 一括）実行し、
+        最新ソフトトークン位置の隠れ状態 `h_t` (`[B, d_model]`) を返す。
+        """
+        if is_prefill:
+            batch, tgt_len, _ = x.size()
+            if self.token_offset > 0:
+                padding_mask = (x != PAD_TOKEN_ID).any(dim=-1)
+            else:
+                padding_mask = (x >= 0).any(dim=-1)
+            x_emb = self._aggregate_group_embeddings(x).to(dtype=torch.bfloat16)
+            x_unpadded, indices, cu_seqlens, max_s, _ = unpad_input(x_emb, padding_mask)
+            with torch.autocast(device_type=x_unpadded.device.type, dtype=torch.bfloat16):
+                out = self.decoder(
+                    tgt=x_unpadded,
+                    tgt_is_causal=True,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_s,
+                    batch_size=batch,
+                    indices=indices,
+                    is_save_cache=True,
+                )
+            out = pad_input(out, indices, batch, tgt_len)
+            return out[:, -1, :]
+
+        if x.dim() == 3:
+            x = x.squeeze(1)
+        x_emb = self._aggregate_group_embeddings(x).to(dtype=torch.bfloat16)
+        with torch.autocast(device_type=x_emb.device.type, dtype=torch.bfloat16):
+            out = self.decoder(
+                tgt=x_emb,
+                tgt_is_causal=True,
+                cu_seqlens=None,
+                max_seqlen=None,
+                batch_size=None,
+                indices=None,
+                is_save_cache=True,
+            )
+        return out
+
     @torch.inference_mode()
     def generate(
         self,
@@ -938,16 +1054,30 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         self.eval()
         self.reset_kv_cache()
         try:
-            # Prefill
-            logits = self.forward(seq, is_causal=True, is_save_cache=True)
-            next_logits = logits[:, -1, :, :]  # [B, G, group_vocab_size]
+            # Prefill (メインバックボーンのみ一括実行し、最終位置の隠れ状態 h_t を取得)
+            h_t = self._forward_backbone_last_hidden(seq, is_prefill=True)
 
             cur_soft_pos = seq.size(1)
             generated = [seq]
+            use_depth_ar = (
+                isinstance(self.Wout, DecodeCodebookHead)
+                and not bool(self.Wout._legacy_untrained_depth)
+            )
+            layer_stride = self.vq_groups * self.codebook_size
+
             while cur_soft_pos < target_soft_len:
-                constrained = self._apply_grouped_grammar_mask(next_logits, soft_pos=cur_soft_pos)
+                step_pos = cur_soft_pos - 1
                 if self.use_instrument_tokens and 1 <= cur_soft_pos < prefix_soft_len:
                     # 楽器スロットステップでは全 G グループで同一の楽器トークンを共有する
+                    with torch.autocast(device_type=h_t.device.type, enabled=False):
+                        if isinstance(self.Wout, DecodeCodebookHead):
+                            next_logits = self.Wout(
+                                h_t.to(self.Wout.weight.dtype), start_pos=step_pos
+                            ).float()
+                        else:
+                            raw_logits = self.Wout(h_t.to(self.Wout.weight.dtype)).float()
+                            next_logits = raw_logits.reshape(-1, self.vq_groups, self.group_vocab_size)
+                    constrained = self._apply_grouped_grammar_mask(next_logits, soft_pos=cur_soft_pos)
                     inst_tok = self._sample_from_logits(
                         constrained[:, 0, :], temperature=temperature, top_k=top_k, top_p=top_p
                     )  # [B]
@@ -955,19 +1085,6 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                 else:
                     cur_layer_idx = max(0, cur_soft_pos - prefix_soft_len) % self.vq_layers
                     if cur_layer_idx == 0:
-                        if repetition_penalty > 1.0 and recent_l0:
-                            win = recent_l0[-max(1, int(repetition_window)) :]
-                            for b_i in range(constrained.size(0)):
-                                for g_i in range(self.vq_groups):
-                                    counts: dict[int, int] = {}
-                                    for past_t in win:
-                                        tid = int(past_t[b_i, g_i].item())
-                                        if tid >= self.token_offset:
-                                            counts[tid] = counts.get(tid, 0) + 1
-                                    for tid, cnt in counts.items():
-                                        pen = float(repetition_penalty) ** min(cnt, 4)
-                                        val = constrained[b_i, g_i, tid]
-                                        constrained[b_i, g_i, tid] = val / pen if val > 0 else val * pen
                         step_temp = temperature
                         step_top_k = top_k
                         step_top_p = top_p
@@ -976,9 +1093,85 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                         step_top_k = fine_top_k if fine_top_k is not None else top_k
                         step_top_p = fine_top_p if fine_top_p is not None else top_p
 
-                    local_sampled = self._sample_from_logits(
-                        constrained, temperature=step_temp, top_k=step_top_k, top_p=step_top_p
-                    )  # [B, G]
+                    if use_depth_ar:
+                        # Depth Transformer による G グループ順次の自己回帰サンプリング (g = 0 -> 1 -> 2 -> 3)
+                        cur_group_embs = torch.zeros(
+                            (seq.size(0), self.vq_groups - 1, self.args.d_model),
+                            device=device,
+                            dtype=self.Wout.weight.dtype,
+                        )
+                        sampled_locals: list[Tensor] = []
+                        eff_layer = cur_layer_idx % self.effective_layers
+                        for g_i in range(self.vq_groups):
+                            with torch.autocast(device_type=h_t.device.type, enabled=False):
+                                depth_logits = self.Wout(
+                                    h_t.to(self.Wout.weight.dtype),
+                                    start_pos=step_pos,
+                                    group_embs=cur_group_embs,
+                                ).float()
+                            constrained = self._apply_grouped_grammar_mask(
+                                depth_logits, soft_pos=cur_soft_pos
+                            )
+                            logits_g = constrained[:, g_i, :]
+                            if cur_layer_idx == 0 and repetition_penalty > 1.0 and recent_l0:
+                                win = recent_l0[-max(1, int(repetition_window)) :]
+                                for b_i in range(logits_g.size(0)):
+                                    counts: dict[int, int] = {}
+                                    for past_t in win:
+                                        tid = int(past_t[b_i, g_i].item())
+                                        if tid >= self.token_offset:
+                                            counts[tid] = counts.get(tid, 0) + 1
+                                    for tid, cnt in counts.items():
+                                        pen = float(repetition_penalty) ** min(cnt, 4)
+                                        val = logits_g[b_i, tid]
+                                        logits_g[b_i, tid] = val / pen if val > 0 else val * pen
+
+                            tok_g = self._sample_from_logits(
+                                logits_g,
+                                temperature=step_temp,
+                                top_k=step_top_k,
+                                top_p=step_top_p,
+                            )  # [B]
+                            sampled_locals.append(tok_g)
+                            if g_i < self.vq_groups - 1:
+                                local_k_g = (tok_g - self.token_offset).clamp(min=0) % self.codebook_size
+                                global_id_g = (
+                                    self.token_offset
+                                    + eff_layer * layer_stride
+                                    + g_i * self.codebook_size
+                                    + local_k_g
+                                )
+                                cur_group_embs[:, g_i, :] = self.embedding(global_id_g).to(
+                                    dtype=cur_group_embs.dtype
+                                )
+                        local_sampled = torch.stack(sampled_locals, dim=-1)  # [B, G]
+                    else:
+                        with torch.autocast(device_type=h_t.device.type, enabled=False):
+                            if isinstance(self.Wout, DecodeCodebookHead):
+                                next_logits = self.Wout(
+                                    h_t.to(self.Wout.weight.dtype), start_pos=step_pos
+                                ).float()
+                            else:
+                                raw_logits = self.Wout(h_t.to(self.Wout.weight.dtype)).float()
+                                next_logits = raw_logits.reshape(-1, self.vq_groups, self.group_vocab_size)
+                        constrained = self._apply_grouped_grammar_mask(next_logits, soft_pos=cur_soft_pos)
+                        if cur_layer_idx == 0 and repetition_penalty > 1.0 and recent_l0:
+                            win = recent_l0[-max(1, int(repetition_window)) :]
+                            for b_i in range(constrained.size(0)):
+                                for g_i in range(self.vq_groups):
+                                    counts_p: dict[int, int] = {}
+                                    for past_t in win:
+                                        tid = int(past_t[b_i, g_i].item())
+                                        if tid >= self.token_offset:
+                                            counts_p[tid] = counts_p.get(tid, 0) + 1
+                                    for tid, cnt in counts_p.items():
+                                        pen = float(repetition_penalty) ** min(cnt, 4)
+                                        val = constrained[b_i, g_i, tid]
+                                        constrained[b_i, g_i, tid] = val / pen if val > 0 else val * pen
+                        local_sampled = self._sample_from_logits(
+                            constrained, temperature=step_temp, top_k=step_top_k, top_p=step_top_p
+                        )  # [B, G]
+
                     if cur_layer_idx == 0 and repetition_penalty > 1.0:
                         recent_l0.append(local_sampled)
                     next_global = self.local_to_global_ids(
@@ -988,8 +1181,7 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                 generated.append(next_global)
                 cur_soft_pos += 1
                 if cur_soft_pos < target_soft_len:
-                    step_logits = self.forward(next_global, is_causal=True, is_save_cache=True)
-                    next_logits = step_logits[:, -1, :, :]
+                    h_t = self._forward_backbone_last_hidden(next_global, is_prefill=False)
 
             if append_eos and self.token_offset > EOS_TOKEN_ID:
                 eos_soft = torch.full(
@@ -1009,6 +1201,8 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         padding_mask: Optional[Tensor] = None,
         is_causal: bool = True,
         is_save_cache: bool = False,
+        targets: Optional[Tensor] = None,
+        group_embs: Optional[Tensor] = None,
     ) -> Tensor:
         if not is_save_cache and self._has_active_kv_cache():
             self.reset_kv_cache()
@@ -1048,7 +1242,15 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                 out = out.unsqueeze(1)
             with torch.autocast(device_type=out.device.type, enabled=False):
                 if isinstance(self.Wout, DecodeCodebookHead):
-                    score: Tensor = self.Wout(out.to(self.Wout.weight.dtype), start_pos=step_pos).float()
+                    eff_step_embs = group_embs
+                    if eff_step_embs is None and targets is not None:
+                        tgt_step = targets.reshape(x.size(0), 1, self.vq_groups) if keep_seq_dim else targets.reshape(x.size(0), self.vq_groups)
+                        eff_step_embs = self._extract_shifted_group_embeddings(tgt_step)
+                    score: Tensor = self.Wout(
+                        out.to(self.Wout.weight.dtype),
+                        start_pos=step_pos,
+                        group_embs=eff_step_embs,
+                    ).float()
                 else:
                     score = self.Wout(out.to(self.Wout.weight.dtype)).float()
                     score = score.reshape(*score.shape[:-1], self.vq_groups, self.group_vocab_size)
@@ -1114,7 +1316,17 @@ class AblationTransformer2(_BaseMORTM5Transformer):
 
         with torch.autocast(device_type=out.device.type, enabled=False):
             if isinstance(self.Wout, DecodeCodebookHead):
-                score = self.Wout(out.to(self.Wout.weight.dtype), start_pos=0).float()
+                eff_group_embs = group_embs
+                if eff_group_embs is None and targets is not None:
+                    tgt_3d = targets
+                    if tgt_3d.dim() == 2:
+                        tgt_3d = tgt_3d.reshape(batch, tgt_len, self.vq_groups)
+                    eff_group_embs = self._extract_shifted_group_embeddings(tgt_3d)
+                score = self.Wout(
+                    out.to(self.Wout.weight.dtype),
+                    start_pos=0,
+                    group_embs=eff_group_embs,
+                ).float()
             else:
                 score = self.Wout(out.to(self.Wout.weight.dtype)).float()
                 # [B, S, G * group_vocab_size] -> [B, S, G, group_vocab_size] に分割し、Gグループ分のロジットを並列出力
