@@ -138,6 +138,17 @@ class RemoteColabMORTM5Client:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as he:
                 err_body = he.read().decode("utf-8", errors="replace")
+                if he.code == 524 and path.startswith("/mortm5/validate"):
+                    # Cloudflare 524 means the GPU worker is still busy running the validation loop on its event loop;
+                    # wait for /health to become responsive instead of queueing duplicate validation runs.
+                    for _ in range(30):
+                        time.sleep(5.0)
+                        try:
+                            req_h = urllib.request.Request(f"{self.base_url}/health", headers=headers, method="GET")
+                            with urllib.request.urlopen(req_h, timeout=5.0) as _:
+                                break
+                        except Exception:
+                            pass
                 if attempt + 1 >= retries:
                     raise RuntimeError(f"HTTP {he.code} on {path}: {err_body}") from he
                 time.sleep(min(15.0, 2.0 * (attempt + 1)))
@@ -393,7 +404,8 @@ class RemoteMORTM5HybridTrainer:
             "stage_to_local": bool(self.stage_to_local),
             "use_torch_compile": bool(self.use_torch_compile),
             "pretrained_checkpoint_path": self.pretrained_ckpt_path,
-            "resume_checkpoint_path": self.resume_ckpt_path,
+            "resume_checkpoint_path": self.resume_ckpt_path or self.pretrained_ckpt_path,
+            "allow_weights_only_resume": bool(self.pretrained_ckpt_path is not None),
             "version": self.version,
             "seed": int(self.seed),
             "clean_old_checkpoints": (self.resume_ckpt_path is None),
@@ -789,7 +801,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--big-batch-size", type=int, default=None, help="Outer Batch ウィンドウ数の上書き")
     parser.add_argument("--epochs", type=int, default=None, help="エポック数の上書き")
     parser.add_argument("--max-steps", type=int, default=None, help="最大オプティマイザステップ数の上書き (Iso-FLOPs 早期終了用)")
-    parser.add_argument("--val-max-batches", type=int, default=0, help="検証時の最大ミニバッチ数 (0=全件)")
+    parser.add_argument("--val-max-batches", type=int, default=32, help="検証時の最大ミニバッチ数 (既定32=Cloudflare 100s制限回避、0=全件)")
     parser.add_argument("--seed", type=int, default=42, help="乱数シード")
     return parser.parse_args()
 

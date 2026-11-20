@@ -380,6 +380,7 @@ class _BaseMORTM5Transformer(nn.Module):
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        min_p: float = 0.0,
     ) -> Tensor:
         """[..., V] のロジットから `-inf` 文法マスクを厳守しつつサンプリングまたは greedy 選択を行い [...] のインデックスを返す。"""
         if logits.numel() == 0:
@@ -410,6 +411,13 @@ class _BaseMORTM5Transformer(nn.Module):
         scaled = _BaseMORTM5Transformer._sanitize_logits_f32(
             shifted / temp_val, posinf_value=0.0
         )
+
+        if 0.0 < min_p <= 1.0:
+            min_p_clamped = min(1.0, float(min_p))
+            row_scaled_max = scaled.amax(dim=-1, keepdim=True)
+            log_floor = row_scaled_max + (0.0 if min_p_clamped >= 1.0 else math.log(min_p_clamped))
+            keep_mask = (scaled >= log_floor) | (scaled == row_scaled_max)
+            scaled = torch.where(keep_mask, scaled, torch.full_like(scaled, float("-inf")))
 
         if top_k > 0 and top_k < scaled.size(-1):
             topk_vals, _ = torch.topk(scaled, k=top_k, dim=-1)
@@ -502,6 +510,7 @@ class AblationTransformer1(_BaseMORTM5Transformer):
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        min_p: float = 0.0,
         append_eos: bool = True,
         repetition_penalty: float = 1.0,
         repetition_window: int = 24,
@@ -578,7 +587,11 @@ class AblationTransformer1(_BaseMORTM5Transformer):
                     step_top_p = top_p
 
                 next_tok = self._sample_from_logits(
-                    constrained, temperature=step_temp, top_k=step_top_k, top_p=step_top_p
+                    constrained,
+                    temperature=step_temp,
+                    top_k=step_top_k,
+                    top_p=step_top_p,
+                    min_p=min_p,
                 ).unsqueeze(1)  # [B, 1]
                 if layer_idx == 0 and repetition_penalty > 1.0 and 0 <= group_idx < self.vq_groups:
                     recent_l0_by_group[group_idx].append(next_tok.squeeze(1))
@@ -1011,6 +1024,7 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        min_p: float = 0.0,
         append_eos: bool = True,
         return_flat: bool = False,
         repetition_penalty: float = 1.0,
@@ -1079,7 +1093,11 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                             next_logits = raw_logits.reshape(-1, self.vq_groups, self.group_vocab_size)
                     constrained = self._apply_grouped_grammar_mask(next_logits, soft_pos=cur_soft_pos)
                     inst_tok = self._sample_from_logits(
-                        constrained[:, 0, :], temperature=temperature, top_k=top_k, top_p=top_p
+                        constrained[:, 0, :],
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        min_p=min_p,
                     )  # [B]
                     next_global = inst_tok[:, None, None].expand(-1, 1, self.vq_groups).contiguous()
                 else:
@@ -1131,6 +1149,7 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                                 temperature=step_temp,
                                 top_k=step_top_k,
                                 top_p=step_top_p,
+                                min_p=min_p,
                             )  # [B]
                             sampled_locals.append(tok_g)
                             if g_i < self.vq_groups - 1:
@@ -1169,7 +1188,11 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                                         val = constrained[b_i, g_i, tid]
                                         constrained[b_i, g_i, tid] = val / pen if val > 0 else val * pen
                         local_sampled = self._sample_from_logits(
-                            constrained, temperature=step_temp, top_k=step_top_k, top_p=step_top_p
+                            constrained,
+                            temperature=step_temp,
+                            top_k=step_top_k,
+                            top_p=step_top_p,
+                            min_p=min_p,
                         )  # [B, G]
 
                     if cur_layer_idx == 0 and repetition_penalty > 1.0:
@@ -1543,6 +1566,7 @@ class OctupleTransformer(_BaseMORTM5Transformer):
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        min_p: float = 0.0,
         monotonic_time: bool = True,
         allow_eos: bool = True,
         append_eos: bool = True,
@@ -1703,7 +1727,7 @@ class OctupleTransformer(_BaseMORTM5Transformer):
                         )
 
                 bar_local = self._sample_from_logits(
-                    bar_logits, temperature=temperature, top_k=top_k, top_p=top_p
+                    bar_logits, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p
                 )  # [B]
                 step_is_eos = (bar_local == EOS_TOKEN_ID) | (~active_batch)
                 sampled_bar = (bar_local - self.token_offset).clamp(min=0, max=bar_limit - 1)
@@ -1752,7 +1776,7 @@ class OctupleTransformer(_BaseMORTM5Transformer):
                 rest_logits[:, 0, self.token_offset : self.token_offset + pos_limit] = pos_slice
 
                 rest_local = self._sample_from_logits(
-                    rest_logits, temperature=temperature, top_k=top_k, top_p=top_p
+                    rest_logits, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p
                 )  # [B, 5]
                 local_tuple = torch.cat([bar_local.unsqueeze(1), rest_local], dim=1)
                 tuple_global = self.local_to_global_ids(local_tuple)
@@ -1773,7 +1797,7 @@ class OctupleTransformer(_BaseMORTM5Transformer):
                             s_pos = int(cur_pos_vec[b_i].item())
                             inst_rows[b_i] = self._apply_instrument_prefix_mask(inst_rows[b_i], soft_pos=s_pos)
                     inst_tok = self._sample_from_logits(
-                        inst_rows, temperature=temperature, top_k=top_k, top_p=top_p
+                        inst_rows, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p
                     )
                     inst_tuple = inst_tok.unsqueeze(1).expand(-1, self.tuple_size)
                     tuple_global = torch.where(need_inst.unsqueeze(1), inst_tuple, tuple_global)
@@ -2140,6 +2164,7 @@ class REMITransformer(_BaseMORTM5Transformer):
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        min_p: float = 0.0,
         monotonic_time: bool = True,
         allow_eos: bool = True,
         append_eos: bool = True,
@@ -2368,7 +2393,7 @@ class REMITransformer(_BaseMORTM5Transformer):
                             out_row[PAD_TOKEN_ID] = 0.0
 
                 next_tok = self._sample_from_logits(
-                    constrained, temperature=temperature, top_k=top_k, top_p=top_p
+                    constrained, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p
                 )  # [B]
                 next_tok_cpu = next_tok.detach().cpu().tolist()
 
