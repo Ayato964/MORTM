@@ -222,33 +222,38 @@ class OddRoundEngine:
                 if k in acc:
                     hist[k].append(acc[k])
 
-            if len(raw_buf) == cfg.eval_window and step % max(1, cfg.log_every) == 0:
+            # Compute buffered ROC-AUC & logit means from the very first log step (`len(raw_buf) >= 1`)
+            # so early logs never display misleading `nan` / `-1.0000`, while gating early-stop strictly
+            # on `len(raw_buf) >= effective_eval_window` to prevent small-sample premature stopping.
+            effective_eval_win = min(cfg.eval_window, cfg.max_steps)
+            if len(raw_buf) >= 1 and step % max(1, cfg.log_every) == 0:
                 sc = np.concatenate([r[0] for r in raw_buf])
                 ya = np.concatenate([r[1] for r in raw_buf])
                 sr = [x for r in raw_buf for x in r[2]]
                 last_auc = auc_by_source(sc, ya, sr)
                 a_gem = last_auc.get("auc_gem", float("nan"))
-                if a_gem == a_gem:
+                if math.isfinite(a_gem):
                     best_auc = max(best_auc, a_gem)
-                    auc_hist.append((step, a_gem))
-                    if len(auc_hist) == cfg.auc_slope_window:
-                        xs = np.array([h[0] for h in auc_hist], dtype=np.float64)
-                        ys = np.array([h[1] for h in auc_hist], dtype=np.float64)
-                        slope = float(np.polyfit(xs, ys, 1)[0] * 1000.0)
-                        stale = stale + 1 if slope < cfg.auc_min_slope else 0
-                    if a_gem >= cfg.auc_threshold:
-                        reason = f"discriminator_ready: AUC(human vs gem) {a_gem:.4f} >= {cfg.auc_threshold}"
-                    elif step >= cfg.auc_min_steps and stale >= cfg.auc_patience:
-                        reason = (
-                            f"auc_converged: slope {slope:+.4f}/1k < {cfg.auc_min_slope} "
-                            f"for {stale} checks (best={best_auc:.4f}, cur={a_gem:.4f})"
-                        )
+                    if len(raw_buf) >= effective_eval_win:
+                        auc_hist.append((step, a_gem))
+                        if len(auc_hist) == cfg.auc_slope_window:
+                            xs = np.array([h[0] for h in auc_hist], dtype=np.float64)
+                            ys = np.array([h[1] for h in auc_hist], dtype=np.float64)
+                            slope = float(np.polyfit(xs, ys, 1)[0] * 1000.0)
+                            stale = stale + 1 if slope < cfg.auc_min_slope else 0
+                        if a_gem >= cfg.auc_threshold:
+                            reason = f"discriminator_ready: AUC(human vs gem) {a_gem:.4f} >= {cfg.auc_threshold}"
+                        elif step >= cfg.auc_min_steps and stale >= cfg.auc_patience:
+                            reason = (
+                                f"auc_converged: slope {slope:+.4f}/1k < {cfg.auc_min_slope} "
+                                f"for {stale} checks (best={best_auc:.4f}, cur={a_gem:.4f})"
+                            )
 
             step_log: Dict[str, Any] = {
                 "odd/loss": float(loss.detach().item()),
                 "odd/step": step,
                 "odd/qtable_size": len(self._qtable),
-                "odd/auc_best": best_auc,
+                "odd/auc_best": best_auc if best_auc >= 0.0 else float("nan"),
                 "odd/auc_stale": stale,
                 **{f"odd/acc_{k}": v for k, v in acc.items()},
                 **{f"odd/{k}": v for k, v in last_auc.items()},
@@ -260,10 +265,18 @@ class OddRoundEngine:
                 a_gem = last_auc.get("auc_gem", float("nan"))
                 lh = last_auc.get("logit_mean_human", float("nan"))
                 lg = last_auc.get("logit_mean_gem", float("nan"))
+                auc_str = f"{a_gem:.4f}" if math.isfinite(a_gem) else "n/a"
+                best_str = f"{best_auc:.4f}" if best_auc >= 0.0 else "n/a"
+                slope_str = (
+                    f"{slope:+.4f}/1k"
+                    if math.isfinite(slope)
+                    else f"warmup({len(auc_hist)}/{cfg.auc_slope_window})"
+                )
+                win_tag = "" if len(raw_buf) >= effective_eval_win else f" [buf {len(raw_buf)}/{effective_eval_win}]"
                 print(
                     f"[R{round_no} Odd] step {step:5d}/{cfg.max_steps} | "
                     f"bce={float(loss.detach().item()):.4f} | "
-                    f"AUC(gem)={a_gem:.4f} (best={best_auc:.4f}, slope={slope:+.4f}/1k, stale={stale}) | "
+                    f"AUC(gem)={auc_str}{win_tag} (best={best_str}, slope={slope_str}, stale={stale}) | "
                     f"logit(H={lh:+.2f}, G={lg:+.2f}) | Q={len(self._qtable)}",
                     flush=True,
                 )

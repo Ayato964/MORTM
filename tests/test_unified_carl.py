@@ -1030,3 +1030,84 @@ def test_non_finite_grad_and_loss_protection_and_strict_resume_errors(tmp_path: 
     assert str(out["reason"]).startswith("non_finite_abort")
     assert out["rolled_back"] is True
     assert all(torch.isfinite(p).all() for p in actor.actor_module.parameters())
+
+
+
+def test_batched_kvcache_sdpa_and_single_group_depth_head_exact_equivalence(capsys: Any) -> None:
+    """Verify batched `flash_attn_with_kvcache`, `DecodeCodebookHead(target_group=g)`, and early Odd AUC logs."""
+    from mortm.models.modules.attention import flash_attn_with_kvcache
+    from mortm.train.rl.engine import OddRoundEngine
+    from mortm.train.rl.q_table import QTable
+
+    torch.manual_seed(2026)
+
+    # 1. Uniform & Ragged batched `flash_attn_with_kvcache` equivalence against per-item reference
+    B, Sq, H, D = 6, 1, 4, 16
+    q = torch.randn(B, Sq, H, D)
+    k_new = torch.randn(B, Sq, H, D)
+    v_new = torch.randn(B, Sq, H, D)
+    k_cache_1 = torch.randn(B, 16, H, D)
+    v_cache_1 = torch.randn(B, 16, H, D)
+    k_cache_2 = k_cache_1.clone()
+    v_cache_2 = v_cache_1.clone()
+
+    # Ragged lengths `[2, 7, 4, 9, 1, 6]`
+    ragged_lens = torch.tensor([2, 7, 4, 9, 1, 6], dtype=torch.int32)
+    out_batched = flash_attn_with_kvcache(q, k_cache_1, v_cache_1, k=k_new, v=v_new, cache_seqlens=ragged_lens, causal=True)
+
+    ref_outs = []
+    for i in range(B):
+        p = int(ragged_lens[i].item())
+        k_cache_2[i, p : p + 1] = k_new[i]
+        v_cache_2[i, p : p + 1] = v_new[i]
+        o_i = torch.nn.functional.scaled_dot_product_attention(
+            q[i].permute(1, 0, 2).unsqueeze(0),
+            k_cache_2[i, : p + 1].permute(1, 0, 2).unsqueeze(0),
+            v_cache_2[i, : p + 1].permute(1, 0, 2).unsqueeze(0),
+        )
+        ref_outs.append(o_i.squeeze(0).permute(1, 0, 2))
+    assert torch.allclose(out_batched, torch.stack(ref_outs, dim=0), atol=1e-5)
+
+    # Uniform length `pos = 5` (`uniform_seqlen=5`, zero CPU sync path)
+    uni_lens = torch.full((B,), 5, dtype=torch.int32)
+    out_uni = flash_attn_with_kvcache(
+        q, k_cache_1, v_cache_1, k=k_new, v=v_new, cache_seqlens=uni_lens, causal=True, uniform_seqlen=5
+    )
+    assert out_uni.shape == (B, Sq, H, D)
+    assert torch.isfinite(out_uni).all()
+
+    # 2. `DecodeCodebookHead(target_group=g_i)` equivalence with non-zero trained `q_up` Depth weights
+    dev = _select_test_device()
+    m_args = MORTM5Args(_tiny_symic_config())
+    model = build_mortm5_ablation_model(m_args).to(dev).eval()
+    with torch.no_grad():
+        for name, p in model.Wout.depth_decoder.named_parameters():
+            if name.endswith("q_up.weight"):
+                nn.init.normal_(p, std=0.1)
+    model.Wout._legacy_untrained_depth.fill_(False)
+
+    h_t = torch.randn(4, int(m_args.d_model), device=dev)
+    g_embs = torch.randn(4, 3, int(m_args.d_model), device=dev)
+    for s_pos in (1, 132):
+        full_logits = model.Wout(h_t, start_pos=s_pos, group_embs=g_embs).float()
+        for g_i in range(4):
+            single_g = model.Wout(h_t, start_pos=s_pos, group_embs=g_embs, target_group=g_i).float()
+            assert torch.allclose(single_g, full_logits[:, g_i, :], atol=2e-2)
+
+    # 3. Verify `OddRoundEngine` prints finite AUC & logits even when `step (2) < eval_window (100)`
+    actor = SyMIcGroupedActorAdapter(model, dev, prompt_bars=1, total_bars=2)
+    critic = SyMIcCriticAdapter.from_pretrained(m_args, None, dev, prompt_bars=1, lora_rank=4)
+    ana_pool = InMemorySamplePool(
+        [_make_synthetic_symic_example(m_args, song_id=i, prompt_bars=1, total_bars=2) for i in range(4)]
+    )
+    odd = OddRoundEngine(
+        actor=actor,
+        critic=critic,
+        qtable=QTable(q_max=8),
+        cfg=UnifiedOddConfig(batch_size=4, pool_size=4, max_steps=2, eval_window=100, log_every=2),
+    )
+    odd.run(ana_pool, round_no=1)
+    captured = capsys.readouterr().out
+    assert "AUC(gem)=nan" not in captured
+    assert "best=-1.0000" not in captured
+    assert "+nan/1k" not in captured

@@ -296,6 +296,7 @@ class _BaseMORTM5Transformer(nn.Module):
             if attn is not None:
                 attn.kv_cache = None
                 attn.cache_seqlens = None
+                attn._uniform_cache_len = None
 
     def _has_active_kv_cache(self) -> bool:
         return (
@@ -1122,15 +1123,15 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                         eff_layer = cur_layer_idx % self.effective_layers
                         for g_i in range(self.vq_groups):
                             with torch.autocast(device_type=h_t.device.type, enabled=False):
-                                depth_logits = self.Wout(
+                                logits_g_raw = self.Wout(
                                     h_t.to(self.Wout.weight.dtype),
                                     start_pos=step_pos,
                                     group_embs=cur_group_embs,
+                                    target_group=g_i,
                                 ).float()
-                            constrained = self._apply_grouped_grammar_mask(
-                                depth_logits, soft_pos=cur_soft_pos
-                            )
-                            logits_g = constrained[:, g_i, :]
+                            logits_g = self._apply_grouped_grammar_mask(
+                                logits_g_raw.unsqueeze(1), soft_pos=cur_soft_pos
+                            ).squeeze(1)
                             if cur_layer_idx == 0 and repetition_penalty > 1.0 and recent_l0:
                                 win = recent_l0[-max(1, int(repetition_window)) :]
                                 for b_i in range(logits_g.size(0)):
@@ -1247,7 +1248,10 @@ class AblationTransformer2(_BaseMORTM5Transformer):
             if keep_seq_dim:
                 x = x.squeeze(1)  # [B, G]
             attn0 = self.decoder.layers[0].self_attention
-            step_pos = int(attn0.cache_seqlens[0].item()) if attn0.cache_seqlens is not None else 0
+            if getattr(attn0, "_uniform_cache_len", None) is not None:
+                step_pos = int(attn0._uniform_cache_len)
+            else:
+                step_pos = int(attn0.cache_seqlens[0].item()) if attn0.cache_seqlens is not None else 0
 
             # [B, G] -> [B, d_model] (分散1.0正規化付き集約、2D で decoder に渡し残差ブロードキャスト事故を防止)
             x_emb = self._aggregate_group_embeddings(x).to(dtype=torch.bfloat16)

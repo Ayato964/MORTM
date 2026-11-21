@@ -471,6 +471,7 @@ def flash_attn_with_kvcache(
     rotary_interleaved: bool = True,
     alibi_slopes: Optional[Tensor] = None,
     num_splits: int = 0,
+    uniform_seqlen: Optional[int] = None,
 ) -> Tensor:
     if _HAS_FLASH_ATTN and q.is_cuda:
         return _cuda_flash_attn_with_kvcache(
@@ -491,10 +492,75 @@ def flash_attn_with_kvcache(
             alibi_slopes=alibi_slopes,
             num_splits=num_splits,
         )
+
     B, Sq, H, D = q.shape
+    if B == 0:
+        return torch.empty_like(q)
+
+    # Resolve uniform sequence length with at most 1 CPU sync (0 syncs when caller tracks `uniform_seqlen`).
+    lens_list: Optional[list[int]] = None
+    eff_uniform: Optional[int] = int(uniform_seqlen) if uniform_seqlen is not None else None
+    if eff_uniform is None:
+        if cache_seqlens is None:
+            eff_uniform = 0
+        else:
+            lens_list = [int(x) for x in cache_seqlens.detach().cpu().tolist()]
+            if lens_list and min(lens_list) == max(lens_list):
+                eff_uniform = lens_list[0]
+
+    # Fast Path 1: Uniform batch KV length -> Zero Python loop, 1 fused `[B, H, Sq, end_pos]` SDPA call!
+    if eff_uniform is not None:
+        pos = eff_uniform
+        if k is not None and v is not None:
+            k_cache[:, pos : pos + Sq] = k
+            v_cache[:, pos : pos + Sq] = v
+            end_pos = pos + Sq
+        else:
+            end_pos = pos
+        q_bh = q.transpose(1, 2)
+        k_bh = k_cache[:, :end_pos].transpose(1, 2)
+        v_bh = v_cache[:, :end_pos].transpose(1, 2)
+        if alibi_slopes is not None:
+            attn_mask = _build_alibi_bias(Sq, end_pos, alibi_slopes, causal and Sq > 1, q.device, q.dtype)
+            out_bh = torch.nn.functional.scaled_dot_product_attention(
+                q_bh, k_bh, v_bh, attn_mask=attn_mask, dropout_p=0.0, is_causal=False, scale=softmax_scale
+            )
+        else:
+            out_bh = torch.nn.functional.scaled_dot_product_attention(
+                q_bh, k_bh, v_bh, dropout_p=0.0, is_causal=(causal and Sq > 1), scale=softmax_scale
+            )
+        return out_bh.transpose(1, 2)
+
+    # Fast Path 2: Variable-length batch with `Sq == 1` & RoPE -> Vectorized scatter + 1 masked batched SDPA call!
+    if Sq == 1 and alibi_slopes is None and cache_seqlens is not None and lens_list is not None:
+        batch_idx = torch.arange(B, device=q.device, dtype=torch.long)
+        pos_long = cache_seqlens.to(device=q.device, dtype=torch.long)
+        if k is not None and v is not None:
+            k_cache[batch_idx, pos_long] = k[:, 0]
+            v_cache[batch_idx, pos_long] = v[:, 0]
+            end_long = pos_long + 1
+            max_end = max(lens_list) + 1
+        else:
+            end_long = pos_long
+            max_end = max(1, max(lens_list))
+        valid_mask = torch.arange(max_end, device=q.device).view(1, 1, 1, max_end) < end_long.view(B, 1, 1, 1)
+        out_bh = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k_cache[:, :max_end].transpose(1, 2),
+            v_cache[:, :max_end].transpose(1, 2),
+            attn_mask=valid_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=softmax_scale,
+        )
+        return out_bh.transpose(1, 2)
+
+    # Fallback Path: Ragged `Sq > 1` or ragged ALiBi
+    if lens_list is None:
+        lens_list = [int(x) for x in cache_seqlens.detach().cpu().tolist()] if cache_seqlens is not None else [0] * B
     outs = []
     for i in range(B):
-        pos = int(cache_seqlens[i].item()) if cache_seqlens is not None else 0
+        pos = lens_list[i]
         if k is not None and v is not None:
             k_cache[i, pos : pos + Sq] = k[i]
             v_cache[i, pos : pos + Sq] = v[i]
@@ -670,6 +736,7 @@ class FlashSelfAttentionM(nn.Module):
         # KV Cache init
         self.kv_cache: Optional[Tuple[Tensor, Tensor]] = None
         self.cache_seqlens: Optional[Tensor] = None
+        self._uniform_cache_len: Optional[int] = None
 
         device = progress.get_device() if progress else _get_default_device()
 
@@ -695,6 +762,7 @@ class FlashSelfAttentionM(nn.Module):
             torch.zeros(shape, device=device, dtype=dtype)
         )
         self.cache_seqlens = torch.zeros(batch_size, device=device, dtype=torch.int32)
+        self._uniform_cache_len = 0
 
     def _ensure_kv_cache_capacity(
         self, batch_size: int, required_len: int, device: torch.device, dtype: torch.dtype
@@ -732,8 +800,10 @@ class FlashSelfAttentionM(nn.Module):
             self.kv_cache[0][:, :s_len] = k.view(eff_batch, s_len, self.args.num_heads, self.head_dim)
             self.kv_cache[1][:, :s_len] = v.view(eff_batch, s_len, self.args.num_heads, self.head_dim)
             self.cache_seqlens.fill_(s_len)
+            self._uniform_cache_len = int(s_len)
             return
 
+        self._uniform_cache_len = None
         cu_list = layout.cu_seqlens.detach().cpu().tolist()
         for i in range(eff_batch):
             start, end = int(cu_list[i]), int(cu_list[i + 1])
@@ -822,12 +892,16 @@ class FlashSelfAttentionM(nn.Module):
             if is_save_cache:
                 if self.cache_seqlens is None:
                     self._init_kv_cache(q.size(0), q.device, k.dtype, min_capacity=q.size(1))
-                max_pos = int(self.cache_seqlens.max().item()) if self.cache_seqlens.numel() > 0 else 0
-                self._ensure_kv_cache_capacity(q.size(0), max_pos + q.size(1), q.device, k.dtype)
+                step_Sq = int(q.size(1))
+                if self._uniform_cache_len is not None:
+                    max_pos = self._uniform_cache_len
+                else:
+                    max_pos = int(self.cache_seqlens.max().item()) if self.cache_seqlens.numel() > 0 else 0
+                self._ensure_kv_cache_capacity(q.size(0), max_pos + step_Sq, q.device, k.dtype)
 
                 if self.args.use_rope:
-                    position_ids = self.cache_seqlens.clone()
-                    cos, sin = self.rotary_emb(v, seq_len=max_pos + q.size(1))
+                    position_ids = self.cache_seqlens
+                    cos, sin = self.rotary_emb(v, seq_len=max_pos + step_Sq)
 
                     # RoPE適用 (q, k はここで新しく計算されるため安全)
                     q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
@@ -846,7 +920,9 @@ class FlashSelfAttentionM(nn.Module):
                         self.kv_cache[0][i, pos] = k[i, 0]   # k: [B,1,H,D]
                         self.kv_cache[1][i, pos] = v[i, 0]
 
-                    self.cache_seqlens += 1
+                    self.cache_seqlens += step_Sq
+                    if self._uniform_cache_len is not None:
+                        self._uniform_cache_len += step_Sq
                     new_lens = self.cache_seqlens  # [B]
 
                     # 各バッチで attention を計算 (B=1 前提で最適化)
@@ -881,9 +957,12 @@ class FlashSelfAttentionM(nn.Module):
                         k=k,
                         v=v,
                         cache_seqlens=self.cache_seqlens,
-                        causal=True
+                        causal=True,
+                        uniform_seqlen=self._uniform_cache_len,
                     )
-                    self.cache_seqlens += 1
+                    self.cache_seqlens += step_Sq
+                    if self._uniform_cache_len is not None:
+                        self._uniform_cache_len += step_Sq
                     # Decoding Output: [Batch, 1, Heads, Dim] -> [Batch, Heads*Dim]
                     out = out.squeeze(1)
                     out = rearrange(out, "b h d -> b (h d)")
@@ -896,9 +975,12 @@ class FlashSelfAttentionM(nn.Module):
                         v=v,
                         cache_seqlens=self.cache_seqlens,
                         alibi_slopes=self.alibi_slopes,
-                        causal=True
+                        causal=True,
+                        uniform_seqlen=self._uniform_cache_len,
                     )
-                    self.cache_seqlens += 1
+                    self.cache_seqlens += step_Sq
+                    if self._uniform_cache_len is not None:
+                        self._uniform_cache_len += step_Sq
                     out = out.squeeze(1)
                     out = rearrange(out, "b h d -> b (h d)")
             else:

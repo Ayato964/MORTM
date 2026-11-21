@@ -429,6 +429,7 @@ class DecodeCodebookHead(nn.Module):
         x: Tensor,
         start_pos: int = 0,
         group_embs: Optional[Tensor] = None,
+        target_group: Optional[int] = None,
     ) -> Tensor:
         squeeze_seq = (x.dim() == 2)
         if squeeze_seq:
@@ -436,6 +437,10 @@ class DecodeCodebookHead(nn.Module):
         if x.dim() != 3:
             raise ValueError(
                 f"DecodeCodebookHead expects 2D [B, D] or 3D [B, S, D] tensor, got {tuple(x.shape)}."
+            )
+        if target_group is not None and not (0 <= int(target_group) < self.num_group):
+            raise ValueError(
+                f"target_group must be in [0, {self.num_group - 1}], got {target_group}."
             )
 
         batch_size, seq_len, _ = x.shape
@@ -447,6 +452,67 @@ class DecodeCodebookHead(nn.Module):
         # 位置 0 にソフトトークン x ([B, S, 1, D])、位置 1..G-1 に x + 確定済みグループ埋め込み ([B, S, G-1, D]) を配置
         if self.training and bool(self._legacy_untrained_depth):
             self._legacy_untrained_depth.fill_(False)
+
+        # Single-group autoregressive generation fast path (`target_group = g_i`):
+        # Causal self-attention at position `g_i` depends strictly on prefix `0..g_i` (`g_len = g_i + 1`),
+        # saving 37.5% Depth Transformer tokens and 4x codebook Linear projections!
+        if target_group is not None:
+            g_idx = int(target_group)
+            if bool(self._legacy_untrained_depth) and not self.training:
+                x_depth_g = x.to(dtype=self.weight.dtype)
+            else:
+                g_len = g_idx + 1
+                if g_idx == 0:
+                    depth_seq_g = x.unsqueeze(2)
+                else:
+                    if group_embs is None:
+                        sub_embs = x.new_zeros((batch_size, seq_len, g_idx, self.d_model))
+                    else:
+                        if squeeze_seq and group_embs.dim() == 3:
+                            group_embs = group_embs.unsqueeze(1)
+                        sub_embs = group_embs[:, :, :g_idx, :].to(dtype=x.dtype)
+                    depth_seq_g = torch.cat([x.unsqueeze(2), x.unsqueeze(2) + sub_embs], dim=2)
+
+                num_depth_seqs = batch_size * seq_len
+                depth_flat = depth_seq_g.reshape(num_depth_seqs * g_len, self.d_model).to(dtype=torch.bfloat16)
+                cu_seqlens = torch.arange(
+                    0,
+                    (num_depth_seqs + 1) * g_len,
+                    step=g_len,
+                    device=x.device,
+                    dtype=torch.int32,
+                )
+                with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                    depth_out = self.depth_decoder(
+                        tgt=depth_flat,
+                        tgt_is_causal=True,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=g_len,
+                        batch_size=num_depth_seqs,
+                        is_save_cache=False,
+                    )
+                depth_view = depth_out.view(batch_size, seq_len, g_len, self.d_model)
+                delta_g = depth_view[:, :, g_idx, :] - depth_seq_g[:, :, g_idx, :].to(dtype=depth_out.dtype)
+                x_depth_g = x.to(dtype=self.weight.dtype) + delta_g.to(dtype=self.weight.dtype)
+
+            cb_g = x_depth_g.new_empty((batch_size, seq_len, self.codebook_size))
+            if rvq_start > 0:
+                cb_g[:, :rvq_start, :] = self.decode[0][g_idx](x_depth_g[:, :rvq_start, :])
+            if rvq_start < seq_len:
+                first_pos_at_rvq_start = int(start_pos) + rvq_start
+                first_layer = max(0, first_pos_at_rvq_start - first_rvq_input_pos) % self.num_layer
+                for d in range(self.num_layer):
+                    x_l = x_depth_g[:, rvq_start + d :: self.num_layer, :]
+                    if x_l.size(1) == 0:
+                        continue
+                    layer_idx = (first_layer + d) % self.num_layer
+                    cb_g[:, rvq_start + d :: self.num_layer, :] = self.decode[layer_idx][g_idx](x_l)
+
+            if self.special_decode is not None:
+                out_g = torch.cat([self.special_decode(x_depth_g), cb_g], dim=-1)
+            else:
+                out_g = cb_g
+            return out_g.squeeze(1) if squeeze_seq else out_g
 
         if bool(self._legacy_untrained_depth) and not self.training:
             x_depth = x.unsqueeze(2).expand(batch_size, seq_len, self.num_group, self.d_model).to(dtype=self.weight.dtype)
