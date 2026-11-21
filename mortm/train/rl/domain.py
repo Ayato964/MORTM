@@ -140,8 +140,18 @@ class UnifiedSamplingConfig:
             raise ValueError(f"fine_temperature must be >= 0, got {self.fine_temperature}.")
         if not (0.0 < self.top_p <= 1.0):
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
+        if self.fine_top_p is not None and not (0.0 < self.fine_top_p <= 1.0):
+            raise ValueError(f"fine_top_p must be in (0, 1], got {self.fine_top_p}.")
+        if self.top_k < 0:
+            raise ValueError(f"top_k must be >= 0, got {self.top_k}.")
+        if self.fine_top_k is not None and self.fine_top_k < 0:
+            raise ValueError(f"fine_top_k must be >= 0, got {self.fine_top_k}.")
         if self.min_p < 0.0 or self.min_p > 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
+        if self.repetition_penalty < 1.0:
+            raise ValueError(f"repetition_penalty must be >= 1.0, got {self.repetition_penalty}.")
+        if self.max_new_tokens <= 0 or self.max_measures <= 0:
+            raise ValueError("max_new_tokens and max_measures must be positive.")
 
 
 @dataclass(frozen=True)
@@ -163,6 +173,26 @@ class UnifiedOddConfig:
     auc_patience: int = 10
     auc_min_steps: int = 1000
     sampling: UnifiedSamplingConfig = field(default_factory=UnifiedSamplingConfig)
+
+    def __post_init__(self) -> None:
+        if self.batch_size < 2:
+            raise ValueError(
+                f"UnifiedOddConfig.batch_size must be >= 2 so mix_batch includes both Human and AI, got {self.batch_size}."
+            )
+        if self.pool_size < 1 or self.max_steps < 1 or self.eval_window < 1 or self.log_every < 1:
+            raise ValueError("pool_size, max_steps, eval_window, and log_every must be >= 1.")
+        if self.gen_chunk < 1 or self.critic_chunk < 1:
+            raise ValueError("gen_chunk and critic_chunk must be >= 1.")
+        if self.lr <= 0.0 or self.grad_clip < 0.0:
+            raise ValueError("lr must be > 0 and grad_clip must be >= 0.")
+        if not (0.0 < self.auc_threshold <= 1.0):
+            raise ValueError(f"auc_threshold must be in (0, 1], got {self.auc_threshold}.")
+        if self.auc_slope_window < 2:
+            raise ValueError(
+                f"auc_slope_window must be >= 2 for linear slope estimation, got {self.auc_slope_window}."
+            )
+        if self.auc_patience < 1 or self.auc_min_steps < 0:
+            raise ValueError("auc_patience must be >= 1 and auc_min_steps must be >= 0.")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -208,6 +238,20 @@ class UnifiedEvenConfig:
     disc_span: float = 8.0
     empty_penalty: float = -1.0
     sampling: UnifiedSamplingConfig = field(default_factory=UnifiedSamplingConfig)
+
+    def __post_init__(self) -> None:
+        if self.group_size < 1 or self.prompts_per_step < 1 or self.max_steps < 1:
+            raise ValueError("group_size, prompts_per_step, and max_steps must be >= 1.")
+        if self.gen_chunk < 1 or self.critic_chunk < 1 or self.train_chunk < 1:
+            raise ValueError("gen_chunk, critic_chunk, and train_chunk must be >= 1.")
+        if self.stop_window < 1 or self.snapshot_every < 1 or self.log_every < 1:
+            raise ValueError("stop_window, snapshot_every, and log_every must be >= 1.")
+        if self.lr <= 0.0 or self.grad_clip < 0.0:
+            raise ValueError("lr must be > 0 and grad_clip must be >= 0.")
+        if self.clip_eps <= 0.0 or self.kl_coef < 0.0 or self.adv_eps <= 0.0:
+            raise ValueError("clip_eps > 0, kl_coef >= 0, and adv_eps > 0 are required.")
+        if self.disc_span <= 0.0:
+            raise ValueError(f"disc_span must be > 0, got {self.disc_span}.")
 
     def to_dict(self) -> Dict[str, Any]:
         return {

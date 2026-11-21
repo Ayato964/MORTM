@@ -99,6 +99,10 @@ class Mortm45GenSftRepository(CARLDataRepository):
                     aux_metadata=rec,
                 )
             )
+        if len(examples) < 2:
+            raise RuntimeError(
+                f"Mortm45GenSftRepository found only {len(examples)} valid records (need >= 2 for disjoint split)."
+            )
         cut = len(examples) // 2
         return InMemorySamplePool(examples[:cut]), InMemorySamplePool(examples[cut:])
 
@@ -236,10 +240,27 @@ class Mortm45ActorAdapter(CARLActorAdapter):
 
     def load_checkpoint_state(self, state: Dict[str, Any]) -> None:
         cleaned = dict(state)
-        if _is_legacy_merged("", cleaned):
-            raise RuntimeError("Legacy merged LoRA checkpoint detected; run fix_merged_ckpt first.")
+        has_nonzero_lora_b = any(
+            isinstance(k, str)
+            and k.endswith("lora_B")
+            and isinstance(v, Tensor)
+            and float(v.detach().abs().sum().item()) > 0.0
+            for k, v in cleaned.items()
+        )
+        if (_UNMERGED_MARK not in cleaned) and has_nonzero_lora_b:
+            raise RuntimeError(
+                "Legacy merged LoRA checkpoint detected (missing _carl_unmerged marker with non-zero lora_B); "
+                "run `python -m mortm.train.rl.fix_merged_ckpt` first."
+            )
         cleaned.pop(_UNMERGED_MARK, None)
-        self._model.load_state_dict(cleaned)
+        # Switch `loralib.Linear` into `.train()` (`merged=False`) BEFORE loading unmerged weights!
+        was_training = self._model.training
+        self._model.train()
+        try:
+            self._model.load_state_dict(cleaned)
+        finally:
+            if not was_training:
+                self._model.eval()
 
 
 class Mortm45CriticAdapter(CARLCriticAdapter):
@@ -325,14 +346,29 @@ class Mortm45CriticAdapter(CARLCriticAdapter):
     def load_compact_state(self, state: Dict[str, Any]) -> None:
         cleaned = dict(state)
         cleaned.pop(_UNMERGED_MARK, None)
-        _, unexpected = self._ana.load_state_dict(cleaned, strict=False)
+        expected_keys = {
+            k
+            for k in self._ana.state_dict().keys()
+            if ("lora_" in k) or k.startswith(("pma", "out_head", "mil"))
+        }
+        missing_compact = sorted(expected_keys - set(cleaned.keys()))
+        if missing_compact:
+            raise RuntimeError(f"Missing expected Critic adapter keys: {missing_compact[:5]}")
+        # Unmerge `loralib.Linear` (`merged=False`) before updating `lora_A`/`lora_B` so frozen `weight` is never polluted!
+        was_training = self._ana.training
+        self._ana.train()
+        try:
+            _, unexpected = self._ana.load_state_dict(cleaned, strict=False)
+        finally:
+            if not was_training:
+                self._ana.eval()
         if unexpected:
             raise RuntimeError(f"Unexpected Critic keys: {unexpected[:5]}")
 
 
 @dataclass(frozen=True)
 class Mortm45DecodedContext:
-    """Shared decoded representation for MORTM4.5 guardrails (eliminates redundant note parsing)."""
+    """Shared decoded representation for MORTM4.5 guardrails (`O(P)` deduplicated reference notes/rolls)."""
 
     batch: RolloutBatch
     is_empty: Tensor
@@ -340,6 +376,7 @@ class Mortm45DecodedContext:
     cond_raw: Tuple[np.ndarray, ...]
     gen_notes: Tuple[list, ...]
     ref_notes: Tuple[Optional[list], ...]
+    ref_rolls: Tuple[Optional[np.ndarray], ...]
 
 
 class Mortm45ContextBuilder(GuardrailContextBuilder[Mortm45DecodedContext]):
@@ -352,11 +389,24 @@ class Mortm45ContextBuilder(GuardrailContextBuilder[Mortm45DecodedContext]):
         cond_raw_list: List[np.ndarray] = []
         gen_notes_list: List[list] = []
         ref_notes_list: List[Optional[list]] = []
+        ref_rolls_list: List[Optional[np.ndarray]] = []
+
+        # Deduplicate reference condition & GT note/roll extraction per unique `example_id` (`O(P)`).
+        ref_cache: Dict[str, Tuple[np.ndarray, Dict[str, object], Optional[list], Optional[np.ndarray]]] = {}
 
         for ex, gen in zip(batch.examples, batch.generated_sequences):
-            rec = ex.aux_metadata if isinstance(ex.aux_metadata, dict) else {}
-            c_raw = np.asarray(rec.get("cond_meta", []), dtype=np.int64)
-            c_parsed = parse_meta(c_raw, self._tok) if c_raw.size > 0 else {}
+            cached = ref_cache.get(ex.example_id)
+            if cached is None:
+                rec = ex.aux_metadata if isinstance(ex.aux_metadata, dict) else {}
+                c_raw = np.asarray(rec.get("cond_meta", []), dtype=np.int64)
+                c_parsed = parse_meta(c_raw, self._tok) if c_raw.size > 0 else {}
+                gt_seq = rec.get("gt")
+                r_notes = tokens_to_notes(self._tok, gt_seq) if gt_seq is not None else None
+                r_roll = notes_to_roll(r_notes) if r_notes is not None else None
+                cached = (c_raw, c_parsed, r_notes, r_roll)
+                ref_cache[ex.example_id] = cached
+
+            c_raw, c_parsed, r_notes, r_roll = cached
             cond_raw_list.append(c_raw)
             cond_parsed.append(c_parsed)
 
@@ -364,12 +414,13 @@ class Mortm45ContextBuilder(GuardrailContextBuilder[Mortm45DecodedContext]):
                 is_empty_flags.append(True)
                 gen_notes_list.append([])
                 ref_notes_list.append(None)
+                ref_rolls_list.append(None)
                 continue
 
             is_empty_flags.append(False)
             gen_notes_list.append(tokens_to_notes(self._tok, gen))
-            gt_seq = rec.get("gt")
-            ref_notes_list.append(tokens_to_notes(self._tok, gt_seq) if gt_seq is not None else None)
+            ref_notes_list.append(r_notes)
+            ref_rolls_list.append(r_roll)
 
         return Mortm45DecodedContext(
             batch=batch,
@@ -378,6 +429,7 @@ class Mortm45ContextBuilder(GuardrailContextBuilder[Mortm45DecodedContext]):
             cond_raw=tuple(cond_raw_list),
             gen_notes=tuple(gen_notes_list),
             ref_notes=tuple(ref_notes_list),
+            ref_rolls=tuple(ref_rolls_list),
         )
 
 
@@ -501,12 +553,12 @@ class Mortm45SimilarityRule(GuardrailRule[Mortm45DecodedContext]):
         pens: List[float] = []
         sims: List[float] = []
         for idx in range(len(context.batch)):
-            if bool(context.is_empty[idx]) or context.ref_notes[idx] is None:
+            if bool(context.is_empty[idx]) or context.ref_rolls[idx] is None:
                 pens.append(0.0)
                 continue
             sim = roll_similarity(
                 notes_to_roll(context.gen_notes[idx]),
-                notes_to_roll(context.ref_notes[idx]),
+                context.ref_rolls[idx],  # type: ignore[arg-type]
             )
             sims.append(float(sim))
             pens.append(similarity_reward(sim, self._weight, self._center, self._sharpness))

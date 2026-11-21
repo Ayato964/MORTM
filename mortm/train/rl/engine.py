@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import math
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -25,6 +26,7 @@ from .interfaces import (
     CARLDataSamplePool,
     GuardrailSuite,
 )
+from .optim import MasterWeightAdamW
 from .q_table import QTable, accuracy_by_source, auc_by_source, mix_batch
 
 
@@ -144,7 +146,7 @@ class OddRoundEngine:
         group_desc = " / ".join(f"{k}={v:,}" for k, v in param_groups.items())
         print(f"[R{round_no} Odd] Critic trainable params: {total_trainable:,} ({group_desc})", flush=True)
 
-        optimizer = torch.optim.AdamW(
+        optimizer = MasterWeightAdamW(
             [p for p in self._critic.critic_module.parameters() if p.requires_grad],
             lr=cfg.lr,
         )
@@ -168,6 +170,7 @@ class OddRoundEngine:
         slope = float("nan")
         last_auc: Dict[str, float] = {}
         refresh_interval = max(1, cfg.pool_size // max(1, cfg.batch_size))
+        non_finite_streak = 0
 
         step = 0
         for step in range(1, cfg.max_steps + 1):
@@ -179,8 +182,9 @@ class OddRoundEngine:
                     )
                 self._qtable.add(gem_pool)
 
-            # Sample enough fresh human items to cover the 1/2 human share of `mix_batch`.
-            human_candidates = self._sample_human_dicts(ana_pool, max(cfg.batch_size, 4))
+            # Sample exact human share `max(1, cfg.batch_size // 2)` consumed by `mix_batch`.
+            human_share = max(1, cfg.batch_size // 2)
+            human_candidates = self._sample_human_dicts(ana_pool, human_share)
             items, is_ai, source = mix_batch(
                 human_candidates, gem_pool, self._qtable, cfg.batch_size, self._rng
             )
@@ -191,15 +195,25 @@ class OddRoundEngine:
                 seqs, chunk_size=cfg.critic_chunk, grad_enabled=True
             )
             loss = F.binary_cross_entropy_with_logits(disc_logits.float(), targets)
+            if not bool(torch.isfinite(loss).all().item()):
+                optimizer.zero_grad()
+                non_finite_streak += 1
+                if non_finite_streak >= 5:
+                    raise RuntimeError(
+                        f"OddRoundEngine encountered {non_finite_streak} consecutive non-finite BCE losses."
+                    )
+                continue
 
             loss.backward()
-            if cfg.grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in self._critic.critic_module.parameters() if p.requires_grad],
-                    cfg.grad_clip,
-                )
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            stepped = optimizer.step_and_zero_grad(grad_clip=cfg.grad_clip)
+            if not stepped:
+                non_finite_streak += 1
+                if non_finite_streak >= 5:
+                    raise RuntimeError(
+                        f"OddRoundEngine encountered {non_finite_streak} consecutive non-finite gradient steps."
+                    )
+                continue
+            non_finite_streak = 0
 
             logits_np = disc_logits.detach().float().cpu().numpy()
             acc = accuracy_by_source(logits_np, is_ai, source)
@@ -398,7 +412,13 @@ class EvenRoundEngine:
         )
 
         trainable_params = [p for p in self._actor.actor_module.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr)
+        optimizer = MasterWeightAdamW(trainable_params, lr=cfg.lr)
+        if optimizer.num_low_precision_tensors > 0:
+            print(
+                f"[R{round_no} Even] FP32 master weights active for "
+                f"{optimizer.num_low_precision_tensors} low-precision (bf16/fp16) tensors.",
+                flush=True,
+            )
 
         win = max(1, int(cfg.stop_window))
         mv = {k: deque(maxlen=win) for k in ("reward", "kl", "disc")}
@@ -424,13 +444,25 @@ class EvenRoundEngine:
 
             rewards, r_metrics = self._compute_rewards(roll)
             loss_val, pg_val, kl_val = self._step_backward(roll, rewards)
-
-            if cfg.grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, cfg.grad_clip)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-
             mean_r = float(rewards.mean().item())
+
+            if not (
+                math.isfinite(loss_val)
+                and math.isfinite(pg_val)
+                and math.isfinite(kl_val)
+                and math.isfinite(mean_r)
+            ):
+                optimizer.zero_grad()
+                reason = (
+                    f"non_finite_abort: step={step}, loss={loss_val}, kl={kl_val}, reward={mean_r}"
+                )
+                break
+
+            stepped = optimizer.step_and_zero_grad(grad_clip=cfg.grad_clip)
+            if not stepped:
+                reason = f"non_finite_abort: non-finite gradients detected at step={step}"
+                break
+
             mv["reward"].append(mean_r)
             mv["kl"].append(kl_val)
             mv["disc"].append(r_metrics["disc"])
@@ -473,19 +505,22 @@ class EvenRoundEngine:
                 snap_step = step
 
         rolled_back = False
-        if reason is not None and reason.startswith("reward_hacking"):
-            # Feed hacked sequences into Q-Table before restoring Actor to healthy snapshot.
-            if last_batch is not None:
+        injected_hacked = 0
+        if reason is not None and reason.startswith(("reward_hacking", "non_finite_abort")):
+            # Inject hacked sequences into `qtable.table` only on genuine reward hacking (not NaN abort).
+            if reason.startswith("reward_hacking") and last_batch is not None:
                 hacked_items = [
                     {"seq": c_seq}
                     for c_seq in last_batch.critic_sequences
                     if c_seq is not None and c_seq.size > 0
                 ]
-                self._qtable.add(hacked_items)
+                injected_hacked = self._qtable.inject_committed(hacked_items)
             self._actor.restore_state(healthy_snap)
+            optimizer.sync_from_model()
             rolled_back = True
             print(
-                f"[R{round_no} Even] Anti-hacking rollback -> restored Actor snapshot from step {snap_step}.",
+                f"[R{round_no} Even] Rollback ({reason}) -> restored Actor snapshot from step {snap_step} "
+                f"(injected {injected_hacked} hacked sequences directly into QTable).",
                 flush=True,
             )
 
@@ -495,6 +530,7 @@ class EvenRoundEngine:
             "reason": reason,
             "rolled_back": rolled_back,
             "snap_step": snap_step,
+            "injected_hacked": injected_hacked,
         }
 
 
@@ -587,17 +623,25 @@ class UnifiedCARLDriver:
         critic_ckpt: Optional[str | Path] = None,
         qtable_ckpt: Optional[str | Path] = None,
     ) -> None:
-        if actor_ckpt and os.path.isfile(actor_ckpt):
-            sd = torch.load(actor_ckpt, map_location=self._actor.device)
+        if actor_ckpt is not None and str(actor_ckpt).strip():
+            if not os.path.isfile(actor_ckpt):
+                raise FileNotFoundError(f"Actor resume checkpoint not found: {actor_ckpt}")
+            sd = torch.load(actor_ckpt, map_location="cpu", weights_only=False)
             self._actor.load_checkpoint_state(sd)
             print(f"[CARL] Resumed Actor from {actor_ckpt}", flush=True)
-        if qtable_ckpt and os.path.isfile(qtable_ckpt):
-            q_obj = torch.load(qtable_ckpt, weights_only=False)
+
+        if qtable_ckpt is not None and str(qtable_ckpt).strip():
+            if not os.path.isfile(qtable_ckpt):
+                raise FileNotFoundError(f"QTable resume checkpoint not found: {qtable_ckpt}")
+            q_obj = torch.load(qtable_ckpt, map_location="cpu", weights_only=False)
             self._qtable.table = list(q_obj.get("table", []))
             self._qtable.round = int(q_obj.get("round", 0))
             print(f"[CARL] Resumed QTable ({len(self._qtable)} items) from {qtable_ckpt}", flush=True)
-        if critic_ckpt and os.path.isfile(critic_ckpt):
-            c_sd = torch.load(critic_ckpt, map_location=self._critic.device)
+
+        if critic_ckpt is not None and str(critic_ckpt).strip():
+            if not os.path.isfile(critic_ckpt):
+                raise FileNotFoundError(f"Critic resume checkpoint not found: {critic_ckpt}")
+            c_sd = torch.load(critic_ckpt, map_location="cpu", weights_only=False)
             self._critic.load_compact_state(c_sd)
             print(f"[CARL] Resumed Critic from {critic_ckpt}", flush=True)
 
@@ -623,16 +667,25 @@ class UnifiedCARLDriver:
         torch.save({"table": self._qtable.table, "round": self._qtable.round}, q_path)
         print(f"[CARL] QTable prefilled ({st['size']} items) -> {q_path}", flush=True)
 
+    def _save_qtable(self, suffix: str) -> Path:
+        q_payload = {"table": self._qtable.table, "round": self._qtable.round}
+        q_path = self._out_dir / f"qtable{suffix}.pt"
+        torch.save(q_payload, q_path)
+        latest_q = self._out_dir / "qtable_latest.pt"
+        if latest_q != q_path:
+            torch.save(q_payload, latest_q)
+        return q_path
+
     def _save_round(self, kind: str, round_no: int) -> Path:
         suffix = f".r{round_no}" if self._keep_round_ckpts else ""
+        q_path = self._save_qtable(suffix)
         if kind == "odd":
-            q_path = self._out_dir / f"qtable{suffix}.pt"
-            torch.save({"table": self._qtable.table, "round": self._qtable.round}, q_path)
+            c_state = self._critic.export_compact_state()
             c_path = self._out_dir / f"{self._ckpt_prefix}-ana.carl{suffix}.pth"
-            torch.save(self._critic.export_compact_state(), c_path)
+            torch.save(c_state, c_path)
             latest_c = self._out_dir / f"{self._ckpt_prefix}-ana.carl_latest.pth"
             if latest_c != c_path:
-                torch.save(self._critic.export_compact_state(), latest_c)
+                torch.save(c_state, latest_c)
             print(f"[CARL] Saved Critic -> {c_path} & QTable -> {q_path}", flush=True)
             return c_path
 
@@ -642,7 +695,7 @@ class UnifiedCARLDriver:
         latest_g = self._out_dir / f"{self._ckpt_prefix}-gem.carl_latest.pth"
         if latest_g != g_path:
             torch.save(state, latest_g)
-        print(f"[CARL] Saved Actor -> {g_path}", flush=True)
+        print(f"[CARL] Saved Actor -> {g_path} & QTable -> {q_path}", flush=True)
         return g_path
 
     def run_odd(self, round_no: int) -> Dict[str, Any]:

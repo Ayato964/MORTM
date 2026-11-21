@@ -131,7 +131,8 @@ class CARLActorAdapter(ABC):
         """Compute per-step action log-probs and exact conditional KL on a micro-batch."""
 
     def snapshot_state(self) -> Dict[str, Tensor]:
-        return {k: v.detach().clone() for k, v in self.actor_module.state_dict().items()}
+        """Offload healthy Actor snapshot to host CPU RAM to save ~840 MB of GPU/MPS VRAM."""
+        return {k: v.detach().cpu().clone() for k, v in self.actor_module.state_dict().items()}
 
     def restore_state(self, state: Dict[str, Tensor]) -> None:
         self.actor_module.load_state_dict(state)

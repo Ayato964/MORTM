@@ -1,15 +1,18 @@
-"""Unified CLI entrypoint for CARL training across `MORTM5 (SyMIc)` and `MORTM4.5`."""
+"""Unified CLI & OCP Backend Registry for CARL training across `MORTM5 SyMIc` and `MORTM4.5`."""
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
 from mortm.models.modules.config import MORTM5Args
 from mortm.utils.mortm5_infer import select_device
+
 from . import carl_paths as legacy_paths
 from .adapters.mortm45 import (
     Mortm45ActorAdapter,
@@ -27,38 +30,221 @@ from .adapters.symic import (
 )
 from .domain import UnifiedEvenConfig, UnifiedOddConfig, UnifiedSamplingConfig
 from .engine import UnifiedCARLDriver
+from .interfaces import CARLActorAdapter, CARLCriticAdapter, CARLDataSamplePool, GuardrailSuite
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+DEFAULT_SYMIC_CONFIG = "configs/models/mortm5/symic_main/symic_g4l4_160m.json"
+DEFAULT_SYMIC_CKPT = (
+    "out/symic_main/symic_g4l4_160m_depth_4ep/"
+    "MORTM5.SyMIc_G4L4_160M_Depth_Scratch_16bar_4ep_muon_wsd_latest.pth"
+)
+
+
+@dataclass(frozen=True)
+class BuiltBackendComponents:
+    """Resolved backend components injected into `UnifiedCARLDriver`."""
+
+    actor: CARLActorAdapter
+    base_actor: CARLActorAdapter
+    critic: CARLCriticAdapter
+    ana_pool: CARLDataSamplePool
+    gem_pool: CARLDataSamplePool
+    guardrails: GuardrailSuite[Any]
+    ckpt_prefix: str
+
+
+class CARLBackendBuilder(ABC):
+    """Strategy interface (OCP) constructing all CARL components for a specific model family."""
+
+    @abstractmethod
+    def build(self, args: argparse.Namespace, device: torch.device) -> BuiltBackendComponents:
+        ...
+
+
+class SyMIcBackendBuilder(CARLBackendBuilder):
+    """Builder for `MORTM5 SyMIc-G4L4 + Depth`."""
+
+    def build(self, args: argparse.Namespace, device: torch.device) -> BuiltBackendComponents:
+        cfg_path = args.config or DEFAULT_SYMIC_CONFIG
+        ckpt_path = args.ckpt or DEFAULT_SYMIC_CKPT
+        m_args = MORTM5Args(cfg_path)
+        tok_key = m_args.tokenizer_key or "m4_g4l4"
+        vq = load_midivision_codec(
+            tokenizer_key=tok_key,
+            vq_config_path=args.vq_config,
+            vq_ckpt_path=args.vq_ckpt,
+            device=device,
+        )
+        actor = SyMIcGroupedActorAdapter.from_pretrained(
+            m_args,
+            ckpt_path,
+            device=device,
+            prompt_bars=args.prompt_bars,
+            total_bars=args.total_bars,
+            unfreeze_mode=args.unfreeze_mode,
+        )
+        base_actor = SyMIcGroupedActorAdapter.from_pretrained(
+            m_args,
+            ckpt_path,
+            device=device,
+            prompt_bars=args.prompt_bars,
+            total_bars=args.total_bars,
+            unfreeze_mode=args.unfreeze_mode,
+        )
+        base_actor.freeze_all()
+        critic = SyMIcCriticAdapter.from_pretrained(
+            m_args,
+            ckpt_path,
+            device=device,
+            prompt_bars=args.prompt_bars,
+            lora_rank=args.critic_lora_rank,
+            lora_alpha=args.critic_lora_alpha,
+        )
+
+        if args.token_dir:
+            repo = SyMIcMemmapRepository(
+                token_dir=args.token_dir,
+                model_args=m_args,
+                split="train",
+                prompt_bars=args.prompt_bars,
+                total_bars=args.total_bars,
+                min_active_tracks=args.min_active_tracks,
+            )
+            eff_limit = args.pool_limit
+        elif args.midi_manifest:
+            repo = SyMIcMidiRepository(
+                midi_manifest_path=args.midi_manifest,
+                model=actor.actor_module,  # type: ignore[arg-type]
+                vq_model=vq,
+                device=device,
+                prompt_bars=args.prompt_bars,
+                total_bars=args.total_bars,
+                min_active_tracks=args.min_active_tracks,
+            )
+            eff_limit = args.midi_pool_limit
+        else:
+            raise ValueError("SyMIc backend requires either --token-dir or --midi-manifest.")
+
+        ana_pool, gem_pool = repo.load_disjoint_pools(limit=eff_limit, seed=args.seed)
+        guardrails = build_symic_guardrail_suite(vq_model=vq, actor=actor)
+        return BuiltBackendComponents(
+            actor=actor,
+            base_actor=base_actor,
+            critic=critic,
+            ana_pool=ana_pool,
+            gem_pool=gem_pool,
+            guardrails=guardrails,
+            ckpt_prefix="SyMIc",
+        )
+
+
+class Mortm45BackendBuilder(CARLBackendBuilder):
+    """Builder for `MORTM4.5` (`CONST-MIDI` SFT)."""
+
+    def build(self, args: argparse.Namespace, device: torch.device) -> BuiltBackendComponents:
+        from ..tokenizer import TO_MUSIC, Tokenizer, get_token_converter_pro
+
+        tok = Tokenizer(get_token_converter_pro(TO_MUSIC))
+        tok.mode(TO_MUSIC)
+        cfg_path = args.config or legacy_paths.GEM_CONFIG
+        ckpt_path = args.ckpt or legacy_paths.GEM_CKPT
+        manifest_path = args.midi_manifest or legacy_paths.GEN_SFT_MANIFEST
+
+        actor = Mortm45ActorAdapter.from_pretrained(cfg_path, ckpt_path, tok, device, trainable=True)
+        base_actor = Mortm45ActorAdapter.from_pretrained(cfg_path, ckpt_path, tok, device, trainable=False)
+        critic = Mortm45CriticAdapter.from_pretrained(cfg_path, ckpt_path, tok, device, pool="mil")
+        repo_m45 = Mortm45GenSftRepository(manifest_path=manifest_path, tokenizer=tok)
+        ana_pool, gem_pool = repo_m45.load_disjoint_pools(limit=args.pool_limit, seed=args.seed)
+        guardrails = build_mortm45_guardrail_suite(tok)
+        return BuiltBackendComponents(
+            actor=actor,
+            base_actor=base_actor,
+            critic=critic,
+            ana_pool=ana_pool,
+            gem_pool=gem_pool,
+            guardrails=guardrails,
+            ckpt_prefix="MORTM45",
+        )
+
+
+class CARLBackendRegistry:
+    """Open/Closed registry mapping backend names (`'symic'`, `'mortm45'`, ...) to builders."""
+
+    def __init__(self) -> None:
+        self._builders: Dict[str, CARLBackendBuilder] = {}
+
+    def register(self, key: str, builder: CARLBackendBuilder) -> None:
+        norm = str(key).strip().lower()
+        if not norm:
+            raise ValueError("Backend key must be non-empty.")
+        self._builders[norm] = builder
+
+    def get(self, key: str) -> CARLBackendBuilder:
+        norm = str(key).strip().lower()
+        builder = self._builders.get(norm)
+        if builder is None:
+            raise KeyError(
+                f"Unsupported CARL backend '{key}'. Available: {sorted(self._builders.keys())}"
+            )
+        return builder
+
+    def available_keys(self) -> Tuple[str, ...]:
+        return tuple(sorted(self._builders.keys()))
+
+
+DEFAULT_BACKEND_REGISTRY = CARLBackendRegistry()
+DEFAULT_BACKEND_REGISTRY.register("symic", SyMIcBackendBuilder())
+DEFAULT_BACKEND_REGISTRY.register("mortm45", Mortm45BackendBuilder())
+
+
+def resolve_default_paths_for_backend(
+    backend: str,
+    config: Optional[str] = None,
+    ckpt: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Resolve effective `(config_path, ckpt_path)` without cross-backend default pollution."""
+    norm = str(backend).strip().lower()
+    if norm == "symic":
+        return (config or DEFAULT_SYMIC_CONFIG, ckpt or DEFAULT_SYMIC_CKPT)
+    if norm == "mortm45":
+        return (config or legacy_paths.GEM_CONFIG, ckpt or legacy_paths.GEM_CKPT)
+    if config and ckpt:
+        return (config, ckpt)
+    raise ValueError(f"Explicit --config and --ckpt required for custom backend '{backend}'.")
+
+
+def build_arg_parser(registry: Optional[CARLBackendRegistry] = None) -> argparse.ArgumentParser:
+    reg = registry or DEFAULT_BACKEND_REGISTRY
     ap = argparse.ArgumentParser(
         description="Unified CARL (Critique-Augmented RL) Trainer for MORTM5 SyMIc & MORTM4.5"
     )
     ap.add_argument(
         "--backend",
         type=str,
-        choices=("symic", "mortm45"),
+        choices=reg.available_keys(),
         default="symic",
         help="Target model paradigm ('symic' for MORTM5 SyMIc-G4L4+Depth, 'mortm45' for MORTM4.5).",
     )
     ap.add_argument("--device", type=str, default=None, help="Compute device override (cuda, mps, cpu).")
     ap.add_argument("--out-dir", type=str, required=True, help="Output directory for CARL checkpoints & QTable.")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--pool-limit", type=int, default=40000, help="Max total dataset windows/records to load.")
+    ap.add_argument(
+        "--pool-limit",
+        type=int,
+        default=40000,
+        help="Max total windows/records to sample for pre-tokenized Memmap / SFT repositories.",
+    )
+    ap.add_argument(
+        "--midi-pool-limit",
+        type=int,
+        default=512,
+        help="Max non-blank segments to index when using --midi-manifest on-the-fly mode.",
+    )
     ap.add_argument("--q-max", type=int, default=3000, help="QTable replay capacity.")
 
-    # Model & Data paths
-    ap.add_argument(
-        "--config",
-        type=str,
-        default="configs/models/mortm5/symic_main/symic_g4l4_160m.json",
-        help="Model config JSON path.",
-    )
-    ap.add_argument(
-        "--ckpt",
-        type=str,
-        default="out/symic_main/symic_g4l4_160m_depth_4ep/MORTM5.SyMIc_G4L4_160M_Depth_Scratch_16bar_4ep_muon_wsd_latest.pth",
-        help="Initial pretrained Actor/Base/Critic backbone checkpoint.",
-    )
+    # Model & Data paths (None by default so each backend resolves its own canonical defaults!)
+    ap.add_argument("--config", type=str, default=None, help="Model config JSON path (backend-specific default if omitted).")
+    ap.add_argument("--ckpt", type=str, default=None, help="Initial pretrained backbone checkpoint (backend-specific default if omitted).")
     ap.add_argument("--vq-config", type=str, default=None, help="Optional MidiVision config override (SyMIc).")
     ap.add_argument("--vq-ckpt", type=str, default=None, help="Optional MidiVision checkpoint override (SyMIc).")
     ap.add_argument(
@@ -92,7 +278,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fine-temperature", type=float, default=None)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--fine-top-p", type=float, default=None)
+    ap.add_argument("--top-k", type=int, default=0)
+    ap.add_argument("--fine-top-k", type=int, default=None)
     ap.add_argument("--min-p", type=float, default=0.0)
+    ap.add_argument("--repetition-penalty", type=float, default=1.0)
 
     # Odd Round (Critic)
     ap.add_argument("--odd-batch-size", type=int, default=16)
@@ -130,14 +319,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def build_driver_from_args(args: argparse.Namespace) -> UnifiedCARLDriver:
+def build_driver_from_args(
+    args: argparse.Namespace,
+    registry: Optional[CARLBackendRegistry] = None,
+) -> UnifiedCARLDriver:
+    reg = registry or DEFAULT_BACKEND_REGISTRY
     dev = select_device(args.device)
     sampling = UnifiedSamplingConfig(
         temperature=args.temperature,
         fine_temperature=args.fine_temperature,
         top_p=args.top_p,
         fine_top_p=args.fine_top_p,
+        top_k=args.top_k,
+        fine_top_k=args.fine_top_k,
         min_p=args.min_p,
+        repetition_penalty=args.repetition_penalty,
     )
     odd_cfg = UnifiedOddConfig(
         batch_size=args.odd_batch_size,
@@ -166,101 +362,27 @@ def build_driver_from_args(args: argparse.Namespace) -> UnifiedCARLDriver:
         sampling=sampling,
     )
 
-    if args.backend == "symic":
-        m_args = MORTM5Args(args.config)
-        tok_key = m_args.tokenizer_key or "m4_g4l4"
-        vq = load_midivision_codec(
-            tokenizer_key=tok_key,
-            vq_config_path=args.vq_config,
-            vq_ckpt_path=args.vq_ckpt,
-            device=dev,
-        )
-        actor = SyMIcGroupedActorAdapter.from_pretrained(
-            m_args,
-            args.ckpt,
-            device=dev,
-            prompt_bars=args.prompt_bars,
-            total_bars=args.total_bars,
-            unfreeze_mode=args.unfreeze_mode,
-        )
-        base_actor = SyMIcGroupedActorAdapter.from_pretrained(
-            m_args,
-            args.ckpt,
-            device=dev,
-            prompt_bars=args.prompt_bars,
-            total_bars=args.total_bars,
-            unfreeze_mode=args.unfreeze_mode,
-        )
-        base_actor.freeze_all()
-        critic = SyMIcCriticAdapter.from_pretrained(
-            m_args,
-            args.ckpt,
-            device=dev,
-            prompt_bars=args.prompt_bars,
-            lora_rank=args.critic_lora_rank,
-            lora_alpha=args.critic_lora_alpha,
-        )
-
-        if args.token_dir:
-            repo = SyMIcMemmapRepository(
-                token_dir=args.token_dir,
-                model_args=m_args,
-                split="train",
-                prompt_bars=args.prompt_bars,
-                total_bars=args.total_bars,
-                min_active_tracks=args.min_active_tracks,
-            )
-        elif args.midi_manifest:
-            repo = SyMIcMidiRepository(
-                midi_manifest_path=args.midi_manifest,
-                model=actor.actor_module,  # type: ignore[arg-type]
-                vq_model=vq,
-                device=dev,
-                prompt_bars=args.prompt_bars,
-                total_bars=args.total_bars,
-                min_active_tracks=args.min_active_tracks,
-            )
-        else:
-            raise ValueError("SyMIc backend requires either --token-dir or --midi-manifest.")
-
-        ana_pool, gem_pool = repo.load_disjoint_pools(limit=args.pool_limit, seed=args.seed)
-        guardrails = build_symic_guardrail_suite(vq_model=vq, actor=actor)
-        prefix = "SyMIc"
-    else:
-        from ..tokenizer import TO_MUSIC, Tokenizer, get_token_converter_pro
-
-        tok = Tokenizer(get_token_converter_pro(TO_MUSIC))
-        tok.mode(TO_MUSIC)
-        cfg_path = args.config or legacy_paths.GEM_CONFIG
-        ckpt_path = args.ckpt or legacy_paths.GEM_CKPT
-        manifest_path = args.midi_manifest or legacy_paths.GEN_SFT_MANIFEST
-
-        actor = Mortm45ActorAdapter.from_pretrained(cfg_path, ckpt_path, tok, dev, trainable=True)
-        base_actor = Mortm45ActorAdapter.from_pretrained(cfg_path, ckpt_path, tok, dev, trainable=False)
-        critic = Mortm45CriticAdapter.from_pretrained(cfg_path, ckpt_path, tok, dev, pool="mil")
-        repo_m45 = Mortm45GenSftRepository(manifest_path=manifest_path, tokenizer=tok)
-        ana_pool, gem_pool = repo_m45.load_disjoint_pools(limit=args.pool_limit, seed=args.seed)
-        guardrails = build_mortm45_guardrail_suite(tok)
-        prefix = "MORTM45"
+    builder = reg.get(args.backend)
+    built = builder.build(args, dev)
 
     print(
         f"[CARL] Initialized backend='{args.backend}' on device={dev} | "
-        f"disjoint pools: ana={len(ana_pool):,}, gem={len(gem_pool):,}",
+        f"disjoint pools: ana={len(built.ana_pool):,}, gem={len(built.gem_pool):,}",
         flush=True,
     )
     driver = UnifiedCARLDriver(
-        actor=actor,
-        base_actor=base_actor,
-        critic=critic,
-        ana_pool=ana_pool,
-        gem_pool=gem_pool,
-        guardrail_suite=guardrails,
+        actor=built.actor,
+        base_actor=built.base_actor,
+        critic=built.critic,
+        ana_pool=built.ana_pool,
+        gem_pool=built.gem_pool,
+        guardrail_suite=built.guardrails,
         out_dir=Path(args.out_dir),
         odd_cfg=odd_cfg,
         even_cfg=even_cfg,
         q_max=args.q_max,
         seed=args.seed,
-        ckpt_prefix=prefix,
+        ckpt_prefix=built.ckpt_prefix,
         use_wandb=bool(args.wandb),
         wandb_project=args.wandb_project,
         run_name=args.run_name,

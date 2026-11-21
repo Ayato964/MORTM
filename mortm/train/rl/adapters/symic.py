@@ -213,21 +213,53 @@ class SyMIcMemmapRepository(CARLDataRepository):
             else:
                 gem_indices.append(int(w_idx))
 
-        if limit is not None and int(limit) > 0:
-            half_lim = max(1, int(limit) // 2)
-            if len(ana_indices) > half_lim:
-                ana_indices = [ana_indices[int(i)] for i in rng.choice(len(ana_indices), size=half_lim, replace=False)]
-            if len(gem_indices) > half_lim:
-                gem_indices = [gem_indices[int(i)] for i in rng.choice(len(gem_indices), size=half_lim, replace=False)]
+        half_lim = max(1, int(limit) // 2) if (limit is not None and int(limit) > 0) else None
+        ana_perm = [ana_indices[int(i)] for i in rng.permutation(len(ana_indices))]
+        gem_perm = [gem_indices[int(i)] for i in rng.permutation(len(gem_indices))]
+
+        ana_active = self._collect_active_windows(ana_perm, max_count=half_lim)
+        gem_active = self._collect_active_windows(gem_perm, max_count=half_lim)
+        if not ana_active or not gem_active:
+            raise RuntimeError(
+                f"After filtering silent prompt/continuation windows, got ana={len(ana_active)}, gem={len(gem_active)}."
+            )
 
         return (
-            LazyIndexedSamplePool(ana_indices, self._load_window_example),
-            LazyIndexedSamplePool(gem_indices, self._load_window_example),
+            LazyIndexedSamplePool(ana_active, self._load_window_example),
+            LazyIndexedSamplePool(gem_active, self._load_window_example),
         )
+
+    def _collect_active_windows(
+        self,
+        candidates: Sequence[int],
+        max_count: Optional[int] = None,
+    ) -> List[int]:
+        """Stream candidate memmap windows, dropping silent prompts or >=85%-constant continuations up to `max_count`."""
+        mmap = self._dataset._get_memmap()
+        tpc = self._vq_groups * self._vq_layers
+        p_chunks = self._prompt_chunks
+        kept: List[int] = []
+        for w_idx in candidates:
+            if max_count is not None and len(kept) >= max_count:
+                break
+            tok_start = int(self._dataset.windows[w_idx, 0])
+            tok_len = int(self._dataset.windows[w_idx, 1])
+            raw = np.asarray(mmap[tok_start : tok_start + tok_len]).reshape(-1, tpc)
+            prompt_c = raw[:p_chunks]
+            cont_c = raw[p_chunks : self._total_chunks]
+            if prompt_c.shape[0] > 1 and bool(np.all(prompt_c == prompt_c[0])):
+                continue
+            if cont_c.shape[0] > 1:
+                same_first = float(np.all(cont_c == cont_c[0], axis=1).mean())
+                same_last = float(np.all(cont_c == cont_c[-1], axis=1).mean())
+                if max(same_first, same_last) >= 0.85:
+                    continue
+            kept.append(int(w_idx))
+        return kept
 
 
 class SyMIcMidiRepository(CARLDataRepository):
-    """On-the-fly MIDI -> `MidiVision` repository for local Mac MPS runs and smoke tests."""
+    """Lazy on-the-fly MIDI -> `MidiVision` repository with non-blank prompt & continuation filtering."""
 
     def __init__(
         self,
@@ -238,6 +270,11 @@ class SyMIcMidiRepository(CARLDataRepository):
         prompt_bars: int = 4,
         total_bars: int = 16,
         min_active_tracks: int = 2,
+        min_prompt_notes: int = 8,
+        min_cont_notes: int = 8,
+        max_cont_blank_bar_ratio: float = 0.5,
+        max_windows_per_song: int = 4,
+        max_cache_items: int = 2048,
     ) -> None:
         self._manifest_path = Path(midi_manifest_path)
         if not self._manifest_path.is_file():
@@ -250,17 +287,54 @@ class SyMIcMidiRepository(CARLDataRepository):
             )
         self._vq = vq_model
         self._device = device
-        self._prompt_chunks = int(prompt_bars) * CHUNKS_PER_BAR
-        self._total_chunks = int(total_bars) * CHUNKS_PER_BAR
+        self._prompt_bars = int(prompt_bars)
         self._total_bars = int(total_bars)
+        self._prompt_chunks = self._prompt_bars * CHUNKS_PER_BAR
+        self._total_chunks = self._total_bars * CHUNKS_PER_BAR
         self._min_active_tracks = max(1, int(min_active_tracks))
+        self._min_prompt_notes = max(1, int(min_prompt_notes))
+        self._min_cont_notes = max(1, int(min_cont_notes))
+        self._max_blank_ratio = float(max_cont_blank_bar_ratio)
+        self._max_windows_per_song = max(1, int(max_windows_per_song))
+        self._max_cache_items = max(16, int(max_cache_items))
         self._vq_layers = int(model.vq_layers)
         self._prefix_len = 1 + (NUM_SLOT_TOKENS if bool(model.use_instrument_tokens) else 0)
         self._prompt_soft_len = self._prefix_len + self._prompt_chunks * self._vq_layers
+        self._specs: List[Tuple[int, int, Tuple[int, ...], np.ndarray]] = []
+        self._cache: Dict[int, CARLExample] = {}
+
+    @torch.no_grad()
+    def _encode_spec(self, spec_idx: int) -> CARLExample:
+        cached = self._cache.get(spec_idx)
+        if cached is not None:
+            return cached
+        song_id, c0, slot_tuple, notes_5col = self._specs[spec_idx]
+        chunks_f32 = rasterize_notes_to_chunks_float(self._total_chunks, notes_5col)
+        full_seq = Mortm5PromptEncoder.encode_chunks_to_prompt(
+            chunks_f32,
+            vq_model=self._vq,
+            model=self._model,
+            slot_codes=slot_tuple,
+            device=self._device,
+        )
+        full_np = full_seq[0].detach().cpu().numpy().astype(np.int64)
+        prompt_np = np.ascontiguousarray(full_np[: self._prompt_soft_len], dtype=np.int64)
+        ex = CARLExample(
+            example_id=f"midi_s{song_id:06d}_c{c0:04d}",
+            song_id=song_id,
+            prompt_tokens=prompt_np,
+            human_full_tokens=full_np,
+            slot_codes=slot_tuple,
+        )
+        if len(self._cache) >= self._max_cache_items:
+            oldest_key = next(iter(self._cache))
+            self._cache.pop(oldest_key, None)
+        self._cache[spec_idx] = ex
+        return ex
 
     def load_disjoint_pools(
         self,
-        limit: Optional[int] = 200,
+        limit: Optional[int] = 512,
         seed: int = 42,
     ) -> Tuple[CARLDataSamplePool, CARLDataSamplePool]:
         import json
@@ -269,11 +343,20 @@ class SyMIcMidiRepository(CARLDataRepository):
             entries = json.load(fh)
         rng = np.random.default_rng(seed)
         perm = rng.permutation(len(entries))
-        target_total = int(limit) if limit is not None and int(limit) > 0 else len(entries)
+        target_total = (
+            max(2, int(limit))
+            if limit is not None and int(limit) > 0
+            else max(2, min(len(entries) * 2, 512))
+        )
+        per_song_cap = max(1, min(self._max_windows_per_song, target_total // 2))
+        cont_bars = max(1, self._total_bars - self._prompt_bars)
 
-        collected: List[CARLExample] = []
+        self._specs = []
+        self._cache = {}
+        song_to_spec_indices: Dict[int, List[int]] = {}
+
         for raw_idx in perm.tolist():
-            if len(collected) >= target_total:
+            if len(self._specs) >= target_total and len(song_to_spec_indices) >= 2:
                 break
             entry = entries[raw_idx]
             path_str = entry if isinstance(entry, str) else str(entry.get("path", ""))
@@ -289,42 +372,63 @@ class SyMIcMidiRepository(CARLDataRepository):
             if sum(1 for c in slot_tuple if c != SLOT_CODE_EMPTY) < self._min_active_tracks:
                 continue
 
-            seg_notes = extract_segment_canonical_notes(
-                notes_arr, chunk_start=0, chunk_end=self._total_chunks, max_bars=self._total_bars
-            )
-            if len(seg_notes) == 0:
-                continue
-            # Convert canonical `(bar, pos, slot, pitch, duration, velocity)` to 5-col `(slot, start, end, pitch, vel)`.
-            starts = seg_notes[:, 0] * 192 + seg_notes[:, 1]
-            ends = np.minimum(self._total_chunks * 24, starts + seg_notes[:, 4])
-            notes_5col = np.stack(
-                [seg_notes[:, 2], starts, ends, seg_notes[:, 3], seg_notes[:, 5]], axis=1
-            ).astype(np.int32)
-
-            chunks_f32 = rasterize_notes_to_chunks_float(self._total_chunks, notes_5col)
-            full_seq = Mortm5PromptEncoder.encode_chunks_to_prompt(
-                chunks_f32,
-                vq_model=self._vq,
-                model=self._model,
-                slot_codes=slot_tuple,
-                device=self._device,
-            )  # [1, full_soft_len, G]
-            full_np = full_seq[0].detach().cpu().numpy().astype(np.int64)
-            prompt_np = np.ascontiguousarray(full_np[: self._prompt_soft_len], dtype=np.int64)
-            collected.append(
-                CARLExample(
-                    example_id=f"midi_s{raw_idx:06d}",
-                    song_id=int(raw_idx),
-                    prompt_tokens=prompt_np,
-                    human_full_tokens=full_np,
-                    slot_codes=slot_tuple,
+            # Cap windows per song (`per_song_cap <= target_total // 2`) so 1 long song never monopolizes `limit`.
+            song_taken = 0
+            for c0 in range(0, num_chunks - self._total_chunks + 1, self._total_chunks):
+                if song_taken >= per_song_cap:
+                    break
+                if len(self._specs) >= target_total and len(song_to_spec_indices) >= 2:
+                    break
+                seg_notes = extract_segment_canonical_notes(
+                    notes_arr,
+                    chunk_start=c0,
+                    chunk_end=c0 + self._total_chunks,
+                    max_bars=self._total_bars,
                 )
-            )
+                if len(seg_notes) == 0:
+                    continue
+                bars = seg_notes[:, 0]
+                p_mask = bars < self._prompt_bars
+                c_mask = bars >= self._prompt_bars
+                if int(np.sum(p_mask)) < self._min_prompt_notes or int(np.sum(c_mask)) < self._min_cont_notes:
+                    continue
+                active_cont_bars = len(np.unique(bars[c_mask]))
+                blank_ratio = 1.0 - (float(active_cont_bars) / float(cont_bars))
+                if blank_ratio > self._max_blank_ratio:
+                    continue
 
-        if len(collected) < 2:
-            raise RuntimeError(f"SyMIcMidiRepository collected only {len(collected)} valid songs (need >= 2).")
-        cut = len(collected) // 2
-        return InMemorySamplePool(collected[:cut]), InMemorySamplePool(collected[cut:])
+                starts = seg_notes[:, 0] * 192 + seg_notes[:, 1]
+                ends = np.minimum(self._total_chunks * 24, starts + seg_notes[:, 4])
+                notes_5col = np.stack(
+                    [seg_notes[:, 2], starts, ends, seg_notes[:, 3], seg_notes[:, 5]], axis=1
+                ).astype(np.int32)
+
+                spec_idx = len(self._specs)
+                self._specs.append((int(raw_idx), int(c0), slot_tuple, notes_5col))
+                song_to_spec_indices.setdefault(int(raw_idx), []).append(spec_idx)
+                song_taken += 1
+
+        unique_songs = list(song_to_spec_indices.keys())
+        if len(unique_songs) < 2:
+            raise RuntimeError(
+                f"SyMIcMidiRepository found only {len(unique_songs)} valid non-blank songs (need >= 2)."
+            )
+        shuffled_songs = rng.permutation(np.asarray(unique_songs, dtype=np.int64))
+        cut = max(1, len(shuffled_songs) // 2)
+        ana_songs = set(int(s) for s in shuffled_songs[:cut].tolist())
+
+        ana_idx: List[int] = []
+        gem_idx: List[int] = []
+        for s_id, s_specs in song_to_spec_indices.items():
+            if s_id in ana_songs:
+                ana_idx.extend(s_specs)
+            else:
+                gem_idx.extend(s_specs)
+
+        return (
+            LazyIndexedSamplePool(ana_idx, self._encode_spec),
+            LazyIndexedSamplePool(gem_idx, self._encode_spec),
+        )
 
 
 # ======================================================================
@@ -475,6 +579,16 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
 
     def load_compact_state(self, state: Dict[str, Any]) -> None:
         cleaned = {k: v for k, v in state.items() if k != "_carl_unmerged"}
+        expected_keys = {
+            k
+            for k in self._ana.state_dict().keys()
+            if (".lora_A" in k) or (".lora_B" in k) or k.startswith("mil.")
+        }
+        missing_compact = sorted(expected_keys - set(cleaned.keys()))
+        if missing_compact:
+            raise RuntimeError(
+                f"Missing expected SyMIc Critic adapter keys: {missing_compact[:5]}"
+            )
         _, unexpected = self._ana.load_state_dict(cleaned, strict=False)
         if unexpected:
             raise RuntimeError(f"Unexpected keys in SyMIc Critic state_dict: {unexpected[:5]}")
@@ -940,16 +1054,25 @@ class SyMIcSilenceDropoutRule(GuardrailRule[SyMIcDecodedContext]):
 
 
 class SyMIcRelativeDensityRule(GuardrailRule[SyMIcDecodedContext]):
-    """Penalizes severe note-density collapse (`< 0.5x`) or note-spam explosion (`> 2.0x`) vs GT."""
+    """Penalizes severe note-density collapse (`< 0.5x`) or note-spam explosion (`> 2.0x`) vs GT.
+
+    Uses an asymmetric safe upper reference floor (`min_ref_onsets`) so even if a ground-truth
+    continuation is unusually sparse, normal musical generation is never falsely penalized while
+    preserving `penalty == 0.0` on all human ground-truth continuations.
+    """
 
     def __init__(
         self,
         weight: float = 0.25,
-        band_octaves: float = 1.0,
+        low_ratio: float = 0.50,
+        high_ratio: float = 2.00,
+        min_ref_onsets: float = 16.0,
         span_octaves: float = 1.5,
     ) -> None:
         self._weight = float(weight)
-        self._band = float(band_octaves)
+        self._low_ratio = float(low_ratio)
+        self._high_ratio = float(high_ratio)
+        self._min_ref = float(min_ref_onsets)
         self._span = max(0.1, float(span_octaves))
 
     @property
@@ -957,14 +1080,25 @@ class SyMIcRelativeDensityRule(GuardrailRule[SyMIcDecodedContext]):
         return "density"
 
     def evaluate(self, context: SyMIcDecodedContext) -> Tuple[Tensor, Dict[str, float]]:
-        ratio = (context.gen_onset_counts + 1.0) / (context.gt_onset_counts + 1.0)
-        oct_dev = torch.abs(torch.log2(ratio))
-        violation = torch.clamp((oct_dev - self._band) / self._span, min=0.0, max=1.0)
+        gen = context.gen_onset_counts
+        gt = context.gt_onset_counts
+        low_bound = self._low_ratio * gt
+        high_bound = self._high_ratio * torch.clamp(gt, min=self._min_ref)
+
+        oct_low = torch.clamp(torch.log2((low_bound + 1.0) / (gen + 1.0)), min=0.0)
+        oct_high = torch.clamp(torch.log2((gen + 1.0) / (high_bound + 1.0)), min=0.0)
+        oct_violation = torch.where(
+            gen < low_bound,
+            oct_low,
+            torch.where(gen > high_bound, oct_high, torch.zeros_like(gen)),
+        )
+        violation = torch.clamp(oct_violation / self._span, min=0.0, max=1.0)
         penalties = -self._weight * violation
+        ratio = (gen + 1.0) / (gt + 1.0)
         return (
             penalties,
             {
-                "onset_count_mean": float(context.gen_onset_counts.mean().item()),
+                "onset_count_mean": float(gen.mean().item()),
                 "density_ratio_mean": float(ratio.mean().item()),
             },
         )
@@ -976,7 +1110,7 @@ class SyMIcScaleOutlierRule(GuardrailRule[SyMIcDecodedContext]):
     def __init__(
         self,
         weight: float = 0.25,
-        tau_floor: float = 0.12,
+        tau_floor: float = 0.15,
         margin: float = 0.08,
     ) -> None:
         self._weight = float(weight)

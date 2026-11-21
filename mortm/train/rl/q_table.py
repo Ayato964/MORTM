@@ -111,6 +111,25 @@ class QTable:
         stats["size"] = len(self.table)
         return stats
 
+    def inject_committed(self, items: Sequence[dict]) -> int:
+        """報酬ハッキング系列を確定済み `self.table` へ即時投入し、直後の奇数ラウンド step 1 からサンプル可能にする。"""
+        incoming = list(items)
+        if not incoming:
+            return 0
+        # 単一ステップの大量投入で過去履歴を全消去しないよう、最大でも q_max // 2 まで受け入れる
+        cap = max(1, self.q_max // 2) if self.q_max > 1 else self.q_max
+        take = incoming[: min(len(incoming), cap)]
+        overflow = (len(self.table) + len(take)) - self.q_max
+        if overflow > 0 and len(self.table) > 0:
+            n_keep = max(0, len(self.table) - overflow)
+            if n_keep == 0:
+                self.table = []
+            else:
+                keep_idx = self.rng.choice(len(self.table), size=n_keep, replace=False)
+                self.table = [self.table[int(i)] for i in sorted(keep_idx)]
+        self.table.extend(take)
+        return len(take)
+
 
 # ----------------------------------------------------------------------
 # バッチ混合

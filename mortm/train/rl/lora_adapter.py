@@ -43,9 +43,13 @@ class LoRALinearAdapter(nn.Module):
             param.requires_grad_(False)
 
         dev = base_linear.weight.device
-        dtype = base_linear.weight.dtype
-        self.lora_A = nn.Parameter(torch.empty((self.rank, self.in_features), device=dev, dtype=dtype))
-        self.lora_B = nn.Parameter(torch.zeros((self.out_features, self.rank), device=dev, dtype=dtype))
+        # Keep LoRA adapter parameters strictly in float32 (~2 MB total) to prevent bf16 ULP stagnation.
+        self.lora_A = nn.Parameter(
+            torch.empty((self.rank, self.in_features), device=dev, dtype=torch.float32)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros((self.out_features, self.rank), device=dev, dtype=torch.float32)
+        )
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         self.lora_dropout: nn.Module = nn.Dropout(p=float(dropout)) if dropout > 0.0 else nn.Identity()
 

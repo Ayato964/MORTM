@@ -215,9 +215,7 @@ def test_symic_memmap_repository_strict_song_disjoint_split(tmp_path: Path) -> N
         cursor += song_len
 
     np.concatenate(all_tokens).tofile(tmp_path / "train_tokens.bin")
-    np.asarray(offsets, dtype=np.int64). save if False else np.save(
-        tmp_path / "train_offsets.npy", np.asarray(offsets, dtype=np.int64)
-    )
+    np.save(tmp_path / "train_offsets.npy", np.asarray(offsets, dtype=np.int64))
     np.save(tmp_path / "train_slots.npy", np.asarray(slots, dtype=np.int16))
 
     repo = SyMIcMemmapRepository(
@@ -255,8 +253,6 @@ def test_symic_guardrails_zero_on_human_and_end_to_end_carl_driver(tmp_path: Pat
     m_actor.Wout._legacy_untrained_depth.fill_(False)
     m_base = build_mortm5_ablation_model(m_args).to(dev)
     m_base.load_state_dict(m_actor.state_dict())
-    m_critic_bb = build_mortm5_ablation_model(m_args).to(dev)
-    m_critic_bb.load_state_dict(m_actor.state_dict())
 
     actor = SyMIcGroupedActorAdapter(m_actor, dev, prompt_bars=1, total_bars=2)
     base_actor = SyMIcGroupedActorAdapter(m_base, dev, prompt_bars=1, total_bars=2)
@@ -481,3 +477,556 @@ def test_generic_engine_supports_custom_symbolic_adapter(tmp_path: Path) -> None
     )
     hist = drv.run(max_rounds=2)
     assert len(hist) == 2
+
+
+
+def test_master_weight_adamw_updates_bf16_attention_at_low_lr() -> None:
+    """Regression test for Defect #1: `bfloat16` parameters must accumulate `lr=2e-6` updates."""
+    from mortm.train.rl.optim import MasterWeightAdamW
+
+    # `|w| = 0.03125` in bf16 has half-ULP `2^-13 ≈ 1.22e-4`, which is 61x larger than `lr = 2e-6`.
+    w_bf16 = nn.Parameter(torch.full((8, 8), 0.03125, dtype=torch.bfloat16))
+    initial = w_bf16.detach().clone()
+
+    # Verify naive AdamW stagnates completely (`bf16(w - 2e-6) == w`), whereas MasterWeightAdamW crosses ULP!
+    opt = MasterWeightAdamW([w_bf16], lr=2e-6, weight_decay=0.0)
+    assert opt.num_low_precision_tensors == 1
+    for _ in range(80):
+        w_bf16.grad = torch.ones_like(w_bf16)
+        opt.step_and_zero_grad(grad_clip=1.0)
+
+    assert not torch.equal(w_bf16, initial)
+    assert float((initial.float() - w_bf16.float()).mean().item()) > 1e-4
+
+    # Also verify LoRALinearAdapter keeps `lora_A` / `lora_B` in float32 even when base Linear is bf16!
+    bf16_linear = nn.Linear(16, 16, bias=False).to(dtype=torch.bfloat16)
+    lora_wrap = LoRALinearAdapter(bf16_linear, rank=4, alpha=8.0)
+    assert lora_wrap.lora_A.dtype == torch.float32
+    assert lora_wrap.lora_B.dtype == torch.float32
+
+
+def test_reward_hacking_rollback_immediately_commits_to_qtable_and_persists(tmp_path: Path) -> None:
+    """Regression test for Defect #2 & #7: hacked rollouts must enter `qtable.table` immediately and snapshot on CPU."""
+
+    class _DriftingActor(CARLActorAdapter):
+        def __init__(self) -> None:
+            self._net = nn.Sequential(nn.Embedding(16, 8), nn.Linear(8, 16))
+
+        @property
+        def actor_module(self) -> nn.Module:
+            return self._net
+
+        @property
+        def device(self) -> torch.device:
+            return torch.device("cpu")
+
+        def unfreeze_for_grpo(self) -> Tuple[int, int]:
+            for p in self._net.parameters():
+                p.requires_grad_(True)
+            tot = sum(p.numel() for p in self._net.parameters())
+            return tot, tot
+
+        def rollout_group(
+            self,
+            examples: Sequence[CARLExample],
+            group_size: int,
+            sampling: UnifiedSamplingConfig,
+            chunk_size: int = 16,
+            seed: Optional[int] = None,
+        ) -> RolloutBatch:
+            exs, gens = [], []
+            for ex in examples:
+                for g_i in range(group_size):
+                    exs.append(ex)
+                    gens.append(np.array([9, 9, 9, 10 + (g_i % 3)], dtype=np.int64))
+            return RolloutBatch(tuple(exs), tuple(gens), tuple(gens), group_size)
+
+        def forward_logprobs_and_exact_kl(
+            self,
+            base_actor: CARLActorAdapter,
+            examples: Sequence[CARLExample],
+            generated_sequences: Sequence[np.ndarray],
+        ) -> StepLogProbsKL:
+            x = torch.as_tensor(np.stack(generated_sequences), dtype=torch.long)
+            logp = torch.log_softmax(self._net(x), dim=-1)
+            act_lp = logp.gather(-1, x.unsqueeze(-1)).squeeze(-1)
+            # Simulate severe KL divergence (> kl_stop) to trigger anti-hacking rollback.
+            high_kl = torch.full_like(act_lp, 0.95)
+            return StepLogProbsKL(act_lp, high_kl, torch.ones_like(act_lp, dtype=torch.bool))
+
+        def export_checkpoint_state(self) -> Dict[str, Any]:
+            return {k: v.clone() for k, v in self._net.state_dict().items()}
+
+        def load_checkpoint_state(self, state: Dict[str, Any]) -> None:
+            self._net.load_state_dict(state)
+
+    class _FooledCritic(CARLCriticAdapter):
+        def __init__(self) -> None:
+            self._p = nn.Linear(4, 1)
+
+        @property
+        def critic_module(self) -> nn.Module:
+            return self._p
+
+        @property
+        def device(self) -> torch.device:
+            return torch.device("cpu")
+
+        def mark_trainable(self) -> Dict[str, int]:
+            return {"p": 5}
+
+        def score_disc_logits(
+            self,
+            critic_sequences: Sequence[np.ndarray],
+            chunk_size: Optional[int] = None,
+            grad_enabled: bool = False,
+        ) -> Tensor:
+            # Negative logit (-4.0) -> `R_disc = clamp(0.5 - (-4)/8) = 1.0 > disc_stop (0.8)`
+            return torch.full((len(critic_sequences),), -4.0, dtype=torch.float32)
+
+        def export_compact_state(self) -> Dict[str, Any]:
+            return {}
+
+        def load_compact_state(self, state: Dict[str, Any]) -> None:
+            pass
+
+    class _NoOpBuilder(GuardrailContextBuilder[int]):
+        def build_context(self, batch: RolloutBatch) -> int:
+            return len(batch)
+
+    class _ZeroRule(GuardrailRule[int]):
+        @property
+        def name(self) -> str:
+            return "zero"
+
+        def evaluate(self, context: int) -> Tuple[Tensor, Dict[str, float]]:
+            return torch.zeros((context,), dtype=torch.float32), {}
+
+    actor = _DriftingActor()
+    snap = actor.snapshot_state()
+    assert all(t.device.type == "cpu" for t in snap.values())
+
+    base = _DriftingActor()
+    base.load_checkpoint_state(actor.export_checkpoint_state())
+    base.freeze_all()
+    critic = _FooledCritic()
+    pool = InMemorySamplePool(
+        [
+            CARLExample(
+                example_id=f"p_{i}",
+                song_id=i,
+                prompt_tokens=np.array([1, 2], dtype=np.int64),
+                human_full_tokens=np.array([3, 4, 5, 6], dtype=np.int64),
+            )
+            for i in range(4)
+        ]
+    )
+    suite = GuardrailSuite(_NoOpBuilder(), lambda n: torch.zeros((n,), dtype=torch.bool), (_ZeroRule(),))
+    out_dir = tmp_path / "hack_test"
+    drv = UnifiedCARLDriver(
+        actor=actor,
+        base_actor=base,
+        critic=critic,
+        ana_pool=pool,
+        gem_pool=pool,
+        guardrail_suite=suite,
+        out_dir=out_dir,
+        even_cfg=UnifiedEvenConfig(
+            group_size=2,
+            prompts_per_step=2,
+            lr=1e-2,
+            max_steps=5,
+            stop_window=2,
+            kl_stop=0.30,
+            disc_stop=0.80,
+            train_chunk=2,
+        ),
+        q_max=16,
+    )
+    # Pre-seed 1 item so `prefill_qtable` doesn't overwrite our clean check.
+    drv.qtable.inject_committed([{"seq": np.array([1, 1, 1, 1], dtype=np.int64)}])
+    even_out = drv.run_even(round_no=2)
+    assert even_out["rolled_back"] is True
+    assert even_out["injected_hacked"] == 4
+    # Hacked items `[9, 9, 9, ...]` must already be inside `qtable.table` for immediate sampling!
+    sampled = drv.qtable.sample(len(drv.qtable))
+    assert any(int(it["seq"][0]) == 9 for it in sampled)
+    assert (out_dir / "qtable.r2.pt").is_file()
+
+
+def test_cli_backend_registry_defaults_and_guardrail_invariants() -> None:
+    """Regression tests for Defects #3, #4, #5, #6, and #9."""
+    from mortm.train.rl import carl_paths as legacy_paths
+    from mortm.train.rl.adapters.mortm45 import Mortm45ActorAdapter
+    from mortm.train.rl.adapters.symic import (
+        SyMIcDecodedContext,
+        SyMIcRelativeDensityRule,
+        SyMIcScaleOutlierRule,
+    )
+    from mortm.train.rl.cli import (
+        DEFAULT_SYMIC_CKPT,
+        DEFAULT_SYMIC_CONFIG,
+        build_arg_parser,
+        resolve_default_paths_for_backend,
+    )
+
+    parser = build_arg_parser()
+    args_m45 = parser.parse_args(["--backend", "mortm45", "--out-dir", "out/tmp_m45"])
+    assert args_m45.config is None and args_m45.ckpt is None
+    assert resolve_default_paths_for_backend("mortm45", args_m45.config, args_m45.ckpt) == (
+        legacy_paths.GEM_CONFIG,
+        legacy_paths.GEM_CKPT,
+    )
+    assert resolve_default_paths_for_backend("symic", None, None) == (
+        DEFAULT_SYMIC_CONFIG,
+        DEFAULT_SYMIC_CKPT,
+    )
+
+    # Defect #6: ScaleOutlierRule default `tau_floor` must match plan spec `0.15`.
+    scale_rule = SyMIcScaleOutlierRule()
+    assert abs(scale_rule._tau_floor - 0.15) < 1e-9
+
+    # Defect #5: RelativeDensityRule must be 0.0 on Human GT AND 0.0 when `gt == 0` and Actor generates 20 notes.
+    dens_rule = SyMIcRelativeDensityRule(min_ref_onsets=16.0)
+    z = torch.zeros((2,), dtype=torch.float32)
+    ctx = SyMIcDecodedContext(
+        batch_size=2,
+        is_empty=torch.zeros((2,), dtype=torch.bool),
+        gen_onset_counts=torch.tensor([20.0, 2.0]),
+        gt_onset_counts=torch.tensor([0.0, 2.0]),
+        gen_blank_bar_ratio=z,
+        gt_blank_bar_ratio=z,
+        gen_out_of_scale=z,
+        gt_out_of_scale=z,
+        has_melodic_gt=torch.ones((2,), dtype=torch.bool),
+        gt_copy_iou=z,
+        gen_adj_2bar_iou=z,
+        gt_adj_2bar_iou=z,
+    )
+    pens, _ = dens_rule.evaluate(ctx)
+    assert torch.allclose(pens, torch.zeros_like(pens), atol=1e-6)
+
+    # Defect #4: Mortm45ActorAdapter.load_checkpoint_state must reject un-marked checkpoints with non-zero lora_B.
+    dummy_m45 = Mortm45ActorAdapter.__new__(Mortm45ActorAdapter)
+    dummy_m45._model = nn.Linear(4, 4)
+    with pytest.raises(RuntimeError, match="Legacy merged LoRA checkpoint"):
+        dummy_m45.load_checkpoint_state({"layer.lora_B": torch.ones(4, 2)})
+
+
+
+def test_symic_midi_repository_small_limit_does_not_monopolize_single_song(tmp_path: Path) -> None:
+    """Regression test: small `limit=4` on long multi-window MIDIs must still split across >=2 songs."""
+    import json
+    from mortm.train.rl.adapters.symic import SyMIcMidiRepository
+    from mortm.utils.convert_pianoroll import _notes_to_midi, slot_codes_to_roll_meta
+
+    slot_codes = (128, 0, 32, -1)
+    meta = slot_codes_to_roll_meta(slot_codes)
+    midi_paths: List[str] = []
+    # Create 2 long songs (12 bars each -> six 2-bar windows per song!) so song #0 alone has 6 windows > limit=4.
+    for s_idx in range(2):
+        tuples = []
+        for bar in range(12):
+            base_step = bar * 192
+            for beat in range(4):
+                st = base_step + beat * 48
+                tuples.append((0, st, st + 24, 36, 100))
+                tuples.append((1, st, st + 36, 60 + ((bar + s_idx) % 7), 95))
+        mp = tmp_path / f"long_song_{s_idx}.mid"
+        _notes_to_midi(tuples, meta, mp)
+        midi_paths.append(str(mp))
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(midi_paths), encoding="utf-8")
+
+    dev = _select_test_device()
+    m_args = MORTM5Args(_tiny_symic_config())
+    vq_args = MORTM5Args(_tiny_vq_config())
+    model = build_mortm5_ablation_model(m_args).to(dev).eval()
+    vq = MidiVision(vq_args, sync_codebook=False).to(dev).eval()
+
+    repo = SyMIcMidiRepository(
+        midi_manifest_path=manifest,
+        model=model,
+        vq_model=vq,
+        device=dev,
+        prompt_bars=1,
+        total_bars=2,
+        min_active_tracks=2,
+        min_prompt_notes=2,
+        min_cont_notes=2,
+    )
+    for lim in (2, 4):
+        ana_p, gem_p = repo.load_disjoint_pools(limit=lim, seed=42)
+        assert len(ana_p) >= 1 and len(gem_p) >= 1
+        assert {ana_p[i].song_id for i in range(len(ana_p))}.isdisjoint(
+            {gem_p[i].song_id for i in range(len(gem_p))}
+        )
+
+
+
+def test_mortm45_loralib_eval_mode_load_never_corrupts_weights() -> None:
+    """Regression test for Critic Defect #1: loading unmerged state onto `.eval()` (`merged=True`) `loralib.Linear`."""
+    import loralib as lora
+    from mortm.train.rl.adapters.mortm45 import Mortm45ActorAdapter, Mortm45CriticAdapter
+
+    torch.manual_seed(7)
+    x = torch.randn(4, 16)
+
+    # 1. Actor (`Mortm45ActorAdapter.export_checkpoint_state` / `load_checkpoint_state`)
+    src_actor_net = nn.Sequential(lora.Linear(16, 16, r=4, lora_alpha=8))
+    nn.init.normal_(src_actor_net[0].lora_A, std=0.2)
+    nn.init.normal_(src_actor_net[0].lora_B, std=0.2)
+    base_weight_expected = src_actor_net[0].weight.detach().clone()  # unmerged base weight in train()
+
+    src_actor_net.eval()  # merges B @ A * scaling into weight (`merged=True`)
+    expected_eval_out = src_actor_net(x).detach().clone()
+
+    src_adapter = Mortm45ActorAdapter.__new__(Mortm45ActorAdapter)
+    src_adapter._model = src_actor_net
+    exported = src_adapter.export_checkpoint_state()
+
+    # Target model is ALREADY in `.eval()` (`merged=True`) when `load_checkpoint_state` is called!
+    dst_actor_net = nn.Sequential(lora.Linear(16, 16, r=4, lora_alpha=8))
+    nn.init.normal_(dst_actor_net[0].lora_A, std=0.5)
+    nn.init.normal_(dst_actor_net[0].lora_B, std=0.5)
+    dst_actor_net.eval()
+    assert dst_actor_net[0].merged is True
+
+    dst_adapter = Mortm45ActorAdapter.__new__(Mortm45ActorAdapter)
+    dst_adapter._model = dst_actor_net
+    dst_adapter.load_checkpoint_state(exported)
+
+    assert dst_actor_net.training is False
+    assert dst_actor_net[0].merged is True
+    assert torch.allclose(dst_actor_net(x), expected_eval_out, atol=1e-5)
+
+    # Switching back to `.train()` must cleanly recover exact `base_weight_expected` (no reverse subtraction!).
+    dst_actor_net.train()
+    assert torch.allclose(dst_actor_net[0].weight, base_weight_expected, atol=1e-5)
+
+    # 2. Critic (`Mortm45CriticAdapter.export_compact_state` / `load_compact_state`)
+    class _DummyM45Critic(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attn = lora.Linear(16, 16, r=4, lora_alpha=8)
+            self.mil = nn.Linear(16, 1)
+
+    ana_mod = _DummyM45Critic()
+    frozen_bb_weight = ana_mod.attn.weight.detach().clone()
+    nn.init.normal_(ana_mod.attn.lora_A, std=0.3)
+    nn.init.normal_(ana_mod.attn.lora_B, std=0.3)
+    ana_mod.eval()  # `merged=True` with old LoRA baked into `attn.weight`!
+
+    c_adapter = Mortm45CriticAdapter.__new__(Mortm45CriticAdapter)
+    c_adapter._ana = ana_mod  # type: ignore[assignment]
+
+    new_compact = {
+        "attn.lora_A": torch.full_like(ana_mod.attn.lora_A, 0.1),
+        "attn.lora_B": torch.full_like(ana_mod.attn.lora_B, -0.2),
+        "mil.weight": torch.ones_like(ana_mod.mil.weight),
+        "mil.bias": torch.zeros_like(ana_mod.mil.bias),
+    }
+    c_adapter.load_compact_state(new_compact)
+    assert ana_mod.training is False
+    ana_mod.train()
+    # Frozen backbone weight must remain 100% unpolluted by old LoRA!
+    assert torch.allclose(ana_mod.attn.weight, frozen_bb_weight, atol=1e-5)
+
+
+def test_symic_memmap_rejects_all_silent_and_skips_silent_before_limit(tmp_path: Path) -> None:
+    """Regression test for Critic Defect #2: all-silent raises RuntimeError; mixed pool skips silent before `limit`."""
+    m_args = MORTM5Args(_tiny_symic_config())
+    g = int(m_args.vq_groups)
+    l_cnt = int(m_args.vq_layers)
+    k_sz = int(m_args.codebook_size)
+    tpc = g * l_cnt
+    chunks_per_song = 16  # 2 bars
+    song_len = chunks_per_song * tpc
+
+    # Case A: 100% constant/silent tokens -> must raise RuntimeError (never fall back to silent windows!).
+    silent_dir = tmp_path / "all_silent"
+    silent_dir.mkdir()
+    np.full((4 * song_len,), 10, dtype=np.uint16).tofile(silent_dir / "train_tokens.bin")
+    offsets_a = np.array([(i * song_len, song_len) for i in range(4)], dtype=np.int64)
+    slots_a = np.tile(np.array([[128, 0, 32, -1]], dtype=np.int16), (4, 1))
+    np.save(silent_dir / "train_offsets.npy", offsets_a)
+    np.save(silent_dir / "train_slots.npy", slots_a)
+
+    repo_silent = SyMIcMemmapRepository(
+        token_dir=silent_dir, model_args=m_args, split="train", prompt_bars=1, total_bars=2
+    )
+    with pytest.raises(RuntimeError, match="After filtering silent"):
+        repo_silent.load_disjoint_pools(limit=2, seed=0)
+
+    # Case B: Each song has 3 silent windows + 1 active window; `limit=2` must still find active windows!
+    mix_dir = tmp_path / "mixed"
+    mix_dir.mkdir()
+    rng = np.random.default_rng(99)
+    parts: List[np.ndarray] = []
+    offsets_b: List[Tuple[int, int]] = []
+    cur = 0
+    for _ in range(4):
+        s_win = np.full((3 * song_len,), 10, dtype=np.uint16)
+        a_win = rng.integers(3, 3 + g * k_sz, size=(song_len,), dtype=np.uint16)
+        full_song = np.concatenate([s_win, a_win])
+        parts.append(full_song)
+        offsets_b.append((cur, full_song.size))
+        cur += full_song.size
+
+    np.concatenate(parts).tofile(mix_dir / "train_tokens.bin")
+    np.save(mix_dir / "train_offsets.npy", np.asarray(offsets_b, dtype=np.int64))
+    np.save(mix_dir / "train_slots.npy", slots_a)
+
+    repo_mix = SyMIcMemmapRepository(
+        token_dir=mix_dir, model_args=m_args, split="train", prompt_bars=1, total_bars=2
+    )
+    ana_p, gem_p = repo_mix.load_disjoint_pools(limit=2, seed=1)
+    assert len(ana_p) == 1 and len(gem_p) == 1
+
+
+def test_non_finite_grad_and_loss_protection_and_strict_resume_errors(tmp_path: Path) -> None:
+    """Regression test for Critic Defects #3, #4, and #5."""
+    from mortm.train.rl.optim import MasterWeightAdamW
+
+    # Defect #5: Config boundary validation
+    with pytest.raises(ValueError, match="batch_size must be >= 2"):
+        UnifiedOddConfig(batch_size=1)
+    with pytest.raises(ValueError, match="auc_slope_window must be >= 2"):
+        UnifiedOddConfig(auc_slope_window=1)
+    with pytest.raises(ValueError, match="disc_span"):
+        UnifiedEvenConfig(disc_span=0.0)
+
+    # Defect #4a: MasterWeightAdamW skips Inf/NaN gradients without corrupting bf16 or FP32 master weights
+    w = nn.Parameter(torch.full((4, 4), 0.25, dtype=torch.bfloat16))
+    orig = w.detach().clone()
+    opt = MasterWeightAdamW([w], lr=1e-3)
+    w.grad = torch.full_like(w, float("inf"))
+    assert opt.step_and_zero_grad(grad_clip=1.0) is False
+    assert torch.equal(w, orig)
+    w.grad = torch.full_like(w, float("nan"))
+    assert opt.step_and_zero_grad(grad_clip=1.0) is False
+    assert torch.equal(w, orig)
+
+    # Defect #3 & #4b: Missing resume path raises FileNotFoundError; NaN KL triggers rollback to healthy_snap
+    class _NaNActor(CARLActorAdapter):
+        def __init__(self) -> None:
+            self._net = nn.Linear(4, 4)
+
+        @property
+        def actor_module(self) -> nn.Module:
+            return self._net
+
+        @property
+        def device(self) -> torch.device:
+            return torch.device("cpu")
+
+        def unfreeze_for_grpo(self) -> Tuple[int, int]:
+            for p in self._net.parameters():
+                p.requires_grad_(True)
+            return 20, 20
+
+        def rollout_group(
+            self,
+            examples: Sequence[CARLExample],
+            group_size: int,
+            sampling: UnifiedSamplingConfig,
+            chunk_size: int = 16,
+            seed: Optional[int] = None,
+        ) -> RolloutBatch:
+            exs = tuple(ex for ex in examples for _ in range(group_size))
+            gens = tuple(np.array([1, 2, 3, 4], dtype=np.int64) for _ in exs)
+            return RolloutBatch(exs, gens, gens, group_size)
+
+        def forward_logprobs_and_exact_kl(
+            self,
+            base_actor: CARLActorAdapter,
+            examples: Sequence[CARLExample],
+            generated_sequences: Sequence[np.ndarray],
+        ) -> StepLogProbsKL:
+            bsz = len(generated_sequences)
+            lp = self._net.weight.sum() * torch.zeros((bsz, 4), dtype=torch.float32)
+            nan_kl = torch.full((bsz, 4), float("nan"), dtype=torch.float32)
+            return StepLogProbsKL(lp, nan_kl, torch.ones((bsz, 4), dtype=torch.bool))
+
+        def export_checkpoint_state(self) -> Dict[str, Any]:
+            return {k: v.clone() for k, v in self._net.state_dict().items()}
+
+        def load_checkpoint_state(self, state: Dict[str, Any]) -> None:
+            self._net.load_state_dict(state)
+
+    class _SimpleCritic(CARLCriticAdapter):
+        def __init__(self) -> None:
+            self._p = nn.Linear(4, 1)
+
+        @property
+        def critic_module(self) -> nn.Module:
+            return self._p
+
+        @property
+        def device(self) -> torch.device:
+            return torch.device("cpu")
+
+        def mark_trainable(self) -> Dict[str, int]:
+            return {"p": 5}
+
+        def score_disc_logits(
+            self,
+            critic_sequences: Sequence[np.ndarray],
+            chunk_size: Optional[int] = None,
+            grad_enabled: bool = False,
+        ) -> Tensor:
+            return torch.zeros((len(critic_sequences),), dtype=torch.float32)
+
+        def export_compact_state(self) -> Dict[str, Any]:
+            return {}
+
+        def load_compact_state(self, state: Dict[str, Any]) -> None:
+            pass
+
+    class _NoOpBuilder(GuardrailContextBuilder[int]):
+        def build_context(self, batch: RolloutBatch) -> int:
+            return len(batch)
+
+    class _ZeroRule(GuardrailRule[int]):
+        @property
+        def name(self) -> str:
+            return "zero"
+
+        def evaluate(self, context: int) -> Tuple[Tensor, Dict[str, float]]:
+            return torch.zeros((context,), dtype=torch.float32), {}
+
+    actor = _NaNActor()
+    base = _NaNActor()
+    critic = _SimpleCritic()
+    pool = InMemorySamplePool(
+        [
+            CARLExample("e0", 0, np.array([1], dtype=np.int64), np.array([1, 2], dtype=np.int64)),
+            CARLExample("e1", 1, np.array([2], dtype=np.int64), np.array([3, 4], dtype=np.int64)),
+        ]
+    )
+    suite = GuardrailSuite(_NoOpBuilder(), lambda n: torch.zeros((n,), dtype=torch.bool), (_ZeroRule(),))
+    drv = UnifiedCARLDriver(
+        actor=actor,
+        base_actor=base,
+        critic=critic,
+        ana_pool=pool,
+        gem_pool=pool,
+        guardrail_suite=suite,
+        out_dir=tmp_path / "nan_guard",
+        even_cfg=UnifiedEvenConfig(group_size=2, prompts_per_step=1, max_steps=4, train_chunk=2),
+        q_max=8,
+    )
+    with pytest.raises(FileNotFoundError, match="Actor resume checkpoint not found"):
+        drv.resume(actor_ckpt=tmp_path / "does_not_exist.pth")
+    with pytest.raises(FileNotFoundError, match="Critic resume checkpoint not found"):
+        drv.resume(critic_ckpt=tmp_path / "does_not_exist_ana.pth")
+    with pytest.raises(FileNotFoundError, match="QTable resume checkpoint not found"):
+        drv.resume(qtable_ckpt=tmp_path / "does_not_exist_q.pt")
+
+    drv.qtable.inject_committed([{"seq": np.array([1, 2], dtype=np.int64)}])
+    out = drv.run_even(round_no=2)
+    assert out["steps"] == 1
+    assert str(out["reason"]).startswith("non_finite_abort")
+    assert out["rolled_back"] is True
+    assert all(torch.isfinite(p).all() for p in actor.actor_module.parameters())

@@ -44,6 +44,7 @@ from .interfaces import (
     GuardrailSuite,
 )
 from .lora_adapter import LoRALinearAdapter, inject_attention_lora
+from .optim import MasterWeightAdamW
 from .q_table import QTable
 
 __all__ = [
@@ -60,6 +61,7 @@ __all__ = [
     "GuardrailRule",
     "GuardrailSuite",
     "LoRALinearAdapter",
+    "MasterWeightAdamW",
     "Mortm45ActorAdapter",
     "Mortm45CriticAdapter",
     "Mortm45GenSftRepository",
