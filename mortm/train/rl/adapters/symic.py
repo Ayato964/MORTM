@@ -599,13 +599,18 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
 # ======================================================================
 
 
+SYMIC_UNFREEZE_MODES: Tuple[str, ...] = ("full_decoder", "attn_and_depth", "depth_only")
+
+
 class SyMIcGroupedActorAdapter(CARLActorAdapter):
     """`CARLActorAdapter` for `SyMIc-G4L4 + Depth` (`AblationTransformer2`).
 
-    Even-round parameter policy (A2):
-      - Unfreezes all 12 layers' `self_attention` AND `Wout` (`DecodeCodebookHead`:
-        Depth Transformer + group/special codebook projections).
-      - Keeps `embedding`, `FFN`, and `RMSNorm` frozen.
+    Even-round parameter policies (`unfreeze_mode`):
+      - `'full_decoder'`: Unfreezes all 12 layers' `self_attention`, `ffn`, AND `Wout`
+        (`201.24M / 234.96M` on 160M), keeping `embedding` and `RMSNorm` frozen.
+      - `'attn_and_depth'`: Unfreezes `self_attention` + `Wout`, keeping `embedding`, `ffn`,
+        and `RMSNorm` frozen.
+      - `'depth_only'`: Unfreezes `Wout` (`DecodeCodebookHead`) only.
       - Runs GRPO forward passes in `.eval()` mode to eliminate `dropout=0.1` KL noise.
     """
 
@@ -617,9 +622,9 @@ class SyMIcGroupedActorAdapter(CARLActorAdapter):
         total_bars: int = 16,
         unfreeze_mode: str = "attn_and_depth",
     ) -> None:
-        if unfreeze_mode not in ("attn_and_depth", "depth_only"):
+        if unfreeze_mode not in SYMIC_UNFREEZE_MODES:
             raise ValueError(
-                f"unfreeze_mode must be 'attn_and_depth' or 'depth_only', got '{unfreeze_mode}'."
+                f"unfreeze_mode must be one of {SYMIC_UNFREEZE_MODES}, got '{unfreeze_mode}'."
             )
         self._model = model
         self._device = device
@@ -675,8 +680,12 @@ class SyMIcGroupedActorAdapter(CARLActorAdapter):
         for name, param in self._model.named_parameters():
             n_total += param.numel()
             is_wout = name.startswith("Wout.") or name.startswith("wout.")
-            is_attn = ".self_attention." in name and self._unfreeze_mode == "attn_and_depth"
-            trainable = bool(is_wout or is_attn)
+            is_attn = ".self_attention." in name and self._unfreeze_mode in (
+                "full_decoder",
+                "attn_and_depth",
+            )
+            is_ffn = ".ffn." in name and self._unfreeze_mode == "full_decoder"
+            trainable = bool(is_wout or is_attn or is_ffn)
             param.requires_grad_(trainable)
             if trainable:
                 n_train += param.numel()

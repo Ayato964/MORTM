@@ -191,6 +191,52 @@ def test_symic_actor_unfreeze_exact_kl_and_depth_gradients() -> None:
     assert model_a.Wout.depth_decoder.layers[0].q_up.weight.grad is not None
 
 
+def test_symic_actor_full_decoder_unfreeze_propagates_ffn_gradients() -> None:
+    dev = _select_test_device()
+    m_args = MORTM5Args(_tiny_symic_config())
+    model_full = build_mortm5_ablation_model(m_args).to(dev)
+    model_base = build_mortm5_ablation_model(m_args).to(dev)
+    model_base.load_state_dict(model_full.state_dict())
+
+    actor_attn = SyMIcGroupedActorAdapter(
+        model_full, dev, prompt_bars=1, total_bars=2, unfreeze_mode="attn_and_depth"
+    )
+    n_attn, _ = actor_attn.unfreeze_for_grpo()
+
+    actor_full = SyMIcGroupedActorAdapter(
+        model_full, dev, prompt_bars=1, total_bars=2, unfreeze_mode="full_decoder"
+    )
+    base_actor = SyMIcGroupedActorAdapter(model_base, dev, prompt_bars=1, total_bars=2)
+    base_actor.freeze_all()
+
+    n_full, n_total = actor_full.unfreeze_for_grpo()
+    assert n_attn < n_full < n_total
+    assert not model_full.embedding.weight.requires_grad
+    assert not model_full.decoder.layers[0].norm1.weight.requires_grad
+    assert not model_full.decoder.norm.weight.requires_grad
+    assert model_full.decoder.layers[0].ffn.w1.weight.requires_grad
+    assert model_full.decoder.layers[0].self_attention.qkv_block.qkv_weight.weight.requires_grad
+    assert model_full.Wout.depth_decoder.layers[0].q_up.weight.requires_grad
+
+    actor_full.prepare_for_grpo_forward()
+    ex = _make_synthetic_symic_example(m_args, song_id=2, prompt_bars=1, total_bars=2)
+    stats = actor_full.forward_logprobs_and_exact_kl(
+        base_actor=base_actor,
+        examples=[ex],
+        generated_sequences=[ex.human_full_tokens],
+    )
+    (-stats.action_logprobs.mean()).backward()
+    assert model_full.decoder.layers[0].ffn.w1.weight.grad is not None
+    assert float(model_full.decoder.layers[0].ffn.w1.weight.grad.abs().sum().item()) > 0.0
+
+    from mortm.train.rl.cli import build_arg_parser
+
+    parsed = build_arg_parser().parse_args(
+        ["--out-dir", "out/tmp_carl", "--unfreeze-mode", "full_decoder"]
+    )
+    assert parsed.unfreeze_mode == "full_decoder"
+
+
 def test_symic_memmap_repository_strict_song_disjoint_split(tmp_path: Path) -> None:
     m_args = MORTM5Args(_tiny_symic_config())
     g = int(m_args.vq_groups)
