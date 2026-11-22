@@ -21,6 +21,7 @@ from .adapters.mortm45 import (
     build_mortm45_guardrail_suite,
 )
 from .adapters.symic import (
+    SYMIC_GUARDRAIL_MODES,
     SYMIC_UNFREEZE_MODES,
     SyMIcCriticAdapter,
     SyMIcGroupedActorAdapter,
@@ -127,7 +128,11 @@ class SyMIcBackendBuilder(CARLBackendBuilder):
             raise ValueError("SyMIc backend requires either --token-dir or --midi-manifest.")
 
         ana_pool, gem_pool = repo.load_disjoint_pools(limit=eff_limit, seed=args.seed)
-        guardrails = build_symic_guardrail_suite(vq_model=vq, actor=actor)
+        guardrails = build_symic_guardrail_suite(
+            vq_model=vq,
+            actor=actor,
+            mode=args.guardrail_mode,
+        )
         return BuiltBackendComponents(
             actor=actor,
             base_actor=base_actor,
@@ -271,6 +276,13 @@ def build_arg_parser(registry: Optional[CARLBackendRegistry] = None) -> argparse
         choices=SYMIC_UNFREEZE_MODES,
         default="attn_and_depth",
         help="SyMIc Actor GRPO trainable scope ('full_decoder' unfreezes Attention+FFN+Wout, 'attn_and_depth' freezes FFN, 'depth_only' trains Wout only).",
+    )
+    ap.add_argument(
+        "--guardrail-mode",
+        type=str,
+        choices=SYMIC_GUARDRAIL_MODES,
+        default="empty_only",
+        help="SyMIc reward mode ('empty_only' uses R_disc + empty_penalty only; 'full' adds silence/density/scale/loop_copy rules).",
     )
     ap.add_argument("--critic-lora-rank", type=int, default=8)
     ap.add_argument("--critic-lora-alpha", type=float, default=16.0)

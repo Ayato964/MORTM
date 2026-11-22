@@ -1196,14 +1196,109 @@ class SyMIcLoopAndCopyRule(GuardrailRule[SyMIcDecodedContext]):
         )
 
 
+SYMIC_GUARDRAIL_MODES: Tuple[str, ...] = ("empty_only", "full")
+
+
+@dataclass(frozen=True)
+class SyMIcEmptyContext:
+    """Minimal GPU-reduced context when using `R_disc + empty` only (`guardrail_mode='empty_only'`)."""
+
+    is_empty: Tensor
+
+
+class SyMIcEmptyOnlyContextBuilder(GuardrailContextBuilder[SyMIcEmptyContext]):
+    """Checks non-empty continuation activity directly on GPU without GT decode or CPU roll copies."""
+
+    def __init__(
+        self,
+        vq_model: MidiVision,
+        prompt_soft_len: int,
+        vq_layers: int = 4,
+        vq_groups: int = 4,
+        token_offset: int = 133,
+        decode_chunk_size: int = 256,
+    ) -> None:
+        if int(vq_model.num_quantizers) != int(vq_layers) or int(vq_model.vq_groups) != int(vq_groups):
+            raise ValueError(
+                f"MidiVision shape (L={vq_model.num_quantizers}, G={vq_model.vq_groups}) "
+                f"does not match SyMIc model (L={vq_layers}, G={vq_groups})."
+            )
+        self._vq = vq_model
+        self._prompt_soft_len = int(prompt_soft_len)
+        self._vq_layers = int(vq_layers)
+        self._vq_groups = int(vq_groups)
+        self._token_offset = int(token_offset)
+        self._decode_chunk_size = max(16, int(decode_chunk_size))
+
+    @torch.no_grad()
+    def build_context(self, batch: RolloutBatch) -> SyMIcEmptyContext:
+        m_cnt = len(batch)
+        dev = next(self._vq.parameters()).device
+        stacked = np.stack(
+            [seq[self._prompt_soft_len :, :] for seq in batch.generated_sequences], axis=0
+        )
+        cont_steps = stacked.shape[1]
+        if cont_steps % self._vq_layers != 0:
+            raise ValueError(
+                f"Continuation soft-token count ({cont_steps}) must be divisible by vq_layers ({self._vq_layers})."
+            )
+        c_cont = cont_steps // self._vq_layers
+        flat_chunks = stacked.reshape(m_cnt * c_cont, self._vq_layers, self._vq_groups)
+
+        chan_rows: List[List[bool]] = []
+        for ex in batch.examples:
+            row = [False] * 8
+            for s_i, code in enumerate(ex.slot_codes[:4]):
+                if int(code) != SLOT_CODE_EMPTY:
+                    row[2 * s_i] = True
+                    row[2 * s_i + 1] = True
+            chan_rows.append(row)
+        flat_chan_mask = (
+            torch.tensor(chan_rows, dtype=torch.bool, device=dev)
+            .unsqueeze(1)
+            .expand(m_cnt, c_cont, 8)
+            .reshape(m_cnt * c_cont, 8, 1, 1)
+        )
+
+        chunk_active_parts: List[Tensor] = []
+        step = self._decode_chunk_size
+        for start in range(0, flat_chunks.shape[0], step):
+            stop = min(start + step, flat_chunks.shape[0])
+            tok_t = torch.as_tensor(flat_chunks[start:stop], dtype=torch.long, device=dev)
+            logits = self._vq.decode_tokens(tok_t, token_offset=self._token_offset)
+            has_note = ((logits >= 0.0) & flat_chan_mask[start:stop]).any(dim=(1, 2, 3))
+            chunk_active_parts.append(has_note)
+
+        seq_has_note = torch.cat(chunk_active_parts, dim=0).view(m_cnt, c_cont).any(dim=1)
+        return SyMIcEmptyContext(is_empty=(~seq_has_note).cpu())
+
+
 def build_symic_guardrail_suite(
     vq_model: MidiVision,
     actor: SyMIcGroupedActorAdapter,
     enable_gt_copy_penalty: bool = True,
-) -> GuardrailSuite[SyMIcDecodedContext]:
+    mode: str = "full",
+) -> GuardrailSuite[Any]:
+    if mode not in SYMIC_GUARDRAIL_MODES:
+        raise ValueError(
+            f"SyMIc guardrail mode must be one of {SYMIC_GUARDRAIL_MODES}, got '{mode}'."
+        )
     raw_model = actor.actor_module
     if not isinstance(raw_model, AblationTransformer2):
         raise TypeError(f"Expected AblationTransformer2, got {type(raw_model).__name__}.")
+    if mode == "empty_only":
+        empty_builder = SyMIcEmptyOnlyContextBuilder(
+            vq_model=vq_model,
+            prompt_soft_len=actor.prompt_soft_len,
+            vq_layers=int(raw_model.vq_layers),
+            vq_groups=int(raw_model.vq_groups),
+            token_offset=int(raw_model.token_offset),
+        )
+        return GuardrailSuite(
+            context_builder=empty_builder,
+            empty_detector=lambda ctx: ctx.is_empty,
+            rules=(),
+        )
     builder = SyMIcPianoRollContextBuilder(
         vq_model=vq_model,
         prompt_soft_len=actor.prompt_soft_len,

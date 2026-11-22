@@ -235,6 +235,70 @@ def test_symic_actor_full_decoder_unfreeze_propagates_ffn_gradients() -> None:
         ["--out-dir", "out/tmp_carl", "--unfreeze-mode", "full_decoder"]
     )
     assert parsed.unfreeze_mode == "full_decoder"
+    assert parsed.guardrail_mode == "empty_only"
+
+
+def test_symic_empty_only_guardrail_mode_exact_parity_and_pure_r_disc() -> None:
+    dev = _select_test_device()
+    m_args = MORTM5Args(_tiny_symic_config())
+    vq_args = MORTM5Args(_tiny_vq_config())
+
+    vq = MidiVision(vq_args, sync_codebook=False).to(dev).eval()
+    with torch.no_grad():
+        for mod in vq.decoder.modules():
+            if isinstance(mod, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)) and mod.bias is not None:
+                mod.bias.add_(0.35)
+
+    m_actor = build_mortm5_ablation_model(m_args).to(dev)
+    actor = SyMIcGroupedActorAdapter(m_actor, dev, prompt_bars=1, total_bars=2)
+    base_actor = SyMIcGroupedActorAdapter(m_actor, dev, prompt_bars=1, total_bars=2)
+    critic = SyMIcCriticAdapter.from_pretrained(
+        m_args, ckpt_path=None, device=dev, prompt_bars=1, lora_rank=4, lora_alpha=8.0
+    )
+
+    ex_active = _make_synthetic_symic_example(m_args, song_id=1, prompt_bars=1, total_bars=2)
+    # Example where ALL 4 slots are `SLOT_CODE_EMPTY == -1` -> decoder positive bias on inactive slots MUST still be detected as empty!
+    ex_inactive_slots = CARLExample(
+        example_id="all_inactive",
+        song_id=2,
+        prompt_tokens=ex_active.prompt_tokens,
+        human_full_tokens=ex_active.human_full_tokens,
+        slot_codes=(-1, -1, -1, -1),
+    )
+
+    batch = RolloutBatch(
+        examples=(ex_active, ex_inactive_slots),
+        generated_sequences=(ex_active.human_full_tokens, ex_inactive_slots.human_full_tokens),
+        critic_sequences=(ex_active.human_full_tokens, ex_inactive_slots.human_full_tokens),
+        group_size=1,
+    )
+
+    suite_empty = build_symic_guardrail_suite(vq, actor, mode="empty_only")
+    suite_full = build_symic_guardrail_suite(vq, actor, mode="full")
+
+    ev_empty = suite_empty.evaluate(batch)
+    ev_full = suite_full.evaluate(batch)
+
+    assert torch.equal(ev_empty.is_empty, ev_full.is_empty)
+    assert ev_empty.is_empty.tolist() == [False, True]
+    assert torch.equal(ev_empty.penalties, torch.zeros((2,), dtype=torch.float32))
+    assert ev_empty.rule_penalties == {}
+
+    from mortm.train.rl.engine import EvenRoundEngine
+    from mortm.train.rl.q_table import QTable
+
+    even_engine = EvenRoundEngine(
+        actor=actor,
+        base_actor=base_actor,
+        critic=critic,
+        guardrail_suite=suite_empty,
+        qtable=QTable(q_max=16),
+        cfg=UnifiedEvenConfig(group_size=1, prompts_per_step=2, empty_penalty=-1.0),
+    )
+    rewards, metrics = even_engine._compute_rewards(batch)
+    assert abs(float(rewards[0].item()) - metrics["disc"]) < 1e-6
+    assert abs(float(rewards[1].item()) - (-1.0)) < 1e-6
+    assert abs(metrics["pen_total"]) < 1e-9
 
 
 def test_symic_memmap_repository_strict_song_disjoint_split(tmp_path: Path) -> None:
