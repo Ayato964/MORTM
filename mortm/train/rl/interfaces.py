@@ -39,18 +39,26 @@ class CARLDataSamplePool(ABC):
         idx = rng.choice(total, size=count, replace=(total < count))
         return [self[int(i)] for i in np.atleast_1d(idx)]
 
+    def unique_song_count(self) -> Optional[int]:
+        """Return exact unique song count if available in O(N) without forcing full lazy I/O."""
+        return None
+
 
 class InMemorySamplePool(CARLDataSamplePool):
     """Immutable in-memory pool wrapping a pre-validated sequence of `CARLExample`."""
 
     def __init__(self, items: Sequence[CARLExample]) -> None:
         self._items: Tuple[CARLExample, ...] = tuple(items)
+        self._unique_songs: int = len({it.song_id for it in self._items})
 
     def __len__(self) -> int:
         return len(self._items)
 
     def __getitem__(self, index: int) -> CARLExample:
         return self._items[index]
+
+    def unique_song_count(self) -> Optional[int]:
+        return self._unique_songs
 
 
 class LazyIndexedSamplePool(CARLDataSamplePool):
@@ -60,9 +68,15 @@ class LazyIndexedSamplePool(CARLDataSamplePool):
         self,
         indices: Sequence[int] | np.ndarray,
         loader_fn: Callable[[int], CARLExample],
+        song_ids: Optional[Sequence[int] | np.ndarray] = None,
     ) -> None:
         self._indices = np.asarray(indices, dtype=np.int64).copy()
         self._loader_fn = loader_fn
+        self._unique_songs: Optional[int] = (
+            int(np.unique(np.asarray(song_ids, dtype=np.int64)).size)
+            if song_ids is not None
+            else None
+        )
 
     def __len__(self) -> int:
         return int(self._indices.shape[0])
@@ -70,6 +84,9 @@ class LazyIndexedSamplePool(CARLDataSamplePool):
     def __getitem__(self, index: int) -> CARLExample:
         raw_idx = int(self._indices[int(index)])
         return self._loader_fn(raw_idx)
+
+    def unique_song_count(self) -> Optional[int]:
+        return self._unique_songs
 
 
 class CARLDataRepository(ABC):
@@ -127,6 +144,7 @@ class CARLActorAdapter(ABC):
         base_actor: "CARLActorAdapter",
         examples: Sequence[CARLExample],
         generated_sequences: Sequence[np.ndarray],
+        sampling: Optional[UnifiedSamplingConfig] = None,
     ) -> StepLogProbsKL:
         """Compute per-step action log-probs and exact conditional KL on a micro-batch."""
 

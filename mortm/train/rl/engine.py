@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace as dc_replace
 import math
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from torch import Tensor, nn
 
 from .domain import (
     CARLExample,
+    CriticCalibration,
     RolloutBatch,
     StepLogProbsKL,
     UnifiedEvenConfig,
@@ -30,11 +32,17 @@ from .optim import MasterWeightAdamW
 from .q_table import QTable, accuracy_by_source, auc_by_source, mix_batch
 
 
-def compute_discriminator_reward(disc_logits: Tensor, span: float = 8.0) -> Tensor:
+def compute_discriminator_reward(
+    disc_logits: Tensor,
+    span: float = 8.0,
+    calibration: Optional[CriticCalibration] = None,
+) -> Tensor:
     """Linearly map Critic logits (`+` = AI, `-` = Human) to `[0.0, 1.0]` without GAN saturation."""
+    if calibration is not None:
+        return calibration.score_to_reward(disc_logits)
     if span <= 0.0:
         raise ValueError(f"disc_span must be positive, got {span}.")
-    return torch.clamp(0.5 - disc_logits.float() / float(span), min=0.0, max=1.0)
+    return CriticCalibration(center=0.0, span=float(span)).score_to_reward(disc_logits)
 
 
 def compute_grpo_advantages(rewards: Tensor, group_size: int, eps: float = 1e-4) -> Tensor:
@@ -76,6 +84,29 @@ class ClippedGRPOLoss(nn.Module):
         kl_seq = (step_stats.exact_kl * mask).sum(dim=1) / denom
         loss = (pg_seq + self.kl_coef * kl_seq).mean()
         return loss, pg_seq.mean().detach(), kl_seq.mean().detach()
+
+    def forward_with_diagnostics(
+        self,
+        step_stats: StepLogProbsKL,
+        old_action_logprobs: Tensor,
+        advantages: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        mask = step_stats.action_mask.float()
+        denom = mask.sum(dim=1).clamp(min=1.0)
+
+        ratio = torch.exp((step_stats.action_logprobs - old_action_logprobs).clamp(-20.0, 20.0))
+        adv = advantages.to(device=ratio.device, dtype=ratio.dtype).unsqueeze(1)
+        unclipped = ratio * adv
+        clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
+        pg_tok = -torch.minimum(unclipped, clipped)
+
+        is_clipped = ((ratio - 1.0).abs() > self.clip_eps).float() * mask
+        clip_frac = (is_clipped.sum(dim=1) / denom).mean().detach()
+
+        pg_seq = (pg_tok * mask).sum(dim=1) / denom
+        kl_seq = (step_stats.exact_kl * mask).sum(dim=1) / denom
+        loss = (pg_seq + self.kl_coef * kl_seq).mean()
+        return loss, pg_seq.mean().detach(), kl_seq.mean().detach(), clip_frac
 
 
 class OddRoundEngine:
@@ -169,6 +200,8 @@ class OddRoundEngine:
         stale = 0
         slope = float("nan")
         last_auc: Dict[str, float] = {}
+        cur_cal = CriticCalibration(center=0.0, span=cfg.fallback_disc_span, calibrated=False)
+        z_pass = cur_cal.reward_to_logit_threshold(cfg.pass_reward_target)
         refresh_interval = max(1, cfg.pool_size // max(1, cfg.batch_size))
         non_finite_streak = 0
 
@@ -194,7 +227,12 @@ class OddRoundEngine:
             disc_logits = self._critic.score_disc_logits(
                 seqs, chunk_size=cfg.critic_chunk, grad_enabled=True
             )
-            loss = F.binary_cross_entropy_with_logits(disc_logits.float(), targets)
+            bce_loss = F.binary_cross_entropy_with_logits(disc_logits.float(), targets)
+            if cfg.logit_reg_coef > 0.0:
+                reg_loss = float(cfg.logit_reg_coef) * (disc_logits.float() ** 2).mean()
+                loss = bce_loss + reg_loss
+            else:
+                loss = bce_loss
             if not bool(torch.isfinite(loss).all().item()):
                 optimizer.zero_grad()
                 non_finite_streak += 1
@@ -216,41 +254,71 @@ class OddRoundEngine:
             non_finite_streak = 0
 
             logits_np = disc_logits.detach().float().cpu().numpy()
-            acc = accuracy_by_source(logits_np, is_ai, source)
             raw_buf.append((logits_np, np.asarray(is_ai, dtype=np.float32), list(source)))
-            for k in hist:
-                if k in acc:
-                    hist[k].append(acc[k])
 
-            # Compute buffered ROC-AUC & logit means from the very first log step (`len(raw_buf) >= 1`)
-            # so early logs never display misleading `nan` / `-1.0000`, while gating early-stop strictly
-            # on `len(raw_buf) >= effective_eval_window` to prevent small-sample premature stopping.
+            # Compute buffered ROC-AUC, logit calibration & threshold-aligned accuracy over `eval_window`.
             effective_eval_win = min(cfg.eval_window, cfg.max_steps)
-            if len(raw_buf) >= 1 and step % max(1, cfg.log_every) == 0:
+            buf_acc: Dict[str, float] = {}
+            if len(raw_buf) >= 1 and (step % max(1, cfg.log_every) == 0 or len(raw_buf) >= effective_eval_win):
                 sc = np.concatenate([r[0] for r in raw_buf])
                 ya = np.concatenate([r[1] for r in raw_buf])
                 sr = [x for r in raw_buf for x in r[2]]
                 last_auc = auc_by_source(sc, ya, sr)
+                lh_buf = last_auc.get("logit_mean_human", float("nan"))
+                lg_buf = last_auc.get("logit_mean_gem", float("nan"))
+                cur_cal = CriticCalibration.from_odd_stats(
+                    lh_buf,
+                    lg_buf,
+                    pass_reward=cfg.pass_reward_target,
+                    fallback_span=cfg.fallback_disc_span,
+                )
+                z_pass = cur_cal.reward_to_logit_threshold(cfg.pass_reward_target)
+                buf_acc = accuracy_by_source(sc, ya, sr, logit_threshold=z_pass)
+                zero_acc = accuracy_by_source(sc, ya, sr, logit_threshold=0.0)
+
                 a_gem = last_auc.get("auc_gem", float("nan"))
                 if math.isfinite(a_gem):
                     best_auc = max(best_auc, a_gem)
-                    if len(raw_buf) >= effective_eval_win:
+                    if len(raw_buf) >= effective_eval_win and step % max(1, cfg.log_every) == 0:
                         auc_hist.append((step, a_gem))
                         if len(auc_hist) == cfg.auc_slope_window:
                             xs = np.array([h[0] for h in auc_hist], dtype=np.float64)
                             ys = np.array([h[1] for h in auc_hist], dtype=np.float64)
                             slope = float(np.polyfit(xs, ys, 1)[0] * 1000.0)
                             stale = stale + 1 if slope < cfg.auc_min_slope else 0
-                        if a_gem >= cfg.auc_threshold:
-                            reason = f"discriminator_ready: AUC(human vs gem) {a_gem:.4f} >= {cfg.auc_threshold}"
+
+                        hum_pass_ok = buf_acc.get("human", 0.0) >= cfg.min_class_acc
+                        gem_fail_ok = buf_acc.get("gem", 0.0) >= cfg.min_class_acc
+                        centered_ok = (
+                            zero_acc.get("human", 0.0) >= 0.50 and zero_acc.get("gem", 0.0) >= 0.50
+                        )
+                        if (
+                            a_gem >= cfg.auc_threshold
+                            and cur_cal.calibrated
+                            and hum_pass_ok
+                            and gem_fail_ok
+                            and centered_ok
+                        ):
+                            reason = (
+                                f"discriminator_ready: AUC(human vs gem) {a_gem:.4f} >= {cfg.auc_threshold} "
+                                f"& acc@z={z_pass:+.2f} (H={buf_acc.get('human', 0.0):.3f}, "
+                                f"G={buf_acc.get('gem', 0.0):.3f} >= {cfg.min_class_acc})"
+                            )
                         elif step >= cfg.auc_min_steps and stale >= cfg.auc_patience:
                             reason = (
                                 f"auc_converged: slope {slope:+.4f}/1k < {cfg.auc_min_slope} "
                                 f"for {stale} checks (best={best_auc:.4f}, cur={a_gem:.4f})"
                             )
 
+            acc = accuracy_by_source(logits_np, is_ai, source, logit_threshold=z_pass)
+            for k in hist:
+                if k in acc:
+                    hist[k].append(acc[k])
+
             step_log: Dict[str, Any] = {
                 "odd/loss": float(loss.detach().item()),
+                "odd/bce_loss": float(bce_loss.detach().item()),
+                "odd/z_pass": z_pass,
                 "odd/step": step,
                 "odd/qtable_size": len(self._qtable),
                 "odd/auc_best": best_auc if best_auc >= 0.0 else float("nan"),
@@ -273,23 +341,47 @@ class OddRoundEngine:
                     else f"warmup({len(auc_hist)}/{cfg.auc_slope_window})"
                 )
                 win_tag = "" if len(raw_buf) >= effective_eval_win else f" [buf {len(raw_buf)}/{effective_eval_win}]"
+                h_acc_w = buf_acc.get("human", float("nan"))
+                g_acc_w = buf_acc.get("gem", float("nan"))
                 print(
                     f"[R{round_no} Odd] step {step:5d}/{cfg.max_steps} | "
-                    f"bce={float(loss.detach().item()):.4f} | "
+                    f"bce={float(bce_loss.detach().item()):.4f} | "
                     f"AUC(gem)={auc_str}{win_tag} (best={best_str}, slope={slope_str}, stale={stale}) | "
-                    f"logit(H={lh:+.2f}, G={lg:+.2f}) | Q={len(self._qtable)}",
+                    f"logit(H={lh:+.2f}, G={lg:+.2f}, z_pass={z_pass:+.2f}) | "
+                    f"acc(H={h_acc_w:.2f}, G={g_acc_w:.2f}) | Q={len(self._qtable)}",
                     flush=True,
                 )
             if reason is not None:
                 break
 
+        if raw_buf:
+            sc_f = np.concatenate([r[0] for r in raw_buf])
+            ya_f = np.concatenate([r[1] for r in raw_buf])
+            sr_f = [x for r in raw_buf for x in r[2]]
+            final_stats = auc_by_source(sc_f, ya_f, sr_f)
+            final_cal = CriticCalibration.from_odd_stats(
+                final_stats.get("logit_mean_human", float("nan")),
+                final_stats.get("logit_mean_gem", float("nan")),
+                pass_reward=cfg.pass_reward_target,
+                fallback_span=cfg.fallback_disc_span,
+            )
+        else:
+            final_cal = cur_cal
+
         qstats = self._qtable.commit()
         print(
             f"[R{round_no} Odd] Done ({reason or 'max_steps'}) | "
+            f"Calibrated={final_cal.calibrated} (center={final_cal.center:+.3f}, span={final_cal.span:.3f}) | "
             f"QTable: {qstats['before']} -> -{qstats['forgot']} +{qstats['merged']} = {qstats['size']}",
             flush=True,
         )
-        return {"steps": step, "reason": reason, "qtable": qstats, "best_auc": best_auc}
+        return {
+            "steps": step,
+            "reason": reason,
+            "qtable": qstats,
+            "best_auc": best_auc,
+            "calibration": final_cal.to_dict(),
+        }
 
 
 class EvenRoundEngine:
@@ -304,6 +396,7 @@ class EvenRoundEngine:
         qtable: QTable,
         cfg: UnifiedEvenConfig,
         rng: Optional[np.random.Generator] = None,
+        calibration: Optional[CriticCalibration] = None,
     ) -> None:
         self._actor = actor
         self._base_actor = base_actor
@@ -312,19 +405,31 @@ class EvenRoundEngine:
         self._qtable = qtable
         self._cfg = cfg
         self._rng = rng if rng is not None else np.random.default_rng()
+        self._calibration = calibration
         self._loss_fn = ClippedGRPOLoss(clip_eps=cfg.clip_eps, kl_coef=cfg.kl_coef)
+
+    def _effective_calibration(self) -> CriticCalibration:
+        if (
+            self._cfg.calibrate_reward
+            and self._calibration is not None
+            and self._calibration.calibrated
+        ):
+            return self._calibration
+        return CriticCalibration(center=0.0, span=self._cfg.disc_span, calibrated=False)
 
     def _compute_rewards(
         self,
         batch: RolloutBatch,
     ) -> Tuple[Tensor, Dict[str, float]]:
         cfg = self._cfg
+        cal = self._effective_calibration()
         guard_eval = self._guardrails.evaluate(batch)
         is_empty = guard_eval.is_empty
 
         # Score non-empty critic sequences in one batched forward pass.
         n = len(batch)
         disc_rewards = torch.zeros((n,), dtype=torch.float32)
+        mean_disc_logit = float("nan")
         valid_indices = [
             idx
             for idx, (emp, c_seq) in enumerate(zip(is_empty.tolist(), batch.critic_sequences))
@@ -335,7 +440,10 @@ class EvenRoundEngine:
             disc_logits = self._critic.score_disc_logits(
                 valid_seqs, chunk_size=cfg.critic_chunk, grad_enabled=False
             ).cpu()
-            valid_r_disc = cfg.disc_weight * compute_discriminator_reward(disc_logits, span=cfg.disc_span)
+            mean_disc_logit = float(disc_logits.float().mean().item())
+            valid_r_disc = cfg.disc_weight * compute_discriminator_reward(
+                disc_logits, span=cfg.disc_span, calibration=cal
+            )
             for out_pos, batch_idx in enumerate(valid_indices):
                 disc_rewards[batch_idx] = valid_r_disc[out_pos]
         else:
@@ -351,6 +459,7 @@ class EvenRoundEngine:
         )
         metrics: Dict[str, float] = {
             "disc": mean_disc,
+            "disc_logit": mean_disc_logit,
             "pen_total": float(guard_eval.penalties[valid_mask].mean().item())
             if bool(valid_mask.any())
             else 0.0,
@@ -358,17 +467,61 @@ class EvenRoundEngine:
         }
         return rewards, metrics
 
+    @staticmethod
+    def _materialize_old_logprobs(
+        sub_old_lps: Optional[Sequence[np.ndarray]],
+        step_stats: StepLogProbsKL,
+    ) -> Tensor:
+        new_lp = step_stats.action_logprobs
+        if sub_old_lps is None:
+            return new_lp.detach()
+        bsz, t_act = new_lp.shape
+        if all(arr.ndim == 1 and arr.shape[0] == t_act for arr in sub_old_lps):
+            stacked = np.stack(sub_old_lps, axis=0)
+            return torch.as_tensor(stacked, dtype=new_lp.dtype, device=new_lp.device)
+        old_t = new_lp.detach().clone()
+        for row_i, arr in enumerate(sub_old_lps):
+            arr_t = torch.as_tensor(arr.reshape(-1), dtype=new_lp.dtype, device=new_lp.device)
+            mask_row = step_stats.action_mask[row_i].bool()
+            if int(mask_row.sum().item()) == arr_t.numel():
+                old_t[row_i, mask_row] = arr_t
+            else:
+                copy_n = min(t_act, arr_t.numel())
+                old_t[row_i, :copy_n] = arr_t[:copy_n]
+        return old_t
+
+    @torch.no_grad()
+    def _precompute_fallback_old_logprobs(self, batch: RolloutBatch) -> Tuple[np.ndarray, ...]:
+        total_n = len(batch)
+        chunk_sz = max(1, int(self._cfg.train_chunk))
+        parts: List[np.ndarray] = []
+        for start in range(0, total_n, chunk_sz):
+            stop = min(start + chunk_sz, total_n)
+            st = self._actor.forward_logprobs_and_exact_kl(
+                base_actor=self._base_actor,
+                examples=batch.examples[start:stop],
+                generated_sequences=batch.generated_sequences[start:stop],
+                sampling=self._cfg.sampling,
+            )
+            lp_np = st.action_logprobs.detach().float().cpu().numpy()
+            for row_i in range(lp_np.shape[0]):
+                parts.append(lp_np[row_i])
+        return tuple(parts)
+
     def _step_backward(
         self,
         batch: RolloutBatch,
         rewards: Tensor,
-    ) -> Tuple[float, float, float]:
+        override_old_lps: Optional[Tuple[np.ndarray, ...]] = None,
+    ) -> Tuple[float, float, float, float]:
         advantages = compute_grpo_advantages(rewards, batch.group_size, eps=self._cfg.adv_eps)
         total_n = len(batch)
         chunk_sz = max(1, int(self._cfg.train_chunk))
         acc_loss = 0.0
         acc_pg = 0.0
         acc_kl = 0.0
+        acc_clip = 0.0
+        old_source = batch.old_action_logprobs if batch.old_action_logprobs is not None else override_old_lps
 
         for start in range(0, total_n, chunk_sz):
             stop = min(start + chunk_sz, total_n)
@@ -376,21 +529,26 @@ class EvenRoundEngine:
             sub_ex = batch.examples[start:stop]
             sub_gen = batch.generated_sequences[start:stop]
             sub_adv = advantages[start:stop]
+            sub_old = old_source[start:stop] if old_source is not None else None
 
             step_stats = self._actor.forward_logprobs_and_exact_kl(
                 base_actor=self._base_actor,
                 examples=sub_ex,
                 generated_sequences=sub_gen,
+                sampling=self._cfg.sampling,
             )
-            old_logp = step_stats.action_logprobs.detach()
-            loss, pg_mean, kl_mean = self._loss_fn(step_stats, old_logp, sub_adv)
+            old_logp = self._materialize_old_logprobs(sub_old, step_stats)
+            loss, pg_mean, kl_mean, clip_frac = self._loss_fn.forward_with_diagnostics(
+                step_stats, old_logp, sub_adv
+            )
             (loss * weight).backward()
 
             acc_loss += float(loss.detach().item()) * weight
             acc_pg += float(pg_mean.item()) * weight
             acc_kl += float(kl_mean.item()) * weight
+            acc_clip += float(clip_frac.item()) * weight
 
-        return acc_loss, acc_pg, acc_kl
+        return acc_loss, acc_pg, acc_kl, acc_clip
 
     def should_stop(self, mean_reward: float, mean_kl: float, mean_disc: float) -> Optional[str]:
         if mean_kl > self._cfg.kl_stop and mean_disc > self._cfg.disc_stop:
@@ -417,10 +575,14 @@ class EvenRoundEngine:
             raise RuntimeError("EvenRoundEngine: Actor reported 0 trainable parameters for GRPO.")
         self._actor.prepare_for_grpo_forward()
         pct = 100.0 * float(n_train) / float(max(1, n_total))
+        cal = self._effective_calibration()
+        z_goal = cal.reward_to_logit_threshold(cfg.reward_stop / max(1e-6, cfg.disc_weight))
         print(
             f"[R{round_no} Even] Actor trainable: {n_train / 1e6:.2f}M / {n_total / 1e6:.2f}M ({pct:.1f}%) | "
-            f"lr={cfg.lr} | G={cfg.group_size} x P={cfg.prompts_per_step} = "
-            f"{cfg.group_size * cfg.prompts_per_step} rollouts/step",
+            f"lr={cfg.lr} | ppo_epochs={cfg.ppo_epochs} | G={cfg.group_size} x P={cfg.prompts_per_step} = "
+            f"{cfg.group_size * cfg.prompts_per_step} rollouts/step\n"
+            f"[R{round_no} Even] Reward ruler ({'calibrated' if cal.calibrated else 'fixed'}): "
+            f"center={cal.center:+.3f}, span={cal.span:.3f}, z_pass<={z_goal:+.3f} for R>={cfg.reward_stop:.3f}",
             flush=True,
         )
 
@@ -456,24 +618,42 @@ class EvenRoundEngine:
             self._actor.prepare_for_grpo_forward()
 
             rewards, r_metrics = self._compute_rewards(roll)
-            loss_val, pg_val, kl_val = self._step_backward(roll, rewards)
             mean_r = float(rewards.mean().item())
+            fallback_old_lps = (
+                self._precompute_fallback_old_logprobs(roll)
+                if (roll.old_action_logprobs is None and cfg.ppo_epochs > 1)
+                else None
+            )
 
-            if not (
-                math.isfinite(loss_val)
-                and math.isfinite(pg_val)
-                and math.isfinite(kl_val)
-                and math.isfinite(mean_r)
-            ):
-                optimizer.zero_grad()
-                reason = (
-                    f"non_finite_abort: step={step}, loss={loss_val}, kl={kl_val}, reward={mean_r}"
+            loss_val = float("nan")
+            pg_val = float("nan")
+            kl_val = float("nan")
+            clip_val = 0.0
+            aborted_epoch = False
+            for _ in range(cfg.ppo_epochs):
+                loss_val, pg_val, kl_val, clip_val = self._step_backward(
+                    roll, rewards, override_old_lps=fallback_old_lps
                 )
-                break
+                if not (
+                    math.isfinite(loss_val)
+                    and math.isfinite(pg_val)
+                    and math.isfinite(kl_val)
+                    and math.isfinite(mean_r)
+                ):
+                    optimizer.zero_grad()
+                    reason = (
+                        f"non_finite_abort: step={step}, loss={loss_val}, kl={kl_val}, reward={mean_r}"
+                    )
+                    aborted_epoch = True
+                    break
 
-            stepped = optimizer.step_and_zero_grad(grad_clip=cfg.grad_clip)
-            if not stepped:
-                reason = f"non_finite_abort: non-finite gradients detected at step={step}"
+                stepped = optimizer.step_and_zero_grad(grad_clip=cfg.grad_clip)
+                if not stepped:
+                    reason = f"non_finite_abort: non-finite gradients detected at step={step}"
+                    aborted_epoch = True
+                    break
+
+            if aborted_epoch:
                 break
 
             mv["reward"].append(mean_r)
@@ -491,6 +671,7 @@ class EvenRoundEngine:
                 "even/pen_total": r_metrics["pen_total"],
                 "even/kl": kl_val,
                 "even/pg_loss": pg_val,
+                "even/clip_frac": clip_val,
                 "even/loss": loss_val,
                 "even/reward_ma": avg["reward"],
                 "even/kl_ma": avg["kl"],
@@ -501,12 +682,13 @@ class EvenRoundEngine:
                 on_step(step_log)
 
             if step % max(1, cfg.log_every) == 0:
+                z_mean = r_metrics.get("disc_logit", float("nan"))
                 print(
                     f"[R{round_no} Even] step {step:4d}/{cfg.max_steps} | "
                     f"R={mean_r:+.3f} (ma={avg['reward']:+.3f}/{cfg.reward_stop:+.2f}) | "
-                    f"R_disc={r_metrics['disc']:+.3f} | pen={r_metrics['pen_total']:+.3f} | "
+                    f"R_disc={r_metrics['disc']:+.3f} (z={z_mean:+.2f}) | pen={r_metrics['pen_total']:+.3f} | "
                     f"empty={100.0 * r_metrics.get('empty_rate', 0.0):.1f}% | "
-                    f"KL={kl_val:.4f} (ma={avg['kl']:.4f}/{cfg.kl_stop:.2f})",
+                    f"KL={kl_val:.4f} (ma={avg['kl']:.4f}/{cfg.kl_stop:.2f}) | clip={100.0 * clip_val:.1f}%",
                     flush=True,
                 )
 
@@ -580,9 +762,21 @@ class UnifiedCARLDriver:
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._odd_cfg = odd_cfg or UnifiedOddConfig()
         self._even_cfg = even_cfg or UnifiedEvenConfig()
+        # Synchronize Odd-round pass-threshold target with Even-round `reward_stop` unless explicitly overridden.
+        linked_target = min(
+            0.92,
+            max(0.50, float(self._even_cfg.reward_stop) / max(1e-6, float(self._even_cfg.disc_weight))),
+        )
+        if abs(self._odd_cfg.pass_reward_target - 0.625) < 1e-9 and abs(linked_target - 0.625) > 1e-9:
+            self._odd_cfg = dc_replace(
+                self._odd_cfg,
+                pass_reward_target=linked_target,
+                fallback_disc_span=self._even_cfg.disc_span,
+            )
         self._rng = np.random.default_rng(seed)
         torch.manual_seed(seed)
         self._qtable = QTable(q_max=q_max, rng=self._rng)
+        self._calibration: Optional[CriticCalibration] = None
         self._ckpt_prefix = str(ckpt_prefix)
         self._keep_round_ckpts = bool(keep_round_ckpts)
         self._eval_hook = eval_hook
@@ -593,6 +787,10 @@ class UnifiedCARLDriver:
     @property
     def qtable(self) -> QTable:
         return self._qtable
+
+    @property
+    def calibration(self) -> Optional[CriticCalibration]:
+        return self._calibration
 
     def _init_wandb(
         self,
@@ -649,6 +847,8 @@ class UnifiedCARLDriver:
             q_obj = torch.load(qtable_ckpt, map_location="cpu", weights_only=False)
             self._qtable.table = list(q_obj.get("table", []))
             self._qtable.round = int(q_obj.get("round", 0))
+            if isinstance(q_obj.get("calibration"), dict):
+                self._calibration = CriticCalibration.from_dict(q_obj["calibration"])
             print(f"[CARL] Resumed QTable ({len(self._qtable)} items) from {qtable_ckpt}", flush=True)
 
         if critic_ckpt is not None and str(critic_ckpt).strip():
@@ -681,7 +881,9 @@ class UnifiedCARLDriver:
         print(f"[CARL] QTable prefilled ({st['size']} items) -> {q_path}", flush=True)
 
     def _save_qtable(self, suffix: str) -> Path:
-        q_payload = {"table": self._qtable.table, "round": self._qtable.round}
+        q_payload: Dict[str, Any] = {"table": self._qtable.table, "round": self._qtable.round}
+        if self._calibration is not None:
+            q_payload["calibration"] = self._calibration.to_dict()
         q_path = self._out_dir / f"qtable{suffix}.pt"
         torch.save(q_payload, q_path)
         latest_q = self._out_dir / "qtable_latest.pt"
@@ -724,6 +926,8 @@ class UnifiedCARLDriver:
             round_no=round_no,
             on_step=lambda d: self._log({**d, "round": round_no}),
         )
+        if isinstance(out.get("calibration"), dict):
+            self._calibration = CriticCalibration.from_dict(out["calibration"])
         self._save_round("odd", round_no)
         return out
 
@@ -739,6 +943,7 @@ class UnifiedCARLDriver:
             qtable=self._qtable,
             cfg=self._even_cfg,
             rng=self._rng,
+            calibration=self._calibration,
         )
         out = even.run(
             self._gem_pool,

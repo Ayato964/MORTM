@@ -180,10 +180,19 @@ def mix_batch(human: Sequence[dict], gem: Sequence[dict],
 # ----------------------------------------------------------------------
 # 停止判定(出所別)
 # ----------------------------------------------------------------------
-def accuracy_by_source(disc_logit, is_ai, source) -> Dict[str, float]:
-    """判別精度を出所別に出す。`overall` と `human`/`gem`/`qtable` を返す。"""
+def accuracy_by_source(
+    disc_logit,
+    is_ai,
+    source,
+    logit_threshold: float = 0.0,
+) -> Dict[str, float]:
+    """判別精度を指定ロジット閾値 (`logit_threshold`) 基準で出所別に出す。
+
+    `disc_logit <= logit_threshold` を人間（報酬合格側）、`disc_logit > logit_threshold` を AI（不合格側）として判定する。
+    """
     import torch
-    p = (torch.as_tensor(disc_logit).float() > 0).cpu().numpy().astype(np.float32)
+
+    p = (torch.as_tensor(disc_logit).float() > float(logit_threshold)).cpu().numpy().astype(np.float32)
     y = np.asarray(is_ai, dtype=np.float32)
     correct = (p == y).astype(np.float32)
     out = {"overall": float(correct.mean()) if len(correct) else 0.0}

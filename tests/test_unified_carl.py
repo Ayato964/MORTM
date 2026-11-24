@@ -183,7 +183,7 @@ def test_symic_actor_unfreeze_exact_kl_and_depth_gradients() -> None:
     )
     # Identical Actor & Base in `.eval()` mode must yield 0 exact KL!
     assert float(stats.exact_kl.abs().max().item()) < 1e-5
-    assert stats.action_logprobs.shape == (1, 8 * 4)
+    assert stats.action_logprobs.shape == (1, 8 * 4 * 4)
 
     loss = -stats.action_logprobs.mean()
     loss.backward()
@@ -491,6 +491,7 @@ def test_generic_engine_supports_custom_symbolic_adapter(tmp_path: Path) -> None
             base_actor: CARLActorAdapter,
             examples: Sequence[CARLExample],
             generated_sequences: Sequence[np.ndarray],
+            sampling: Optional[UnifiedSamplingConfig] = None,
         ) -> StepLogProbsKL:
             x = torch.as_tensor(np.stack(generated_sequences), dtype=torch.long)
             logp = torch.log_softmax(self._net(x), dim=-1)
@@ -656,6 +657,7 @@ def test_reward_hacking_rollback_immediately_commits_to_qtable_and_persists(tmp_
             base_actor: CARLActorAdapter,
             examples: Sequence[CARLExample],
             generated_sequences: Sequence[np.ndarray],
+            sampling: Optional[UnifiedSamplingConfig] = None,
         ) -> StepLogProbsKL:
             x = torch.as_tensor(np.stack(generated_sequences), dtype=torch.long)
             logp = torch.log_softmax(self._net(x), dim=-1)
@@ -1053,6 +1055,7 @@ def test_non_finite_grad_and_loss_protection_and_strict_resume_errors(tmp_path: 
             base_actor: CARLActorAdapter,
             examples: Sequence[CARLExample],
             generated_sequences: Sequence[np.ndarray],
+            sampling: Optional[UnifiedSamplingConfig] = None,
         ) -> StepLogProbsKL:
             bsz = len(generated_sequences)
             lp = self._net.weight.sum() * torch.zeros((bsz, 4), dtype=torch.float32)
@@ -1221,3 +1224,311 @@ def test_batched_kvcache_sdpa_and_single_group_depth_head_exact_equivalence(caps
     assert "AUC(gem)=nan" not in captured
     assert "best=-1.0000" not in captured
     assert "+nan/1k" not in captured
+
+
+def test_symic_pianoroll_canonicalizer_invariance_and_cli_flags() -> None:
+    """Verify symmetric GPU piano-roll canonicalization collapses distinct RVQ paths of the same notes."""
+    from mortm.train.rl import SyMIcPianoRollCanonicalizer
+    from mortm.train.rl.cli import build_arg_parser
+
+    parser = build_arg_parser()
+    assert parser.parse_args(["--out-dir", "out/tmp"]).critic_pianoroll is False
+    assert parser.parse_args(["--out-dir", "out/tmp", "--no-critic-pianoroll"]).critic_pianoroll is False
+    assert parser.parse_args(["--out-dir", "out/tmp", "--critic-pianoroll"]).critic_pianoroll is True
+
+    dev = _select_test_device()
+    m_args = MORTM5Args(_tiny_symic_config())
+    vq_args = MORTM5Args(_tiny_vq_config())
+    vq = MidiVision(vq_args, sync_codebook=False).to(dev).eval()
+    for p in vq.parameters():
+        p.requires_grad_(False)
+    with torch.no_grad():
+        for name, buf in vq.named_buffers():
+            if name.endswith("initted"):
+                buf.fill_(True)
+        for mod in vq.decoder.modules():
+            if hasattr(mod, "weight") and mod.weight is not None and isinstance(mod, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+                if not isinstance(mod, (nn.LayerNorm, nn.GroupNorm)):
+                    mod.weight.zero_()
+            if hasattr(mod, "bias") and mod.bias is not None:
+                mod.bias.fill_(-2.0)
+
+    with pytest.raises(ValueError, match="requires a frozen MidiVision"):
+        SyMIcCriticAdapter.from_pretrained(m_args, None, dev, prompt_bars=1, canonicalize_pianoroll=True)
+
+    torch.manual_seed(11)
+    critic_raw = SyMIcCriticAdapter.from_pretrained(
+        m_args, None, dev, prompt_bars=1, lora_rank=4, canonicalize_pianoroll=False
+    )
+    torch.manual_seed(11)
+    critic_canon = SyMIcCriticAdapter.from_pretrained(
+        m_args,
+        None,
+        dev,
+        prompt_bars=1,
+        lora_rank=4,
+        vq_model=vq,
+        canonicalize_pianoroll=True,
+    )
+    assert critic_raw.uses_pianoroll_canonicalizer is False
+    assert critic_canon.uses_pianoroll_canonicalizer is True
+    assert isinstance(critic_canon._canonicalizer, SyMIcPianoRollCanonicalizer)
+
+    ex_a = _make_synthetic_symic_example(m_args, song_id=1, prompt_bars=1, total_bars=2, seed=10)
+    ex_b = _make_synthetic_symic_example(m_args, song_id=2, prompt_bars=1, total_bars=2, seed=99)
+    prompt_soft_len = 5 + 8 * 4
+    # Share the exact same prompt, differ completely in continuation RVQ tokens, yet decode to the same discrete roll!
+    seq_a = ex_a.human_full_tokens.copy()
+    seq_b = np.concatenate([seq_a[:prompt_soft_len], ex_b.human_full_tokens[prompt_soft_len:]], axis=0)
+    assert not np.array_equal(seq_a[prompt_soft_len:], seq_b[prompt_soft_len:])
+
+    t_in = torch.as_tensor(np.stack([seq_a, seq_b], axis=0), dtype=torch.long, device=dev)
+    t_out = critic_canon._canonicalizer.canonicalize_sequences(t_in)
+    # Prompt must be preserved bit-for-bit; continuation must collapse to identical canonical RVQ tokens!
+    assert torch.equal(t_out[:, :prompt_soft_len, :], t_in[:, :prompt_soft_len, :])
+    assert torch.equal(t_out[0], t_out[1])
+
+    # Raw Critic distinguishes seq_a vs seq_b via surface RVQ tokens; Canonicalized Critic gives IDENTICAL logits!
+    logits_raw = critic_raw.score_disc_logits([seq_a, seq_b])
+    logits_canon = critic_canon.score_disc_logits([seq_a, seq_b])
+    assert abs(float((logits_raw[0] - logits_raw[1]).item())) > 1e-5
+    assert torch.allclose(logits_canon[0], logits_canon[1], atol=1e-6)
+
+    # Verify set_train_mode(True) keeps MidiVision frozen in .eval() and backward() updates LoRA/MIL cleanly.
+    critic_canon.mark_trainable()
+    critic_canon.set_train_mode(True)
+    assert vq.training is False
+    out_grad = critic_canon.score_disc_logits([seq_a, seq_b], grad_enabled=True)
+    out_grad.sum().backward()
+    assert critic_canon.critic_module.mil.scorer[0].weight.grad is not None
+
+
+def test_critic_calibration_ruler_and_odd_dual_gate_stopping(tmp_path: Path) -> None:
+    """Verify Odd⇄Even CriticCalibration prevents `-6 vs -2.8` premature pass and links `q_table` threshold."""
+    from mortm.train.rl import CriticCalibration
+    from mortm.train.rl.engine import OddRoundEngine, compute_discriminator_reward
+    from mortm.train.rl.q_table import QTable, accuracy_by_source
+
+    # Suppose Critic pushed Human down to -6.0 and AI sits at +1.0:
+    # On the old uncalibrated ruler (`0.5 - z/8`), `z = -2.8` falsely scored `0.85` (pass!).
+    # With CriticCalibration, `z = -2.8` is strictly BELOW `0.80` while `z = -6.0` (Human) >= `0.85`!
+    cal = CriticCalibration.from_odd_stats(human_mean=-6.0, gem_mean=1.0, pass_reward=0.80)
+    assert cal.calibrated is True
+    r_vals = compute_discriminator_reward(torch.tensor([-6.0, -2.8, 1.0]), calibration=cal)
+    assert float(r_vals[0].item()) >= 0.849
+    assert float(r_vals[1].item()) < 0.80  # z=-2.8 no longer falsely passes!
+    assert float(r_vals[2].item()) <= 0.151
+
+    z_pass = cal.reward_to_logit_threshold(0.80)
+    assert -6.0 < z_pass < -2.8
+    # Verify `accuracy_by_source` aligns with `z_pass` (`-2.8 > z_pass` is correctly flagged as AI=1)
+    acc = accuracy_by_source(
+        disc_logit=np.array([-6.2, -5.8, -2.8, 1.2], dtype=np.float32),
+        is_ai=np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32),
+        source=["human", "human", "gem", "gem"],
+        logit_threshold=z_pass,
+    )
+    assert acc["human"] == 1.0
+    assert acc["gem"] == 1.0
+
+    # Verify OddRoundEngine does NOT stop on `AUC == 1.0` if both Human (-6) and Gem (-4) drifted negative!
+    class _StubActor(CARLActorAdapter):
+        def __init__(self) -> None:
+            self._p = nn.Linear(2, 2)
+
+        @property
+        def actor_module(self) -> nn.Module:
+            return self._p
+
+        @property
+        def device(self) -> torch.device:
+            return torch.device("cpu")
+
+        def unfreeze_for_grpo(self) -> Tuple[int, int]:
+            return 4, 4
+
+        def rollout_group(self, examples, group_size, sampling, chunk_size=16, seed=None) -> RolloutBatch:
+            exs = tuple(ex for ex in examples for _ in range(group_size))
+            gens = tuple(np.array([9, 9], dtype=np.int64) for _ in exs)
+            return RolloutBatch(exs, gens, gens, group_size)
+
+        def forward_logprobs_and_exact_kl(self, base_actor, examples, generated_sequences, sampling=None) -> StepLogProbsKL:
+            z = torch.zeros((len(generated_sequences), 2))
+            return StepLogProbsKL(z, z, torch.ones_like(z, dtype=torch.bool))
+
+        def export_checkpoint_state(self) -> Dict[str, Any]:
+            return {}
+
+        def load_checkpoint_state(self, state: Dict[str, Any]) -> None:
+            pass
+
+    class _ShiftedCritic(CARLCriticAdapter):
+        def __init__(self, h_logit: float, g_logit: float) -> None:
+            self._w = nn.Parameter(torch.zeros(1))
+            self._mod = nn.ModuleList([nn.Linear(1, 1)])
+            self._mod[0].weight = self._w
+            self._h = h_logit
+            self._g = g_logit
+
+        @property
+        def critic_module(self) -> nn.Module:
+            return self._mod
+
+        @property
+        def device(self) -> torch.device:
+            return torch.device("cpu")
+
+        def mark_trainable(self) -> Dict[str, int]:
+            self._w.requires_grad_(True)
+            return {"w": 1}
+
+        def score_disc_logits(self, critic_sequences, chunk_size=None, grad_enabled=False) -> Tensor:
+            vals = [self._g if int(s[0]) == 9 else self._h for s in critic_sequences]
+            base = torch.tensor(vals, dtype=torch.float32)
+            return base + 0.0 * self._w.sum()
+
+        def export_compact_state(self) -> Dict[str, Any]:
+            return {}
+
+        def load_compact_state(self, state: Dict[str, Any]) -> None:
+            pass
+
+    pool = InMemorySamplePool(
+        [CARLExample(f"h{i}", i, np.array([1], dtype=np.int64), np.array([1, 2], dtype=np.int64)) for i in range(4)]
+    )
+    # Drifted Critic: Human=-6.0, Gem=-4.0 -> AUC is 1.0, but Gem < 0 so `centered_ok` blocks false stop!
+    odd_drifted = OddRoundEngine(
+        actor=_StubActor(),
+        critic=_ShiftedCritic(-6.0, -4.0),
+        qtable=QTable(q_max=8),
+        cfg=UnifiedOddConfig(batch_size=4, pool_size=4, max_steps=4, eval_window=2, log_every=1, auc_threshold=0.90),
+    )
+    res_drifted = odd_drifted.run(pool, round_no=1)
+    assert res_drifted["reason"] is None  # ran all 4 steps instead of stopping prematurely!
+
+    # Properly centered Critic: Human=-2.0, Gem=+2.0 -> stops cleanly with `discriminator_ready` & saves calibration!
+    odd_clean = OddRoundEngine(
+        actor=_StubActor(),
+        critic=_ShiftedCritic(-2.0, +2.0),
+        qtable=QTable(q_max=8),
+        cfg=UnifiedOddConfig(batch_size=4, pool_size=4, max_steps=4, eval_window=2, log_every=1, auc_threshold=0.90),
+    )
+    res_clean = odd_clean.run(pool, round_no=1)
+    assert str(res_clean["reason"]).startswith("discriminator_ready")
+    assert res_clean["calibration"]["calibrated"] is True
+
+
+def test_grpo_persisted_rollout_old_logprobs_temperature_match_and_1536_norm() -> None:
+    """Verify `old_action_logprobs` is captured at rollout, matches temperature-scaled forward, and normalizes by `T_cont * G`."""
+    from mortm.train.rl.engine import EvenRoundEngine
+    from mortm.train.rl.q_table import QTable
+
+    dev = _select_test_device()
+    m_args = MORTM5Args(_tiny_symic_config())
+    vq_args = MORTM5Args(_tiny_vq_config())
+    vq = MidiVision(vq_args, sync_codebook=False).to(dev).eval()
+
+    model_a = build_mortm5_ablation_model(m_args).to(dev)
+    model_a.Wout._legacy_untrained_depth.fill_(False)
+    model_b = build_mortm5_ablation_model(m_args).to(dev)
+    model_b.load_state_dict(model_a.state_dict())
+
+    actor = SyMIcGroupedActorAdapter(model_a, dev, prompt_bars=1, total_bars=2, unfreeze_mode="full_decoder")
+    base_actor = SyMIcGroupedActorAdapter(model_b, dev, prompt_bars=1, total_bars=2)
+    base_actor.freeze_all()
+    critic = SyMIcCriticAdapter.from_pretrained(m_args, None, dev, prompt_bars=1, lora_rank=4)
+
+    ex = _make_synthetic_symic_example(m_args, song_id=1, prompt_bars=1, total_bars=2)
+    # With top_p=1.0, top_k=0, min_p=0.0, rollout `old_action_logprobs` must match `forward_logprobs_and_exact_kl` at C2F temperatures!
+    c2f_sampling = UnifiedSamplingConfig(temperature=0.85, fine_temperature=0.65, top_p=1.0, top_k=0, min_p=0.0)
+    roll = actor.rollout_group([ex], group_size=2, sampling=c2f_sampling, chunk_size=2, seed=123)
+
+    assert roll.old_action_logprobs is not None
+    assert len(roll.old_action_logprobs) == 2
+    # 1 continuation bar = 8 chunks * 4 layers * 4 groups = 128 individual codebook actions (12 bars = 1,536!)
+    assert roll.old_action_logprobs[0].shape == (8 * 4 * 4,)
+
+    actor.prepare_for_grpo_forward()
+    with torch.no_grad():
+        st = actor.forward_logprobs_and_exact_kl(
+            base_actor=base_actor,
+            examples=roll.examples,
+            generated_sequences=roll.generated_sequences,
+            sampling=c2f_sampling,
+        )
+    roll_old_t = torch.as_tensor(np.stack(roll.old_action_logprobs, axis=0), device=dev, dtype=torch.float32)
+    # bf16 decoder forward vs KV-cache rollout agrees closely -> initial ratio ~ 1.0 (never 4x summed or raw T=1.0 mismatched!)
+    ratio_init = torch.exp(st.action_logprobs - roll_old_t)
+    assert float((ratio_init - 1.0).abs().mean().item()) < 0.05
+    assert st.action_mask.sum(dim=1).tolist() == [128, 128]
+
+    # Verify multi-epoch (`ppo_epochs=2`) GRPO step executes cleanly with persisted `old_action_logprobs`
+    suite = build_symic_guardrail_suite(vq, actor, mode="empty_only")
+    even = EvenRoundEngine(
+        actor=actor,
+        base_actor=base_actor,
+        critic=critic,
+        guardrail_suite=suite,
+        qtable=QTable(q_max=8),
+        cfg=UnifiedEvenConfig(
+            group_size=2,
+            prompts_per_step=1,
+            lr=1e-3,
+            max_steps=1,
+            ppo_epochs=2,
+            train_chunk=2,
+            sampling=UnifiedSamplingConfig(temperature=0.85, top_p=0.95),
+        ),
+    )
+    out = even.run(InMemorySamplePool([ex]), round_no=2)
+    assert out["steps"] == 1
+
+
+def test_song_balanced_memmap_and_cli_pool_limit_inheritance(tmp_path: Path) -> None:
+    """Verify 1-window-per-unique-song round-robin prevents long-song domination and CLI inherits `--pool-limit`."""
+    from mortm.train.rl.cli import build_arg_parser
+
+    parser = build_arg_parser()
+    args = parser.parse_args(["--out-dir", "out/tmp", "--pool-limit", "10000"])
+    assert args.pool_limit == 10000
+    assert args.midi_pool_limit is None
+    assert args.calibrate_reward is True
+    assert abs(args.odd_logit_reg - 1e-3) < 1e-12
+
+    m_args = MORTM5Args(_tiny_symic_config())
+    g = int(m_args.vq_groups)
+    l_cnt = int(m_args.vq_layers)
+    k_sz = int(m_args.codebook_size)
+    tpc = g * l_cnt
+    win_len = 16 * tpc  # 2 bars
+
+    rng = np.random.default_rng(77)
+    parts: List[np.ndarray] = []
+    offsets: List[Tuple[int, int]] = []
+    slots: List[List[int]] = []
+    cur = 0
+    # Song 0 & Song 1 are 20x longer (20 windows each), Songs 2..7 have 1 window each.
+    # Asking for `limit=8` (`4` ana + `4` gem) MUST yield 4 unique songs in `ana` and 4 unique songs in `gem`!
+    for s_i in range(8):
+        n_wins = 20 if s_i < 2 else 1
+        s_len = n_wins * win_len
+        toks = rng.integers(3, 3 + g * k_sz, size=(s_len,), dtype=np.uint16)
+        parts.append(toks)
+        offsets.append((cur, s_len))
+        slots.append([128, 0, 32, -1])
+        cur += s_len
+
+    np.concatenate(parts).tofile(tmp_path / "train_tokens.bin")
+    np.save(tmp_path / "train_offsets.npy", np.asarray(offsets, dtype=np.int64))
+    np.save(tmp_path / "train_slots.npy", np.asarray(slots, dtype=np.int16))
+
+    repo = SyMIcMemmapRepository(
+        token_dir=tmp_path, model_args=m_args, split="train", prompt_bars=1, total_bars=2
+    )
+    ana_p, gem_p = repo.load_disjoint_pools(limit=8, seed=42)
+    assert len(ana_p) == 4 and len(gem_p) == 4
+    assert ana_p.unique_song_count() == 4
+    assert gem_p.unique_song_count() == 4
+    assert {ana_p[i].song_id for i in range(4)}.isdisjoint({gem_p[i].song_id for i in range(4)})
+
+

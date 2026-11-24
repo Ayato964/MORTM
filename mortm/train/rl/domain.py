@@ -3,10 +3,95 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
+import torch
 from torch import Tensor
+
+
+@dataclass(frozen=True)
+class CriticCalibration:
+    """Immutable Odd⇄Even Critic logit-to-reward ruler calibration.
+
+    Maps Critic logits (`+` = AI, `-` = Human) linearly onto `[0.0, 1.0]`:
+        `R_disc(z) = clamp(0.5 - (z - center) / span, 0.0, 1.0)`
+    so Odd-round stopping thresholds and Even-round `reward_stop` share the exact same scale.
+    """
+
+    center: float = 0.0
+    span: float = 8.0
+    human_mean: Optional[float] = None
+    gem_mean: Optional[float] = None
+    calibrated: bool = False
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.center):
+            raise ValueError(f"CriticCalibration.center must be finite, got {self.center}.")
+        if not math.isfinite(self.span) or self.span <= 0.0:
+            raise ValueError(f"CriticCalibration.span must be finite and > 0, got {self.span}.")
+
+    def score_to_reward(self, disc_logits: Tensor) -> Tensor:
+        return torch.clamp(
+            0.5 - (disc_logits.float() - float(self.center)) / float(self.span),
+            min=0.0,
+            max=1.0,
+        )
+
+    def reward_to_logit_threshold(self, target_reward: float) -> float:
+        r_clamped = min(1.0, max(0.0, float(target_reward)))
+        return float(self.center) - (r_clamped - 0.5) * float(self.span)
+
+    @classmethod
+    def from_odd_stats(
+        cls,
+        human_mean: float,
+        gem_mean: float,
+        pass_reward: float = 0.625,
+        min_span: float = 2.0,
+        fallback_span: float = 8.0,
+    ) -> "CriticCalibration":
+        h_f = float(human_mean)
+        g_f = float(gem_mean)
+        if not (math.isfinite(h_f) and math.isfinite(g_f) and g_f > h_f + 1e-4):
+            return cls(
+                center=0.0,
+                span=float(fallback_span),
+                human_mean=h_f if math.isfinite(h_f) else None,
+                gem_mean=g_f if math.isfinite(g_f) else None,
+                calibrated=False,
+            )
+        center = 0.5 * (h_f + g_f)
+        delta = max(float(min_span), g_f - h_f)
+        anchor_r = min(0.92, max(0.85, float(pass_reward) + 0.05))
+        span = delta / (2.0 * (anchor_r - 0.5))
+        return cls(
+            center=center,
+            span=span,
+            human_mean=h_f,
+            gem_mean=g_f,
+            calibrated=True,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "center": self.center,
+            "span": self.span,
+            "human_mean": self.human_mean,
+            "gem_mean": self.gem_mean,
+            "calibrated": self.calibrated,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CriticCalibration":
+        return cls(
+            center=float(data.get("center", 0.0)),
+            span=float(data.get("span", 8.0)),
+            human_mean=float(data["human_mean"]) if data.get("human_mean") is not None else None,
+            gem_mean=float(data["gem_mean"]) if data.get("gem_mean") is not None else None,
+            calibrated=bool(data.get("calibrated", False)),
+        )
 
 
 @dataclass(frozen=True)
@@ -52,6 +137,7 @@ class RolloutBatch:
     generated_sequences: Tuple[np.ndarray, ...]
     critic_sequences: Tuple[Optional[np.ndarray], ...]
     group_size: int
+    old_action_logprobs: Optional[Tuple[np.ndarray, ...]] = None
 
     def __post_init__(self) -> None:
         if self.group_size <= 0:
@@ -61,6 +147,11 @@ class RolloutBatch:
             raise ValueError(
                 f"RolloutBatch length mismatch: examples={n}, "
                 f"generated={len(self.generated_sequences)}, critic={len(self.critic_sequences)}."
+            )
+        if self.old_action_logprobs is not None and len(self.old_action_logprobs) != n:
+            raise ValueError(
+                f"RolloutBatch old_action_logprobs length ({len(self.old_action_logprobs)}) "
+                f"must match examples ({n})."
             )
         if n % self.group_size != 0:
             raise ValueError(
@@ -172,6 +263,10 @@ class UnifiedOddConfig:
     auc_slope_window: int = 50
     auc_patience: int = 10
     auc_min_steps: int = 1000
+    logit_reg_coef: float = 1e-3
+    min_class_acc: float = 0.70
+    pass_reward_target: float = 0.625
+    fallback_disc_span: float = 8.0
     sampling: UnifiedSamplingConfig = field(default_factory=UnifiedSamplingConfig)
 
     def __post_init__(self) -> None:
@@ -193,6 +288,14 @@ class UnifiedOddConfig:
             )
         if self.auc_patience < 1 or self.auc_min_steps < 0:
             raise ValueError("auc_patience must be >= 1 and auc_min_steps must be >= 0.")
+        if self.logit_reg_coef < 0.0:
+            raise ValueError(f"logit_reg_coef must be >= 0, got {self.logit_reg_coef}.")
+        if not (0.0 <= self.min_class_acc <= 1.0):
+            raise ValueError(f"min_class_acc must be in [0, 1], got {self.min_class_acc}.")
+        if not (0.0 < self.pass_reward_target < 1.0):
+            raise ValueError(f"pass_reward_target must be in (0, 1), got {self.pass_reward_target}.")
+        if self.fallback_disc_span <= 0.0:
+            raise ValueError(f"fallback_disc_span must be > 0, got {self.fallback_disc_span}.")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -210,6 +313,10 @@ class UnifiedOddConfig:
             "auc_slope_window": self.auc_slope_window,
             "auc_patience": self.auc_patience,
             "auc_min_steps": self.auc_min_steps,
+            "logit_reg_coef": self.logit_reg_coef,
+            "min_class_acc": self.min_class_acc,
+            "pass_reward_target": self.pass_reward_target,
+            "fallback_disc_span": self.fallback_disc_span,
         }
 
 
@@ -236,6 +343,8 @@ class UnifiedEvenConfig:
     log_every: int = 10
     disc_weight: float = 1.0
     disc_span: float = 8.0
+    calibrate_reward: bool = True
+    ppo_epochs: int = 1
     empty_penalty: float = -1.0
     sampling: UnifiedSamplingConfig = field(default_factory=UnifiedSamplingConfig)
 
@@ -252,6 +361,8 @@ class UnifiedEvenConfig:
             raise ValueError("clip_eps > 0, kl_coef >= 0, and adv_eps > 0 are required.")
         if self.disc_span <= 0.0:
             raise ValueError(f"disc_span must be > 0, got {self.disc_span}.")
+        if self.ppo_epochs < 1:
+            raise ValueError(f"ppo_epochs must be >= 1, got {self.ppo_epochs}.")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -274,5 +385,7 @@ class UnifiedEvenConfig:
             "log_every": self.log_every,
             "disc_weight": self.disc_weight,
             "disc_span": self.disc_span,
+            "calibrate_reward": self.calibrate_reward,
+            "ppo_epochs": self.ppo_epochs,
             "empty_penalty": self.empty_penalty,
         }

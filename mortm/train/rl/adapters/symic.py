@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import math
 import os
@@ -16,9 +18,11 @@ from torch import Tensor, nn
 from mortm.models.modules.attention import pad_input, unpad_input
 from mortm.models.modules.config import (
     EOS_TOKEN_ID,
+    INST_EMPTY_TOKEN_ID,
     MORTM5Args,
     NUM_SLOT_TOKENS,
     PAD_TOKEN_ID,
+    RVQ_TOKEN_OFFSET,
     SLOT_CODE_EMPTY,
 )
 from mortm.models.modules.layers import DecodeCodebookHead, MILPool
@@ -202,60 +206,191 @@ class SyMIcMemmapRepository(CARLDataRepository):
         rng = np.random.default_rng(seed)
         shuffled_songs = rng.permutation(unique_songs)
         cut = max(1, len(shuffled_songs) // 2)
-        ana_song_set = set(int(s) for s in shuffled_songs[:cut].tolist())
+        ana_songs_list = [int(s) for s in shuffled_songs[:cut].tolist()]
+        gem_songs_list = [int(s) for s in shuffled_songs[cut:].tolist()]
+        ana_song_set = set(ana_songs_list)
 
-        ana_indices: List[int] = []
-        gem_indices: List[int] = []
+        ana_by_song: Dict[int, List[int]] = {}
+        gem_by_song: Dict[int, List[int]] = {}
         for w_idx in valid_win_indices.tolist():
             s_id = int(song_ids[w_idx])
             if s_id in ana_song_set:
-                ana_indices.append(int(w_idx))
+                ana_by_song.setdefault(s_id, []).append(int(w_idx))
             else:
-                gem_indices.append(int(w_idx))
+                gem_by_song.setdefault(s_id, []).append(int(w_idx))
 
         half_lim = max(1, int(limit) // 2) if (limit is not None and int(limit) > 0) else None
-        ana_perm = [ana_indices[int(i)] for i in rng.permutation(len(ana_indices))]
-        gem_perm = [gem_indices[int(i)] for i in rng.permutation(len(gem_indices))]
-
-        ana_active = self._collect_active_windows(ana_perm, max_count=half_lim)
-        gem_active = self._collect_active_windows(gem_perm, max_count=half_lim)
+        ana_active, ana_win_songs = self._collect_song_balanced_active_windows(
+            ana_by_song, ana_songs_list, rng=rng, max_count=half_lim
+        )
+        gem_active, gem_win_songs = self._collect_song_balanced_active_windows(
+            gem_by_song, gem_songs_list, rng=rng, max_count=half_lim
+        )
         if not ana_active or not gem_active:
             raise RuntimeError(
                 f"After filtering silent prompt/continuation windows, got ana={len(ana_active)}, gem={len(gem_active)}."
             )
 
         return (
-            LazyIndexedSamplePool(ana_active, self._load_window_example),
-            LazyIndexedSamplePool(gem_active, self._load_window_example),
+            LazyIndexedSamplePool(ana_active, self._load_window_example, song_ids=ana_win_songs),
+            LazyIndexedSamplePool(gem_active, self._load_window_example, song_ids=gem_win_songs),
         )
 
-    def _collect_active_windows(
-        self,
-        candidates: Sequence[int],
-        max_count: Optional[int] = None,
-    ) -> List[int]:
-        """Stream candidate memmap windows, dropping silent prompts or >=85%-constant continuations up to `max_count`."""
-        mmap = self._dataset._get_memmap()
+    def _is_active_window(self, mmap: np.ndarray, w_idx: int) -> bool:
         tpc = self._vq_groups * self._vq_layers
         p_chunks = self._prompt_chunks
-        kept: List[int] = []
-        for w_idx in candidates:
-            if max_count is not None and len(kept) >= max_count:
-                break
-            tok_start = int(self._dataset.windows[w_idx, 0])
-            tok_len = int(self._dataset.windows[w_idx, 1])
-            raw = np.asarray(mmap[tok_start : tok_start + tok_len]).reshape(-1, tpc)
-            prompt_c = raw[:p_chunks]
-            cont_c = raw[p_chunks : self._total_chunks]
-            if prompt_c.shape[0] > 1 and bool(np.all(prompt_c == prompt_c[0])):
+        tok_start = int(self._dataset.windows[w_idx, 0])
+        tok_len = int(self._dataset.windows[w_idx, 1])
+        raw = np.asarray(mmap[tok_start : tok_start + tok_len]).reshape(-1, tpc)
+        prompt_c = raw[:p_chunks]
+        cont_c = raw[p_chunks : self._total_chunks]
+        if prompt_c.shape[0] > 1 and bool(np.all(prompt_c == prompt_c[0])):
+            return False
+        if cont_c.shape[0] > 1:
+            same_first = float(np.all(cont_c == cont_c[0], axis=1).mean())
+            same_last = float(np.all(cont_c == cont_c[-1], axis=1).mean())
+            if max(same_first, same_last) >= 0.85:
+                return False
+        return True
+
+    def _collect_song_balanced_active_windows(
+        self,
+        windows_by_song: Dict[int, List[int]],
+        ordered_songs: Sequence[int],
+        rng: np.random.Generator,
+        max_count: Optional[int] = None,
+    ) -> Tuple[List[int], List[int]]:
+        """Round-robin across unique songs (1 active window/song first) so 10k+ pools maximize song diversity."""
+        mmap = self._dataset._get_memmap()
+        shuffled_per_song: List[Tuple[int, List[int]]] = []
+        for s_id in ordered_songs:
+            w_list = windows_by_song.get(int(s_id))
+            if not w_list:
                 continue
-            if cont_c.shape[0] > 1:
-                same_first = float(np.all(cont_c == cont_c[0], axis=1).mean())
-                same_last = float(np.all(cont_c == cont_c[-1], axis=1).mean())
-                if max(same_first, same_last) >= 0.85:
-                    continue
-            kept.append(int(w_idx))
-        return kept
+            if len(w_list) > 1:
+                perm_w = [w_list[int(i)] for i in rng.permutation(len(w_list))]
+            else:
+                perm_w = list(w_list)
+            shuffled_per_song.append((int(s_id), perm_w))
+
+        cursors = [0] * len(shuffled_per_song)
+        kept_wins: List[int] = []
+        kept_songs: List[int] = []
+        made_progress = True
+
+        while made_progress:
+            made_progress = False
+            for idx, (s_id, w_list) in enumerate(shuffled_per_song):
+                if max_count is not None and len(kept_wins) >= max_count:
+                    return kept_wins, kept_songs
+                cur = cursors[idx]
+                while cur < len(w_list):
+                    w_cand = w_list[cur]
+                    cur += 1
+                    if self._is_active_window(mmap, w_cand):
+                        kept_wins.append(int(w_cand))
+                        kept_songs.append(s_id)
+                        made_progress = True
+                        break
+                cursors[idx] = cur
+        return kept_wins, kept_songs
+
+
+def _scan_midi_entry_worker(
+    args: Tuple[int, str, int, int, int, int, int, int, float, int],
+) -> List[Tuple[int, int, Tuple[int, ...], np.ndarray]]:
+    """Top-level multiprocess worker extracting valid non-blank 16-bar note windows from one MIDI."""
+    (
+        raw_idx,
+        path_str,
+        prompt_bars,
+        total_bars,
+        total_chunks,
+        min_active_tracks,
+        min_prompt_notes,
+        min_cont_notes,
+        max_blank_ratio,
+        per_song_cap,
+    ) = args
+    if not path_str or not os.path.isfile(path_str):
+        return []
+    try:
+        num_chunks, notes_arr, slot_codes = extract_quantized_notes_and_slots(path_str)
+    except Exception:
+        return []
+    if num_chunks < total_chunks or len(notes_arr) == 0:
+        return []
+    slot_tuple = tuple(int(c) for c in slot_codes.tolist())
+    if sum(1 for c in slot_tuple if c != SLOT_CODE_EMPTY) < min_active_tracks:
+        return []
+
+    cont_bars = max(1, total_bars - prompt_bars)
+    found: List[Tuple[int, int, Tuple[int, ...], np.ndarray]] = []
+    for c0 in range(0, num_chunks - total_chunks + 1, total_chunks):
+        if len(found) >= per_song_cap:
+            break
+        seg_notes = extract_segment_canonical_notes(
+            notes_arr,
+            chunk_start=c0,
+            chunk_end=c0 + total_chunks,
+            max_bars=total_bars,
+        )
+        if len(seg_notes) == 0:
+            continue
+        bars = seg_notes[:, 0]
+        p_mask = bars < prompt_bars
+        c_mask = bars >= prompt_bars
+        if int(np.sum(p_mask)) < min_prompt_notes or int(np.sum(c_mask)) < min_cont_notes:
+            continue
+        active_cont_bars = len(np.unique(bars[c_mask]))
+        blank_ratio = 1.0 - (float(active_cont_bars) / float(cont_bars))
+        if blank_ratio > max_blank_ratio:
+            continue
+
+        starts = seg_notes[:, 0] * 192 + seg_notes[:, 1]
+        ends = np.minimum(total_chunks * 24, starts + seg_notes[:, 4])
+        notes_5col = np.stack(
+            [seg_notes[:, 2], starts, ends, seg_notes[:, 3], seg_notes[:, 5]], axis=1
+        ).astype(np.int32)
+        found.append((int(raw_idx), int(c0), slot_tuple, notes_5col))
+    return found
+
+
+class BatchedMidiSamplePool(CARLDataSamplePool):
+    """Sample pool for `SyMIcMidiRepository` that batch-encodes uncached windows on GPU in a single pass."""
+
+    def __init__(
+        self,
+        indices: Sequence[int] | np.ndarray,
+        single_loader: Any,
+        batch_loader: Any,
+        song_ids: Optional[Sequence[int] | np.ndarray] = None,
+    ) -> None:
+        self._indices = np.asarray(indices, dtype=np.int64).copy()
+        self._single_loader = single_loader
+        self._batch_loader = batch_loader
+        self._unique_songs: Optional[int] = (
+            int(np.unique(np.asarray(song_ids, dtype=np.int64)).size)
+            if song_ids is not None
+            else None
+        )
+
+    def __len__(self) -> int:
+        return int(self._indices.shape[0])
+
+    def __getitem__(self, index: int) -> CARLExample:
+        return self._single_loader(int(self._indices[int(index)]))
+
+    def sample(self, count: int, rng: np.random.Generator) -> List[CARLExample]:
+        total = len(self)
+        if total == 0 or count <= 0:
+            return []
+        picked_pos = np.atleast_1d(rng.choice(total, size=count, replace=(total < count)))
+        spec_indices = [int(self._indices[int(p)]) for p in picked_pos]
+        return self._batch_loader(spec_indices)
+
+    def unique_song_count(self) -> Optional[int]:
+        return self._unique_songs
 
 
 class SyMIcMidiRepository(CARLDataRepository):
@@ -274,7 +409,7 @@ class SyMIcMidiRepository(CARLDataRepository):
         min_cont_notes: int = 8,
         max_cont_blank_bar_ratio: float = 0.5,
         max_windows_per_song: int = 4,
-        max_cache_items: int = 2048,
+        max_cache_items: int = 4096,
     ) -> None:
         self._manifest_path = Path(midi_manifest_path)
         if not self._manifest_path.is_file():
@@ -301,40 +436,84 @@ class SyMIcMidiRepository(CARLDataRepository):
         self._prefix_len = 1 + (NUM_SLOT_TOKENS if bool(model.use_instrument_tokens) else 0)
         self._prompt_soft_len = self._prefix_len + self._prompt_chunks * self._vq_layers
         self._specs: List[Tuple[int, int, Tuple[int, ...], np.ndarray]] = []
-        self._cache: Dict[int, CARLExample] = {}
+        self._cache: OrderedDict[int, CARLExample] = OrderedDict()
+
+    def _put_cache(self, spec_idx: int, ex: CARLExample) -> None:
+        if spec_idx in self._cache:
+            self._cache.move_to_end(spec_idx)
+            return
+        if len(self._cache) >= self._max_cache_items:
+            self._cache.popitem(last=False)
+        self._cache[spec_idx] = ex
+
+    @torch.no_grad()
+    def _encode_specs_batch(self, spec_indices: Sequence[int]) -> List[CARLExample]:
+        if not spec_indices:
+            return []
+        missing = sorted({int(i) for i in spec_indices if int(i) not in self._cache})
+        if missing:
+            rolls = [
+                rasterize_notes_to_chunks_float(self._total_chunks, self._specs[m_i][3])
+                for m_i in missing
+            ]
+            stacked = np.concatenate(rolls, axis=0)
+            vq_dev = next(self._vq.parameters()).device
+            tok_parts: List[Tensor] = []
+            for start in range(0, stacked.shape[0], 512):
+                x_t = torch.from_numpy(stacked[start : start + 512]).to(
+                    device=vq_dev, dtype=torch.float32
+                )
+                tok_parts.append(self._vq.encode_tokens(x_t, include_offset=True).clone())
+            raw_rvq = torch.cat(tok_parts, dim=0)
+
+            l_cnt = int(self._model.vq_layers)
+            g_cnt = int(self._model.vq_groups)
+            k_sz = int(self._model.codebook_size)
+            tok_off = int(self._model.token_offset)
+            vq_off = int(getattr(self._vq, "token_offset", RVQ_TOKEN_OFFSET))
+
+            rvq_4d = raw_rvq.view(len(missing), self._total_chunks, l_cnt, g_cnt).to(dtype=torch.long) + (
+                tok_off - vq_off
+            )
+            if bool(getattr(self._model, "separate_rvq_layers", False)):
+                layer_offsets = (
+                    torch.arange(l_cnt, device=vq_dev, dtype=torch.long).view(1, 1, l_cnt, 1)
+                    * (g_cnt * k_sz)
+                )
+                rvq_4d = rvq_4d + layer_offsets
+            body_np = rvq_4d.reshape(len(missing), self._total_chunks * l_cnt, g_cnt).cpu().numpy().astype(np.int64)
+
+            for pos, m_i in enumerate(missing):
+                song_id, c0, slot_tuple, _ = self._specs[m_i]
+                prefix = self._model.build_prefix_tokens(slot_codes=slot_tuple, batch_size=1, device="cpu")
+                prefix_2d = prefix[0].numpy().astype(np.int64)
+                full_np = np.concatenate([prefix_2d, body_np[pos]], axis=0)
+                prompt_np = np.ascontiguousarray(full_np[: self._prompt_soft_len], dtype=np.int64)
+                self._put_cache(
+                    m_i,
+                    CARLExample(
+                        example_id=f"midi_s{song_id:07d}_c{c0:04d}",
+                        song_id=song_id,
+                        prompt_tokens=prompt_np,
+                        human_full_tokens=full_np,
+                        slot_codes=slot_tuple,
+                    ),
+                )
+
+        out: List[CARLExample] = []
+        for idx in spec_indices:
+            i_int = int(idx)
+            self._cache.move_to_end(i_int)
+            out.append(self._cache[i_int])
+        return out
 
     @torch.no_grad()
     def _encode_spec(self, spec_idx: int) -> CARLExample:
-        cached = self._cache.get(spec_idx)
-        if cached is not None:
-            return cached
-        song_id, c0, slot_tuple, notes_5col = self._specs[spec_idx]
-        chunks_f32 = rasterize_notes_to_chunks_float(self._total_chunks, notes_5col)
-        full_seq = Mortm5PromptEncoder.encode_chunks_to_prompt(
-            chunks_f32,
-            vq_model=self._vq,
-            model=self._model,
-            slot_codes=slot_tuple,
-            device=self._device,
-        )
-        full_np = full_seq[0].detach().cpu().numpy().astype(np.int64)
-        prompt_np = np.ascontiguousarray(full_np[: self._prompt_soft_len], dtype=np.int64)
-        ex = CARLExample(
-            example_id=f"midi_s{song_id:06d}_c{c0:04d}",
-            song_id=song_id,
-            prompt_tokens=prompt_np,
-            human_full_tokens=full_np,
-            slot_codes=slot_tuple,
-        )
-        if len(self._cache) >= self._max_cache_items:
-            oldest_key = next(iter(self._cache))
-            self._cache.pop(oldest_key, None)
-        self._cache[spec_idx] = ex
-        return ex
+        return self._encode_specs_batch([spec_idx])[0]
 
     def load_disjoint_pools(
         self,
-        limit: Optional[int] = 512,
+        limit: Optional[int] = 10000,
         seed: int = 42,
     ) -> Tuple[CARLDataSamplePool, CARLDataSamplePool]:
         import json
@@ -342,71 +521,84 @@ class SyMIcMidiRepository(CARLDataRepository):
         with self._manifest_path.open("r", encoding="utf-8") as fh:
             entries = json.load(fh)
         rng = np.random.default_rng(seed)
-        perm = rng.permutation(len(entries))
+        perm = rng.permutation(len(entries)).tolist()
         target_total = (
             max(2, int(limit))
             if limit is not None and int(limit) > 0
-            else max(2, min(len(entries) * 2, 512))
+            else max(2, min(len(entries), 10000))
         )
-        per_song_cap = max(1, min(self._max_windows_per_song, target_total // 2))
-        cont_bars = max(1, self._total_bars - self._prompt_bars)
+        # Prioritize 1 window per unique song when manifest is large (>= target_total * 2),
+        # while allowing up to `max_windows_per_song` on small test manifests.
+        if len(entries) >= target_total * 2:
+            per_song_cap = 1
+        else:
+            per_song_cap = max(1, min(self._max_windows_per_song, target_total // 2))
 
         self._specs = []
-        self._cache = {}
+        self._cache = OrderedDict()
         song_to_spec_indices: Dict[int, List[int]] = {}
 
-        for raw_idx in perm.tolist():
-            if len(self._specs) >= target_total and len(song_to_spec_indices) >= 2:
-                break
-            entry = entries[raw_idx]
-            path_str = entry if isinstance(entry, str) else str(entry.get("path", ""))
-            if not path_str or not os.path.isfile(path_str):
-                continue
-            try:
-                num_chunks, notes_arr, slot_codes = extract_quantized_notes_and_slots(path_str)
-            except Exception:
-                continue
-            if num_chunks < self._total_chunks or len(notes_arr) == 0:
-                continue
-            slot_tuple = tuple(int(c) for c in slot_codes.tolist())
-            if sum(1 for c in slot_tuple if c != SLOT_CODE_EMPTY) < self._min_active_tracks:
-                continue
-
-            # Cap windows per song (`per_song_cap <= target_total // 2`) so 1 long song never monopolizes `limit`.
-            song_taken = 0
-            for c0 in range(0, num_chunks - self._total_chunks + 1, self._total_chunks):
-                if song_taken >= per_song_cap:
-                    break
+        def _ingest_song_windows(
+            found_wins: List[Tuple[int, int, Tuple[int, ...], np.ndarray]],
+        ) -> bool:
+            for raw_id, c0, s_tup, n_5 in found_wins:
                 if len(self._specs) >= target_total and len(song_to_spec_indices) >= 2:
-                    break
-                seg_notes = extract_segment_canonical_notes(
-                    notes_arr,
-                    chunk_start=c0,
-                    chunk_end=c0 + self._total_chunks,
-                    max_bars=self._total_bars,
+                    return True
+                s_idx = len(self._specs)
+                self._specs.append((raw_id, c0, s_tup, n_5))
+                song_to_spec_indices.setdefault(raw_id, []).append(s_idx)
+            return len(self._specs) >= target_total and len(song_to_spec_indices) >= 2
+
+        use_mp = len(perm) > 64 and target_total > 32
+        if use_mp:
+            workers = min(12, os.cpu_count() or 4)
+            scan_chunk = max(target_total * 2, 512)
+            cursor = 0
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                while cursor < len(perm):
+                    sub_perm = perm[cursor : cursor + scan_chunk]
+                    cursor += len(sub_perm)
+                    tasks = [
+                        (
+                            int(r_i),
+                            entries[r_i] if isinstance(entries[r_i], str) else str(entries[r_i].get("path", "")),
+                            self._prompt_bars,
+                            self._total_bars,
+                            self._total_chunks,
+                            self._min_active_tracks,
+                            self._min_prompt_notes,
+                            self._min_cont_notes,
+                            self._max_blank_ratio,
+                            per_song_cap,
+                        )
+                        for r_i in sub_perm
+                    ]
+                    done_scanning = False
+                    for res in pool.map(_scan_midi_entry_worker, tasks, chunksize=64):
+                        if res and _ingest_song_windows(res):
+                            done_scanning = True
+                            break
+                    if done_scanning:
+                        break
+        else:
+            for r_i in perm:
+                p_str = entries[r_i] if isinstance(entries[r_i], str) else str(entries[r_i].get("path", ""))
+                res = _scan_midi_entry_worker(
+                    (
+                        int(r_i),
+                        p_str,
+                        self._prompt_bars,
+                        self._total_bars,
+                        self._total_chunks,
+                        self._min_active_tracks,
+                        self._min_prompt_notes,
+                        self._min_cont_notes,
+                        self._max_blank_ratio,
+                        per_song_cap,
+                    )
                 )
-                if len(seg_notes) == 0:
-                    continue
-                bars = seg_notes[:, 0]
-                p_mask = bars < self._prompt_bars
-                c_mask = bars >= self._prompt_bars
-                if int(np.sum(p_mask)) < self._min_prompt_notes or int(np.sum(c_mask)) < self._min_cont_notes:
-                    continue
-                active_cont_bars = len(np.unique(bars[c_mask]))
-                blank_ratio = 1.0 - (float(active_cont_bars) / float(cont_bars))
-                if blank_ratio > self._max_blank_ratio:
-                    continue
-
-                starts = seg_notes[:, 0] * 192 + seg_notes[:, 1]
-                ends = np.minimum(self._total_chunks * 24, starts + seg_notes[:, 4])
-                notes_5col = np.stack(
-                    [seg_notes[:, 2], starts, ends, seg_notes[:, 3], seg_notes[:, 5]], axis=1
-                ).astype(np.int32)
-
-                spec_idx = len(self._specs)
-                self._specs.append((int(raw_idx), int(c0), slot_tuple, notes_5col))
-                song_to_spec_indices.setdefault(int(raw_idx), []).append(spec_idx)
-                song_taken += 1
+                if res and _ingest_song_windows(res):
+                    break
 
         unique_songs = list(song_to_spec_indices.keys())
         if len(unique_songs) < 2:
@@ -418,16 +610,20 @@ class SyMIcMidiRepository(CARLDataRepository):
         ana_songs = set(int(s) for s in shuffled_songs[:cut].tolist())
 
         ana_idx: List[int] = []
+        ana_song_ids: List[int] = []
         gem_idx: List[int] = []
+        gem_song_ids: List[int] = []
         for s_id, s_specs in song_to_spec_indices.items():
             if s_id in ana_songs:
                 ana_idx.extend(s_specs)
+                ana_song_ids.extend([s_id] * len(s_specs))
             else:
                 gem_idx.extend(s_specs)
+                gem_song_ids.extend([s_id] * len(s_specs))
 
         return (
-            LazyIndexedSamplePool(ana_idx, self._encode_spec),
-            LazyIndexedSamplePool(gem_idx, self._encode_spec),
+            BatchedMidiSamplePool(ana_idx, self._encode_spec, self._encode_specs_batch, song_ids=ana_song_ids),
+            BatchedMidiSamplePool(gem_idx, self._encode_spec, self._encode_specs_batch, song_ids=gem_song_ids),
         )
 
 
@@ -504,12 +700,123 @@ class AnalysisSyMIc(nn.Module):
         return (torch.logsumexp(r_val * tok_scores, dim=1) - math.log(n_cont)) / r_val
 
 
-class SyMIcCriticAdapter(CARLCriticAdapter):
-    """`CARLCriticAdapter` wrapping `AnalysisSyMIc`."""
+class SyMIcPianoRollCanonicalizer:
+    """Experimental diagnostic filter (`Decode -> Pixelwise Discretize -> Re-Encode`) for `SyMIcCriticAdapter`.
 
-    def __init__(self, ana_model: AnalysisSyMIc, device: torch.device) -> None:
+    Note: `MidiVision` is a lossy neural RVQ autoencoder, so `Decode -> Discretize -> Re-Encode`
+    is NOT strictly idempotent (each pass incurs slight onset/sustain/velocity reconstruction drift,
+    especially in fine residual layers `L1..L3`) and adds CNN decode+encode overhead. Keep disabled
+    (`canonicalize_pianoroll=False`) in standard CARL runs unless explicitly benchmarking round-trip behavior.
+    """
+
+    def __init__(
+        self,
+        vq_model: MidiVision,
+        prompt_soft_len: int,
+        vq_layers: int = 4,
+        vq_groups: int = 4,
+        codebook_size: int = 2048,
+        token_offset: int = 133,
+        separate_rvq_layers: bool = True,
+        use_instrument_tokens: bool = True,
+        decode_chunk_size: int = 512,
+    ) -> None:
+        if int(vq_model.num_quantizers) != int(vq_layers) or int(vq_model.vq_groups) != int(vq_groups):
+            raise ValueError(
+                f"MidiVision shape (L={vq_model.num_quantizers}, G={vq_model.vq_groups}) "
+                f"does not match SyMIc model (L={vq_layers}, G={vq_groups})."
+            )
+        self._vq = vq_model
+        self._prompt_soft_len = int(prompt_soft_len)
+        self._vq_layers = int(vq_layers)
+        self._vq_groups = int(vq_groups)
+        self._codebook_size = int(codebook_size)
+        self._token_offset = int(token_offset)
+        self._vq_offset = int(getattr(vq_model, "token_offset", RVQ_TOKEN_OFFSET))
+        self._separate_rvq_layers = bool(separate_rvq_layers)
+        self._use_instrument_tokens = bool(use_instrument_tokens)
+        self._decode_chunk_size = max(16, int(decode_chunk_size))
+
+    @torch.no_grad()
+    def canonicalize_sequences(self, seq_3d: Tensor) -> Tensor:
+        if seq_3d.dim() != 3:
+            raise ValueError(f"Expected 3D [B, S, G] tensor, got {tuple(seq_3d.shape)}.")
+        bsz, seq_len, g_cnt = seq_3d.shape
+        if seq_len <= self._prompt_soft_len:
+            return seq_3d
+
+        cont = seq_3d[:, self._prompt_soft_len :, :]
+        cont_steps = cont.size(1)
+        if cont_steps % self._vq_layers != 0:
+            raise ValueError(
+                f"Continuation soft-token count ({cont_steps}) must be divisible by vq_layers ({self._vq_layers})."
+            )
+        n_chunks = cont_steps // self._vq_layers
+        vq_dev = next(self._vq.parameters()).device
+
+        if (
+            self._use_instrument_tokens
+            and self._token_offset > INST_EMPTY_TOKEN_ID
+            and seq_len >= 1 + NUM_SLOT_TOKENS
+        ):
+            slot_active = (seq_3d[:, 1 : 1 + NUM_SLOT_TOKENS, 0] != INST_EMPTY_TOKEN_ID).to(device=vq_dev)
+        else:
+            slot_active = torch.ones((bsz, 4), dtype=torch.bool, device=vq_dev)
+
+        chan_active = torch.stack([slot_active, slot_active], dim=-1).reshape(bsz, 1, 8, 1, 1)
+        flat_chan_active = chan_active.expand(bsz, n_chunks, 8, 1, 1).reshape(bsz * n_chunks, 8, 1, 1)
+
+        self._vq.eval()
+        flat_in = cont.to(device=vq_dev, dtype=torch.long).reshape(bsz * n_chunks, self._vq_layers, g_cnt)
+        re_parts: List[Tensor] = []
+        step = self._decode_chunk_size
+        for start in range(0, flat_in.size(0), step):
+            stop = min(start + step, flat_in.size(0))
+            logits = self._vq.decode_tokens(flat_in[start:stop], token_offset=self._token_offset)
+            probs = torch.sigmoid(logits.float()) * flat_chan_active[start:stop].float()
+
+            on = probs[:, 0::2, :, :]
+            su = probs[:, 1::2, :, :]
+            on_mask = on >= 0.5
+            su_mask = (su >= 0.5) | on_mask
+
+            vel_127 = torch.clamp(torch.round((on - 0.5) * 2.0 * 127.0), 1.0, 127.0)
+            on_u8 = torch.round((0.5 + 0.5 * (vel_127 / 127.0)) * 254.0) / 254.0
+            disc_on = torch.where(on_mask, on_u8, torch.zeros_like(on))
+            disc_su = torch.where(su_mask, torch.ones_like(su), torch.zeros_like(su))
+            disc_roll = torch.stack([disc_on, disc_su], dim=2).reshape(stop - start, 8, 128, 24)
+
+            # Clone outside `encode_tokens`'s `@torch.inference_mode()` so autograd can save indices in OddRound.
+            re_parts.append(self._vq.encode_tokens(disc_roll, include_offset=True).clone())
+
+        re_rvq = torch.cat(re_parts, dim=0).view(bsz, n_chunks, self._vq_layers, g_cnt).to(dtype=torch.long)
+        re_rvq = re_rvq + (self._token_offset - self._vq_offset)
+        if self._separate_rvq_layers:
+            layer_offsets = (
+                torch.arange(self._vq_layers, device=vq_dev, dtype=torch.long).view(1, 1, self._vq_layers, 1)
+                * (g_cnt * self._codebook_size)
+            )
+            re_rvq = re_rvq + layer_offsets
+        re_cont = re_rvq.reshape(bsz, cont_steps, g_cnt).to(device=seq_3d.device)
+        return torch.cat([seq_3d[:, : self._prompt_soft_len, :], re_cont], dim=1).clone()
+
+
+class SyMIcCriticAdapter(CARLCriticAdapter):
+    """`CARLCriticAdapter` wrapping `AnalysisSyMIc` (with optional discrete piano-roll canonicalization)."""
+
+    def __init__(
+        self,
+        ana_model: AnalysisSyMIc,
+        device: torch.device,
+        canonicalizer: Optional[SyMIcPianoRollCanonicalizer] = None,
+    ) -> None:
         self._ana = ana_model
         self._device = device
+        self._canonicalizer = canonicalizer
+
+    @property
+    def uses_pianoroll_canonicalizer(self) -> bool:
+        return self._canonicalizer is not None
 
     @classmethod
     def from_pretrained(
@@ -520,6 +827,8 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
         prompt_bars: int = 4,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
+        vq_model: Optional[MidiVision] = None,
+        canonicalize_pianoroll: bool = False,
     ) -> "SyMIcCriticAdapter":
         backbone = load_symic_model(config_source, ckpt_path, device)
         prefix_len = 1 + (NUM_SLOT_TOKENS if bool(backbone.use_instrument_tokens) else 0)
@@ -530,7 +839,22 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
         )
-        return cls(ana_model=ana, device=device)
+        ana.eval()
+        canonicalizer: Optional[SyMIcPianoRollCanonicalizer] = None
+        if canonicalize_pianoroll:
+            if vq_model is None:
+                raise ValueError("canonicalize_pianoroll=True requires a frozen MidiVision `vq_model`.")
+            canonicalizer = SyMIcPianoRollCanonicalizer(
+                vq_model=vq_model,
+                prompt_soft_len=prompt_soft_len,
+                vq_layers=int(backbone.vq_layers),
+                vq_groups=int(backbone.vq_groups),
+                codebook_size=int(backbone.codebook_size),
+                token_offset=int(backbone.token_offset),
+                separate_rvq_layers=bool(backbone.separate_rvq_layers),
+                use_instrument_tokens=bool(backbone.use_instrument_tokens),
+            )
+        return cls(ana_model=ana, device=device, canonicalizer=canonicalizer)
 
     @property
     def critic_module(self) -> nn.Module:
@@ -563,10 +887,12 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
         step = len(critic_sequences) if chunk_size is None or chunk_size <= 0 else int(chunk_size)
         parts: List[Tensor] = []
         ctx = torch.enable_grad() if grad_enabled else torch.no_grad()
-        with ctx:
-            for start in range(0, len(critic_sequences), step):
-                arr = np.stack(critic_sequences[start : start + step], axis=0)
-                batch_t = torch.as_tensor(arr, dtype=torch.long, device=self._device)
+        for start in range(0, len(critic_sequences), step):
+            arr = np.stack(critic_sequences[start : start + step], axis=0)
+            batch_t = torch.as_tensor(arr, dtype=torch.long, device=self._device)
+            if self._canonicalizer is not None:
+                batch_t = self._canonicalizer.canonicalize_sequences(batch_t)
+            with ctx:
                 parts.append(self._ana.forward_disc(batch_t))
         return torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
 
@@ -715,13 +1041,15 @@ class SyMIcGroupedActorAdapter(CARLActorAdapter):
         all_prompts = np.stack(prompt_list, axis=0)  # [N, S_prompt, G]
         step = max(1, int(chunk_size))
         gen_chunks: List[np.ndarray] = []
+        lp_chunks: List[np.ndarray] = []
+        cont_soft_steps = self._full_soft_len - self._prompt_soft_len
 
         self._model.eval()
         for start in range(0, len(expanded_examples), step):
             p_batch = torch.as_tensor(
                 all_prompts[start : start + step], dtype=torch.long, device=self._device
             )
-            out_seq = self._model.generate(
+            out_seq, gen_lp = self._model.generate(
                 num_chunks=self._total_chunks,
                 prompt=p_batch,
                 batch_size=p_batch.size(0),
@@ -736,24 +1064,55 @@ class SyMIcGroupedActorAdapter(CARLActorAdapter):
                 fine_temperature=sampling.fine_temperature,
                 fine_top_k=sampling.fine_top_k,
                 fine_top_p=sampling.fine_top_p,
-            )  # [chunk_B, full_soft_len, G]
+                return_logprobs=True,
+            )  # out_seq: [chunk_B, full_soft_len, G], gen_lp: [chunk_B, cont_soft_steps, G]
             gen_chunks.append(out_seq[:, : self._full_soft_len, :].detach().cpu().numpy().astype(np.int64))
+            cont_lp = gen_lp[:, :cont_soft_steps, :].reshape(p_batch.size(0), -1)
+            lp_chunks.append(cont_lp.detach().cpu().numpy().astype(np.float32))
 
         stacked_out = np.concatenate(gen_chunks, axis=0)
+        stacked_lp = np.concatenate(lp_chunks, axis=0)
         gen_tuples = tuple(stacked_out[i] for i in range(stacked_out.shape[0]))
+        lp_tuples = tuple(stacked_lp[i] for i in range(stacked_lp.shape[0]))
         return RolloutBatch(
             examples=tuple(expanded_examples),
             generated_sequences=gen_tuples,
             critic_sequences=gen_tuples,
             group_size=group_size,
+            old_action_logprobs=lp_tuples,
         )
+
+    def _build_layer_temperature_tensor(
+        self,
+        cont_soft_steps: int,
+        sampling: Optional[UnifiedSamplingConfig],
+        device: torch.device,
+    ) -> Optional[Tensor]:
+        if sampling is None:
+            return None
+        coarse_t = max(1e-4, float(sampling.temperature))
+        fine_t = max(
+            1e-4,
+            float(sampling.fine_temperature if sampling.fine_temperature is not None else sampling.temperature),
+        )
+        if abs(coarse_t - 1.0) < 1e-7 and abs(fine_t - 1.0) < 1e-7:
+            return None
+        l_cnt = int(self._model.vq_layers)
+        idx = torch.arange(cont_soft_steps, device=device) % l_cnt
+        temps = torch.where(
+            idx == 0,
+            torch.full_like(idx, coarse_t, dtype=torch.float32),
+            torch.full_like(idx, fine_t, dtype=torch.float32),
+        )
+        return temps.view(1, cont_soft_steps, 1, 1)
 
     def _forward_continuation_codebook_logprobs(
         self,
         model: AblationTransformer2,
         seq_3d: Tensor,
+        sampling: Optional[UnifiedSamplingConfig] = None,
     ) -> Tensor:
-        """Compute `[B, T_cont, G, K]` log-softmax over valid RVQ codebook entries for continuation steps."""
+        """Compute `[B, T_cont, G, K]` temperature-aligned log-softmax over valid RVQ codebook entries."""
         inp = seq_3d[:, :-1, :]
         tgt = seq_3d[:, 1:, :]
         c_start = self._prompt_soft_len - 1  # position predicting first continuation soft-token
@@ -792,6 +1151,9 @@ class SyMIcGroupedActorAdapter(CARLActorAdapter):
         low = int(model.token_offset)
         high = low + int(model.codebook_size)
         codebook_logits = logits[..., low:high]  # [B, T_cont, G, K]
+        temp_4d = self._build_layer_temperature_tensor(codebook_logits.size(1), sampling, seq_3d.device)
+        if temp_4d is not None:
+            codebook_logits = codebook_logits / temp_4d
         return F.log_softmax(codebook_logits, dim=-1)
 
     def forward_logprobs_and_exact_kl(
@@ -799,34 +1161,41 @@ class SyMIcGroupedActorAdapter(CARLActorAdapter):
         base_actor: CARLActorAdapter,
         examples: Sequence[CARLExample],
         generated_sequences: Sequence[np.ndarray],
+        sampling: Optional[UnifiedSamplingConfig] = None,
     ) -> StepLogProbsKL:
         if not isinstance(base_actor.actor_module, AblationTransformer2):
             raise TypeError("SyMIcGroupedActorAdapter requires an AblationTransformer2 base_actor.")
 
         seq_np = np.stack(generated_sequences, axis=0)
         seq_3d = torch.as_tensor(seq_np, dtype=torch.long, device=self._device)
+        bsz = seq_3d.size(0)
 
         with torch.no_grad():
-            logp_base = self._forward_continuation_codebook_logprobs(base_actor.actor_module, seq_3d)
-        logp_new = self._forward_continuation_codebook_logprobs(self._model, seq_3d)
+            logp_base = self._forward_continuation_codebook_logprobs(
+                base_actor.actor_module, seq_3d, sampling=sampling
+            )
+        logp_new = self._forward_continuation_codebook_logprobs(
+            self._model, seq_3d, sampling=sampling
+        )
 
-        # Extract local codebook targets `[0, K)` for continuation positions `prompt_soft_len .. full_soft_len - 1`.
+        # Extract local codebook targets `[0, K)` and flatten `[B, T_cont, G]` -> `[B, T_cont * G]`
+        # (`384 * 4 = 1,536` tokens for 12 bars) so per-token ratio clipping and KL normalization are exact.
         cont_tokens = seq_3d[:, self._prompt_soft_len :, :]  # [B, T_cont, G]
         local_k = (
             (cont_tokens - int(self._model.token_offset)).clamp(min=0) % int(self._model.codebook_size)
         )  # [B, T_cont, G]
 
         tok_logp_per_group = logp_new.gather(-1, local_k.unsqueeze(-1)).squeeze(-1)  # [B, T_cont, G]
-        joint_step_logp = tok_logp_per_group.sum(dim=-1)  # [B, T_cont]
+        flat_action_logprobs = tok_logp_per_group.reshape(bsz, -1)  # [B, T_cont * G]
 
         p_new = logp_new.exp()
         kl_per_group = (p_new * (logp_new - logp_base)).sum(dim=-1)  # [B, T_cont, G]
-        joint_step_kl = kl_per_group.sum(dim=-1)  # [B, T_cont]
+        flat_exact_kl = kl_per_group.reshape(bsz, -1)  # [B, T_cont * G]
 
-        mask = torch.ones_like(joint_step_logp, dtype=torch.bool)
+        mask = torch.ones_like(flat_action_logprobs, dtype=torch.bool)
         return StepLogProbsKL(
-            action_logprobs=joint_step_logp,
-            exact_kl=joint_step_kl,
+            action_logprobs=flat_action_logprobs,
+            exact_kl=flat_exact_kl,
             action_mask=mask,
         )
 

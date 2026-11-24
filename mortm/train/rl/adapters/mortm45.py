@@ -53,12 +53,67 @@ def _pad_1d_sequences(seqs: Sequence[Sequence[int] | np.ndarray], device: torch.
     return out, (out != 0)
 
 
-def _autocast_full_logprobs(model: nn.Module, x: Tensor, padding_mask: Tensor) -> Tensor:
+def _autocast_full_logprobs(
+    model: nn.Module,
+    x: Tensor,
+    padding_mask: Tensor,
+    temperature: float = 1.0,
+) -> Tensor:
     dev_type = x.device.type
     use_bf16 = dev_type in ("cuda", "mps")
     with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=use_bf16):
         logits = model.forward(x, padding_mask=padding_mask, is_causal=True, is_save_cache=False)
-    return torch.log_softmax(logits[:, :-1, :].float(), dim=-1)
+    temp_val = max(1e-4, float(temperature))
+    scaled = logits[:, :-1, :].float() / temp_val if abs(temp_val - 1.0) > 1e-7 else logits[:, :-1, :].float()
+    return torch.log_softmax(scaled, dim=-1)
+
+
+def _compute_m45_rollout_logprobs(
+    model: nn.Module,
+    prompts: Sequence[Sequence[int]],
+    gens: Sequence[Sequence[int]],
+    device: torch.device,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    chunk_size: int = 16,
+) -> Tuple[np.ndarray, ...]:
+    """Compute exact temperature + top_p rollout log-probabilities `[T_gen]` for MORTM4.5 sequences."""
+    step = max(1, int(chunk_size))
+    out_arrays: List[np.ndarray] = []
+    temp_val = max(1e-4, float(temperature))
+    was_training = model.training
+    model.eval()
+    try:
+        for start in range(0, len(prompts), step):
+            p_sub = prompts[start : start + step]
+            g_sub = gens[start : start + step]
+            seqs = [list(p) + list(g) for p, g in zip(p_sub, g_sub)]
+            x, pad = _pad_1d_sequences(seqs, device)
+            dev_type = x.device.type
+            use_bf16 = dev_type in ("cuda", "mps")
+            with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=use_bf16):
+                logits = model.forward(x, padding_mask=pad, is_causal=True, is_save_cache=False)
+            scaled = logits[:, :-1, :].float() / temp_val
+            if 0.0 < top_p < 1.0:
+                sorted_l, sorted_i = torch.sort(scaled, descending=True, dim=-1)
+                cum_p = torch.cumsum(torch.softmax(sorted_l, dim=-1), dim=-1)
+                rem = cum_p > float(top_p)
+                rem[..., 1:] = rem[..., :-1].clone()
+                rem[..., 0] = False
+                rem_mask = torch.zeros_like(scaled, dtype=torch.bool).scatter(-1, sorted_i, rem)
+                scaled = scaled.masked_fill(rem_mask, float("-inf"))
+            log_p = torch.log_softmax(scaled, dim=-1)
+            tgt = x[:, 1:]
+            picked = log_p.gather(-1, tgt.unsqueeze(-1)).squeeze(-1).cpu().numpy()
+            for row_i, (p_item, g_item) in enumerate(zip(p_sub, g_sub)):
+                p_off = max(0, len(p_item) - 1)
+                g_len = len(g_item)
+                # Position `len(p) - 1` in `logits[:, :-1]` predicts `g[0]` in `x[:, 1:]`.
+                out_arrays.append(picked[row_i, p_off : p_off + g_len].astype(np.float32, copy=True))
+    finally:
+        if was_training:
+            model.train()
+    return tuple(out_arrays)
 
 
 class Mortm45GenSftRepository(CARLDataRepository):
@@ -187,11 +242,21 @@ class Mortm45ActorAdapter(CARLActorAdapter):
                 tag_end = int(self._tokenizer.get("<TAG_END>"))
                 critic_arrays.append(np.asarray([const_m] + body + [tag_end], dtype=np.int64))
 
+        old_lps = _compute_m45_rollout_logprobs(
+            self._model,
+            prompts,
+            gens,
+            self._device,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            chunk_size=chunk_size,
+        )
         return RolloutBatch(
             examples=tuple(expanded_examples),
             generated_sequences=tuple(gen_arrays),
             critic_sequences=tuple(critic_arrays),
             group_size=group_size,
+            old_action_logprobs=old_lps,
         )
 
     def forward_logprobs_and_exact_kl(
@@ -199,6 +264,7 @@ class Mortm45ActorAdapter(CARLActorAdapter):
         base_actor: CARLActorAdapter,
         examples: Sequence[CARLExample],
         generated_sequences: Sequence[np.ndarray],
+        sampling: Optional[UnifiedSamplingConfig] = None,
     ) -> StepLogProbsKL:
         seqs: List[List[int]] = []
         resp_masks: List[List[bool]] = []
@@ -213,9 +279,10 @@ class Mortm45ActorAdapter(CARLActorAdapter):
         for idx, r_m in enumerate(resp_masks):
             mask_full[idx, : len(r_m)] = torch.tensor(r_m, dtype=torch.bool, device=self._device)
 
+        temp = sampling.temperature if sampling is not None else 1.0
         with torch.no_grad():
-            logp_base_full = _autocast_full_logprobs(base_actor.actor_module, x, pad)
-        logp_new_full = _autocast_full_logprobs(self._model, x, pad)
+            logp_base_full = _autocast_full_logprobs(base_actor.actor_module, x, pad, temperature=temp)
+        logp_new_full = _autocast_full_logprobs(self._model, x, pad, temperature=temp)
 
         tgt = x[:, 1:]
         act_mask = mask_full[:, 1:]

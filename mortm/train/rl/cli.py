@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import argparse
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -40,6 +41,7 @@ DEFAULT_SYMIC_CKPT = (
     "out/symic_main/symic_g4l4_160m_depth_4ep/"
     "MORTM5.SyMIc_G4L4_160M_Depth_Scratch_16bar_4ep_muon_wsd_latest.pth"
 )
+DEFAULT_SYMIC_TRAIN_MANIFEST = "data/gmd/train.json"
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,13 @@ class SyMIcBackendBuilder(CARLBackendBuilder):
             prompt_bars=args.prompt_bars,
             lora_rank=args.critic_lora_rank,
             lora_alpha=args.critic_lora_alpha,
+            vq_model=vq,
+            canonicalize_pianoroll=bool(args.critic_pianoroll),
+        )
+        print(
+            f"[CARL] SyMIc Critic discrete piano-roll canonicalization: "
+            f"{'ON' if critic.uses_pianoroll_canonicalizer else 'OFF'}",
+            flush=True,
         )
 
         if args.token_dir:
@@ -113,9 +122,14 @@ class SyMIcBackendBuilder(CARLBackendBuilder):
                 min_active_tracks=args.min_active_tracks,
             )
             eff_limit = args.pool_limit
-        elif args.midi_manifest:
+        else:
+            manifest_path = args.midi_manifest or (
+                DEFAULT_SYMIC_TRAIN_MANIFEST if os.path.isfile(DEFAULT_SYMIC_TRAIN_MANIFEST) else None
+            )
+            if not manifest_path:
+                raise ValueError("SyMIc backend requires either --token-dir or --midi-manifest.")
             repo = SyMIcMidiRepository(
-                midi_manifest_path=args.midi_manifest,
+                midi_manifest_path=manifest_path,
                 model=actor.actor_module,  # type: ignore[arg-type]
                 vq_model=vq,
                 device=device,
@@ -123,9 +137,7 @@ class SyMIcBackendBuilder(CARLBackendBuilder):
                 total_bars=args.total_bars,
                 min_active_tracks=args.min_active_tracks,
             )
-            eff_limit = args.midi_pool_limit
-        else:
-            raise ValueError("SyMIc backend requires either --token-dir or --midi-manifest.")
+            eff_limit = args.midi_pool_limit if args.midi_pool_limit is not None else args.pool_limit
 
         ana_pool, gem_pool = repo.load_disjoint_pools(limit=eff_limit, seed=args.seed)
         guardrails = build_symic_guardrail_suite(
@@ -237,14 +249,14 @@ def build_arg_parser(registry: Optional[CARLBackendRegistry] = None) -> argparse
     ap.add_argument(
         "--pool-limit",
         type=int,
-        default=40000,
-        help="Max total windows/records to sample for pre-tokenized Memmap / SFT repositories.",
+        default=20000,
+        help="Max total unique songs/windows to split 50:50 across Odd (ana) & Even (gem) pools (20000 = 10k + 10k songs).",
     )
     ap.add_argument(
         "--midi-pool-limit",
         type=int,
-        default=512,
-        help="Max non-blank segments to index when using --midi-manifest on-the-fly mode.",
+        default=None,
+        help="Optional override for --midi-manifest pool size (defaults to --pool-limit).",
     )
     ap.add_argument("--q-max", type=int, default=3000, help="QTable replay capacity.")
 
@@ -286,6 +298,12 @@ def build_arg_parser(registry: Optional[CARLBackendRegistry] = None) -> argparse
     )
     ap.add_argument("--critic-lora-rank", type=int, default=8)
     ap.add_argument("--critic-lora-alpha", type=float, default=16.0)
+    ap.add_argument(
+        "--critic-pianoroll",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Experimental: decode SyMIc Critic inputs to discrete piano-roll and re-encode symmetrically before scoring (default: False).",
+    )
 
     # Sampling (shared or Coarse-to-Fine)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -305,16 +323,35 @@ def build_arg_parser(registry: Optional[CARLBackendRegistry] = None) -> argparse
     ap.add_argument("--odd-eval-window", type=int, default=100)
     ap.add_argument("--auc-threshold", type=float, default=0.93)
     ap.add_argument("--auc-min-steps", type=int, default=1000)
+    ap.add_argument(
+        "--odd-logit-reg",
+        type=float,
+        default=1e-3,
+        help="L2 logit regularization coefficient preventing Critic logit inflation (default: 1e-3).",
+    )
+    ap.add_argument(
+        "--odd-min-acc",
+        type=float,
+        default=0.70,
+        help="Minimum Human & latest-AI accuracy at the calibrated pass threshold required to finish Odd round.",
+    )
 
     # Even Round (GRPO Actor)
     ap.add_argument("--group-size", type=int, default=16)
     ap.add_argument("--prompts-per-step", type=int, default=4)
     ap.add_argument("--even-lr", type=float, default=2e-6)
     ap.add_argument("--even-max-steps", type=int, default=3000)
+    ap.add_argument("--ppo-epochs", type=int, default=1, help="GRPO optimization passes per rollout batch.")
     ap.add_argument("--kl-coef", type=float, default=0.05)
     ap.add_argument("--kl-stop", type=float, default=0.30)
     ap.add_argument("--disc-stop", type=float, default=0.80)
     ap.add_argument("--reward-stop", type=float, default=0.625)
+    ap.add_argument(
+        "--calibrate-reward",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Calibrate Even-round R_disc scale to the preceding Odd-round Human/AI logit distribution (default: True).",
+    )
     ap.add_argument("--gen-chunk", type=int, default=16)
     ap.add_argument("--critic-chunk", type=int, default=16)
     ap.add_argument("--train-chunk", type=int, default=8)
@@ -349,6 +386,7 @@ def build_driver_from_args(
         min_p=args.min_p,
         repetition_penalty=args.repetition_penalty,
     )
+    pass_target = min(0.92, max(0.50, float(args.reward_stop)))
     odd_cfg = UnifiedOddConfig(
         batch_size=args.odd_batch_size,
         pool_size=args.odd_pool_size,
@@ -359,6 +397,9 @@ def build_driver_from_args(
         critic_chunk=args.critic_chunk,
         auc_threshold=args.auc_threshold,
         auc_min_steps=args.auc_min_steps,
+        logit_reg_coef=args.odd_logit_reg,
+        min_class_acc=args.odd_min_acc,
+        pass_reward_target=pass_target,
         sampling=sampling,
     )
     even_cfg = UnifiedEvenConfig(
@@ -366,10 +407,12 @@ def build_driver_from_args(
         prompts_per_step=args.prompts_per_step,
         lr=args.even_lr,
         max_steps=args.even_max_steps,
+        ppo_epochs=args.ppo_epochs,
         kl_coef=args.kl_coef,
         kl_stop=args.kl_stop,
         disc_stop=args.disc_stop,
         reward_stop=args.reward_stop,
+        calibrate_reward=bool(args.calibrate_reward),
         gen_chunk=args.gen_chunk,
         critic_chunk=args.critic_chunk,
         train_chunk=args.train_chunk,
@@ -379,9 +422,13 @@ def build_driver_from_args(
     builder = reg.get(args.backend)
     built = builder.build(args, dev)
 
+    ana_u = built.ana_pool.unique_song_count()
+    gem_u = built.gem_pool.unique_song_count()
+    ana_desc = f"{len(built.ana_pool):,} ({ana_u:,} songs)" if ana_u is not None else f"{len(built.ana_pool):,}"
+    gem_desc = f"{len(built.gem_pool):,} ({gem_u:,} songs)" if gem_u is not None else f"{len(built.gem_pool):,}"
     print(
         f"[CARL] Initialized backend='{args.backend}' on device={dev} | "
-        f"disjoint pools: ana={len(built.ana_pool):,}, gem={len(built.gem_pool):,}",
+        f"disjoint pools: ana={ana_desc}, gem={gem_desc}",
         flush=True,
     )
     driver = UnifiedCARLDriver(

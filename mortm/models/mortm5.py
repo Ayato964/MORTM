@@ -382,10 +382,14 @@ class _BaseMORTM5Transformer(nn.Module):
         top_k: int = 0,
         top_p: float = 1.0,
         min_p: float = 0.0,
-    ) -> Tensor:
-        """[..., V] のロジットから `-inf` 文法マスクを厳守しつつサンプリングまたは greedy 選択を行い [...] のインデックスを返す。"""
+        return_logprobs: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        """[..., V] のロジットから `-inf` 文法マスクを厳守しつつサンプリングまたは greedy 選択を行い [...] のインデックス（`return_logprobs=True` 時は `(sampled, sampled_logprobs)`）を返す。"""
         if logits.numel() == 0:
-            return torch.empty(logits.shape[:-1], dtype=torch.long, device=logits.device)
+            empty_idx = torch.empty(logits.shape[:-1], dtype=torch.long, device=logits.device)
+            if return_logprobs:
+                return empty_idx, torch.empty(logits.shape[:-1], dtype=torch.float32, device=logits.device)
+            return empty_idx
 
         logits_f32 = logits.contiguous().to(dtype=torch.float32)
         was_nan = torch.isnan(logits_f32)
@@ -405,7 +409,10 @@ class _BaseMORTM5Transformer(nn.Module):
 
         temp_val = float(temperature)
         if not (temp_val > 1.0e-6):
-            return torch.argmax(base_logits, dim=-1)
+            greedy = torch.argmax(base_logits, dim=-1)
+            if return_logprobs:
+                return greedy, torch.zeros(greedy.shape, dtype=torch.float32, device=logits.device)
+            return greedy
 
         row_max = base_logits.amax(dim=-1, keepdim=True)
         shifted = base_logits - row_max
@@ -434,9 +441,13 @@ class _BaseMORTM5Transformer(nn.Module):
             remove_mask = torch.zeros_like(scaled, dtype=torch.bool).scatter(-1, sorted_indices, sorted_remove)
             scaled = scaled.masked_fill(remove_mask, float("-inf"))
 
-        probs = torch.softmax(scaled, dim=-1)
+        log_probs = torch.log_softmax(scaled, dim=-1)
+        probs = log_probs.exp()
         flat_probs = probs.reshape(-1, probs.size(-1))
         sampled = torch.multinomial(flat_probs, num_samples=1).reshape(probs.shape[:-1])
+        if return_logprobs:
+            picked_lp = log_probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+            return sampled, picked_lp
         return sampled
 
 
@@ -1033,10 +1044,12 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         fine_temperature: Optional[float] = None,
         fine_top_k: Optional[int] = None,
         fine_top_p: Optional[float] = None,
-    ) -> Tensor:
+        return_logprobs: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
         KVキャッシュと文法制約マスクを用いて num_chunks チャンク分のソフトトークン系列
         [B, S_soft, G] (return_flat=True の場合は [B, S_soft * G]) を自己回帰生成する。
+        `return_logprobs=True` の場合は `(full_seq, generated_step_logprobs)` ([B, S_gen, G]) を返す。
         """
         if num_chunks <= 0:
             raise ValueError(f"num_chunks must be positive, got {num_chunks}")
@@ -1057,7 +1070,10 @@ class AblationTransformer2(_BaseMORTM5Transformer):
         prefix_soft_len = 1 + (NUM_SLOT_TOKENS if self.use_instrument_tokens else 0)
         target_soft_len = prefix_soft_len + num_chunks * self.vq_layers
         if seq.size(1) >= target_soft_len:
-            return seq.reshape(seq.size(0), -1) if return_flat else seq
+            out_s = seq.reshape(seq.size(0), -1) if return_flat else seq
+            if return_logprobs:
+                return out_s, torch.empty((seq.size(0), 0, self.vq_groups), dtype=torch.float32, device=device)
+            return out_s
 
         recent_l0: list[Tensor] = []
         if repetition_penalty > 1.0 and seq.size(1) > prefix_soft_len:
@@ -1074,6 +1090,7 @@ class AblationTransformer2(_BaseMORTM5Transformer):
 
             cur_soft_pos = seq.size(1)
             generated = [seq]
+            generated_lps: list[Tensor] = []
             use_depth_ar = (
                 isinstance(self.Wout, DecodeCodebookHead)
                 and not bool(self.Wout._legacy_untrained_depth)
@@ -1093,13 +1110,24 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                             raw_logits = self.Wout(h_t.to(self.Wout.weight.dtype)).float()
                             next_logits = raw_logits.reshape(-1, self.vq_groups, self.group_vocab_size)
                     constrained = self._apply_grouped_grammar_mask(next_logits, soft_pos=cur_soft_pos)
-                    inst_tok = self._sample_from_logits(
-                        constrained[:, 0, :],
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p,
-                        min_p=min_p,
-                    )  # [B]
+                    if return_logprobs:
+                        inst_tok, inst_lp = self._sample_from_logits(
+                            constrained[:, 0, :],
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            min_p=min_p,
+                            return_logprobs=True,
+                        )
+                        generated_lps.append(inst_lp[:, None, None].expand(-1, 1, self.vq_groups).contiguous())
+                    else:
+                        inst_tok = self._sample_from_logits(
+                            constrained[:, 0, :],
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            min_p=min_p,
+                        )  # [B]
                     next_global = inst_tok[:, None, None].expand(-1, 1, self.vq_groups).contiguous()
                 else:
                     cur_layer_idx = max(0, cur_soft_pos - prefix_soft_len) % self.vq_layers
@@ -1120,6 +1148,7 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                             dtype=self.Wout.weight.dtype,
                         )
                         sampled_locals: list[Tensor] = []
+                        sampled_group_lps: list[Tensor] = []
                         eff_layer = cur_layer_idx % self.effective_layers
                         for g_i in range(self.vq_groups):
                             with torch.autocast(device_type=h_t.device.type, enabled=False):
@@ -1145,13 +1174,24 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                                         val = logits_g[b_i, tid]
                                         logits_g[b_i, tid] = val / pen if val > 0 else val * pen
 
-                            tok_g = self._sample_from_logits(
-                                logits_g,
-                                temperature=step_temp,
-                                top_k=step_top_k,
-                                top_p=step_top_p,
-                                min_p=min_p,
-                            )  # [B]
+                            if return_logprobs:
+                                tok_g, lp_g = self._sample_from_logits(
+                                    logits_g,
+                                    temperature=step_temp,
+                                    top_k=step_top_k,
+                                    top_p=step_top_p,
+                                    min_p=min_p,
+                                    return_logprobs=True,
+                                )
+                                sampled_group_lps.append(lp_g)
+                            else:
+                                tok_g = self._sample_from_logits(
+                                    logits_g,
+                                    temperature=step_temp,
+                                    top_k=step_top_k,
+                                    top_p=step_top_p,
+                                    min_p=min_p,
+                                )  # [B]
                             sampled_locals.append(tok_g)
                             if g_i < self.vq_groups - 1:
                                 local_k_g = (tok_g - self.token_offset).clamp(min=0) % self.codebook_size
@@ -1165,6 +1205,8 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                                     dtype=cur_group_embs.dtype
                                 )
                         local_sampled = torch.stack(sampled_locals, dim=-1)  # [B, G]
+                        if return_logprobs:
+                            generated_lps.append(torch.stack(sampled_group_lps, dim=-1).unsqueeze(1))
                     else:
                         with torch.autocast(device_type=h_t.device.type, enabled=False):
                             if isinstance(self.Wout, DecodeCodebookHead):
@@ -1188,13 +1230,24 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                                         pen = float(repetition_penalty) ** min(cnt, 4)
                                         val = constrained[b_i, g_i, tid]
                                         constrained[b_i, g_i, tid] = val / pen if val > 0 else val * pen
-                        local_sampled = self._sample_from_logits(
-                            constrained,
-                            temperature=step_temp,
-                            top_k=step_top_k,
-                            top_p=step_top_p,
-                            min_p=min_p,
-                        )  # [B, G]
+                        if return_logprobs:
+                            local_sampled, step_lp = self._sample_from_logits(
+                                constrained,
+                                temperature=step_temp,
+                                top_k=step_top_k,
+                                top_p=step_top_p,
+                                min_p=min_p,
+                                return_logprobs=True,
+                            )
+                            generated_lps.append(step_lp.unsqueeze(1))
+                        else:
+                            local_sampled = self._sample_from_logits(
+                                constrained,
+                                temperature=step_temp,
+                                top_k=step_top_k,
+                                top_p=step_top_p,
+                                min_p=min_p,
+                            )  # [B, G]
 
                     if cur_layer_idx == 0 and repetition_penalty > 1.0:
                         recent_l0.append(local_sampled)
@@ -1213,7 +1266,15 @@ class AblationTransformer2(_BaseMORTM5Transformer):
                 )
                 generated.append(eos_soft)
             full_seq = torch.cat(generated, dim=1)
-            return full_seq.reshape(full_seq.size(0), -1) if return_flat else full_seq
+            out_seq = full_seq.reshape(full_seq.size(0), -1) if return_flat else full_seq
+            if return_logprobs:
+                full_lps = (
+                    torch.cat(generated_lps, dim=1)
+                    if generated_lps
+                    else torch.empty((seq.size(0), 0, self.vq_groups), dtype=torch.float32, device=device)
+                )
+                return out_seq, full_lps
+            return out_seq
         finally:
             self.reset_kv_cache()
             if was_training:
