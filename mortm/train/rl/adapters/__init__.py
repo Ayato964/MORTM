@@ -8,7 +8,14 @@ from .mortm45 import (
 )
 from .symic import (
     AnalysisSyMIc,
+    ContinuationMILPoolHead,
+    DEFAULT_SYMIC_CRITIC_POOL_REGISTRY,
+    MultiHeadAttentiveStatsPool,
+    PromptContinuationAttentionPoolHead,
+    SYMIC_CRITIC_POOLS,
     SyMIcCriticAdapter,
+    SyMIcCriticPoolHead,
+    SyMIcCriticPoolRegistry,
     SyMIcGroupedActorAdapter,
     SyMIcMemmapRepository,
     SyMIcMidiRepository,
@@ -20,10 +27,17 @@ from .symic import (
 
 __all__ = [
     "AnalysisSyMIc",
+    "ContinuationMILPoolHead",
+    "DEFAULT_SYMIC_CRITIC_POOL_REGISTRY",
     "Mortm45ActorAdapter",
     "Mortm45CriticAdapter",
     "Mortm45GenSftRepository",
+    "MultiHeadAttentiveStatsPool",
+    "PromptContinuationAttentionPoolHead",
+    "SYMIC_CRITIC_POOLS",
     "SyMIcCriticAdapter",
+    "SyMIcCriticPoolHead",
+    "SyMIcCriticPoolRegistry",
     "SyMIcGroupedActorAdapter",
     "SyMIcMemmapRepository",
     "SyMIcMidiRepository",

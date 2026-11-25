@@ -1294,13 +1294,16 @@ def test_symic_pianoroll_canonicalizer_invariance_and_cli_flags() -> None:
     assert abs(float((logits_raw[0] - logits_raw[1]).item())) > 1e-5
     assert torch.allclose(logits_canon[0], logits_canon[1], atol=1e-6)
 
-    # Verify set_train_mode(True) keeps MidiVision frozen in .eval() and backward() updates LoRA/MIL cleanly.
+    # Verify set_train_mode(True) keeps MidiVision frozen in .eval() and backward() updates LoRA/pool_head cleanly.
     critic_canon.mark_trainable()
     critic_canon.set_train_mode(True)
     assert vq.training is False
     out_grad = critic_canon.score_disc_logits([seq_a, seq_b], grad_enabled=True)
     out_grad.sum().backward()
-    assert critic_canon.critic_module.mil.scorer[0].weight.grad is not None
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum().item()) > 0.0
+        for p in critic_canon.critic_module.pool_head.parameters()
+    )
 
 
 def test_critic_calibration_ruler_and_odd_dual_gate_stopping(tmp_path: Path) -> None:
@@ -1530,5 +1533,92 @@ def test_song_balanced_memmap_and_cli_pool_limit_inheritance(tmp_path: Path) -> 
     assert ana_p.unique_song_count() == 4
     assert gem_p.unique_song_count() == 4
     assert {ana_p[i].song_id for i in range(4)}.isdisjoint({gem_p[i].song_id for i in range(4)})
+
+
+def test_symic_prompt_continuation_attention_pool_mismatch_sensitivity_and_compact_state() -> None:
+    """Verify default `'attn'` Critic head is length-invariant, compares prompt vs continuation, and round-trips state."""
+    from mortm.train.rl import (
+        ContinuationMILPoolHead,
+        PromptContinuationAttentionPoolHead,
+    )
+    from mortm.train.rl.cli import build_arg_parser
+
+    parsed_default = build_arg_parser().parse_args(["--out-dir", "out/tmp_carl"])
+    assert parsed_default.critic_pool == "attn"
+    parsed_mil = build_arg_parser().parse_args(["--out-dir", "out/tmp_carl", "--critic-pool", "mil"])
+    assert parsed_mil.critic_pool == "mil"
+
+    # 1. Exact length-invariance & prompt-mismatch sensitivity on `PromptContinuationAttentionPoolHead`
+    torch.manual_seed(7)
+    attn_head = PromptContinuationAttentionPoolHead(d_model=64, max_proj_dim=64, num_heads=8)
+    mil_head = ContinuationMILPoolHead(d_model=64)
+
+    prompt_sparse = torch.randn(2, 32, 64, requires_grad=True)  # 4-bar prompt (e.g. sparse)
+    prompt_dense = (torch.randn(2, 32, 64) * 3.0 + 1.5).detach().requires_grad_(True)
+    # Continuation repeating `prompt_sparse` 3x (12 bars = 96 steps) MUST yield `c_vec == p_vec` (`diff == 0`)!
+    cont_matched = prompt_sparse.detach().repeat(1, 3, 1).requires_grad_(True)
+    p_vec = attn_head.shared_pool(prompt_sparse)
+    c_vec = attn_head.shared_pool(cont_matched)
+    assert torch.allclose(p_vec, c_vec, atol=1e-5)
+
+    # Holding `cont_matched` fixed while swapping `prompt_sparse` -> `prompt_dense` MUST change `'attn'` logits,
+    # whereas `'mil'` ignores `prompt_hidden` completely!
+    logit_attn_match = attn_head(prompt_sparse, cont_matched)
+    logit_attn_mismatch = attn_head(prompt_dense, cont_matched)
+    assert not torch.allclose(logit_attn_match, logit_attn_mismatch, atol=1e-4)
+
+    logit_mil_a = mil_head(prompt_sparse, cont_matched)
+    logit_mil_b = mil_head(prompt_dense, cont_matched)
+    assert torch.allclose(logit_mil_a, logit_mil_b, atol=1e-6)
+
+    (logit_attn_match.sum() + logit_attn_mismatch.sum()).backward()
+    assert prompt_sparse.grad is not None and float(prompt_sparse.grad.abs().sum().item()) > 0.0
+    assert prompt_dense.grad is not None and float(prompt_dense.grad.abs().sum().item()) > 0.0
+    assert cont_matched.grad is not None and float(cont_matched.grad.abs().sum().item()) > 0.0
+
+    # 2. End-to-end `SyMIcCriticAdapter` (`pool_mode='attn'` default & `'mil'`, compact checkpoint round-trip)
+    dev = _select_test_device()
+    m_args = MORTM5Args(_tiny_symic_config())
+    critic_attn = SyMIcCriticAdapter.from_pretrained(m_args, None, dev, prompt_bars=1, lora_rank=4)
+    assert critic_attn.pool_mode == "attn"
+    assert isinstance(critic_attn.critic_module.pool_head, PromptContinuationAttentionPoolHead)
+    groups = critic_attn.mark_trainable()
+    assert groups["lora"] > 0 and groups["pool_head"] > 0
+
+    ex_1 = _make_synthetic_symic_example(m_args, song_id=1, prompt_bars=1, total_bars=2, seed=1)
+    ex_2 = _make_synthetic_symic_example(m_args, song_id=2, prompt_bars=1, total_bars=2, seed=2)
+    # Perturb trainable weights, export compact state, and restore into a fresh adapter: logits must match!
+    with torch.no_grad():
+        for name, param in critic_attn.critic_module.named_parameters():
+            if param.requires_grad:
+                param.add_(0.05 * torch.randn_like(param))
+    expected_logits = critic_attn.score_disc_logits([ex_1.human_full_tokens, ex_2.human_full_tokens])
+    compact_attn = critic_attn.export_compact_state()
+    assert any(k.startswith("pool_head.shared_pool.") for k in compact_attn)
+    assert any(k.startswith("pool_head.classifier.") for k in compact_attn)
+
+    critic_attn_reloaded = SyMIcCriticAdapter.from_pretrained(m_args, None, dev, prompt_bars=1, lora_rank=4)
+    # Ensure backbone weights match (since ckpt_path=None uses random init)
+    critic_attn_reloaded.critic_module.backbone.load_state_dict(
+        critic_attn.critic_module.backbone.state_dict(), strict=True
+    )
+    critic_attn_reloaded.load_compact_state(compact_attn)
+    reloaded_logits = critic_attn_reloaded.score_disc_logits([ex_1.human_full_tokens, ex_2.human_full_tokens])
+    assert torch.allclose(expected_logits, reloaded_logits, atol=1e-4)
+
+    # 3. Verify legacy `mil.*` compact checkpoint remapping into `pool_mode='mil'` & cross-mode mismatch guard
+    critic_mil = SyMIcCriticAdapter.from_pretrained(
+        m_args, None, dev, prompt_bars=1, lora_rank=4, pool_mode="mil"
+    )
+    assert critic_mil.pool_mode == "mil"
+    compact_mil = critic_mil.export_compact_state()
+    legacy_mil_state = {
+        (k[len("pool_head.") :] if k.startswith("pool_head.mil.") else k): v
+        for k, v in compact_mil.items()
+    }
+    critic_mil.load_compact_state(legacy_mil_state)
+    with pytest.raises(RuntimeError, match="pool_mode='attn'"):
+        critic_attn_reloaded.load_compact_state(legacy_mil_state)
+
 
 

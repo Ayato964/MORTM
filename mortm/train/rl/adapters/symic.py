@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -628,17 +629,190 @@ class SyMIcMidiRepository(CARLDataRepository):
 
 
 # ======================================================================
-# 2. Critic (`AnalysisSyMIc` + `SyMIcCriticAdapter`)
+# 2. Critic (`AnalysisSyMIc` + `SyMIcCriticPoolHead` Strategies + `SyMIcCriticAdapter`)
 # ======================================================================
 
 
-class AnalysisSyMIc(nn.Module):
-    """SyMIc causal discriminator with native Attention LoRA + continuation-only `MILPool`.
+class MultiHeadAttentiveStatsPool(nn.Module):
+    """Length-invariant multi-head attention pooling computing 1st & 2nd moments (`[mean, std]`).
 
-    Passes `[Prefix | Prompt (4 bars) | Continuation (12 bars)]` through the causal
-    SyMIc decoder so continuation tokens attend to the 4-bar prompt seam, then pools
-    **strictly over continuation positions `prompt_soft_len .. full_soft_len - 1`** via
-    LogSumExp MIL (`MILPool`) to eliminate any prompt-shortcut leakage.
+    Summarizing a variable-length segment (`[B, S, D]`, e.g., 4-bar prompt RVQ tokens vs
+    12-bar continuation RVQ tokens) via softmax-normalized weights `sum_t alpha_{t,h} = 1`
+    maps both segments into the exact same `[B, 2 * proj_dim]` feature space regardless of
+    bar count, capturing both macro density/register (`mean`) and rhythmic/harmonic dispersion (`std`).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        max_proj_dim: int = 256,
+        num_heads: int = 8,
+        eps: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        if d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {d_model}.")
+        proj_dim = min(int(d_model), int(max_proj_dim))
+        eff_heads = math.gcd(proj_dim, max(1, int(num_heads))) or 1
+
+        self.d_model = int(d_model)
+        self.proj_dim = proj_dim
+        self.num_heads = eff_heads
+        self.head_dim = proj_dim // eff_heads
+        self.out_dim = 2 * proj_dim
+        self.eps = float(eps)
+
+        self.norm = nn.LayerNorm(self.d_model)
+        self.attn = nn.Sequential(
+            nn.Linear(self.d_model, self.proj_dim),
+            nn.Tanh(),
+            nn.Linear(self.proj_dim, self.num_heads),
+        )
+        self.val_proj = nn.Linear(self.d_model, self.proj_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.dim() != 3 or x.size(1) == 0:
+            raise ValueError(
+                f"MultiHeadAttentiveStatsPool expects non-empty [B, S, D], got {tuple(x.shape)}."
+            )
+        bsz, seq_len, _ = x.shape
+        h = self.norm(x.float())
+        weights = torch.softmax(self.attn(h), dim=1).unsqueeze(-1)  # [B, S, H, 1]
+        vals = F.gelu(self.val_proj(h)).view(bsz, seq_len, self.num_heads, self.head_dim)
+
+        mean = (weights * vals).sum(dim=1)  # [B, H, head_dim]
+        var = (weights * (vals - mean.unsqueeze(1)).square()).sum(dim=1)
+        std = torch.sqrt(var.clamp_min(self.eps))
+        return torch.cat([mean.flatten(1), std.flatten(1)], dim=-1)  # [B, 2 * proj_dim]
+
+
+class SyMIcCriticPoolHead(nn.Module, ABC):
+    """Strategy interface (OCP) aggregating prompt & continuation states into 1D AI/Human logits."""
+
+    @property
+    @abstractmethod
+    def pool_mode(self) -> str:
+        """Canonical registry identifier (`'attn'`, `'mil'`, ...)."""
+
+    @abstractmethod
+    def forward(self, prompt_hidden: Tensor, cont_hidden: Tensor) -> Tensor:
+        """Return 1D float32 discriminator logits `[B]` (`> 0` = AI, `< 0` = Human)."""
+
+
+class PromptContinuationAttentionPoolHead(SyMIcCriticPoolHead):
+    """Shared Prompt-vs-Continuation `AttentionPool` relational discriminator head (`'attn'`).
+
+    Pools the 4-bar prompt RVQ states into `p` and the 12-bar continuation RVQ states into `c`
+    through the **same** `MultiHeadAttentiveStatsPool`, then scores `[c, c - p, |c - p|, p_hat * c_hat]`
+    so the Critic directly detects macro prompt-continuation density/style mismatches (e.g., a sparse
+    6.5-note/bar prompt inflating to 39.9 notes/bar) without brittle rule-based penalties.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        max_proj_dim: int = 256,
+        num_heads: int = 8,
+    ) -> None:
+        super().__init__()
+        self.shared_pool = MultiHeadAttentiveStatsPool(
+            d_model=d_model,
+            max_proj_dim=max_proj_dim,
+            num_heads=num_heads,
+        )
+        s_dim = self.shared_pool.out_dim
+        rel_dim = 4 * s_dim
+        hidden_dim = self.shared_pool.proj_dim
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(rel_dim),
+            nn.Linear(rel_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    @property
+    def pool_mode(self) -> str:
+        return "attn"
+
+    def forward(self, prompt_hidden: Tensor, cont_hidden: Tensor) -> Tensor:
+        with torch.autocast(device_type=cont_hidden.device.type, enabled=False):
+            p_vec = self.shared_pool(prompt_hidden)
+            c_vec = self.shared_pool(cont_hidden)
+            diff = c_vec - p_vec
+            p_unit = F.normalize(p_vec, p=2.0, dim=-1, eps=1e-5)
+            c_unit = F.normalize(c_vec, p=2.0, dim=-1, eps=1e-5)
+            rel_feat = torch.cat([c_vec, diff, diff.abs(), p_unit * c_unit], dim=-1)
+            return self.classifier(rel_feat).squeeze(-1).float()
+
+
+class ContinuationMILPoolHead(SyMIcCriticPoolHead):
+    """Continuation-only LogSumExp Multiple-Instance Learning head (`'mil'`)."""
+
+    def __init__(self, d_model: int, r_init: float = 2.0) -> None:
+        super().__init__()
+        self.mil = MILPool(int(d_model), r_init=r_init)
+
+    @property
+    def pool_mode(self) -> str:
+        return "mil"
+
+    def forward(self, prompt_hidden: Tensor, cont_hidden: Tensor) -> Tensor:
+        del prompt_hidden
+        with torch.autocast(device_type=cont_hidden.device.type, enabled=False):
+            cont_fp = cont_hidden.to(dtype=self.mil.scorer[0].weight.dtype)
+            tok_scores = self.mil.scorer(cont_fp).squeeze(-1).float()
+            r_val = self.mil.log_r.exp().clamp(0.05, 20.0)
+            n_cont = float(tok_scores.size(1))
+            return (torch.logsumexp(r_val * tok_scores, dim=1) - math.log(n_cont)) / r_val
+
+
+PoolHeadFactory = Callable[[int, float], SyMIcCriticPoolHead]
+
+
+class SyMIcCriticPoolRegistry:
+    """Open/Closed registry mapping pooling strategy keys (`'attn'`, `'mil'`) to factories."""
+
+    def __init__(self) -> None:
+        self._factories: Dict[str, PoolHeadFactory] = {}
+
+    def register(self, key: str, factory: PoolHeadFactory) -> None:
+        norm = str(key).strip().lower()
+        if not norm:
+            raise ValueError("Critic pool key must be non-empty.")
+        self._factories[norm] = factory
+
+    def build(self, key: str, d_model: int, mil_r_init: float = 2.0) -> SyMIcCriticPoolHead:
+        norm = str(key).strip().lower()
+        factory = self._factories.get(norm)
+        if factory is None:
+            raise ValueError(
+                f"Unsupported SyMIc Critic pool_mode '{key}'. Available: {self.available_keys()}"
+            )
+        return factory(int(d_model), float(mil_r_init))
+
+    def available_keys(self) -> Tuple[str, ...]:
+        return tuple(self._factories.keys())
+
+
+DEFAULT_SYMIC_CRITIC_POOL_REGISTRY = SyMIcCriticPoolRegistry()
+DEFAULT_SYMIC_CRITIC_POOL_REGISTRY.register(
+    "attn",
+    lambda d_model, _r_init: PromptContinuationAttentionPoolHead(d_model=d_model),
+)
+DEFAULT_SYMIC_CRITIC_POOL_REGISTRY.register(
+    "mil",
+    lambda d_model, r_init: ContinuationMILPoolHead(d_model=d_model, r_init=r_init),
+)
+SYMIC_CRITIC_POOLS: Tuple[str, ...] = DEFAULT_SYMIC_CRITIC_POOL_REGISTRY.available_keys()
+
+
+class AnalysisSyMIc(nn.Module):
+    """SyMIc causal discriminator with native Attention LoRA + pluggable `SyMIcCriticPoolHead`.
+
+    Passes `[Prefix | Prompt (4 bars) | Continuation (12 bars)]` through the causal SyMIc
+    decoder, slices musical prompt states (`prefix_soft_len .. prompt_soft_len - 1`) and
+    continuation states (`prompt_soft_len .. full_soft_len - 1`), and delegates logit aggregation
+    to `self.pool_head` (default `'attn'`: shared Prompt-vs-Continuation `AttentionPool`).
     """
 
     def __init__(
@@ -649,10 +823,25 @@ class AnalysisSyMIc(nn.Module):
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
         mil_r_init: float = 2.0,
+        pool_mode: str = "attn",
+        prefix_soft_len: Optional[int] = None,
+        pool_head: Optional[SyMIcCriticPoolHead] = None,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.prompt_soft_len = int(prompt_soft_len)
+        if prefix_soft_len is None:
+            default_prefix = 1 + (
+                NUM_SLOT_TOKENS if bool(getattr(backbone, "use_instrument_tokens", True)) else 0
+            )
+            self.prefix_soft_len = default_prefix if self.prompt_soft_len > default_prefix else 0
+        else:
+            self.prefix_soft_len = int(prefix_soft_len)
+        if not (0 <= self.prefix_soft_len < self.prompt_soft_len):
+            raise ValueError(
+                f"Expected 0 <= prefix_soft_len ({self.prefix_soft_len}) < prompt_soft_len ({self.prompt_soft_len})."
+            )
+
         for param in self.backbone.parameters():
             param.requires_grad_(False)
 
@@ -663,7 +852,14 @@ class AnalysisSyMIc(nn.Module):
             dropout=lora_dropout,
         )
         dev = self.backbone.embedding.weight.device
-        self.mil = MILPool(int(self.backbone.args.d_model), r_init=mil_r_init).to(dev)
+        resolved_head = pool_head or DEFAULT_SYMIC_CRITIC_POOL_REGISTRY.build(
+            pool_mode, d_model=int(self.backbone.args.d_model), mil_r_init=mil_r_init
+        )
+        self.pool_head: SyMIcCriticPoolHead = resolved_head.to(dev)
+
+    @property
+    def pool_mode(self) -> str:
+        return self.pool_head.pool_mode
 
     def forward_disc(self, seq_3d: Tensor) -> Tensor:
         """Compute 1D AI/Human logits `[B]` from `[B, S_full, G]` grouped token sequences."""
@@ -691,13 +887,9 @@ class AnalysisSyMIc(nn.Module):
                 is_save_cache=False,
             )
         dec_out = pad_input(dec_unpad, indices, bsz, seq_len)
-        cont_hidden = dec_out[:, self.prompt_soft_len :, :].to(dtype=self.mil.scorer[0].weight.dtype)
-
-        # Vectorized rectangular LogSumExp MIL pooling (identical to MILPool.forward on equal-length bags).
-        tok_scores = self.mil.scorer(cont_hidden).squeeze(-1).float()  # [B, S_cont]
-        r_val = self.mil.log_r.exp().clamp(0.05, 20.0)
-        n_cont = float(tok_scores.size(1))
-        return (torch.logsumexp(r_val * tok_scores, dim=1) - math.log(n_cont)) / r_val
+        prompt_hidden = dec_out[:, self.prefix_soft_len : self.prompt_soft_len, :]
+        cont_hidden = dec_out[:, self.prompt_soft_len :, :]
+        return self.pool_head(prompt_hidden, cont_hidden)
 
 
 class SyMIcPianoRollCanonicalizer:
@@ -815,6 +1007,10 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
         self._canonicalizer = canonicalizer
 
     @property
+    def pool_mode(self) -> str:
+        return self._ana.pool_mode
+
+    @property
     def uses_pianoroll_canonicalizer(self) -> bool:
         return self._canonicalizer is not None
 
@@ -827,6 +1023,7 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
         prompt_bars: int = 4,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
+        pool_mode: str = "attn",
         vq_model: Optional[MidiVision] = None,
         canonicalize_pianoroll: bool = False,
     ) -> "SyMIcCriticAdapter":
@@ -838,6 +1035,8 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
             prompt_soft_len=prompt_soft_len,
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
+            pool_mode=pool_mode,
+            prefix_soft_len=prefix_len,
         )
         ana.eval()
         canonicalizer: Optional[SyMIcPianoRollCanonicalizer] = None
@@ -864,17 +1063,21 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
     def device(self) -> torch.device:
         return self._device
 
+    @staticmethod
+    def _is_compact_critic_key(key: str) -> bool:
+        return (".lora_A" in key) or (".lora_B" in key) or key.startswith(("pool_head.", "mil."))
+
     def mark_trainable(self) -> Dict[str, int]:
-        groups = {"lora": 0, "mil": 0}
+        groups = {"lora": 0, "pool_head": 0}
         for name, param in self._ana.named_parameters():
             is_lora = ".lora_A" in name or ".lora_B" in name
-            is_mil = name.startswith("mil.")
-            param.requires_grad_(bool(is_lora or is_mil))
+            is_head = name.startswith(("pool_head.", "mil."))
+            param.requires_grad_(bool(is_lora or is_head))
             if is_lora:
                 groups["lora"] += param.numel()
-            elif is_mil:
-                groups["mil"] += param.numel()
-        if groups["lora"] == 0 or groups["mil"] == 0:
+            elif is_head:
+                groups["pool_head"] += param.numel()
+        if groups["lora"] == 0 or groups["pool_head"] == 0:
             raise RuntimeError(f"SyMIcCriticAdapter missing trainable parameter groups: {groups}")
         return groups
 
@@ -900,20 +1103,26 @@ class SyMIcCriticAdapter(CARLCriticAdapter):
         return {
             k: v.detach().cpu().clone()
             for k, v in self._ana.state_dict().items()
-            if (".lora_A" in k) or (".lora_B" in k) or k.startswith("mil.")
+            if self._is_compact_critic_key(k)
         }
 
     def load_compact_state(self, state: Dict[str, Any]) -> None:
-        cleaned = {k: v for k, v in state.items() if k != "_carl_unmerged"}
-        expected_keys = {
-            k
-            for k in self._ana.state_dict().keys()
-            if (".lora_A" in k) or (".lora_B" in k) or k.startswith("mil.")
-        }
+        ana_sd = self._ana.state_dict()
+        cleaned: Dict[str, Any] = {}
+        for k, v in state.items():
+            if k == "_carl_unmerged":
+                continue
+            if k.startswith("mil.") and f"pool_head.{k}" in ana_sd:
+                cleaned[f"pool_head.{k}"] = v
+            else:
+                cleaned[k] = v
+
+        expected_keys = {k for k in ana_sd.keys() if self._is_compact_critic_key(k)}
         missing_compact = sorted(expected_keys - set(cleaned.keys()))
         if missing_compact:
             raise RuntimeError(
-                f"Missing expected SyMIc Critic adapter keys: {missing_compact[:5]}"
+                f"Missing expected SyMIc Critic adapter keys for pool_mode='{self.pool_mode}': "
+                f"{missing_compact[:5]}"
             )
         _, unexpected = self._ana.load_state_dict(cleaned, strict=False)
         if unexpected:

@@ -22,6 +22,7 @@ from .adapters.mortm45 import (
     build_mortm45_guardrail_suite,
 )
 from .adapters.symic import (
+    SYMIC_CRITIC_POOLS,
     SYMIC_GUARDRAIL_MODES,
     SYMIC_UNFREEZE_MODES,
     SyMIcCriticAdapter,
@@ -103,12 +104,13 @@ class SyMIcBackendBuilder(CARLBackendBuilder):
             prompt_bars=args.prompt_bars,
             lora_rank=args.critic_lora_rank,
             lora_alpha=args.critic_lora_alpha,
+            pool_mode=args.critic_pool,
             vq_model=vq,
             canonicalize_pianoroll=bool(args.critic_pianoroll),
         )
         print(
-            f"[CARL] SyMIc Critic discrete piano-roll canonicalization: "
-            f"{'ON' if critic.uses_pianoroll_canonicalizer else 'OFF'}",
+            f"[CARL] SyMIc Critic pooling mode: {critic.pool_mode} | "
+            f"discrete piano-roll canonicalization: {'ON' if critic.uses_pianoroll_canonicalizer else 'OFF'}",
             flush=True,
         )
 
@@ -298,6 +300,13 @@ def build_arg_parser(registry: Optional[CARLBackendRegistry] = None) -> argparse
     )
     ap.add_argument("--critic-lora-rank", type=int, default=8)
     ap.add_argument("--critic-lora-alpha", type=float, default=16.0)
+    ap.add_argument(
+        "--critic-pool",
+        type=str,
+        choices=SYMIC_CRITIC_POOLS,
+        default="attn",
+        help="SyMIc Critic pooling head ('attn' compares prompt & continuation via shared AttentionPool; 'mil' pools continuation via LogSumExp MIL).",
+    )
     ap.add_argument(
         "--critic-pianoroll",
         action=argparse.BooleanOptionalAction,
