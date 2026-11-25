@@ -29,7 +29,13 @@ from .interfaces import (
     GuardrailSuite,
 )
 from .optim import MasterWeightAdamW
-from .q_table import QTable, accuracy_by_source, auc_by_source, mix_batch
+from .q_table import (
+    QTable,
+    accuracy_by_source,
+    asymmetric_reward_accuracy_by_source,
+    auc_by_source,
+    mix_batch,
+)
 
 
 def compute_discriminator_reward(
@@ -200,10 +206,20 @@ class OddRoundEngine:
         stale = 0
         slope = float("nan")
         last_auc: Dict[str, float] = {}
-        cur_cal = CriticCalibration(center=0.0, span=cfg.fallback_disc_span, calibrated=False)
-        z_pass = cur_cal.reward_to_logit_threshold(cfg.pass_reward_target)
+        fixed_ruler = CriticCalibration(center=0.0, span=cfg.fallback_disc_span, calibrated=False)
+        human_r_thr = max(0.5, float(cfg.pass_reward_target))
+        ai_r_thr = 1.0 - human_r_thr
+        eff_min_gem_seqs = min(int(cfg.min_gem_seqs), int(self._qtable.q_max))
+        gem_seen = 0
         refresh_interval = max(1, cfg.pool_size // max(1, cfg.batch_size))
         non_finite_streak = 0
+
+        print(
+            f"[R{round_no} Odd] Stop gates: Human-ACC(R>={human_r_thr:.2f})>={cfg.human_acc_threshold:.2f} & "
+            f"Gem-ACC(R<={ai_r_thr:.2f})>={cfg.gem_acc_threshold:.2f} | "
+            f"QTable new>={self._qtable.q_max:,} & gem_seen>={eff_min_gem_seqs:,}",
+            flush=True,
+        )
 
         step = 0
         for step in range(1, cfg.max_steps + 1):
@@ -253,28 +269,28 @@ class OddRoundEngine:
                 continue
             non_finite_streak = 0
 
+            gem_seen += sum(1 for s in source if s == "gem")
             logits_np = disc_logits.detach().float().cpu().numpy()
             raw_buf.append((logits_np, np.asarray(is_ai, dtype=np.float32), list(source)))
 
-            # Compute buffered ROC-AUC, logit calibration & threshold-aligned accuracy over `eval_window`.
+            # Evaluate on the FIXED absolute `[0, 1]` reward ruler (`Human >= human_r_thr`, `AI <= ai_r_thr`).
             effective_eval_win = min(cfg.eval_window, cfg.max_steps)
             buf_acc: Dict[str, float] = {}
-            if len(raw_buf) >= 1 and (step % max(1, cfg.log_every) == 0 or len(raw_buf) >= effective_eval_win):
+            qtable_ready = self._qtable.is_ready_for_full_update and (gem_seen >= eff_min_gem_seqs)
+            should_eval = len(raw_buf) >= 1 and (
+                step == 1
+                or step % max(1, cfg.log_every) == 0
+                or len(raw_buf) >= effective_eval_win
+            )
+            if should_eval:
                 sc = np.concatenate([r[0] for r in raw_buf])
                 ya = np.concatenate([r[1] for r in raw_buf])
                 sr = [x for r in raw_buf for x in r[2]]
                 last_auc = auc_by_source(sc, ya, sr)
-                lh_buf = last_auc.get("logit_mean_human", float("nan"))
-                lg_buf = last_auc.get("logit_mean_gem", float("nan"))
-                cur_cal = CriticCalibration.from_odd_stats(
-                    lh_buf,
-                    lg_buf,
-                    pass_reward=cfg.pass_reward_target,
-                    fallback_span=cfg.fallback_disc_span,
+                r_buf = fixed_ruler.score_to_reward(torch.as_tensor(sc, dtype=torch.float32))
+                buf_acc = asymmetric_reward_accuracy_by_source(
+                    r_buf, ya, sr, human_min_reward=human_r_thr, ai_max_reward=ai_r_thr
                 )
-                z_pass = cur_cal.reward_to_logit_threshold(cfg.pass_reward_target)
-                buf_acc = accuracy_by_source(sc, ya, sr, logit_threshold=z_pass)
-                zero_acc = accuracy_by_source(sc, ya, sr, logit_threshold=0.0)
 
                 a_gem = last_auc.get("auc_gem", float("nan"))
                 if math.isfinite(a_gem):
@@ -287,30 +303,20 @@ class OddRoundEngine:
                             slope = float(np.polyfit(xs, ys, 1)[0] * 1000.0)
                             stale = stale + 1 if slope < cfg.auc_min_slope else 0
 
-                        hum_pass_ok = buf_acc.get("human", 0.0) >= cfg.min_class_acc
-                        gem_fail_ok = buf_acc.get("gem", 0.0) >= cfg.min_class_acc
-                        centered_ok = (
-                            zero_acc.get("human", 0.0) >= 0.50 and zero_acc.get("gem", 0.0) >= 0.50
+                if len(raw_buf) >= effective_eval_win and qtable_ready:
+                    hum_acc_val = buf_acc.get("human", 0.0)
+                    gem_acc_val = buf_acc.get("gem", 0.0)
+                    if hum_acc_val >= cfg.human_acc_threshold and gem_acc_val >= cfg.gem_acc_threshold:
+                        reason = (
+                            f"discriminator_ready: Human-ACC(R>={human_r_thr:.2f})={hum_acc_val:.3f}>={cfg.human_acc_threshold:.2f} & "
+                            f"Gem-ACC(R<={ai_r_thr:.2f})={gem_acc_val:.3f}>={cfg.gem_acc_threshold:.2f} "
+                            f"(newQ={len(self._qtable.new)}, gem_seen={gem_seen})"
                         )
-                        if (
-                            a_gem >= cfg.auc_threshold
-                            and cur_cal.calibrated
-                            and hum_pass_ok
-                            and gem_fail_ok
-                            and centered_ok
-                        ):
-                            reason = (
-                                f"discriminator_ready: AUC(human vs gem) {a_gem:.4f} >= {cfg.auc_threshold} "
-                                f"& acc@z={z_pass:+.2f} (H={buf_acc.get('human', 0.0):.3f}, "
-                                f"G={buf_acc.get('gem', 0.0):.3f} >= {cfg.min_class_acc})"
-                            )
-                        elif step >= cfg.auc_min_steps and stale >= cfg.auc_patience:
-                            reason = (
-                                f"auc_converged: slope {slope:+.4f}/1k < {cfg.auc_min_slope} "
-                                f"for {stale} checks (best={best_auc:.4f}, cur={a_gem:.4f})"
-                            )
 
-            acc = accuracy_by_source(logits_np, is_ai, source, logit_threshold=z_pass)
+            step_r = fixed_ruler.score_to_reward(torch.as_tensor(logits_np, dtype=torch.float32))
+            acc = asymmetric_reward_accuracy_by_source(
+                step_r, is_ai, source, human_min_reward=human_r_thr, ai_max_reward=ai_r_thr
+            )
             for k in hist:
                 if k in acc:
                     hist[k].append(acc[k])
@@ -318,9 +324,12 @@ class OddRoundEngine:
             step_log: Dict[str, Any] = {
                 "odd/loss": float(loss.detach().item()),
                 "odd/bce_loss": float(bce_loss.detach().item()),
-                "odd/z_pass": z_pass,
+                "odd/human_r_thr": human_r_thr,
+                "odd/ai_r_thr": ai_r_thr,
                 "odd/step": step,
                 "odd/qtable_size": len(self._qtable),
+                "odd/qtable_new": len(self._qtable.new),
+                "odd/gem_seen": gem_seen,
                 "odd/auc_best": best_auc if best_auc >= 0.0 else float("nan"),
                 "odd/auc_stale": stale,
                 **{f"odd/acc_{k}": v for k, v in acc.items()},
@@ -329,26 +338,23 @@ class OddRoundEngine:
             if on_step is not None:
                 on_step(step_log)
 
-            if step % max(1, cfg.log_every) == 0:
+            if step == 1 or step % max(1, cfg.log_every) == 0 or reason is not None:
                 a_gem = last_auc.get("auc_gem", float("nan"))
                 lh = last_auc.get("logit_mean_human", float("nan"))
                 lg = last_auc.get("logit_mean_gem", float("nan"))
                 auc_str = f"{a_gem:.4f}" if math.isfinite(a_gem) else "n/a"
-                best_str = f"{best_auc:.4f}" if best_auc >= 0.0 else "n/a"
-                slope_str = (
-                    f"{slope:+.4f}/1k"
-                    if math.isfinite(slope)
-                    else f"warmup({len(auc_hist)}/{cfg.auc_slope_window})"
-                )
                 win_tag = "" if len(raw_buf) >= effective_eval_win else f" [buf {len(raw_buf)}/{effective_eval_win}]"
                 h_acc_w = buf_acc.get("human", float("nan"))
                 g_acc_w = buf_acc.get("gem", float("nan"))
+                q_acc_w = buf_acc.get("qtable", float("nan"))
+                q_str = f", Q={q_acc_w:.2f}" if math.isfinite(q_acc_w) else ""
                 print(
                     f"[R{round_no} Odd] step {step:5d}/{cfg.max_steps} | "
                     f"bce={float(bce_loss.detach().item()):.4f} | "
-                    f"AUC(gem)={auc_str}{win_tag} (best={best_str}, slope={slope_str}, stale={stale}) | "
-                    f"logit(H={lh:+.2f}, G={lg:+.2f}, z_pass={z_pass:+.2f}) | "
-                    f"acc(H={h_acc_w:.2f}, G={g_acc_w:.2f}) | Q={len(self._qtable)}",
+                    f"AUC(gem)={auc_str}{win_tag} | "
+                    f"logit(H={lh:+.2f}, G={lg:+.2f}) | "
+                    f"acc(H={h_acc_w:.2f}>={human_r_thr:.2f}, G={g_acc_w:.2f}<={ai_r_thr:.2f}{q_str}) | "
+                    f"newQ={len(self._qtable.new)}/{self._qtable.q_max} | gem={gem_seen}/{eff_min_gem_seqs}",
                     flush=True,
                 )
             if reason is not None:
@@ -359,19 +365,19 @@ class OddRoundEngine:
             ya_f = np.concatenate([r[1] for r in raw_buf])
             sr_f = [x for r in raw_buf for x in r[2]]
             final_stats = auc_by_source(sc_f, ya_f, sr_f)
-            final_cal = CriticCalibration.from_odd_stats(
-                final_stats.get("logit_mean_human", float("nan")),
-                final_stats.get("logit_mean_gem", float("nan")),
-                pass_reward=cfg.pass_reward_target,
-                fallback_span=cfg.fallback_disc_span,
+            final_cal = CriticCalibration(
+                center=0.0,
+                span=cfg.fallback_disc_span,
+                human_mean=final_stats.get("logit_mean_human"),
+                gem_mean=final_stats.get("logit_mean_gem"),
+                calibrated=False,
             )
         else:
-            final_cal = cur_cal
+            final_cal = fixed_ruler
 
         qstats = self._qtable.commit()
         print(
             f"[R{round_no} Odd] Done ({reason or 'max_steps'}) | "
-            f"Calibrated={final_cal.calibrated} (center={final_cal.center:+.3f}, span={final_cal.span:.3f}) | "
             f"QTable: {qstats['before']} -> -{qstats['forgot']} +{qstats['merged']} = {qstats['size']}",
             flush=True,
         )
@@ -380,6 +386,7 @@ class OddRoundEngine:
             "reason": reason,
             "qtable": qstats,
             "best_auc": best_auc,
+            "gem_seen": gem_seen,
             "calibration": final_cal.to_dict(),
         }
 
@@ -597,7 +604,7 @@ class EvenRoundEngine:
 
         win = max(1, int(cfg.stop_window))
         mv = {k: deque(maxlen=win) for k in ("reward", "kl", "disc")}
-        healthy_snap = self._actor.snapshot_state()
+        healthy_snap = self._actor.export_checkpoint_state()
         snap_step = 0
 
         reason: Optional[str] = None
@@ -695,27 +702,36 @@ class EvenRoundEngine:
             if len(mv["kl"]) == win:
                 reason = self.should_stop(avg["reward"], avg["kl"], avg["disc"])
 
-            if reason is None and step % max(1, cfg.snapshot_every) == 0 and avg["kl"] <= cfg.kl_stop:
-                healthy_snap = self._actor.snapshot_state()
+            if reason is None and step % max(1, cfg.snapshot_every) == 0 and avg["kl"] <= 0.5 * cfg.kl_stop:
+                healthy_snap = self._actor.export_checkpoint_state()
                 snap_step = step
 
         rolled_back = False
+        rollback_deferred = False
+        deferred_rollback_state: Optional[Dict[str, Any]] = None
         injected_hacked = 0
-        if reason is not None and reason.startswith(("reward_hacking", "non_finite_abort")):
-            # Inject hacked sequences into `qtable.table` only on genuine reward hacking (not NaN abort).
-            if reason.startswith("reward_hacking") and last_batch is not None:
+        if reason is not None and reason.startswith("reward_hacking"):
+            if last_batch is not None:
                 hacked_items = [
                     {"seq": c_seq}
                     for c_seq in last_batch.critic_sequences
                     if c_seq is not None and c_seq.size > 0
                 ]
                 injected_hacked = self._qtable.inject_committed(hacked_items)
-            self._actor.restore_state(healthy_snap)
+            rollback_deferred = True
+            deferred_rollback_state = healthy_snap
+            print(
+                f"[R{round_no} Even] Reward hacking detected ({reason}) -> keeping hacked Actor active "
+                f"for R{round_no + 1} Odd Critic training & scheduling rollback to R{round_no} step {snap_step} "
+                f"at start of R{round_no + 2} Even (injected {injected_hacked} hacked sequences into QTable).",
+                flush=True,
+            )
+        elif reason is not None and reason.startswith("non_finite_abort"):
+            self._actor.load_checkpoint_state(healthy_snap)
             optimizer.sync_from_model()
             rolled_back = True
             print(
-                f"[R{round_no} Even] Rollback ({reason}) -> restored Actor snapshot from step {snap_step} "
-                f"(injected {injected_hacked} hacked sequences directly into QTable).",
+                f"[R{round_no} Even] Immediate NaN Rollback ({reason}) -> restored Actor snapshot from step {snap_step}.",
                 flush=True,
             )
 
@@ -724,6 +740,8 @@ class EvenRoundEngine:
             "steps": step,
             "reason": reason,
             "rolled_back": rolled_back,
+            "rollback_deferred": rollback_deferred,
+            "deferred_rollback_state": deferred_rollback_state,
             "snap_step": snap_step,
             "injected_hacked": injected_hacked,
         }
@@ -764,10 +782,13 @@ class UnifiedCARLDriver:
         self._even_cfg = even_cfg or UnifiedEvenConfig()
         # Synchronize Odd-round pass-threshold target with Even-round `reward_stop` unless explicitly overridden.
         linked_target = min(
-            0.92,
+            0.99,
             max(0.50, float(self._even_cfg.reward_stop) / max(1e-6, float(self._even_cfg.disc_weight))),
         )
-        if abs(self._odd_cfg.pass_reward_target - 0.625) < 1e-9 and abs(linked_target - 0.625) > 1e-9:
+        if (
+            abs(self._odd_cfg.pass_reward_target - UnifiedOddConfig.pass_reward_target) < 1e-9
+            and abs(linked_target - self._odd_cfg.pass_reward_target) > 1e-9
+        ):
             self._odd_cfg = dc_replace(
                 self._odd_cfg,
                 pass_reward_target=linked_target,
@@ -777,6 +798,7 @@ class UnifiedCARLDriver:
         torch.manual_seed(seed)
         self._qtable = QTable(q_max=q_max, rng=self._rng)
         self._calibration: Optional[CriticCalibration] = None
+        self._pending_actor_rollback: Optional[Dict[str, Any]] = None
         self._ckpt_prefix = str(ckpt_prefix)
         self._keep_round_ckpts = bool(keep_round_ckpts)
         self._eval_hook = eval_hook
@@ -791,6 +813,36 @@ class UnifiedCARLDriver:
     @property
     def calibration(self) -> Optional[CriticCalibration]:
         return self._calibration
+
+    @property
+    def has_pending_rollback(self) -> bool:
+        return self._pending_actor_rollback is not None
+
+    def _pending_rollback_path(self) -> Path:
+        return self._out_dir / f"{self._ckpt_prefix}-gem.rollback_pending.pth"
+
+    def _apply_pending_rollback_if_any(self, round_no: int) -> bool:
+        if self._pending_actor_rollback is None:
+            rb_path = self._pending_rollback_path()
+            if rb_path.is_file():
+                self._pending_actor_rollback = torch.load(rb_path, map_location="cpu", weights_only=False)
+        if self._pending_actor_rollback is None:
+            return False
+
+        pending = self._pending_actor_rollback
+        self._actor.load_checkpoint_state(pending["state"])
+        from_rnd = pending.get("from_round", "?")
+        snap_st = pending.get("snap_step", 0)
+        self._pending_actor_rollback = None
+        rb_path = self._pending_rollback_path()
+        if rb_path.is_file():
+            rb_path.unlink()
+        print(
+            f"[R{round_no} Even] Applied deferred rollback -> restored healthy pre-hacking Actor "
+            f"from R{from_rnd} (step {snap_st}) after Odd-round Critic inoculation.",
+            flush=True,
+        )
+        return True
 
     def _init_wandb(
         self,
@@ -857,6 +909,17 @@ class UnifiedCARLDriver:
             c_sd = torch.load(critic_ckpt, map_location="cpu", weights_only=False)
             self._critic.load_compact_state(c_sd)
             print(f"[CARL] Resumed Critic from {critic_ckpt}", flush=True)
+
+        rb_path = self._pending_rollback_path()
+        if rb_path.is_file():
+            self._pending_actor_rollback = torch.load(rb_path, map_location="cpu", weights_only=False)
+            from_rnd = self._pending_actor_rollback.get("from_round", "?")
+            snap_st = self._pending_actor_rollback.get("snap_step", 0)
+            print(
+                f"[CARL] Resumed pending deferred Actor rollback from {rb_path} "
+                f"(from R{from_rnd} step {snap_st}; scheduled for next Even round).",
+                flush=True,
+            )
 
     def prefill_qtable(self, target_size: Optional[int] = None) -> None:
         goal = int(target_size or self._qtable.q_max)
@@ -932,6 +995,10 @@ class UnifiedCARLDriver:
         return out
 
     def run_even(self, round_no: int) -> Dict[str, Any]:
+        # Apply any deferred rollback from a prior reward-hacked Even round AFTER the intervening Odd round
+        # has trained the Critic & QTable against the hacked Actor.
+        applied_deferred = self._apply_pending_rollback_if_any(round_no)
+
         # Prefill QTable BEFORE unfreezing Actor so `refresh_gem_pool`'s freeze doesn't clobber GRPO grads.
         if len(self._qtable) == 0:
             self.prefill_qtable()
@@ -950,6 +1017,22 @@ class UnifiedCARLDriver:
             round_no=round_no,
             on_step=lambda d: self._log({**d, "round": round_no}),
         )
+        out["applied_deferred_rollback"] = applied_deferred
+        deferred_state = out.pop("deferred_rollback_state", None)
+        if deferred_state is not None:
+            payload = {
+                "state": deferred_state,
+                "from_round": round_no,
+                "snap_step": int(out.get("snap_step", 0)),
+                "reason": str(out.get("reason") or ""),
+            }
+            self._pending_actor_rollback = payload
+            rb_path = self._pending_rollback_path()
+            torch.save(payload, rb_path)
+            if self._keep_round_ckpts:
+                healthy_path = self._out_dir / f"{self._ckpt_prefix}-gem.carl.r{round_no}.healthy.pth"
+                torch.save(deferred_state, healthy_path)
+
         self._save_round("even", round_no)
         if self._eval_hook is not None:
             eval_metrics = self._eval_hook(round_no, self._actor)

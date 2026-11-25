@@ -55,20 +55,35 @@ class QTable:
     def __len__(self) -> int:
         return len(self.table)
 
+    @property
+    def is_ready_for_full_update(self) -> bool:
+        """今ラウンドの新規バッファ `self.new` が `q_max` に達し、縮退なしで更新可能か返す。"""
+        return len(self.new) >= self.q_max
+
     # -- 蓄積 ---------------------------------------------------------
     def add(self, items: Sequence[dict]) -> int:
-        """今ラウンドの gem 出力を貯める。q_max に達したらそれ以上は捨てる。
+        """今ラウンドの gem 出力を貯める。満杯後もランダム置換で最新ステップまで一様に反映する。
 
         items は `{"seq": 音楽ブロック, "meta": 答え側META}` の辞書。
         META を一緒に持つのは、Q-Table から引くたびにキー推定(約97ms/本)を
         やり直すと学習が止まるため。生成時に一度だけ計算して以後は使い回す。
         """
-        room = self.q_max - len(self.new)
-        if room <= 0:
+        incoming = list(items)
+        if not incoming or self.q_max <= 0:
             return 0
-        take = list(items)[:room]
-        self.new.extend(take)
-        return len(take)
+        room = self.q_max - len(self.new)
+        added = 0
+        if room > 0:
+            take = incoming[:room]
+            self.new.extend(take)
+            added = len(take)
+            incoming = incoming[room:]
+        if incoming and len(self.new) > 0:
+            n_rep = min(len(incoming), len(self.new))
+            rep_idx = self.rng.choice(len(self.new), size=n_rep, replace=False)
+            for dst_i, item in zip(np.atleast_1d(rep_idx), incoming[:n_rep]):
+                self.new[int(dst_i)] = item
+        return added
 
     # -- 参照 ---------------------------------------------------------
     def sample(self, n: int) -> List[dict]:
@@ -81,11 +96,11 @@ class QTable:
 
     # -- 更新(奇数ラウンド終了時に一括) -------------------------------
     def commit(self) -> Dict[str, int]:
-        """1/4 を忘却し、新規の 1/4 をマージする。統計を返す。
+        """1/4 を忘却し、新規プールから欠員分（標準 1/4）をマージする。統計を返す。
 
         初回(テーブルが空)は忘却する対象が無いので、新規から q_max まで一気に満たす。
-        ラウンドが早期終了して new が少ない場合、マージ数もその分少なくなり、
-        テーブルは一時的に縮む(戻り値の `size` で観測できる)。
+        `max_steps` 到達等で `len(self.new) < q_max` のまま終了した場合でも、忘却で空いた枠は
+        `self.new` に在庫がある限り補充し、Q-Table サイズの不必要な縮小を防ぐ。
         """
         stats = {"before": len(self.table), "forgot": 0, "merged": 0,
                  "new_pool": len(self.new)}
@@ -94,14 +109,15 @@ class QTable:
             self.table = list(keep)
             stats["merged"] = len(keep)
         else:
-            n_forget = int(len(self.table) * self.forget_ratio)
+            before_n = len(self.table)
+            n_forget = int(before_n * self.forget_ratio)
             if n_forget > 0:
-                keep_idx = self.rng.choice(len(self.table),
-                                           size=len(self.table) - n_forget, replace=False)
+                keep_idx = self.rng.choice(before_n,
+                                           size=before_n - n_forget, replace=False)
                 self.table = [self.table[i] for i in sorted(keep_idx)]
                 stats["forgot"] = n_forget
-            n_merge = min(int(len(self.new) * self.merge_ratio),
-                          self.q_max - len(self.table))
+            desired = max(int(len(self.new) * self.merge_ratio), n_forget)
+            n_merge = min(desired, len(self.new), self.q_max - len(self.table))
             if n_merge > 0:
                 idx = self.rng.choice(len(self.new), size=n_merge, replace=False)
                 self.table.extend(self.new[i] for i in idx)
@@ -199,6 +215,37 @@ def accuracy_by_source(
     src = np.asarray(source)
     for s in (HUMAN, GEM, QTAB):
         m = (src == s)
+        if m.any():
+            out[s] = float(correct[m].mean())
+    return out
+
+
+def asymmetric_reward_accuracy_by_source(
+    rewards,
+    is_ai,
+    source,
+    human_min_reward: float = 0.80,
+    ai_max_reward: Optional[float] = None,
+) -> Dict[str, float]:
+    """非対称マージン基準（人間 `R >= human_min_reward` / AI `R <= 1 - human_min_reward`）で出所別正解率を算出する。
+
+    グレーゾーン `(ai_max_reward, human_min_reward)` に入ったサンプルは人間・AI どちらであっても不正解 (`0.0`) とみなす。
+    これにより「中途半端なスコア（例: `R = 0.50`）で奇数ラウンドが抜けてしまう」現象を完全に排除する。
+    """
+    import torch
+
+    r_np = torch.as_tensor(rewards).float().cpu().numpy()
+    y_np = np.asarray(is_ai, dtype=np.float32)
+    h_thr = float(human_min_reward)
+    a_thr = float(1.0 - h_thr) if ai_max_reward is None else float(ai_max_reward)
+
+    is_human = y_np <= 0.5
+    correct = np.where(is_human, r_np >= h_thr, r_np <= a_thr).astype(np.float32)
+
+    out: Dict[str, float] = {"overall": float(correct.mean()) if len(correct) else 0.0}
+    src = np.asarray(source)
+    for s in (HUMAN, GEM, QTAB):
+        m = src == s
         if m.any():
             out[s] = float(correct[m].mean())
     return out

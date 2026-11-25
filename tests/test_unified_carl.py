@@ -685,6 +685,8 @@ def test_reward_hacking_rollback_immediately_commits_to_qtable_and_persists(tmp_
             return torch.device("cpu")
 
         def mark_trainable(self) -> Dict[str, int]:
+            for p in self._p.parameters():
+                p.requires_grad_(True)
             return {"p": 5}
 
         def score_disc_logits(
@@ -693,8 +695,9 @@ def test_reward_hacking_rollback_immediately_commits_to_qtable_and_persists(tmp_
             chunk_size: Optional[int] = None,
             grad_enabled: bool = False,
         ) -> Tensor:
-            # Negative logit (-4.0) -> `R_disc = clamp(0.5 - (-4)/8) = 1.0 > disc_stop (0.8)`
-            return torch.full((len(critic_sequences),), -4.0, dtype=torch.float32)
+            # Negative logits (-3.6 .. -4.4) -> `R_disc = clamp(0.5 - z/8) >= 0.95 > disc_stop (0.8)` with non-zero group variance!
+            base_z = -3.6 - 0.2 * torch.arange(len(critic_sequences), dtype=torch.float32)
+            return base_z + 0.0 * sum(p.sum() for p in self._p.parameters()) if grad_enabled else base_z
 
         def export_compact_state(self) -> Dict[str, Any]:
             return {}
@@ -715,6 +718,7 @@ def test_reward_hacking_rollback_immediately_commits_to_qtable_and_persists(tmp_
             return torch.zeros((context,), dtype=torch.float32), {}
 
     actor = _DriftingActor()
+    initial_w = actor.actor_module[1].weight.detach().clone()
     snap = actor.snapshot_state()
     assert all(t.device.type == "cpu" for t in snap.values())
 
@@ -743,10 +747,11 @@ def test_reward_hacking_rollback_immediately_commits_to_qtable_and_persists(tmp_
         gem_pool=pool,
         guardrail_suite=suite,
         out_dir=out_dir,
+        odd_cfg=UnifiedOddConfig(batch_size=4, pool_size=4, max_steps=2, eval_window=2),
         even_cfg=UnifiedEvenConfig(
             group_size=2,
             prompts_per_step=2,
-            lr=1e-2,
+            lr=5e-2,
             max_steps=5,
             stop_window=2,
             kl_stop=0.30,
@@ -758,12 +763,57 @@ def test_reward_hacking_rollback_immediately_commits_to_qtable_and_persists(tmp_
     # Pre-seed 1 item so `prefill_qtable` doesn't overwrite our clean check.
     drv.qtable.inject_committed([{"seq": np.array([1, 1, 1, 1], dtype=np.int64)}])
     even_out = drv.run_even(round_no=2)
-    assert even_out["rolled_back"] is True
+    # 1. At end of R2 Even: Actor MUST stay in hacked state (NOT rolled back yet!) so R3 Odd trains against it!
+    assert even_out["rolled_back"] is False
+    assert even_out["rollback_deferred"] is True
+    assert drv.has_pending_rollback is True
     assert even_out["injected_hacked"] == 4
-    # Hacked items `[9, 9, 9, ...]` must already be inside `qtable.table` for immediate sampling!
+    hacked_w = actor.actor_module[1].weight.detach().clone()
+    assert not torch.allclose(hacked_w, initial_w)
+    assert (out_dir / "CARL-gem.rollback_pending.pth").is_file()
+    assert (out_dir / "CARL-gem.carl.r2.healthy.pth").is_file()
     sampled = drv.qtable.sample(len(drv.qtable))
     assert any(int(it["seq"][0]) == 9 for it in sampled)
     assert (out_dir / "qtable.r2.pt").is_file()
+
+    # 2. During R3 Odd: Actor remains in `hacked_w` throughout Critic training!
+    drv.run_odd(round_no=3)
+    assert torch.allclose(actor.actor_module[1].weight, hacked_w)
+    assert drv.has_pending_rollback is True
+
+    # 3. Simulate Colab restart & resume before R4 Even: R4 Even MUST restore `initial_w` at the very start!
+    actor_resumed = _DriftingActor()
+    drv_resumed = UnifiedCARLDriver(
+        actor=actor_resumed,
+        base_actor=base,
+        critic=critic,
+        ana_pool=pool,
+        gem_pool=pool,
+        guardrail_suite=suite,
+        out_dir=out_dir,
+        even_cfg=UnifiedEvenConfig(
+            group_size=2,
+            prompts_per_step=2,
+            lr=1e-9,  # near-zero lr so we can verify R4 started from exact `initial_w`!
+            max_steps=1,
+            stop_window=2,
+            kl_stop=10.0,
+            train_chunk=2,
+        ),
+        q_max=16,
+    )
+    drv_resumed.resume(
+        actor_ckpt=out_dir / "CARL-gem.carl_latest.pth",
+        qtable_ckpt=out_dir / "qtable_latest.pt",
+    )
+    assert torch.allclose(actor_resumed.actor_module[1].weight, hacked_w)
+    assert drv_resumed.has_pending_rollback is True
+
+    r4_out = drv_resumed.run_even(round_no=4)
+    assert r4_out["applied_deferred_rollback"] is True
+    assert drv_resumed.has_pending_rollback is False
+    assert not (out_dir / "CARL-gem.rollback_pending.pth").exists()
+    assert torch.allclose(actor_resumed.actor_module[1].weight, initial_w, atol=1e-6)
 
 
 def test_cli_backend_registry_defaults_and_guardrail_invariants() -> None:
@@ -1399,26 +1449,37 @@ def test_critic_calibration_ruler_and_odd_dual_gate_stopping(tmp_path: Path) -> 
     pool = InMemorySamplePool(
         [CARLExample(f"h{i}", i, np.array([1], dtype=np.int64), np.array([1, 2], dtype=np.int64)) for i in range(4)]
     )
-    # Drifted Critic: Human=-6.0, Gem=-4.0 -> AUC is 1.0, but Gem < 0 so `centered_ok` blocks false stop!
+    # 1. Drifted Critic: Human=-6.0 (R=1.0>=0.8), Gem=-4.0 (R=1.0>0.2) -> Gem-ACC is 0.00 (NEVER 90%!) -> blocked!
     odd_drifted = OddRoundEngine(
         actor=_StubActor(),
         critic=_ShiftedCritic(-6.0, -4.0),
         qtable=QTable(q_max=8),
-        cfg=UnifiedOddConfig(batch_size=4, pool_size=4, max_steps=4, eval_window=2, log_every=1, auc_threshold=0.90),
+        cfg=UnifiedOddConfig(batch_size=4, pool_size=4, max_steps=4, eval_window=2, log_every=1),
     )
     res_drifted = odd_drifted.run(pool, round_no=1)
-    assert res_drifted["reason"] is None  # ran all 4 steps instead of stopping prematurely!
+    assert res_drifted["reason"] is None
 
-    # Properly centered Critic: Human=-2.0, Gem=+2.0 -> stops cleanly with `discriminator_ready` & saves calibration!
-    odd_clean = OddRoundEngine(
+    # 2. Lukewarm Critic ("中途半端"): Human=-2.0 (R=0.75 < 0.80), Gem=+2.0 (R=0.25 > 0.20) -> BOTH fail 0.80 / 0.20!
+    odd_lukewarm = OddRoundEngine(
         actor=_StubActor(),
         critic=_ShiftedCritic(-2.0, +2.0),
         qtable=QTable(q_max=8),
-        cfg=UnifiedOddConfig(batch_size=4, pool_size=4, max_steps=4, eval_window=2, log_every=1, auc_threshold=0.90),
+        cfg=UnifiedOddConfig(batch_size=4, pool_size=4, max_steps=4, eval_window=2, log_every=1),
+    )
+    res_lukewarm = odd_lukewarm.run(pool, round_no=1)
+    assert res_lukewarm["reason"] is None
+
+    # 3. Decisive Critic: Human=-3.0 (R=0.875>=0.80), Gem=+3.0 (R=0.125<=0.20) -> waits until QTable & gem_seen>=8 (step 4), then stops!
+    odd_clean = OddRoundEngine(
+        actor=_StubActor(),
+        critic=_ShiftedCritic(-3.0, +3.0),
+        qtable=QTable(q_max=8),
+        cfg=UnifiedOddConfig(batch_size=4, pool_size=4, max_steps=6, eval_window=2, log_every=1),
     )
     res_clean = odd_clean.run(pool, round_no=1)
     assert str(res_clean["reason"]).startswith("discriminator_ready")
-    assert res_clean["calibration"]["calibrated"] is True
+    assert res_clean["steps"] == 4  # waited for gem_seen == 8 == q_max before stopping!
+    assert res_clean["qtable"]["size"] == 8
 
 
 def test_grpo_persisted_rollout_old_logprobs_temperature_match_and_1536_norm() -> None:
@@ -1495,7 +1556,11 @@ def test_song_balanced_memmap_and_cli_pool_limit_inheritance(tmp_path: Path) -> 
     args = parser.parse_args(["--out-dir", "out/tmp", "--pool-limit", "10000"])
     assert args.pool_limit == 10000
     assert args.midi_pool_limit is None
-    assert args.calibrate_reward is True
+    assert args.calibrate_reward is False
+    assert abs(args.odd_human_acc - 0.93) < 1e-12
+    assert abs(args.odd_gem_acc - 0.93) < 1e-12
+    assert args.odd_min_gem_seqs == 3000
+    assert abs(args.reward_stop - 0.80) < 1e-12
     assert abs(args.odd_logit_reg - 1e-3) < 1e-12
 
     m_args = MORTM5Args(_tiny_symic_config())

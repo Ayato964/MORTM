@@ -367,6 +367,17 @@ DEFAULT_STAGE3_CANDIDATES: Tuple[ModelCandidateSpec, ...] = (
         ),
     ),
     ModelCandidateSpec(
+        key="symic_g4l4_160m_carl_v8",
+        display_name="SyMIc-G4L4 + Depth + CARL v8 (160M, R10)",
+        paradigm="grouped",
+        config_path="configs/models/mortm5/symic_main/symic_g4l4_160m.json",
+        checkpoint_path="out/carl/symic_g4l4_160m_carl_v8/SyMIc-gem.carl.r10.pth",
+        vq_checkpoint_path=(
+            "out/models/mortm5/m4_deeprvq_g4l4_d128_k2048/"
+            "MORTM5.M4_DeepRVQ_G4L4_D128_K2048_latest.pth"
+        ),
+    ),
+    ModelCandidateSpec(
         key="octuple_160m",
         display_name="Octuple-MMT (160M, 1ep)",
         paradigm="octuple",

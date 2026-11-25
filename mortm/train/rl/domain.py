@@ -265,7 +265,10 @@ class UnifiedOddConfig:
     auc_min_steps: int = 1000
     logit_reg_coef: float = 1e-3
     min_class_acc: float = 0.70
-    pass_reward_target: float = 0.625
+    human_acc_threshold: float = 0.93
+    gem_acc_threshold: float = 0.93
+    min_gem_seqs: int = 3000
+    pass_reward_target: float = 0.80
     fallback_disc_span: float = 8.0
     sampling: UnifiedSamplingConfig = field(default_factory=UnifiedSamplingConfig)
 
@@ -292,6 +295,16 @@ class UnifiedOddConfig:
             raise ValueError(f"logit_reg_coef must be >= 0, got {self.logit_reg_coef}.")
         if not (0.0 <= self.min_class_acc <= 1.0):
             raise ValueError(f"min_class_acc must be in [0, 1], got {self.min_class_acc}.")
+        if not (0.0 < self.human_acc_threshold <= 1.0):
+            raise ValueError(
+                f"human_acc_threshold must be in (0, 1], got {self.human_acc_threshold}."
+            )
+        if not (0.0 < self.gem_acc_threshold <= 1.0):
+            raise ValueError(
+                f"gem_acc_threshold must be in (0, 1], got {self.gem_acc_threshold}."
+            )
+        if self.min_gem_seqs < 0:
+            raise ValueError(f"min_gem_seqs must be >= 0, got {self.min_gem_seqs}.")
         if not (0.0 < self.pass_reward_target < 1.0):
             raise ValueError(f"pass_reward_target must be in (0, 1), got {self.pass_reward_target}.")
         if self.fallback_disc_span <= 0.0:
@@ -315,6 +328,9 @@ class UnifiedOddConfig:
             "auc_min_steps": self.auc_min_steps,
             "logit_reg_coef": self.logit_reg_coef,
             "min_class_acc": self.min_class_acc,
+            "human_acc_threshold": self.human_acc_threshold,
+            "gem_acc_threshold": self.gem_acc_threshold,
+            "min_gem_seqs": self.min_gem_seqs,
             "pass_reward_target": self.pass_reward_target,
             "fallback_disc_span": self.fallback_disc_span,
         }
@@ -337,13 +353,13 @@ class UnifiedEvenConfig:
     train_chunk: int = 8
     kl_stop: float = 0.30
     disc_stop: float = 0.80
-    reward_stop: float = 0.625
+    reward_stop: float = 0.80
     stop_window: int = 20
     snapshot_every: int = 20
     log_every: int = 10
     disc_weight: float = 1.0
     disc_span: float = 8.0
-    calibrate_reward: bool = True
+    calibrate_reward: bool = False
     ppo_epochs: int = 1
     empty_penalty: float = -1.0
     sampling: UnifiedSamplingConfig = field(default_factory=UnifiedSamplingConfig)

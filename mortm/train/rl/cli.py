@@ -339,10 +339,28 @@ def build_arg_parser(registry: Optional[CARLBackendRegistry] = None) -> argparse
         help="L2 logit regularization coefficient preventing Critic logit inflation (default: 1e-3).",
     )
     ap.add_argument(
+        "--odd-human-acc",
+        type=float,
+        default=0.93,
+        help="Minimum Human accuracy at R_disc >= reward_stop required to finish Odd round (default: 0.93).",
+    )
+    ap.add_argument(
+        "--odd-gem-acc",
+        type=float,
+        default=0.93,
+        help="Minimum latest-AI (gem) accuracy at R_disc <= 1 - reward_stop required to finish Odd round (default: 0.93).",
+    )
+    ap.add_argument(
+        "--odd-min-gem-seqs",
+        type=int,
+        default=3000,
+        help="Minimum latest-AI sequences read by Critic (in addition to full QTable update) before Odd round can finish (default: 3000).",
+    )
+    ap.add_argument(
         "--odd-min-acc",
         type=float,
-        default=0.70,
-        help="Minimum Human & latest-AI accuracy at the calibrated pass threshold required to finish Odd round.",
+        default=None,
+        help="Legacy alias setting both --odd-human-acc and --odd-gem-acc if explicitly specified.",
     )
 
     # Even Round (GRPO Actor)
@@ -354,12 +372,12 @@ def build_arg_parser(registry: Optional[CARLBackendRegistry] = None) -> argparse
     ap.add_argument("--kl-coef", type=float, default=0.05)
     ap.add_argument("--kl-stop", type=float, default=0.30)
     ap.add_argument("--disc-stop", type=float, default=0.80)
-    ap.add_argument("--reward-stop", type=float, default=0.625)
+    ap.add_argument("--reward-stop", type=float, default=0.80)
     ap.add_argument(
         "--calibrate-reward",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Calibrate Even-round R_disc scale to the preceding Odd-round Human/AI logit distribution (default: True).",
+        default=False,
+        help="Experimental: dynamically recalibrate Even-round R_disc scale (default: False; uses fixed symmetric [0, 1] ruler).",
     )
     ap.add_argument("--gen-chunk", type=int, default=16)
     ap.add_argument("--critic-chunk", type=int, default=16)
@@ -395,7 +413,9 @@ def build_driver_from_args(
         min_p=args.min_p,
         repetition_penalty=args.repetition_penalty,
     )
-    pass_target = min(0.92, max(0.50, float(args.reward_stop)))
+    pass_target = min(0.99, max(0.50, float(args.reward_stop)))
+    eff_human_acc = float(args.odd_min_acc) if args.odd_min_acc is not None else float(args.odd_human_acc)
+    eff_gem_acc = float(args.odd_min_acc) if args.odd_min_acc is not None else float(args.odd_gem_acc)
     odd_cfg = UnifiedOddConfig(
         batch_size=args.odd_batch_size,
         pool_size=args.odd_pool_size,
@@ -407,7 +427,10 @@ def build_driver_from_args(
         auc_threshold=args.auc_threshold,
         auc_min_steps=args.auc_min_steps,
         logit_reg_coef=args.odd_logit_reg,
-        min_class_acc=args.odd_min_acc,
+        min_class_acc=min(eff_human_acc, eff_gem_acc),
+        human_acc_threshold=eff_human_acc,
+        gem_acc_threshold=eff_gem_acc,
+        min_gem_seqs=args.odd_min_gem_seqs,
         pass_reward_target=pass_target,
         sampling=sampling,
     )
